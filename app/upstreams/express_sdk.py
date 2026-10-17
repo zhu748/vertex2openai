@@ -19,7 +19,7 @@ from message_processing import (create_gemini_prompt, apply_prefill_compat,
 from client_pool import get_pooled_express_client
 import model_capabilities as mc
 from runtime_state import app_state, get_effective_proxy_uri_for_key
-from proxy_resolver import ProxyResolveError, mask_proxy_uri
+from proxy_resolver import ProxyResolveError, mask_proxy_uri, resolve_proxy_uri_async
 import config as app_config
 from schema_validation import SchemaValidationError, validate_request_schemas
 
@@ -237,6 +237,10 @@ class ExpressSDKUpstream(BaseUpstream):
         # （sing-box 缺失/链接非法）在这里拦下，返回明确的 5xx 而非静默直连。
         key_proxy_uri = get_effective_proxy_uri_for_key(key_record)
         try:
+            # 预热：sing-box 首次启动（子进程 + 端口等待，典型 ~100ms、异常 10s
+            # 兑底）放线程池里做，不卡事件循环；随后池签名里的同步 resolve
+            # 命中缓存，零阻塞。
+            await resolve_proxy_uri_async(key_proxy_uri)
             client_to_use = get_pooled_express_client(express_api_key, key_proxy_uri)
         except ProxyResolveError as e:
             print(f"❌ [出站代理] {e}")
@@ -325,6 +329,10 @@ class ExpressSDKUpstream(BaseUpstream):
             print(f"🔎 [出站调试] Express 通道 生成参数={_dbg}")
 
         def retry_target_factory():
+            # 同步上下文（api_helpers 的异步生成器里直接调用）：换 Key 后若
+            # 新 Key 的 sing-box 代理尚未预热，这里会同步启动（典型 ~100ms）。
+            # 重试路径本就有退避等待，这点开销可接受；主调用路径已在上面
+            # 用 resolve_proxy_uri_async 预热过，不落到这里。
             nonlocal express_api_key
             record = express_key_manager_instance.get_express_record(exclude_key=express_api_key)
             if record is None:

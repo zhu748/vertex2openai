@@ -151,3 +151,6 @@ multiple_credentials_implementation.md
 # 运行时状态（web_state.json 含 Cookie/Key，绝不入库）
 data/
 web_state.json
+
+# sing-box 子进程的配置/日志（STATE_DIR 未设置时落在仓库根 singbox/）
+singbox/

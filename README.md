@@ -289,7 +289,7 @@ TCP+TLS 握手（每次约省 100~300ms 与相应 CPU）；429 重试场景收�
 | `STATE_DIR` | 否 | `.` | `web_state.json` 的存放目录。用 Docker 时请指向挂载卷，否则重建容器会丢失全部设置与 Cookie。 |
 | `TRUST_PROXY_HEADERS` | 否 | 空 | 部署在可信反向代理后时设 `1`：登录限速按 `X-Forwarded-For` 区分真实客户端，避免一人失败全站被锁退避。确认入口是自己的反代才开（否则可被伪造头绕过限速）。 |
 | `ALLOW_DEFAULT_KEY` | 否 | 空 | 仅用于在公开托管环境（如 HF Space）临时放行默认 `API_KEY`，正常部署不要设置。 |
-| `SINGBOX_BIN` | 否 | 自动探测 | sing-box 可执行文件路径（默认依次找 `$SINGBOX_BIN` → `/usr/local/bin` 等常见路径 → `PATH`）。仅影响 vless/vmess 等分享链接协议；缺失时这些协议明确报错、不降级直连。 |
+| `SINGBOX_BIN` | 否 | 自动探测 | sing-box 可执行文件路径（默认依次找 `$SINGBOX_BIN` → `/usr/local/bin` 等常见路径 → 仓库根 `bin/sing-box` → `PATH`）。仅影响 vless/vmess 等分享链接协议；缺失时这些协议明确报错、不降级直连。 |
 | `SINGBOX_IDLE_MINUTES` | 否 | `30` | sing-box 空闲实例回收阈值（分钟；`0` = 永不回收）。每个代理链接占一个本地端口与一个子进程，长时间不用自动回收、下次请求时秒级重启。 |
 
 ### 出站代理与多协议支持
@@ -301,7 +301,7 @@ TCP+TLS 握手（每次约省 100~300ms 与相应 CPU）；429 重试场景收�
 - **优先级**：每个 Express Key 可在控制台「通道与凭证」页单独设置**专属代理**（优先于全局；填 `direct` = 该 Key 强制直连），Key 探测也走该 Key 自己的出口；
 - **安全策略**：配置了分享链接协议但环境里找不到 sing-box 时（非 Docker 部署），请求会**明确报错**并给出安装指引——绝不静默直连，防止真实出口 IP 意外泄露；
 - **环境变量**：`PROXY_URL` 作为全局初始值，控制台保存过一次后（含清空保存）以控制台为准；
-- **非 Docker 部署**：手动安装 sing-box（[releases](https://github.com/SagerNet/sing-box/releases)）或设 `SINGBOX_BIN` 指向可执行文件。http/socks5 原生协议不需要 sing-box。
+- **非 Docker 部署**：手动安装 sing-box（[releases](https://github.com/SagerNet/sing-box/releases)）、把二进制放进仓库根 `bin/sing-box`，或设 `SINGBOX_BIN` 指向可执行文件。http/socks5 原生协议不需要 sing-box。
 
 > 提示：`ROUNDROBIN`、`FAKE_STREAMING(_INTERVAL)`、`SAFETY_SCORE` 等环境变量仅作为**初始值**，运行时以控制台设置为准。
 

@@ -72,8 +72,9 @@ async def fetch_and_parse_models_config() -> Optional[Dict[str, List[str]]]:
     # 附属功能：转换失败按无代理直连重试（主调用通道各自对代理失败明确报错），
     # 不让它拖垮本地兜底列表的加载。
     try:
-        from proxy_resolver import resolve_proxy_uri
-        proxy_url = resolve_proxy_uri(get_effective_proxy_url())
+        from proxy_resolver import resolve_proxy_uri_async
+        # 异步版：sing-box 首次启动放线程池，不卡事件循环
+        proxy_url = await resolve_proxy_uri_async(get_effective_proxy_url())
     except Exception:
         proxy_url = ""
     if proxy_url:

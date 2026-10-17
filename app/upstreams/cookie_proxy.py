@@ -24,7 +24,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from models import OpenAIRequest, normalize_content_part
 from upstreams.base import BaseUpstream
 from runtime_state import app_state, get_effective_proxy_url
-from proxy_resolver import ProxyResolveError, resolve_proxy_uri
+from proxy_resolver import ProxyResolveError, resolve_proxy_uri_async
 import config as app_config
 import model_capabilities as mc
 from message_processing import (
@@ -1417,7 +1417,8 @@ class CookieProxyUpstream(BaseUpstream):
         _proxy_raw = get_effective_proxy_url()
         if _proxy_raw:
             try:
-                _proxy_url = resolve_proxy_uri(_proxy_raw)
+                # 异步版：sing-box 首次启动放线程池，不卡事件循环
+                _proxy_url = await resolve_proxy_uri_async(_proxy_raw)
             except ProxyResolveError as e:
                 # 不静默直连（防真实 IP 泄露）：返回明确的 5xx。
                 print(f"❌ [Studio] 全局出站代理不可用：{e}")

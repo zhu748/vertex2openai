@@ -952,7 +952,6 @@ def fetch_remote_image(url: str, timeout: float = 10.0) -> Optional[Tuple[bytes,
     from proxy_resolver import resolve_proxy_uri
 
     raw_proxy = get_effective_proxy_url()
-    check_host = not raw_proxy
     # vless/vmess 等分享链接 → 本地 socks5；解析失败按无代理处理
     # （图片抓取是附属功能，不能因代理问题拖垮整个请求；
     #   上游主调用仍会在各自通道里对代理失败明确报错）。
@@ -960,6 +959,10 @@ def fetch_remote_image(url: str, timeout: float = 10.0) -> Optional[Tuple[bytes,
         proxy_url = resolve_proxy_uri(raw_proxy)
     except Exception:
         proxy_url = ""
+    # F-3 内网检查按**实际出口**判断：配置了代理但转换失败（如缺 sing-box）
+    # 时此刻是直连出口，必须照常做内网检查——不能因为「配置过代理」就放行，
+    # 否则等于给了 SSRF 一条旁路。
+    check_host = not proxy_url
     try:
         parsed = urlparse(url)
         if parsed.scheme not in ("http", "https"):

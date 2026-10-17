@@ -26,7 +26,7 @@ import httpx
 import config as app_config
 from runtime_state import app_state, get_effective_proxy_uri_for_key
 from express_fingerprint import build_direct_headers
-from proxy_resolver import resolve_proxy_uri
+from proxy_resolver import ProxyResolveError, resolve_proxy_uri, resolve_proxy_uri_async
 
 # 调模型的正确 URL（Express 全局端点格式），{model} 处填一个不存在的模型名来探测
 GENERATE_CONTENT_URL = (
@@ -86,6 +86,12 @@ async def probe_project_id(key: str) -> Tuple[Optional[str], str]:
     records = {r["key"]: r for r in app_state.get_express_keys()}
     rec = records.get(key)
     key_proxy_raw = get_effective_proxy_uri_for_key(rec)
+    try:
+        # 预热：sing-box 首次启动放线程池，不卡事件循环；_client_args 里的
+        # 同步 resolve 随后命中缓存。
+        await resolve_proxy_uri_async(key_proxy_raw)
+    except ProxyResolveError as e:
+        return None, f"该 Key 的出站代理不可用：{e}"
     try:
         async with httpx.AsyncClient(**_client_args(key_proxy_raw)) as client:
             resp = await client.post(

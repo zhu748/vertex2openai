@@ -7,6 +7,7 @@ direct 哨兵语义、sing-box 缺失时明确报错不直连、Key 级代理优
 import base64
 import json
 import os
+import time
 from pathlib import Path
 import sys
 import tempfile
@@ -118,7 +119,8 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(ob["server_port"], 8388)
 
     def test_ss_sip002_plain_userinfo(self):
-        ob = parse_share_uri_to_outbound("ss://aes-128-gcm:plainpass@5.6.7.8:8388/?plugin=x#S2")
+        # （带 plugin 的链接见 test_ss_plugin_rejected_explicitly：现为明确拒绝）
+        ob = parse_share_uri_to_outbound("ss://aes-128-gcm:plainpass@5.6.7.8:8388/?#S2")
         self.assertEqual(ob["method"], "aes-128-gcm")
         self.assertEqual(ob["password"], "plainpass")
 
@@ -164,6 +166,55 @@ class ParseTests(unittest.TestCase):
                     "hysteria2://@h:443", "tuic://:pwd@h:443", "ftp://host:21"):
             with self.assertRaises(ProxyResolveError, msg=bad):
                 parse_share_uri_to_outbound(bad)
+
+    # ---------- 第十七轮修复的回归用例 ----------
+
+    def test_vless_reality_without_fp_gets_default(self):
+        # sing-box 要求 REALITY 必带 uTLS 指纹；链接漏带 fp 时补默认 chrome
+        uri = "vless://uuid-1@r.example.com:443?security=reality&pbk=KEY&sni=r.example.com#R"
+        ob = parse_share_uri_to_outbound(uri)
+        self.assertEqual(ob["tls"]["utls"]["fingerprint"], "chrome")
+
+    def test_vless_flow_stripped_without_tls(self):
+        # flow 只在 TLS/REALITY 下有意义；裸 TCP 带上会被 sing-box 拒启
+        ob = parse_share_uri_to_outbound(
+            "vless://uuid-1@1.2.3.4:80?security=none&flow=xtls-rprx-vision&type=tcp#x")
+        self.assertNotIn("flow", ob)
+
+    def test_ss_plugin_rejected_explicitly(self):
+        # SIP003 plugin 静默忽略会产出永远连不上的代理——必须明确报错
+        with self.assertRaises(ProxyResolveError) as ctx:
+            parse_share_uri_to_outbound("ss://aes-128-gcm:pw@1.2.3.4:8388?plugin=v2ray-plugin")
+        self.assertIn("plugin", str(ctx.exception))
+
+    def test_vmess_b64_tolerates_whitespace(self):
+        # 从网页/聊天窗口复制的 vmess 链接常带折行与首尾空白
+        raw = base64.b64encode(json.dumps(
+            {"add": "a.com", "port": "443", "id": "u"}).encode()).decode()
+        broken = "vmess:// " + raw[:15] + "\n" + raw[15:30] + " " + raw[30:]
+        ob = parse_share_uri_to_outbound(broken)
+        self.assertEqual(ob["server"], "a.com")
+
+    def test_vmess_port_range(self):
+        for bad_port in ("0", "65536", "-1"):
+            with self.assertRaises(ProxyResolveError, msg=bad_port):
+                parse_share_uri_to_outbound(_vmess_uri(port=bad_port))
+
+    def test_ws_path_not_double_decoded(self):
+        # parse_qs 已解码一次；再 unquote 会把字面量 "%2F" 错误地变成 "/"
+        uri = "vless://uuid-1@1.2.3.4:443?security=tls&type=ws&path=%252Fws&sni=x.com"
+        ob = parse_share_uri_to_outbound(uri)
+        self.assertEqual(ob["transport"]["path"], "%2Fws")
+        # 正常单次编码不受影响
+        uri2 = "vless://uuid-1@1.2.3.4:443?security=tls&type=ws&path=%2Fws2&sni=x.com"
+        self.assertEqual(parse_share_uri_to_outbound(uri2)["transport"]["path"], "/ws2")
+
+    def test_ss_bad_port_is_actionable_error(self):
+        # 端口非数字/越界必须报 ProxyResolveError（而不是裸 ValueError）
+        with self.assertRaises(ProxyResolveError):
+            parse_share_uri_to_outbound("ss://aes-128-gcm:pw@1.2.3.4:notaport")
+        with self.assertRaises(ProxyResolveError):
+            parse_share_uri_to_outbound("ss://aes-128-gcm:pw@1.2.3.4:99999")
 
 
 class ClassifyValidateMaskTests(unittest.TestCase):
@@ -235,10 +286,104 @@ class ResolveTests(unittest.TestCase):
             pass
         finally:
             pr.singbox_manager.shutdown_all()
+            # shutdown_all 会置 _closed 哨兵（进程级停机语义）；测试进程
+            # 还要继续跑，必须 reopen 恢复，否则后续用例全报「进程正在退出」。
+            pr.singbox_manager.reopen()
 
     def test_unsupported_scheme_rejected(self):
         with self.assertRaises(ProxyResolveError):
             resolve_proxy_uri("gopher://1.2.3.4:70")
+
+    def test_async_resolve_matches_sync(self):
+        import asyncio as _aio
+        self.assertEqual(_aio.run(pr.resolve_proxy_uri_async("socks5://1.2.3.4:1080")),
+                         "socks5://1.2.3.4:1080")
+        self.assertEqual(_aio.run(pr.resolve_proxy_uri_async("")), "")
+        self.assertEqual(_aio.run(pr.resolve_proxy_uri_async("direct")), "")
+        self.assertEqual(_aio.run(pr.resolve_proxy_uri_async(None)), "")
+
+
+class _FakeInst:
+    """测试替身：只实现管理器用到的接口（不碰真进程）。"""
+
+    def __init__(self, port: int, alive: bool = False):
+        self.uri = ""
+        self.port = port
+        self.process = None
+        self.config_path = ""
+        self.log_path = ""
+        self.started_at = 0.0
+        self.last_used = 0.0
+        self._alive = alive
+
+    def alive(self) -> bool:
+        return self._alive
+
+
+class ManagerRobustnessTests(unittest.TestCase):
+    """进程管理器防御性行为：停机/reopen、崩溃端口复活、死条目清理、锁外回收。"""
+
+    URI = "vless://u@1.2.3.4:443"
+
+    def test_shutdown_all_then_reopen(self):
+        mgr = pr.SingboxManager()          # 独立实例，不碰全局单例
+        with mock.patch.object(pr, "find_singbox_binary", return_value=None):
+            mgr.shutdown_all()
+            with self.assertRaises(ProxyResolveError) as ctx:
+                mgr.get_local_socks5(self.URI)
+            self.assertIn("退出", str(ctx.exception))
+            mgr.reopen()
+            # reopen 后回到正常语义（此处应为「缺二进制」而非「正在退出」）
+            with self.assertRaises(ProxyResolveError) as ctx2:
+                mgr.get_local_socks5(self.URI)
+            self.assertIn("sing-box", str(ctx2.exception))
+            self.assertNotIn("退出", str(ctx2.exception))
+
+    def test_crashed_instance_retries_fresh_port(self):
+        # 崩溃实例优先复用原端口；原端口启动失败（被占/配置错）时
+        # 必须换新端口重试，而不是永远卡在同一个坏端口上。
+        mgr = pr.SingboxManager()
+        mgr._instances[self.URI] = _FakeInst(12345)
+        calls: list[int] = []
+
+        def fake_launch(uri: str, port: int):
+            calls.append(port)
+            if len(calls) == 1:
+                raise pr.ProxyResolveError("端口被占")
+            return _FakeInst(port, alive=True)
+
+        with mock.patch.object(mgr, "_launch", side_effect=fake_launch):
+            url = mgr.get_local_socks5(self.URI)
+        self.assertEqual(calls[0], 12345)              # 先试旧端口
+        self.assertNotEqual(calls[1], 12345)           # 再换新端口
+        self.assertTrue(url.startswith("socks5://127.0.0.1:"))
+        self.assertNotIn(":12345", url)
+
+    def test_total_failure_cleans_dead_entry(self):
+        # 两次尝试都失败：不留死条目（下次取用从全新端口开始），错误上抛。
+        mgr = pr.SingboxManager()
+        mgr._instances[self.URI] = _FakeInst(23456)
+
+        def always_fail(uri: str, port: int):
+            raise pr.ProxyResolveError("坏配置")
+
+        with mock.patch.object(mgr, "_launch", side_effect=always_fail):
+            with self.assertRaises(ProxyResolveError):
+                mgr.get_local_socks5(self.URI)
+        self.assertNotIn(self.URI, mgr._instances)
+
+    def test_reap_idle_terminates_outside_lock(self):
+        mgr = pr.SingboxManager()
+        inst = _FakeInst(34567, alive=True)
+        inst.last_used = time.time() - 99999
+        mgr._instances[self.URI] = inst
+        terminated: list = []
+        with mock.patch.object(mgr, "_terminate", side_effect=lambda i: terminated.append(i)), \
+                mock.patch.dict(os.environ, {"SINGBOX_IDLE_MINUTES": "1"}):
+            n = mgr.reap_idle()
+        self.assertEqual(n, 1)
+        self.assertEqual(terminated, [inst])
+        self.assertNotIn(self.URI, mgr._instances)
 
 
 class KeyPriorityTests(unittest.TestCase):

@@ -1591,7 +1591,7 @@ def validate_proxy_url_format(proxy_url: str) -> str:
 @app.post("/api/proxy/test")
 async def test_proxy(body: ProxyTestBody, _auth: bool = Depends(require_auth)):
     import httpx as _httpx
-    from proxy_resolver import resolve_proxy_uri, ProxyResolveError
+    from proxy_resolver import resolve_proxy_uri_async, ProxyResolveError
 
     candidate = (body.proxy_url or "").strip()
     # 先做静态格式校验，畸形值立即返回（不用等 8 秒超时，错误信息也更直白）
@@ -1611,7 +1611,8 @@ async def test_proxy(body: ProxyTestBody, _auth: bool = Depends(require_auth)):
     # socks5（首个请求时惰性启动 sing-box）。转换失败（sing-box 缺失等）
     # 给出可操作的安装指引；未发出任何请求、也绝不降级直连。
     try:
-        resolved_target = resolve_proxy_uri(target)
+        # 异步版：sing-box 首次启动放线程池，不卡事件循环
+        resolved_target = await resolve_proxy_uri_async(target)
     except ProxyResolveError as e:
         return JSONResponse(content={
             "ok": False, "via_proxy": via_proxy,

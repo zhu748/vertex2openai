@@ -54,7 +54,7 @@ from upstreams.express_sdk import resolve_express_model_path
 from model_loader import get_express_models
 from express_fingerprint import build_direct_headers
 from client_pool import passthrough_client_pool
-from proxy_resolver import ProxyResolveError, resolve_proxy_uri
+from proxy_resolver import ProxyResolveError, resolve_proxy_uri, resolve_proxy_uri_async
 
 router = APIRouter()
 
@@ -307,6 +307,9 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
             # 不静默直连：预算内重选 Key，耗尽后返回明确错误。
             current_proxy_uri = get_effective_proxy_uri_for_key(record)
             try:
+                # 预热（sing-box 首启放线程池）；随后池签名/工厂里的同步
+                # resolve 命中缓存，不卡事件循环。
+                await resolve_proxy_uri_async(current_proxy_uri)
                 client = passthrough_client_pool.get(
                     lambda: _new_client(current_proxy_uri), current_proxy_uri)
             except ProxyResolveError as e:
