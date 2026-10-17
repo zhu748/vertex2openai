@@ -2,6 +2,47 @@
 
 基于原版 `vertex2openai-main`（2026-09-01），只做加法，未改原有架构。
 
+## 第十二轮：Gemini 透传「选 Key 后无限转圈」修复（v1 → v1beta1）+ 出站可观测性
+
+**用户报障**：Gemini 原生格式流式请求后客户端无限转圈、无任何输出；日志停在
+`🔁 [Gemini 透传]` 与 `🔑 [密钥选择]` 之后（无重试/无错误）；OpenAI 兼容
+格式同 Key 同模型完全正常；控制台「总请求」为 0（该统计只计 chat/completions，
+透传路径不计入，非故障信号）。
+
+**根因**：透传 URL 写死 `api_version = v1`，而 google-genai SDK（vertex 模式）
+的默认是 **`v1beta1`**（2.31.0 `_api_client.py` vertexai 分支；
+MockTransport 实测流式 URL 为
+`…/v1beta1/publishers/google/models/{m}:streamGenerateContent?alt=sse`）。
+这带来三层问题：
+
+1. `v1` 端点的 `streamGenerateContent` 对 `alt=sse` 的行为与 `v1beta1`
+   不一致——上游可能返回 200 + 非 SSE 载荷，客户端 SSE 解析器等不到
+   `data:` 行，**无限转圈且全程无任何报错**（与服务端「选 Key 后零日志」
+   的症状完全吻合）；
+2. SDK 通道（OpenAI 格式）落在 `v1beta1`、透传落在 `v1`，同一服务出站
+   形态自相矛盾；
+3. SDK 从不产生 `/v1/` 的 URL，请求头自称 `google-genai-sdk` 却请求
+   `/v1/` 本身就是指纹层面的自曝。
+
+**修复**：
+
+- `EXPRESS_API_VERSION` 改钉 `v1beta1`，与 SDK 真实默认一致；
+- **防漂移回归断言**：回归测试新增 `[1b]` 组——直接构造官方 SDK
+  （MockTransport 注入）抓其真实流式 URL，与 `_build_upstream_url` 输出
+  逐段对照（scheme/host/api_version/模型路径/action），SDK 将来改默认
+  版本时测试立刻报警；
+- **出站可观测性**（本次排查最大痛点就是「选 Key 之后零日志」）：
+  - 上游响应一行摘要：状态码 + content-type（`debug_outbound` 开启时
+    附完整上游 URL）；
+  - 流式请求若上游返回非 `text/event-stream` 立即告警（正是本次
+    v1/v1beta1 问题 silent-fail 的形态）；
+  - 流式转发完成（总字节数）/ 中止（客户端断开或上游异常，含已转发
+    字节数）均打日志。
+
+**验证**：回归测试扩到 53/53 通过（新增 [1b] 5 项 SDK URL 对照断言）；
+compileall 全量通过。改动文件：`app/routes/gemini_native.py`、
+`README.md`、`CHANGES.md`、`scripts/test_gemini_native_fix.py`。
+
 ## 第十一轮：Express SDK 主通道四档案线序实证 + 两处标签形态缺陷修复
 
 **背景**：第十轮验证了「官方 SDK vs 裸 httpx 出站点」逐字节一致，但 SDK

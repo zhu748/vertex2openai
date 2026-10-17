@@ -21,6 +21,10 @@ cachedContent / responseSchema 等全部字段天然 100% 兼容，因为请求�
 - 模型路径拼接对齐 SDK 的 t_model()：完整资源路径（projects/ 等开头）
   原样透传，不再叠加 publishers 前缀（旧版双重前缀会让上游直接返回
   404 空 body，客户端只能显示 Unknown error: 404）。
+- 上游 URL 钉 v1beta1（SDK 在 vertex 模式的真实默认 api_version；写死
+  v1 会让流式请求拿到非 SSE 载荷，客户端无限转圈且无任何报错）。
+- 出站可观测性：上游响应摘要日志（状态码 + content-type，
+  debug_outbound 时附完整 URL）、SSE 形态异常告警、流式转发完成/中止日志。
 - 上游响应（含错误）状态码与 body 原样转发；流式以原始字节流转发 SSE。
 - 429/5xx 自动换下一个 Express Key 重试（最多 3 次）；钉定路径失败
   （404 Publisher model not found / 403 requires billing）自动退回
@@ -55,7 +59,16 @@ router = APIRouter()
 
 # Express 端点（与 SDK 解析结果一致，见 express_sdk._log_resolved_endpoint）
 EXPRESS_BASE = app_config.VERTEX_BASE_URL or "https://aiplatform.googleapis.com"
-EXPRESS_API_VERSION = "v1"
+# ⚠️ 必须钉 v1beta1：google-genai SDK 在 vertex 模式下的默认 api_version 就是
+# v1beta1（2.31.0 _api_client.py 的 vertexai 分支；MockTransport 实测流式 URL
+# 为 …/v1beta1/publishers/google/models/{m}:streamGenerateContent?alt=sse）。
+# 此前写死 v1 是错的：① SDK 通道（OpenAI 格式）落在 v1beta1、透传落在 v1，
+# 同一服务的出站形态自相矛盾；② SDK 从不产生 /v1/ 的 URL，自称
+# google-genai-sdk 却请求 /v1/ 是指纹层面的自曝；③ v1 端点的
+# streamGenerateContent 对 alt=sse 的行为与 v1beta1 不一致——实测症状：
+# 客户端无限转圈且服务端无任何报错（上游 200 但非 SSE 载荷，SSE 解析器
+# 等不到 data: 行），而 OpenAI 格式同 Key 同模型一切正常。
+EXPRESS_API_VERSION = "v1beta1"
 
 # 支持透传的 :action 后缀
 _SUPPORTED_ACTIONS = {"generateContent", "streamGenerateContent", "countTokens", "embedContent"}
@@ -309,6 +322,20 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
             key_attempts += 1
             continue
 
+        # 出站可观测性：此前「选 Key 之后 → 响应/重试」之间零日志，上游挂起
+        # 或返回非预期形态时无从排查（v1/v1beta1 问题的定位就卡在这里）。
+        # 默认一行摘要（状态码 + content-type）；debug_outbound 开启时附完整 URL。
+        _ct = upstream.headers.get("content-type", "?")
+        print(f"{'✅' if upstream.status_code < 400 else '⚠️'} [Gemini 透传] "
+              f"上游响应 HTTP {upstream.status_code}（{_ct}）"
+              + (f" ← {upstream.request.url}"
+                 if app_state.get_setting("debug_outbound", False) else ""))
+        if (is_stream and upstream.status_code < 400
+                and "text/event-stream" not in _ct.lower()):
+            print("⚠️ [Gemini 透传] 流式请求的上游响应不是 text/event-stream——"
+                  "客户端若按 SSE 解析将等不到 data: 行（v1 端点曾出现此形态，"
+                  "现已钉 v1beta1；若复现请把 debug_outbound 打开后上报 URL）。")
+
         # 429/5xx：预算内换下一个 Express Key 重试
         if upstream.status_code in (429, 500, 503) and key_attempts < _KEY_RETRY_MAX:
             last_error_status = upstream.status_code
@@ -388,11 +415,22 @@ async def _relay_stream(upstream: httpx.Response) -> StreamingResponse:
     """
 
     async def _relay():
+        total = 0
+        completed = False
         try:
             async for chunk in upstream.aiter_bytes():
                 if chunk:
+                    total += len(chunk)
                     yield chunk
+            completed = True
         finally:
+            # 先打日志再关连接：客户端断开（任务被取消）时 finally 里的
+            # await 也可能被再取消，保证中止日志一定落盘。
+            if completed:
+                print(f"📤 [Gemini 透传] 流式转发完成（共 {total} 字节）。")
+            else:
+                print(f"✂️ [Gemini 透传] 流式中止（已转发 {total} 字节；"
+                      "客户端断开或上游/网络异常）。")
             await upstream.aclose()
 
     media_type = upstream.headers.get("content-type", "text/event-stream")

@@ -141,9 +141,19 @@ curl -s https://你的域名/v1beta/models -H "x-goog-api-key: 你的API_KEY"
 - **模型路径拼接与 SDK 完全一致**：裸模型名拼 `publishers/google/models/{model}`（Express 端点
   格式）；`projects/...` 完整资源路径（location 钉定生成或客户端自带）原样透传，不叠加前缀。
   > 📌 修复说明：旧版对钉定路径无条件叠加 `publishers/google/models/` 前缀，会请求
-  > `…/v1/publishers/google/models/projects/…` 双重前缀的畸形 URL，Google 前端直接返回
+  > `…/v1beta1/publishers/google/models/projects/…` 双重前缀的畸形 URL，Google 前端直接返回
   > 404 空 body（客户端显示 `Unknown error: 404`）——这正是「OpenAI 兼容接口正常、
   > Gemini 原生格式一律 404」的根因，已按 SDK `t_model()` 语义修复。
+- **上游 URL 钉 `v1beta1`**（与 google-genai SDK 在 vertex 模式的真实默认 api_version
+  一致，MockTransport 实测对照）。旧版写死 `v1`：不仅与自称的 `google-genai-sdk`
+  形态自相矛盾（SDK 从不产生 `/v1/` 的 URL），且 `v1` 端点的
+  `streamGenerateContent` 对 `alt=sse` 的行为与 `v1beta1` 不一致——实测症状为
+  **客户端无限转圈且服务端无任何报错**（选 Key 后无日志、统计不动，
+  OpenAI 格式同 Key 同模型一切正常）。已修复并有防漂移回归断言。
+- **出站可观测性**：上游响应一行摘要（状态码 + content-type，
+  `debug_outbound` 开启时附完整上游 URL）；流式请求上游若返回非
+  `text/event-stream` 立即告警；流式转发完成/中止（客户端断开）均打日志——
+  不再出现「选 Key 之后零日志」无法排查的情况。
 - **钉定失败自动兜底**：钉定路径返回 404 `Publisher model … not found` 或 403
   `requires billing` 时，自动退回裸模型名重试一次（不换 Key），与 OpenAI 兼容通道的
   fallback 行为一致；其余错误仍原样透传。
@@ -344,7 +354,7 @@ TCP+TLS 握手（每次约省 100~300ms 与相应 CPU）；429 重试场景收�
 
 | 请求形态 | `gemini-2.5-pro` | 说明 |
 |---|---|---|
-| 裸模型名（旧行为）→ express 端点 `https://aiplatform.googleapis.com/v1/publishers/google/models/{model}:generateContent` | **404** `projects/…/locations/asia-southeast1/…was not found` | 区域由后端路由，落到没有该模型的区域 |
+| 裸模型名（旧行为）→ express 端点 `https://aiplatform.googleapis.com/v1beta1/publishers/google/models/{model}:generateContent` | **404** `projects/…/locations/asia-southeast1/…was not found` | 区域由后端路由，落到没有该模型的区域 |
 | `projects/{project}/locations/global/publishers/google/models/{model}` | **200 正常出文** | 区域由我们钉定 ✅ |
 
 **默认已经是 `global`**（多数 Gemini 模型只在 global 提供）。控制台「模型参数 → ② 全局设置 → 标准模式 location」下拉里除 `global` 外还列出了 Agent Platform 提供 Gemini 的各区域（美国 / 欧洲 / 亚太 / 其它，共 30 项）可按需切换；选「默认（后端自选）」＝回到旧行为。
