@@ -67,6 +67,47 @@ docker compose up -d
 http://localhost:8050
 ```
 
+> 自托管挂卷提示：镜像以非 root 用户（UID 1000）运行，`docker-compose.yml` 挂载的 `./data` 目录需对 UID 1000 可写：`chown -R 1000:1000 data` 或在 compose 里加 `user: "1000"`。
+
+## 镜像获取与自建
+
+```bash
+# 本仓库 CI 自动构建（push main 即触发，多平台 amd64/arm64）
+docker pull ghcr.io/<你的用户名>/vertex2openai:latest
+```
+
+Fork 本仓库后无需任何配置：GitHub Actions 会自动登录 GHCR（内置 `GITHUB_TOKEN`），
+在每次 push `main` 时构建双平台镜像并推送 `ghcr.io/<你的用户名>/vertex2openai`，
+标签策略：`latest`（默认分支）、`main-<短 SHA>`（可回溯版本）、`vX.Y.Z`（推 tag 时）。
+PR 只构建验证不推送，workflow 已收敛到最小权限（`contents:read` + `packages:write`）。
+
+镜像内置 `HEALTHCHECK`（HEAD `/healthz`），`docker ps` / 编排平台可直接看到健康状态。
+
+## 健康检查端点 `/healthz`
+
+公开、无鉴权、零上游请求（纯进程内状态，开销≈0），供 Render / UptimeRobot / 负载均衡 / 保活脚本探活：
+
+```bash
+curl -fsS https://你的域名/healthz     # GET：返回 JSON 状态
+curl -fsSI https://你的域名/healthz    # HEAD：只看状态码，响应无 body，适合监控平台
+```
+
+GET 返回（代理地址自动脱敏，凭据不外泄）：
+
+```json
+{
+  "status": "ok",
+  "service": "agentplatform2api",
+  "mode": "express",
+  "express_keys": { "total": 2, "enabled": 2 },
+  "cookie_configured": false,
+  "proxy": { "enabled": true, "url": "socks5://***@96.62.118.47:9285" },
+  "time": 1760000000
+}
+```
+
+> Render 部署时把 Health Check Path 设为 `/healthz` 即可，30 秒冷启动期间不会误判不健康。
+
 ## 环境变量
 
 | 变量 | 必填 | 默认值 | 说明 |
@@ -78,7 +119,7 @@ http://localhost:8050
 | `FAKE_STREAMING_INTERVAL` | 否 | `1.0` | 假流式等待期间 keep-alive 间隔秒数。可在控制台热改。 |
 | `MODELS_CONFIG_URL` | 否 | 仓库 `vertexModels.json` | 远程模型列表地址；改远程文件即可刷新，无需重部署。 |
 | `SAFETY_SCORE` | 否 | `false` | 是否把 Gemini safety ratings 附加到输出。可在控制台热改。 |
-| `PROXY_URL` | 否 | 空 | 上游 HTTP/HTTPS/SOCKS 代理。 |
+| `PROXY_URL` | 否 | 空 | 上游 HTTP/HTTPS/SOCKS 代理。**仅作初始值**：控制台「通道与凭证」页可热改并持久化（`proxy_url` 设置项）；保存过一次后（含清空保存 = 强制直连）环境变量不再覆盖。保存时自动校验格式（支持 http/https/socks5/socks5h/socks4）。 |
 | `SSL_CERT_FILE` | 否 | 空 | 自定义证书路径。 |
 | `VERTEX_BASE_URL` | 否 | 空 | **高级**：覆盖标准模式的上游 `base_url`，正常无需设置。要钉定区域请用控制台的「标准模式 location」（详见下方「标准模式的 location」）。 |
 | `GOOGLE_COOKIE` | 否 | 空 | Cookie 直连模式的 Google Cookie（初始值，后续可在控制台更新）。 |

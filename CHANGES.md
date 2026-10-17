@@ -2,6 +2,52 @@
 
 基于原版 `vertex2openai-main`（2026-09-01），只做加法，未改原有架构。
 
+## 第五轮：全面复查加固（安全 + CI/CD + 修复一个回退 Bug）
+
+- **修复：清空代理被环境变量抢回**（`app/runtime_state.py`）：
+  旧实现 `stored or PROXY_URL` 在用户把代理**清空保存**（存 `""`）时会因 falsy 回退到环境变量值，
+  导致「恢复直连」永远做不到。新增 `get_raw_stored_setting()`（只取用户保存过的原始值，不落回默认值），
+  `get_effective_proxy_url()` 据此区分「保存为空 = 强制直连」与「从未保存 = 跟随环境变量」。
+- **安全：API Key 常量时间比较**（`app/auth.py`）：`==` 改 `secrets.compare_digest`，
+  与控制台登录口令校验保持一致，消除时序侧信道。
+- **安全：代理 URL 保存/测试前置格式校验**（`app/main.py`）：新增 `validate_proxy_url_format()`，
+  仅允许 http/https/socks5/socks5h/socks4 且必须有主机地址；畸形值在 `/api/settings` 与
+  `/api/proxy/test` 直接返回 400（带中文原因），不再等 8 秒超时，也防止把「存了坏代理 → 全部上游请求失败」
+  的状态写进设置。前端 `saveProxy()` 同步展示后端返回的具体错误。
+- **安全：Dockerfile 非 root 运行**：新增 `app` 用户（UID 1000），`COPY --chown` + `USER app`；
+  加 `PYTHONDONTWRITEBYTECODE` / `PYTHONUNBUFFERED` / `PIP_NO_CACHE_DIR`。
+- **运维：镜像内置 `HEALTHCHECK`**（HEAD `/healthz`，slim 镜像无 curl 故用 Python 标准库）。
+- **CI/CD：重写 GitHub Actions**（`.github/workflows/docker-image.yml`）：
+  权限从 `write-all` 收敛到 `contents:read + packages:write`；PR 只构建验证不推送（旧版 fork PR
+  会因无权限失败、还可能误覆盖标签）；push main 打 `latest` + `main-<sha>`，推 `v*` tag 打语义化版本；
+  QEMU 多平台（amd64/arm64，PR 时只验 amd64 提速）；buildx GHA 层缓存；
+  新增 `test` 前置 job：compileall + 真实 `import main` 导入冒烟 + workflow 自身 YAML 语法校验
+  （`.github/scripts/check_workflows.py`），把「构建成功但启动即崩」的镜像挡在门外。
+- **文档**：README 新增「镜像获取与自建」「健康检查端点 /healthz」章节；`PROXY_URL` 行为说明补全；
+  `.gitignore` 增加 `data/`、`web_state.json`（运行时凭据文件绝不入库）。
+
+## 第四轮：出站代理控制台化 + /healthz 健康检查
+
+- `app/config.py`：`DEFAULT_SETTINGS` 新增 `proxy_url`（初始值取环境变量 `PROXY_URL`），
+  代理从此进入「控制台可热改 + 持久化到 web_state.json」体系（与 roundrobin 等开关同模式）。
+- `app/runtime_state.py`：新增统一读取口 `get_effective_proxy_url()`（控制台设置优先、环境变量兜底）
+  与脱敏函数 `mask_proxy_url()`（认证信息打码，保留协议与 host:port）。
+- 代理应用点全部切换到统一读取口（5 处，两条通道 + 辅助请求全覆盖）：
+  `http_options.py`（Express SDK）、`upstreams/cookie_proxy.py`（Cookie 通道）、
+  `express_key_probe.py`（Key 探测）、`model_loader.py`（模型列表）、`message_processing.py`（远程图片抓取）。
+  控制台改完代理后**所有出站路径立即同步，无需重启**。
+- `app/main.py`：
+  - **`GET/HEAD /healthz`**（公开、无鉴权、零上游请求）：返回服务状态、当前通道、Express Key 数量、
+    Cookie 是否配置、代理启用状态（脱敏）。供 Render 健康检查 / UptimeRobot 保活 / 负载均衡探活。
+  - **`POST /api/proxy/test`**（需登录）：代理连通性测试。优先测请求体里传入的候选值（先测后存），
+    为空则测当前生效代理；两者皆空测直连。通过代理请求一次 `aiplatform.googleapis.com`，
+    任何 HTTP 状态码都算链路可达，返回延迟毫秒数与脱敏后的代理地址。
+  - lifespan 启动日志打印代理状态（脱敏）——「代理到底启没启用」在日志里一眼可见。
+  - 控制台「通道与凭证」页新增**「出站代理（网络出口）」卡片**：
+    状态徽标（已启用/直连）、代理输入框（明文可编辑）、「测试连通性」「保存代理」按钮、
+    格式说明（含代理商 `socks5://IP:端口:用户名:密码` → 标准格式的转换口诀）。
+- `README.md`：环境变量表 `PROXY_URL` 说明同步更新。
+
 ## 第一轮：Express Key 多账号管理
 
 - `app/runtime_state.py`：Express Key 记录管理（增删改、启用/禁用、Project ID 与来源）；

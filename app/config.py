@@ -154,6 +154,11 @@ DEFAULT_SETTINGS = {
     # 钉定失败（项目不匹配/该区域无此模型）会自动退回裸模型名重试一次，见
     # api_helpers.is_location_pin_failure —— 所以这个默认值不会把任何人变糟。
     "express_location": "global",
+    # ===== 出站代理（网络出口，控制台「通道与凭证」页可热改）=====
+    # 初始值取环境变量 PROXY_URL；此后以控制台保存的值为准（持久化到 web_state.json）。
+    # 支持标准 URL 格式：http://user:pass@host:port / socks5://host:port 等（httpx[socks] 已内置）。
+    # 清空 = 直连上游。两条通道（Express / Cookie）共用同一个出站代理。
+    "proxy_url": PROXY_URL or "",
     # 弱网可靠传输（见 resumable.py）：服务端响应缓冲 + 序列号事件 + 断线重放/分片轮询。
     # 上游读取由后台泵任务驱动，与前端连接解绑；Google 的回复总能完整落缓冲。
     "resumable_enabled": True,            # 总开关；关掉则回到原有直通行为

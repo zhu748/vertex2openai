@@ -23,7 +23,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 
 from models import OpenAIRequest, normalize_content_part
 from upstreams.base import BaseUpstream
-from runtime_state import app_state
+from runtime_state import app_state, get_effective_proxy_url
 import config as app_config
 import model_capabilities as mc
 from message_processing import (
@@ -1392,12 +1392,14 @@ class CookieProxyUpstream(BaseUpstream):
                 print("🧠 [预填充兼容] 已按模型压制原生思考（可在控制台关闭），让预设思维链接管。")
 
         # ===== 4. HTTP 客户端配置 =====
+        # 代理走统一读取口：控制台热改后立即生效（与 Express 通道同步）。
         client_kwargs = {
             "timeout": httpx.Timeout(connect=30.0, read=180.0, write=30.0, pool=10.0),
             "follow_redirects": True,
         }
-        if app_config.PROXY_URL:
-            client_kwargs["proxy"] = app_config.PROXY_URL
+        _proxy_url = get_effective_proxy_url()
+        if _proxy_url:
+            client_kwargs["proxy"] = _proxy_url
 
         # 重试配置（控制台可调）；语义与 Express 通道统一：总尝试次数 = retry_max + 1
         retry_max, backoff_sec = get_retry_settings()

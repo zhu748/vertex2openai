@@ -241,6 +241,21 @@ class AppState:
                 return copy.deepcopy(app_config.DEFAULT_SETTINGS[key])
             return default
 
+    def get_raw_stored_setting(self, key: str, default=None):
+        """只取**用户在控制台持久化保存过**的原始值，不做任何回退。
+
+        与 get_setting 的区别：get_setting 在“从未保存过”时会落回
+        DEFAULT_SETTINGS（其初始值可能来自环境变量），无法区分
+        “保存为空”和“从未保存”。出站代理必须区分这两种情况：
+        用户清空代理保存 = 明确要直连，绝不能被环境变量 PROXY_URL 抢回。
+        从未保存过（返回 default/None）= 跟随环境变量初始值。
+        """
+        with self._lock:
+            stored = self._state.get("settings")
+            if isinstance(stored, dict) and key in stored:
+                return copy.deepcopy(stored[key])
+            return default
+
     def update_settings(self, patch: dict) -> dict:
         """合并更新设置，只接受已知键，返回更新后的完整设置。"""
         if not isinstance(patch, dict):
@@ -314,3 +329,51 @@ class AppState:
 
 # 单例模式导出
 app_state = AppState()
+
+
+# ============================================================
+# 出站代理统一读取口（热改支持）
+# 所有需要代理的上游请求（Express SDK / Cookie 通道 / 模型列表 /
+# Key 探测 / 图片抓取）都必须经过 get_effective_proxy_url()，
+# 这样控制台改完代理后所有出站路径立即同步，无需重启。
+# ============================================================
+def get_effective_proxy_url() -> str:
+    """当前生效的出站代理 URL：控制台保存过（含保存为空=直连）优先，否则用环境变量。
+
+    返回空字符串 = 直连。调用方直接判断 truthy 即可。
+    注意不能用 `stored or env` 的写法：用户把代理清空保存（存 ""）时
+    会被环境变量 PROXY_URL 抢回来，“恢复直连”就永远做不到了。
+    """
+    try:
+        stored = app_state.get_raw_stored_setting("proxy_url")
+    except Exception:
+        stored = None
+    if stored is not None:          # 用户在控制台保存过 → 以它为准（空值=直连）
+        return str(stored or "").strip()
+    # 从未在控制台保存过 → 跟随环境变量初始值
+    return str(app_config.PROXY_URL or "").strip()
+
+
+def mask_proxy_url(url: str) -> str:
+    """代理 URL 脱敏：认证信息（用户名/密码）整体打码，保留协议与 host:port。
+
+    用于启动日志、/healthz 等对外输出，避免凭据落进日志采集或监控截图。
+    """
+    url = str(url or "").strip()
+    if not url:
+        return ""
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        if not host:
+            return "(已配置，格式无法解析)"
+        port = f":{parts.port}" if parts.port else ""
+        if parts.username or parts.password:
+            masked_netloc = f"***@{host}{port}"
+        else:
+            masked_netloc = f"{host}{port}"
+        return urlunsplit((parts.scheme or "proxy", masked_netloc, "", "", ""))
+    except Exception:
+        return "(已配置，格式无法解析)"
+

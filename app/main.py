@@ -16,6 +16,7 @@ from routes import models_api, chat_api
 from logger import rt_logger, stats
 import config
 from runtime_state import app_state
+from runtime_state import get_effective_proxy_url, mask_proxy_url
 import model_capabilities as mc
 from model_loader import get_express_models
 
@@ -65,6 +66,13 @@ async def lifespan(app: FastAPI):
         print("⚠️ [密钥配置] 未配置任何 Express API Key（控制台「通道与凭证」页可随时添加）。"
               "若不启用 Cookie 直连模式，聊天请求将会报错。")
     await refresh_models_config_cache()
+
+    # 网络出口状态：让“代理到底启没启用”一眼可见（控制台「通道与凭证」页可热改）。
+    _proxy_now = get_effective_proxy_url()
+    if _proxy_now:
+        print(f"🌐 [网络] 出站代理已启用：{mask_proxy_url(_proxy_now)}（控制台「通道与凭证」页可热改，保存后无需重启）。")
+    else:
+        print("🌐 [网络] 未配置出站代理，直连 Google 上游（控制台「通道与凭证」页可配置，或设环境变量 PROXY_URL）。")
 
     # 启动时自动探测各 Key 归属的 GCP Project ID（location 钉定要用）。
     # 放后台任务里跑：探测走外网，绝不能阻塞服务启动。
@@ -413,6 +421,31 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <button class="btn px-4 py-2 text-sm" onclick="saveCookie()">保存并激活</button>
       </div>
       <p class="text-xs text-neutral-500 mt-3 leading-relaxed">💡 Cookie 通常较为持久（可维持数周甚至更久，取决于账号会话是否有效）；仅当出现 Permission Denied 等权限错误时再重新获取粘贴即可，并非只有 1–2 小时。</p>
+    </div>
+
+    <!-- 网络出口：出站代理（热改 + 连通性测试） -->
+    <div class="card p-5 mb-4">
+      <div class="flex items-center justify-between flex-wrap gap-2 mb-3">
+        <div>
+          <div class="text-sm font-semibold">出站代理（网络出口）<span class="helpq" onclick="hlp(this,'h_proxy')">?</span></div>
+          <div class="text-xs text-neutral-500 mt-0.5">访问 Google 上游的出口；Express / Cookie 两条通道共用。保存后热生效，无需重启</div>
+        </div>
+        <div class="flex items-center gap-2">
+          <span id="proxy-status" class="pill" style="text-transform:none;background:#f5f5f5;color:#737373">未启用（直连）</span>
+          <button class="px-3 py-1.5 text-sm rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="testProxy()">🛰️ 测试连通性</button>
+          <button class="btn px-4 py-1.5 text-sm" onclick="saveProxy()">保存代理</button>
+        </div>
+      </div>
+      <div id="h_proxy" class="helpbox">
+        <b>格式</b>：<code>协议://用户名:密码@IP:端口</code>。支持 <code>http://</code> / <code>https://</code> / <code>socks5://</code>（已内置 socks 支持，无需额外依赖）。<br>
+        代理商给的 <code>socks5://IP:端口:用户名:密码</code> 是展示格式，要转成标准格式：<b>用户名密码放到 @ 前面</b>，例：<code>socks5://user:pass@1.2.3.4:1080</code>。<br>
+        <b>热生效</b>：保存即写入 <code>web_state.json</code> 并立即作用于全部出站请求（模型调用 / Cookie 通道 / Key 探测 / 模型列表刷新）；环境变量 <code>PROXY_URL</code> 只作为首次启动的初始值，控制台保存后以控制台为准。<br>
+        <b>清空 = 直连</b>：删光输入框内容并保存，即恢复直连。<br>
+        <b>先测后存</b>：「测试连通性」按输入框<b>当前</b>的值测试（还没保存也能测），通过代理请求一次 Google 端点并汇报延迟；任何 HTTP 状态码都算链路可达。<br>
+        <b>云部署提示</b>：Render / HuggingFace 等海外平台本就能直连 Google，通常无需配置；代理不稳定反而会拖垮服务，配置前请先用测试按钮确认代理质量。
+      </div>
+      <input id="proxy-input" class="inp log" placeholder="留空 = 直连。示例：socks5://user:pass@1.2.3.4:1080 或 http://user:pass@1.2.3.4:8080">
+      <div id="proxy-test-result" class="text-xs mt-2 hidden leading-relaxed"></div>
     </div>
   </section>
 
@@ -867,6 +900,44 @@ async function probeAllKeys(){
   }catch(e){ toast('❌ 网络请求失败'); }
 }
 
+/* ---------- 出站代理（网络出口） ---------- */
+function updateProxyPill(on){
+  const p=$('proxy-status'); if(!p) return;
+  p.textContent = on ? '已启用' : '未启用（直连）';
+  p.style.background = on ? '#ecfdf5' : '#f5f5f5';
+  p.style.color = on ? '#047857' : '#737373';
+}
+async function saveProxy(){
+  const v=$('proxy-input').value.trim();
+  try{
+    const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxy_url:v})});
+    if(r.ok){ updateProxyPill(!!v); toast(v?'✅ 代理已保存并热生效（无需重启）':'已清空代理，恢复直连'); }
+    else{
+      let msg='保存失败';
+      try{ const d=await r.json(); if(d && d.error) msg=d.error; }catch(_){}
+      toast('❌ '+msg);
+    }
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+async function testProxy(){
+  const v=$('proxy-input').value.trim();
+  const box=$('proxy-test-result'); box.classList.remove('hidden');
+  box.innerHTML='<span class="text-neutral-500">🛰️ 正在测试（最长 8 秒）…</span>';
+  try{
+    const r=await fetch('/api/proxy/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxy_url:v})});
+    const d=await r.json();
+    if(d.ok){
+      box.innerHTML=`<span style="color:#047857">✅ ${d.message} · 延迟 ${d.latency_ms} ms${d.via_proxy?(' · 经 '+d.proxy):''}</span>`;
+      toast('✅ 连通成功（'+d.latency_ms+' ms）');
+    }else{
+      box.innerHTML=`<span style="color:#be123c">❌ ${d.message} · ${d.latency_ms} ms<br>详细：${(d.error||'').replace(/</g,'&lt;')}</span>`;
+      toast('❌ 连通失败');
+    }
+  }catch(e){
+    box.innerHTML='<span style="color:#be123c">❌ 请求测试端点失败（服务异常或代理地址格式非法）</span>';
+  }
+}
+
 /* ---------- Params ---------- */
 function setV(id,v){ const el=$(id); if(!el) return; if(el.type==='checkbox') el.checked=!!v; else el.value=(v===null||v===undefined)?'':v; }
 async function loadParams(){
@@ -876,6 +947,9 @@ async function loadParams(){
     curAR = s.image_aspect_ratio || "";
     ['native_thinking_mode','thinking_g3_level','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','express_location','resumable_ttl_seconds','resumable_max_streams'].forEach(k=>setV(k,s[k]));
     ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction','inject_prefill_for_image','prefill_cot_guard','resumable_enabled'].forEach(k=>setV(k,s[k]));
+    // 出站代理：回填输入框并刷新状态徽标
+    setV('proxy-input', s.proxy_url || '');
+    updateProxyPill(!!(s.proxy_url||'').trim());
     // 向后兼容：旧版布尔开关映射到新的 native_thinking_mode 下拉
     if((!s.native_thinking_mode || s.native_thinking_mode==='request')){
       if(s.hide_thoughts) setV('native_thinking_mode','off');
@@ -1102,6 +1176,137 @@ async def dashboard_ui(request: Request):
     return HTMLResponse(LOGIN_HTML)
 
 
+# ==========================================
+# 健康检查（公开端点，无鉴权）
+# 供 Render / UptimeRobot / 负载均衡 / 保活脚本探活。
+# 同时注册 GET 与 HEAD：HEAD 响应无 body、只有状态码与头部，
+# 是监控平台的规范用法；不做任何上游请求，纯进程内状态，开销≈0。
+# ==========================================
+def _healthz_payload() -> dict:
+    proxy_url = get_effective_proxy_url()
+    express_keys = app_state.get_express_keys()
+    cookie_configured = bool(app_state.get_google_cookie())
+    return {
+        "status": "ok",
+        "service": "agentplatform2api",
+        "mode": "cookie" if app_state.is_web_proxy_enabled() else "express",
+        "express_keys": {
+            "total": len(express_keys),
+            "enabled": sum(1 for r in express_keys if r.get("enabled", True)),
+        },
+        "cookie_configured": cookie_configured,
+        "proxy": {
+            "enabled": bool(proxy_url),
+            "url": mask_proxy_url(proxy_url),   # 脱敏：绝不回传认证凭据
+        },
+        "time": int(time.time()),
+    }
+
+
+@app.get("/healthz")
+async def healthz_get():
+    return JSONResponse(content=_healthz_payload())
+
+
+@app.head("/healthz")
+async def healthz_head():
+    # HEAD 与 GET 同状态码；FastAPI/Starlette 自动丢弃响应 body。
+    return JSONResponse(content=_healthz_payload())
+
+
+# ==========================================
+# 出站代理连通性测试（需登录）
+# 用当前输入框里的值测试（先测后存），不落盘；为空则测当前已生效的代理/直连。
+# ==========================================
+class ProxyTestBody(BaseModel):
+    proxy_url: str = ""
+
+
+PROXY_TEST_TARGET = "https://aiplatform.googleapis.com/"
+PROXY_TEST_TIMEOUT_SECONDS = 8.0
+
+# 代理 URL 允许的协议（httpx[socks] 原生支持这些）
+_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h", "socks4"}
+
+
+def validate_proxy_url_format(proxy_url: str) -> str:
+    """校验代理 URL 格式，返回错误信息（空串 = 合法）。
+
+    防止把畸形值存进设置：一旦存了，所有上游请求会统一失败，
+    而 Express SDK 对非法 proxy 的报错往往很晦涩，用户很难定位。
+    空字符串 = 清空直连，合法。
+    """
+    value = (proxy_url or "").strip()
+    if not value:
+        return ""
+    try:
+        from urllib.parse import urlsplit
+        parts = urlsplit(value)
+        scheme = (parts.scheme or "").lower()
+        if scheme not in _PROXY_SCHEMES:
+            return f"协议必须是 {'/'.join(sorted(_PROXY_SCHEMES))}，收到的是「{scheme or '（无协议）'}」"
+        if not parts.hostname:
+            return "缺少主机地址，正确格式：协议://用户名:密码@主机:端口"
+        return ""
+    except Exception:
+        return "无法解析的代理地址，正确格式：协议://用户名:密码@主机:端口"
+
+
+@app.post("/api/proxy/test")
+async def test_proxy(body: ProxyTestBody, _auth: bool = Depends(require_auth)):
+    import httpx as _httpx
+
+    candidate = (body.proxy_url or "").strip()
+    # 先做静态格式校验，畸形值立即返回（不用等 8 秒超时，错误信息也更直白）
+    format_error = validate_proxy_url_format(candidate)
+    if format_error:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "via_proxy": bool(candidate),
+            "proxy": mask_proxy_url(candidate), "latency_ms": 0,
+            "error": format_error, "message": "代理地址格式不合法：" + format_error,
+        })
+    effective = get_effective_proxy_url()
+    # 优先测前端传来的候选值（用户还没保存、想先验证的场景）；
+    # 前端为空时测当前已生效的代理；两者都空 = 测直连（验证平台能否直达 Google）。
+    target = candidate or effective
+    via_proxy = bool(target)
+
+    started = time.time()
+    try:
+        client_kwargs = {"timeout": _httpx.Timeout(connect=PROXY_TEST_TIMEOUT_SECONDS,
+                                                   read=PROXY_TEST_TIMEOUT_SECONDS,
+                                                   write=PROXY_TEST_TIMEOUT_SECONDS,
+                                                   pool=PROXY_TEST_TIMEOUT_SECONDS),
+                         "follow_redirects": False}
+        if target:
+            client_kwargs["proxy"] = target
+        async with _httpx.AsyncClient(**client_kwargs) as client:
+            resp = await client.get(PROXY_TEST_TARGET)
+        latency_ms = int((time.time() - started) * 1000)
+        # 任何 HTTP 状态码（包括 404/403）都证明「TCP+TLS+HTTP」整条链路通，
+        # 即代理本身可用；只有连接异常（超时/拒绝/DNS 失败）才算连通失败。
+        return JSONResponse(content={
+            "ok": True,
+            "via_proxy": via_proxy,
+            "proxy": mask_proxy_url(target) if target else "（直连）",
+            "status_code": resp.status_code,
+            "latency_ms": latency_ms,
+            "message": ("代理连通成功" if via_proxy else "直连 Google 成功")
+                       + f"，上游返回 HTTP {resp.status_code}（任意状态码都代表链路可达）",
+        })
+    except Exception as e:
+        latency_ms = int((time.time() - started) * 1000)
+        return JSONResponse(content={
+            "ok": False,
+            "via_proxy": via_proxy,
+            "proxy": mask_proxy_url(target) if target else "（直连）",
+            "latency_ms": latency_ms,
+            "error": f"{type(e).__name__}: {e}",
+            "message": ("代理连通失败" if via_proxy else "直连 Google 失败")
+                       + "：请检查代理地址格式（协议://用户名:密码@IP:端口）、账号密码与代理服务器状态",
+        })
+
+
 class LoginBody(BaseModel):
     password: str
 
@@ -1185,6 +1390,16 @@ async def update_settings_api(request: Request, _auth: bool = Depends(require_au
         patch = {}
     if not isinstance(patch, dict):
         return JSONResponse(status_code=400, content={"error": "请求体必须是 JSON 对象。"})
+    # 出站代理单独校验格式：畸形代理一旦存入，所有上游请求会统一失败
+    if "proxy_url" in patch:
+        if not isinstance(patch["proxy_url"], str):
+            return JSONResponse(status_code=400, content={"error": "proxy_url 必须是字符串。"})
+        err = validate_proxy_url_format(patch["proxy_url"])
+        if err:
+            return JSONResponse(status_code=400, content={
+                "error": "代理地址格式不合法：" + err,
+                "field": "proxy_url",
+            })
     updated = app_state.update_settings(patch)
     return JSONResponse(content=updated)
 

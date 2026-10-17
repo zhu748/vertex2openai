@@ -1,27 +1,99 @@
-name: GHCR CI
-permissions: write-all
+name: Build & Publish Docker Image
+
+# 构建并推送 ghcr.io/<owner>/vertex2openai
+# - push 到 main：打 latest + main-<sha> 标签
+# - 推送 v* 标签：打语义化版本标签（v1.2.3 → 1.2.3 / 1.2 / latest）
+# - PR：只构建验证，不推送（fork PR 没有写权限，也不会误覆盖镜像）
+# - 手动触发：workflow_dispatch
 on:
   push:
     branches: [ "main" ]
+    tags: [ "v*" ]
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
 
+# 最小权限原则：旧版 write-all 会把仓库所有写权限（含 release、deployments）
+# 都发给 workflow，这里只需要读代码 + 写 GHCR 包。
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  # github.repository = <owner>/<repo>，GHCR 要求全小写
+  IMAGE_NAME: ${{ github.repository }}
+
 jobs:
-  build:
+  # 推镜像前先做导入级 CI：语法检查 + 真实 import app/main.py，
+  # 把「构建成功但启动即崩溃」的镜像挡在仓库门外。
+  test:
     runs-on: ubuntu-latest
-
     steps:
-    - name: lowercase repository name
-      run: echo "IMAGE_NAME=${GITHUB_REPOSITORY@L}" >> ${GITHUB_ENV}
-      
-    - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r app/requirements.txt
+      - name: Syntax check (compileall)
+        run: python -m compileall -q app
+      - name: Import smoke test（main 模块可加载）
+        run: python -c "import sys; sys.path.insert(0, 'app'); import main; print('import OK:', main.app.title)"
+      - name: Workflow sanity check
+        run: |
+          pip install -q pyyaml
+          python .github/scripts/check_workflows.py
 
-    - name: Log in to GitHub Container Registry
-      run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Build the Docker image
-      run: docker build . --file Dockerfile --tag ghcr.io/${{ env.IMAGE_NAME }}:latest
+      - name: Set up QEMU（arm64 交叉构建）
+        uses: docker/setup-qemu-action@v3
 
-    - name: Push the Docker image
-      run: docker push ghcr.io/${{ env.IMAGE_NAME }}:latest
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        # PR 事件没有 packages 写权限，跳过登录（后面也只 build 不 push）
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # latest 只在默认分支 push 或版本 tag 时打，PR 构建不带 latest
+          flavor: |
+            latest=${{ github.event_name == 'push' && (github.ref == format('refs/heads/{0}', github.event.repository.default_branch) || startsWith(github.ref, 'refs/tags/v')) }}
+          tags: |
+            type=raw,value=main-{{sha}},enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=pr
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          # PR 只验证默认平台（QEMU 模拟 arm64 很慢）；push 时双平台发布
+          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # GHA 缓存：依赖层不变时构建从 ~3 分钟降到 ~30 秒
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
