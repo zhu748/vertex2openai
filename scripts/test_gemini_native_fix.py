@@ -68,7 +68,7 @@ class StubManager:
     def get_total_keys(self):
         return len(self.records)
 
-    def get_express_record(self):
+    def get_express_record(self, exclude_key=None):
         if not self.records:
             return None
         rec = self.records[self.i % len(self.records)]

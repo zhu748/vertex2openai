@@ -176,6 +176,10 @@ class _CurlRespShim:
     def text(self) -> str:
         return self._r.text
 
+    @property
+    def headers(self):
+        return self._r.headers
+
     def json(self):
         return self._r.json()
 

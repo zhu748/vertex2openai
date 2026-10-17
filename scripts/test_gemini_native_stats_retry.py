@@ -22,6 +22,7 @@ import config
 import main
 from logger import ProxyStats
 from routes import gemini_native
+import retry_policy
 
 
 class KeyManager:
@@ -33,7 +34,7 @@ class KeyManager:
     def get_total_keys(self):
         return len(self.records)
 
-    def get_express_record(self):
+    def get_express_record(self, exclude_key=None):
         if not self.records:
             return None
         record = self.records[self.index % len(self.records)]
@@ -116,6 +117,30 @@ class NativeStatsRetryTests(unittest.TestCase):
                 self.assertEqual(len(self.requests), 2)
                 self.assertEqual({r.headers["x-goog-api-key"] for r in self.requests}, {"key-1"})
         self.assert_stats(total=2, success=2, retries=2)
+
+    def test_single_key_repeated_429_keeps_bare_fallback_and_full_budget(self):
+        self.settings.update(retry_max=10, express_location="global")
+        for action in ("generateContent", "streamGenerateContent"):
+            with self.subTest(action=action):
+                self.requests.clear()
+                bare_attempts = 0
+
+                def responder(request):
+                    nonlocal bare_attempts
+                    if "/projects/" in request.url.path:
+                        return httpx.Response(404, json={"error": {"message": "Publisher model was not found"}})
+                    bare_attempts += 1
+                    if bare_attempts <= 10:
+                        return httpx.Response(429, json={"error": {"code": 429}})
+                    return httpx.Response(200, content=b'data: {"candidates": []}\n\n',
+                                          headers={"content-type": "text/event-stream"})
+
+                self.responder = responder
+                self.assertEqual(self.post(action).status_code, 200)
+                self.assertEqual(len(self.requests), 12)
+                self.assertTrue(all("/projects/" not in req.url.path for req in self.requests[1:]))
+                self.assertEqual({req.headers["x-goog-api-key"] for req in self.requests}, {"key-1"})
+        self.assert_stats(total=2, success=2, retries=20)
 
     def test_pool_can_wrap_until_configured_budget_exhausted(self):
         self.manager.records.append({"key": "key-2", "project_id": "project-2"})
@@ -277,11 +302,41 @@ class NativeStatsRetryTests(unittest.TestCase):
         self.assertEqual(response.content, b'data: {"candidates": []}\n\n')
         self.assert_stats(retries=1)
 
+    def test_explicit_sse_request_rejects_non_sse_upstream(self):
+        response = self.client.post("/v1beta/models/gemini-test:streamGenerateContent?alt=sse",
+                                    json={}, headers={"x-goog-api-key": "client-key"})
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("SSE", response.json()["error"]["message"])
+        self.assert_stats(success=0, error=1)
+
+    def test_full_resource_model_paths_are_routable(self):
+        for path in ("projects/project/locations/global/publishers/google/models/gemini-test",
+                     "publishers/google/models/gemini-test", "tunedModels/custom"):
+            with self.subTest(path=path):
+                response = self.client.post(f"/v1beta/models/{path}:generateContent", json={},
+                                            headers={"x-goog-api-key": "client-key"})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(self.requests[-1].url.path, f"/v1beta1/{path}:generateContent")
+        self.assert_stats(total=3, success=3)
+
+    def test_invalid_local_request_error_is_not_retried(self):
+        def responder(request):
+            raise ValueError("Invalid header for quota model-429")
+        self.responder = responder
+        self.assertEqual(self.post().status_code, 502)
+        self.assertEqual(len(self.requests), 1)
+        self.assert_stats(success=0, error=1)
+
+    def test_upstream_base_url_trailing_slash_is_normalized(self):
+        with mock.patch.object(gemini_native, "EXPRESS_BASE", "https://example.test/"):
+            self.assertEqual(gemini_native._build_upstream_url("gemini-test", "countTokens"),
+                             "https://example.test/v1beta1/publishers/google/models/gemini-test:countTokens")
+
 
 class RetryWaitTests(unittest.IsolatedAsyncioTestCase):
     async def test_disconnect_is_checked_during_backoff(self):
         request = types.SimpleNamespace(is_disconnected=mock.AsyncMock(side_effect=[False, True]))
-        with mock.patch.object(gemini_native.asyncio, "sleep", new_callable=mock.AsyncMock) as sleep:
+        with mock.patch.object(retry_policy.asyncio, "sleep", new_callable=mock.AsyncMock) as sleep:
             self.assertFalse(await gemini_native._wait_for_retry(request, 60))
         sleep.assert_awaited_once()
         self.assertLessEqual(sleep.await_args.args[0], 0.5)

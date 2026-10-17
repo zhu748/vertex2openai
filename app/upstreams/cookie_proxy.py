@@ -42,7 +42,8 @@ from message_processing import (
     _requires_signature,
 )
 from logger import stats
-from api_helpers import get_retry_settings
+from api_helpers import get_retry_settings, is_retryable_exception
+from retry_policy import retry_delay, wait_for_retry
 from usage import map_usage
 from signature_store import SignatureRecord, SignatureState, signature_store
 from schema_validation import SchemaValidationError, validate_request_schemas
@@ -1000,6 +1001,18 @@ def _map_usage(usage_meta: dict | None) -> dict:
     return map_usage(usage_meta)
 
 
+def _api_error_details(data) -> tuple[int, str]:
+    message = data.get("message", str(data)) if isinstance(data, dict) else str(data)
+    code = data.get("code") if isinstance(data, dict) else None
+    if not isinstance(code, int) or not 400 <= code <= 599:
+        code = 429 if _is_retryable_error(message) else 502
+    return code, message
+
+
+def _retryable_status(code: int) -> bool:
+    return code == 429 or 500 <= code <= 599
+
+
 # ========== OpenAI SSE 格式化 ==========
 
 def _make_openai_chunk(
@@ -1044,12 +1057,13 @@ def _sse_heartbeat() -> str:
     return ": keep-alive\n\n"
 
 
-async def _sleep_with_heartbeat(total_sec: float, hb_interval: float = 3.0):
+async def _sleep_with_heartbeat(total_sec: float, hb_interval: float = 3.0, request=None):
     """边等待边吐心跳的异步生成器：每 hb_interval 秒 yield 一次心跳，直到累计 total_sec。"""
     waited = 0.0
     step = max(0.5, min(hb_interval, total_sec)) if total_sec > 0 else 0
     while waited < total_sec:
-        await asyncio.sleep(min(step, total_sec - waited))
+        if not await wait_for_retry(request, min(step, total_sec - waited)):
+            return
         waited += step
         yield _sse_heartbeat()
 
@@ -1085,6 +1099,14 @@ def _wants_usage(request_obj: OpenAIRequest) -> bool:
 
 # ========== 单次流式请求执行器（重构为真正的异步实时生成器） ==========
 
+class _StreamRequestError(str):
+    """保持错误字符串兼容性，并把 HTTP 退避信息带到流式重试层。"""
+    def __new__(cls, message, retry_after=None):
+        value = super().__new__(cls, message)
+        value.retry_after = retry_after
+        return value
+
+
 async def _execute_stream_request_generator_once(
     client: Any,
     headers: dict,
@@ -1115,8 +1137,9 @@ async def _execute_stream_request_generator_once(
                 if _native_tool_error(error_msg):
                     yield "native_tool_unsupported", error_msg
                     return
-                is_retryable = response.status_code in (429, 503, 500) or _is_retryable_error(error_msg)
-                yield "retryable_error" if is_retryable else "fatal_error", error_msg
+                is_retryable = _retryable_status(response.status_code)
+                error = _StreamRequestError(error_msg, getattr(response, "headers", {}).get("retry-after"))
+                yield "retryable_error" if is_retryable else "fatal_error", error
                 return
 
             # 2. 实时遍历并抛出流式 JSON 事件块
@@ -1152,7 +1175,7 @@ async def _execute_stream_request_generator_once(
 
     except Exception as e:
         err_msg = str(e)
-        is_retryable = _is_retryable_error(err_msg) or "timeout" in err_msg.lower()
+        is_retryable = is_retryable_exception(e)
         if not has_content:
             yield "retryable_error" if is_retryable else "fatal_error", err_msg
         else:
@@ -1199,20 +1222,24 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
     for attempt in range(retry_max + 1):
         if await fastapi_request.is_disconnected():
             return {"kind": "error", "message": "客户端已断开连接。"}
+        if attempt:
+            stats.add_retry()
         try:
             req_headers = build_headers(_get_cookie_string()) or headers
             async with open_upstream_client(client_kwargs) as client:
                 response = await client.post(BATCH_GRAPHQL_URL, headers=req_headers, json=body)
 
-            if response.status_code in (429, 503, 500) and attempt < retry_max:
-                stats.add_retry()
+            if _retryable_status(response.status_code) and attempt < retry_max:
                 print(f"⚠️ [Studio] HTTP {response.status_code}（生图，尝试 {attempt+1}），{backoff_sec}s 后重试...")
-                await asyncio.sleep(backoff_sec)
+                delay = retry_delay(getattr(response, "headers", {}).get("retry-after"), backoff_sec)
+                if not await wait_for_retry(fastapi_request, delay):
+                    return {"kind": "error", "message": "客户端已断开连接。"}
                 continue
             if response.status_code != 200:
                 return {"kind": "error", "message": f"HTTP {response.status_code}: {response.text[:300]}"}
 
             full_text, reasoning_text, api_error, usage_meta = "", "", None, None
+            api_error_status = 502
             finish_raw, blocked_msg = None, None
             safety_html = ""
             sampler = _RawSampler()
@@ -1239,17 +1266,16 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
                     elif et == "usage":
                         usage_meta = data
                     elif et == "error":
-                        em = data.get("message", str(data)) if isinstance(data, dict) else str(data)
-                        if _is_retryable_error(em) and attempt < retry_max:
-                            api_error = em
-                            break
-                        full_text += f"\n[错误] {em}"
+                        api_error_status, api_error = _api_error_details(data)
+                        break
 
-            if api_error and attempt < retry_max:
-                stats.add_retry()
+            if api_error and _retryable_status(api_error_status) and attempt < retry_max:
                 print(f"⚠️ [Studio] 生图 429/限流（尝试 {attempt+1}），{backoff_sec}s 后重试...")
-                await asyncio.sleep(backoff_sec)
+                if not await wait_for_retry(fastapi_request, backoff_sec):
+                    return {"kind": "error", "message": "客户端已断开连接。"}
                 continue
+            if api_error:
+                return {"kind": "error", "code": api_error_status, "message": api_error}
 
             if not full_text.strip():
                 # 无正文：给出可见的诊断信息，而不是静默空回复
@@ -1263,10 +1289,10 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
                     "finish_reason": _map_finish_reason(finish_raw), "usage_meta": usage_meta}
         except Exception as e:
             em = str(e)
-            if (_is_retryable_error(em) or "timeout" in em.lower()) and attempt < retry_max:
-                stats.add_retry()
+            if is_retryable_exception(e) and attempt < retry_max:
                 print(f"⚠️ [Studio] 生图异常（尝试 {attempt+1}）：{em[:80]}，{backoff_sec}s 后重试...")
-                await asyncio.sleep(backoff_sec)
+                if not await wait_for_retry(fastapi_request, backoff_sec):
+                    return {"kind": "error", "message": "客户端已断开连接。"}
                 continue
             return {"kind": "error", "message": f"batchGraphql proxy error: {em}"}
     return {"kind": "error", "message": "重试多次仍失败。"}
@@ -1476,6 +1502,8 @@ class CookieProxyUpstream(BaseUpstream):
                     if await fastapi_request.is_disconnected():
                         print("ℹ️ [Studio] 客户端已断开连接，停止流式重试。")
                         return
+                    if attempt:
+                        stats.add_retry()
 
                     use_native_tools = not native_fallback_state["latched"]
                     body = await _cached_body(use_native_tools)
@@ -1564,7 +1592,12 @@ class CookieProxyUpstream(BaseUpstream):
                                     stream_ordinary_metadata.append(ordinary_part_metadata("thought", data, None))
                                     yield _make_openai_chunk(response_id, model_display, reasoning_content=data)
                                 elif status == "api_error_text":
+                                    stats.add_error()
                                     yield _make_openai_chunk(response_id, model_display, content=f"\n[Studio API 错误] {data}")
+                                    yield "data: " + json.dumps({"error": {
+                                        "code": 502, "message": data, "type": "upstream_error"}}, ensure_ascii=False) + "\n\n"
+                                    yield "data: [DONE]\n\n"
+                                    return
                                 elif status == "image":
                                     got_text = True
                                     stream_part_order.append({"type": "ordinary", "index": len(stream_ordinary_metadata)})
@@ -1627,11 +1660,10 @@ class CookieProxyUpstream(BaseUpstream):
                             if await fastapi_request.is_disconnected():
                                 print("ℹ️ [Studio] 客户端已断开连接，取消后续重试。")
                                 return
-                            wait_sec = backoff_sec
-                            stats.add_retry()
+                            wait_sec = retry_delay(getattr(error_to_raise, "retry_after", None), backoff_sec)
                             print(f"⚠️ [Studio] 遇到可重试拥堵/限流: {error_to_raise[:80]}... {wait_sec}s 后进行第 {attempt+2} 次退避重试")
                             # 退避等待期间持续吐心跳，保活前端连接（issue4：3.1-pro 频繁 429 长等待易被前端断开）
-                            async for _hb in _sleep_with_heartbeat(wait_sec):
+                            async for _hb in _sleep_with_heartbeat(wait_sec, request=fastapi_request):
                                 if await fastapi_request.is_disconnected():
                                     print("ℹ️ [Studio] 客户端已断开连接，取消后续重试。")
                                     return
@@ -1722,6 +1754,8 @@ class CookieProxyUpstream(BaseUpstream):
                     return JSONResponse(status_code=499, content={
                         "error": {"message": "客户端已断开连接，请求已取消。", "type": "client_closed_request"}
                     })
+                if attempt:
+                    stats.add_retry()
                 try:
                     use_native_tools = not native_fallback_state["latched"]
                     body = await _cached_body(use_native_tools)
@@ -1753,12 +1787,13 @@ class CookieProxyUpstream(BaseUpstream):
                             )
                             fallback_body = None
 
-                    if response.status_code in (429, 503, 500):
+                    if _retryable_status(response.status_code):
                         if attempt < retry_max:
                             wait_sec = backoff_sec
-                            stats.add_retry()
                             print(f"⚠️ [Studio] HTTP {response.status_code} (尝试 {attempt+1}), {wait_sec}s 后重试...")
-                            await asyncio.sleep(wait_sec)
+                            delay = retry_delay(getattr(response, "headers", {}).get("retry-after"), wait_sec)
+                            if not await wait_for_retry(fastapi_request, delay):
+                                return JSONResponse(status_code=499, content={"error": {"message": "客户端已断开连接。"}})
                             continue
 
                     if response.status_code != 200:
@@ -1776,6 +1811,7 @@ class CookieProxyUpstream(BaseUpstream):
                     part_order = []
                     message_extra = None
                     api_error = None
+                    api_error_status = 502
                     usage_meta = None
                     finish_raw = None
                     blocked_msg = None
@@ -1824,18 +1860,18 @@ class CookieProxyUpstream(BaseUpstream):
                             elif event_type == "usage":
                                 usage_meta = data
                             elif event_type == "error":
-                                err_msg = data.get("message", str(data)) if isinstance(data, dict) else str(data)
-                                if _is_retryable_error(err_msg) and attempt < retry_max:
-                                    api_error = err_msg
-                                    break
-                                full_text += f"\n[错误] {err_msg}"
+                                api_error_status, api_error = _api_error_details(data)
+                                break
 
-                    if api_error and attempt < retry_max:
+                    if api_error and _retryable_status(api_error_status) and attempt < retry_max:
                         wait_sec = backoff_sec
-                        stats.add_retry()
                         print(f"⚠️ [Studio] 429/限流 (尝试 {attempt+1}): {api_error[:100]}, {wait_sec}s 后重试...")
-                        await asyncio.sleep(wait_sec)
+                        if not await wait_for_retry(fastapi_request, wait_sec):
+                            return JSONResponse(status_code=499, content={"error": {"message": "客户端已断开连接。"}})
                         continue
+                    if api_error:
+                        return JSONResponse(status_code=api_error_status, content={"error": {
+                            "code": api_error_status, "message": api_error, "type": "upstream_error"}})
 
                     got_text = bool(full_text.strip())
                     got_output = got_text or bool(tool_calls)
@@ -1895,13 +1931,13 @@ class CookieProxyUpstream(BaseUpstream):
 
                 except Exception as e:
                     err_msg = str(e)
-                    is_retryable = _is_retryable_error(err_msg) or "timeout" in err_msg.lower()
+                    is_retryable = is_retryable_exception(e)
 
                     if is_retryable and attempt < retry_max:
                         wait_sec = backoff_sec
-                        stats.add_retry()
                         print(f"⚠️ [Studio] 异常 (尝试 {attempt+1}): {err_msg[:100]}, {wait_sec}s 后重试...")
-                        await asyncio.sleep(wait_sec)
+                        if not await wait_for_retry(fastapi_request, wait_sec):
+                            return JSONResponse(status_code=499, content={"error": {"message": "客户端已断开连接。"}})
                         continue
 
                     elapsed = time.time() - start_time

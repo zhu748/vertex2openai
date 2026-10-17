@@ -26,19 +26,22 @@ class ExpressKeyManager:
 
     # ---------- 选择 ----------
 
-    def get_random_express_record(self) -> Optional[dict]:
+    def get_random_express_record(self, exclude_key: Optional[str] = None) -> Optional[dict]:
         records = self.get_records()
         if not records:
             print("❌ [密钥配置] 未配置任何 Express API Key，无法调用 Gemini Express Mode。")
             return None
         indexed = list(enumerate(records))
+        # 有其他 Key 时避开刚失败的那把；单 Key 仍可使用完整重试预算。
+        alternatives = [(i, r) for i, r in indexed if r["key"] != exclude_key]
+        indexed = alternatives or indexed
         random.shuffle(indexed)
         original_idx, rec = indexed[0]
         print(f"🔑 [密钥选择] 已随机选择第 {original_idx + 1} 个 Express API Key"
               f"（项目：{rec.get('project_id') or '未探测'}）。")
         return dict(rec, index=original_idx)
 
-    def get_roundrobin_express_record(self) -> Optional[dict]:
+    def get_roundrobin_express_record(self, exclude_key: Optional[str] = None) -> Optional[dict]:
         records = self.get_records()
         if not records:
             print("❌ [密钥配置] 未配置任何 Express API Key，无法调用 Gemini Express Mode。")
@@ -46,17 +49,22 @@ class ExpressKeyManager:
         if self.round_robin_index >= len(records):
             self.round_robin_index = 0
         original_idx = self.round_robin_index
+        for offset in range(len(records)):
+            candidate = (self.round_robin_index + offset) % len(records)
+            if records[candidate]["key"] != exclude_key:
+                original_idx = candidate
+                break
         rec = records[original_idx]
-        self.round_robin_index = (self.round_robin_index + 1) % len(records)
+        self.round_robin_index = (original_idx + 1) % len(records)
         print(f"🔑 [密钥选择] 已按轮询策略选择第 {original_idx + 1} 个 Express API Key"
               f"（项目：{rec.get('project_id') or '未探测'}）。")
         return dict(rec, index=original_idx)
 
-    def get_express_record(self) -> Optional[dict]:
+    def get_express_record(self, exclude_key: Optional[str] = None) -> Optional[dict]:
         """按控制台策略选一条 Key 记录（含它自己的 Project ID）。"""
         if app_state.get_setting("roundrobin", app_config.ROUNDROBIN):
-            return self.get_roundrobin_express_record()
-        return self.get_random_express_record()
+            return self.get_roundrobin_express_record(exclude_key)
+        return self.get_random_express_record(exclude_key)
 
     def refresh_keys(self):
         self.round_robin_index = 0

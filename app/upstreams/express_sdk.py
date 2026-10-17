@@ -29,10 +29,12 @@ OPENAI_SEARCH_SUFFIX = "-openaisearch"
 
 
 def _normalize_model_name(model_name: str) -> tuple[str, bool, str | None]:
-    base_model_name = model_name
+    base_model_name = model_name.strip()
+    if base_model_name == LEGACY_EXPRESS_PREFIX.strip():
+        return "", False, "模型名称不能为空。"
 
     if base_model_name.startswith(LEGACY_EXPRESS_PREFIX):
-        base_model_name = base_model_name[len(LEGACY_EXPRESS_PREFIX):]
+        base_model_name = base_model_name[len(LEGACY_EXPRESS_PREFIX):].strip()
 
     if base_model_name.startswith(LEGACY_PAY_PREFIX):
         return base_model_name, False, "当前版本已经移除 Pay/Service Account 模式，请改用 Express Mode 模型名称。"
@@ -43,6 +45,9 @@ def _normalize_model_name(model_name: str) -> tuple[str, bool, str | None]:
     is_grounded_search = base_model_name.endswith("-search")
     if is_grounded_search:
         base_model_name = base_model_name[:-len("-search")]
+
+    if not base_model_name.strip():
+        return base_model_name, False, "模型名称不能为空。"
 
     return base_model_name, is_grounded_search, None
 
@@ -155,7 +160,7 @@ def resolve_express_model_path(base_model_name: str, settings: dict,
       ③ 都没有 → 退回裸模型名（并提示），绝不拼出半截路径。
     ①在多账号轮换时是必须的：Key 与项目一一对应，用别人的项目会 403（需要计费/无权）。
     """
-    if base_model_name.startswith(("projects/", "publishers/", "models/")):
+    if base_model_name.startswith(("projects/", "publishers/", "models/", "tunedModels/", "endpoints/")):
         return base_model_name          # 客户端已自带完整路径，尊重它
 
     location = str(settings.get("express_location", "") or "").strip()
@@ -305,6 +310,17 @@ class ExpressSDKUpstream(BaseUpstream):
                              "response_modalities", "image_config")}
             print(f"🔎 [出站调试] Express 通道 生成参数={_dbg}")
 
+        def retry_target_factory():
+            nonlocal express_api_key
+            record = express_key_manager_instance.get_express_record(exclude_key=express_api_key)
+            if record is None:
+                return None
+            express_api_key = record["key"]
+            model_path = resolve_express_model_path(
+                base_model_name, _inj_settings, key_project_id=record.get("project_id", ""))
+            return (get_pooled_express_client(express_api_key), model_path,
+                    base_model_name if model_path != base_model_name else None)
+
         return await execute_gemini_call(
             client_to_use, model_to_call, prompt_func, gen_config_dict, request_obj,
             fastapi_request=fastapi_request, prefill_text=prefill_text,
@@ -315,4 +331,5 @@ class ExpressSDKUpstream(BaseUpstream):
             fallback_client_factory=(
                 lambda: get_pooled_express_client(express_api_key)
             ),
+            retry_target_factory=retry_target_factory,
         )

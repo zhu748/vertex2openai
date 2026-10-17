@@ -35,18 +35,16 @@ cachedContent / responseSchema 等全部字段天然 100% 兼容，因为请求�
 请求，故本透传始终走 Express 通道；未配置任何 Express Key 时返回明确错误。
 """
 
-import asyncio
 import json
-import math
-import time
 from typing import Any, Optional
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote
 
 import httpx
 from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from api_helpers import get_retry_settings
+from api_helpers import get_retry_settings, is_retryable_exception
+from retry_policy import retry_delay as _retry_delay, wait_for_retry as _wait_for_retry
 from auth import constant_time_equal
 from config import API_KEY
 from logger import stats
@@ -139,9 +137,8 @@ def _split_model_action(model_action: str) -> tuple[str, str]:
     客户端若传了 `models/gemini-xxx:action` 形式，也一并剥掉前缀。
     """
     name = model_action
-    for prefix in ("models/", "publishers/google/models/", "tunedModels/"):
-        if name.startswith(prefix):
-            name = name[len(prefix):]
+    if name.startswith("models/"):
+        name = name[len("models/"):]
     if ":" in name:
         model, _, action = name.partition(":")
         return model.strip(), action.strip()
@@ -185,7 +182,7 @@ def _build_upstream_url(model_path: str, action: str) -> str:
         model_segment = model_path
     else:
         model_segment = f"publishers/google/models/{model_path}"
-    return f"{EXPRESS_BASE}/{EXPRESS_API_VERSION}/{model_segment}:{action}"
+    return f"{EXPRESS_BASE.rstrip('/')}/{EXPRESS_API_VERSION}/{model_segment}:{action}"
 
 
 async def _passthrough_once(client: httpx.AsyncClient, express_key: str,
@@ -282,6 +279,7 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
     is_stream = action == "streamGenerateContent"
     retry_max, backoff_seconds = get_retry_settings()
     record = None
+    previous_key = None
     key_attempts = 0           # 上游错误已重试次数（不含首次）
     pin_fallback_used = False  # 每次选 Key 后最多兜底一次
 
@@ -290,14 +288,16 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
             return Response(status_code=499)
 
         if record is None:
-            record = manager.get_express_record()
+            record = manager.get_express_record(exclude_key=previous_key)
             if record is None:
                 break
             if key_attempts:
                 # 仅实际发起的重试计入大盘，不把退避中断计为重试。
                 stats.add_retry()
             express_key = record["key"]
-            pin_fallback_used = False
+            if express_key != previous_key:
+                pin_fallback_used = False
+            previous_key = express_key
 
         if pin_fallback_used:
             # 钉定兜底轮：复用同一把 Key（换的是模型路径，不是 Key）
@@ -318,7 +318,7 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
             else:
                 last_error_status = 502
                 last_error_body = str(e).encode()
-            if key_attempts >= retry_max:
+            if key_attempts >= retry_max or not is_retryable_exception(e):
                 break
             print(f"⚠️ [Gemini 透传] 上游连接异常（{type(e).__name__}），"
                   f"{backoff_seconds:.1f}s 后重试（{key_attempts + 1}/{retry_max}）。")
@@ -341,6 +341,9 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
             print("⚠️ [Gemini 透传] 流式请求的上游响应不是 text/event-stream——"
                   "客户端若按 SSE 解析将等不到 data: 行（v1 端点曾出现此形态，"
                   "现已钉 v1beta1；若复现请把 debug_outbound 打开后上报 URL）。")
+            if "sse" in parse_qs(query).get("alt", []):
+                await upstream.aclose()
+                return _native_error(502, "上游未返回 SSE 流，无法完成 alt=sse 请求。", "UNAVAILABLE")
 
         # 429/5xx：按控制台预算重选 Key，不能因单 Key / 池已用遍而提前退出。
         retryable_status = upstream.status_code == 429 or 500 <= upstream.status_code < 600
@@ -356,7 +359,7 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
             await upstream.aclose()
             wait = _retry_delay(upstream.headers.get("retry-after"), backoff_seconds)
             print(f"⚠️ [Gemini 透传] 上游 HTTP {upstream.status_code}，"
-                  f"{wait:.1f}s 后重新选择 Express Key 重试（{key_attempts + 1}/{retry_max}）。")
+                  f"{wait:.1f}s 后重试（{key_attempts + 1}/{retry_max}，单 Key 同样适用）。")
             if not await _wait_for_retry(fastapi_request, wait):
                 return Response(status_code=499)
             key_attempts += 1
@@ -404,27 +407,6 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
         media_type="application/json",
         headers=last_error_headers or None,
     )
-
-
-def _retry_delay(retry_after: Optional[str], backoff_seconds: float) -> float:
-    """有效的 Retry-After 秒数优先；非法值退回控制台设置，最多等待 120 秒。"""
-    try:
-        delay = float(retry_after)
-    except (TypeError, ValueError):
-        return backoff_seconds
-    return min(delay, 120.0) if math.isfinite(delay) and delay >= 0 else backoff_seconds
-
-
-async def _wait_for_retry(request: Request, delay: float) -> bool:
-    """退避期间检测断连，避免客户端离开后继续调用上游。"""
-    deadline = time.monotonic() + delay
-    while True:
-        if await request.is_disconnected():
-            return False
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return True
-        await asyncio.sleep(min(remaining, 0.5))
 
 
 async def _relay_stream(upstream: httpx.Response) -> StreamingResponse:
@@ -524,7 +506,7 @@ def _passthrough_endpoint():
 
 for _prefix in ("/v1beta", "/v1"):
     router.add_api_route(
-        f"{_prefix}/models/{{model_action}}",
+        f"{_prefix}/models/{{model_action:path}}",
         _passthrough_endpoint(),
         methods=["POST"],
         name=f"gemini_native_passthrough{_prefix.replace('/', '_')}",
