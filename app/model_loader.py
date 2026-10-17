@@ -1,6 +1,7 @@
 import httpx
 import asyncio
 import json
+import time
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -10,6 +11,8 @@ from express_fingerprint import build_direct_headers
 
 _model_cache: Optional[Dict[str, List[str]]] = None
 _cache_lock = asyncio.Lock()
+_next_refresh_allowed = 0.0
+_refresh_task: Optional[asyncio.Task] = None
 DEFAULT_MODELS_CONFIG_URL = "https://raw.githubusercontent.com/bad-woman/vertex2openai/main/vertexModels.json"
 FALLBACK_MODELS_CONFIG_URLS = [
     "https://cdn.jsdelivr.net/gh/bad-woman/vertex2openai@main/vertexModels.json",
@@ -28,11 +31,12 @@ def _normalize_models_config(data: object) -> Optional[Dict[str, List[str]]]:
 
     models = data.get("models")
     if isinstance(models, list):
-        return {"models": [str(model) for model in models if isinstance(model, str) and model.strip()]}
+        return {"models": list(dict.fromkeys(model.strip() for model in models
+                                             if isinstance(model, str) and model.strip()))}
 
     legacy_express_models = data.get("vertex_express_models")
     if isinstance(legacy_express_models, list):
-        return {"models": [str(model) for model in legacy_express_models if isinstance(model, str) and model.strip()]}
+        return _normalize_models_config({"models": legacy_express_models})
 
     return None
 
@@ -93,35 +97,62 @@ async def fetch_and_parse_models_config() -> Optional[Dict[str, List[str]]]:
             except Exception as exc:
                 print(f"⚠️ [模型配置] 加载远程模型配置时出现异常，准备尝试下一个地址：{exc}")
 
-    print("⚠️ [模型配置] 所有远程模型配置地址都不可用，将回退到本地 vertexModels.json。")
-    return _load_local_models_config()
+    print("⚠️ [模型配置] 所有远程地址都不可用，保留当前模型缓存。")
+    return None
 
 
 async def get_models_config() -> Dict[str, List[str]]:
     global _model_cache
+    if _model_cache is not None:
+        return _model_cache
     async with _cache_lock:
         if _model_cache is None:
             print("📦 [模型配置] 缓存为空，正在初始化模型列表。")
-            _model_cache = await fetch_and_parse_models_config()
-            if _model_cache is None:
-                print("⚠️ [模型配置] 模型配置初始化失败，当前模型列表为空。")
-                _model_cache = {"models": []}
+            _model_cache = _load_local_models_config()
     return _model_cache
 
 
 async def get_express_models() -> List[str]:
     config = await get_models_config()
-    return config.get("models", [])
+    schedule_models_refresh()
+    return list(config.get("models", []))
 
 
 async def refresh_models_config_cache() -> bool:
-    global _model_cache
-    print("🔄 [模型配置] 正在刷新模型配置缓存。")
+    global _model_cache, _next_refresh_allowed
     async with _cache_lock:
-        new_config = await fetch_and_parse_models_config()
-        if new_config is not None:
+        if time.monotonic() < _next_refresh_allowed:
+            return bool(_model_cache)
+        print("🔄 [模型配置] 正在刷新模型配置缓存。")
+        try:
+            new_config = await fetch_and_parse_models_config()
+        except Exception as exc:
+            print(f"⚠️ [模型配置] 刷新失败，保留当前缓存：{type(exc).__name__}: {exc}")
+            new_config = None
+        ok = bool(new_config and new_config.get("models"))
+        _next_refresh_allowed = time.monotonic() + (3600 if ok else 300)
+        if ok:
             _model_cache = new_config
             print("✅ [模型配置] 模型配置缓存刷新成功。")
             return True
         print("❌ [模型配置] 模型配置缓存刷新失败。")
         return False
+
+
+def schedule_models_refresh() -> None:
+    """统一所有模型列表入口的后台刷新；请求直接使用当前缓存。"""
+    global _refresh_task
+    if time.monotonic() < _next_refresh_allowed:
+        return
+    if _refresh_task is None or _refresh_task.done():
+        _refresh_task = asyncio.create_task(refresh_models_config_cache())
+
+
+async def close_models_refresh() -> None:
+    global _refresh_task, _next_refresh_allowed
+    if _refresh_task is not None:
+        if not _refresh_task.done():
+            _refresh_task.cancel()
+        await asyncio.gather(_refresh_task, return_exceptions=True)
+        _refresh_task = None
+    _next_refresh_allowed = 0.0

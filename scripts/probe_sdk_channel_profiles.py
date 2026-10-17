@@ -8,14 +8,18 @@
     genai.Client(vertexai=True, api_key=..., http_options=get_http_options())
 仅在 async_client_args 注入 MockTransport（SDK 原生支持），不发真实网络。
 
-运行：/home/z/my-project/venv/bin/python /home/z/my-project/scripts/probe_sdk_channel_profiles.py
+运行：python scripts/probe_sdk_channel_profiles.py
 """
 
 import asyncio
+import os
 import sys
+import tempfile
 from pathlib import Path
 
-APP_DIR = Path("/home/z/my-project/vertex2openai/app")
+_STATE_DIR = tempfile.TemporaryDirectory(prefix="v2o-sdk-probe-")
+os.environ["STATE_DIR"] = _STATE_DIR.name
+APP_DIR = Path(__file__).resolve().parents[1] / "app"
 sys.path.insert(0, str(APP_DIR))
 
 import httpx

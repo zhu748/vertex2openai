@@ -21,6 +21,7 @@ base_url、请求头指纹档案）。控制台热改任一项，新请求立即
 """
 
 import asyncio
+import inspect
 import threading
 from typing import Any, Callable, Optional, Tuple
 
@@ -67,13 +68,15 @@ class _GracefulCloser:
 
     def __init__(self):
         self._tasks: set = set()
+        self._pending: dict = {}
 
     def schedule(self, close: Callable[[], Any]) -> None:
         async def _close_later():
             await asyncio.sleep(_GRACE_CLOSE_SECONDS)
+            self._pending.pop(asyncio.current_task(), None)
             try:
                 result = close()
-                if asyncio.iscoroutine(result):
+                if inspect.isawaitable(result):
                     await result
             except Exception:
                 pass  # 关闭失败只能交给 GC（与历史行为一致）
@@ -84,7 +87,25 @@ class _GracefulCloser:
             return  # 不在事件循环里（理论不可达，仅防御）：交给 GC
         task = loop.create_task(_close_later())
         self._tasks.add(task)
+        self._pending[task] = close
         task.add_done_callback(self._tasks.discard)
+
+    async def aclose(self) -> None:
+        """停机时立即关闭仍在宽限期内的客户端，并等待已开始的关闭任务。"""
+        pending = list(self._pending.items())
+        self._pending.clear()
+        tasks = list(self._tasks)
+        for task, _ in pending:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for _, close in pending:
+            try:
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                pass
 
 
 _closer = _GracefulCloser()
@@ -140,6 +161,13 @@ class SdkClientPool:
         with self._lock:
             return len(self._clients)
 
+    async def aclose(self) -> None:
+        with self._lock:
+            clients = [entry[1] for entry in self._clients.values()]
+            self._clients.clear()
+        for client in clients:
+            await _make_sdk_closer(client)()
+
 
 def _make_sdk_closer(client: Any) -> Callable[[], Any]:
     """genai.Client 的完整关闭：同步 + 异步底层 httpx 客户端都关。"""
@@ -194,6 +222,13 @@ class HttpxClientSlot:
             _closer.schedule(_make_httpx_closer(stale))
         return client
 
+    async def aclose(self) -> None:
+        with self._lock:
+            client = self._entry[1] if self._entry else None
+            self._entry = None
+        if client is not None:
+            await _make_httpx_closer(client)()
+
 
 def _make_httpx_closer(client: Any) -> Callable[[], Any]:
     async def _aclose():
@@ -218,3 +253,12 @@ passthrough_client_slot = HttpxClientSlot()
 def get_pooled_express_client(api_key: str) -> Any:
     """Express SDK 通道统一入口：express_sdk / fallback 工厂都用它。"""
     return express_sdk_pool.get(api_key)
+
+
+async def close_all_clients() -> None:
+    """在事件循环结束前释放当前连接池与延迟回收队列。"""
+    from impersonate import _upstream_client_pool
+
+    await asyncio.gather(express_sdk_pool.aclose(), passthrough_client_slot.aclose(),
+                         _upstream_client_pool.aclose())
+    await _closer.aclose()

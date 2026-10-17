@@ -29,7 +29,7 @@ Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风
   - 标准模式 / Cookie 直连模式在线一键切换。
   - 在线热更新并保存 Google Cookie 与 Project ID；智能解析 `Cookie-Editor` 导出的 JSON / Header String；自动从整条控制台 URL 提取 Project ID。
   - **模型参数面板**：按所选模型显示其支持能力，并在线调整思考强度、生图分辨率与比例、采样默认值、输入图压缩、重试、假流式/轮询/安全分显示、预填充兼容模式（详见下文）。
-  - **实时监控**：运行日志推流、健康度图表（成功/错误/拥堵重试）、Express 通道 Token 消耗统计（Cookie 私有接口通常不返回可靠用量）。
+  - **实时监控**：运行日志推流、健康度图表（成功/错误/拥堵重试）、Express 通道 Token 消耗统计（包含思考 Token；Cookie 私有接口通常不返回可靠用量）。成功计数不依赖上游是否返回 Token 用量。
 - **Gemini 能力与适配**
   - 文本对话、流式（SSE）与非流式。
   - OpenAI tools / function calling ↔ Gemini function calling 适配（含 Gemini 3.x 多轮所需的 thought signature 编解码）；Express 与 Cookie 直连通道均支持自定义函数声明、调用与结果回传。
@@ -135,9 +135,14 @@ curl -s https://你的域名/v1beta/models -H "x-goog-api-key: 你的API_KEY"
   （与 OpenAI 端点同一把 Key，常量时间比较校验）。
 - **双前缀**：`/v1beta/...`（Generative Language 风格）与 `/v1/...`（Vertex 风格）都注册了 POST 透传；
   模型列表只在 `/v1beta/models`（`/v1/models` 保持 OpenAI 格式，供 OpenAI 生态使用）。
-- **上游选择**：复用 Express Key 池（轮询/随机）与 location 钉定；429/5xx 自动换下一个 Key 重试
-  （最多 3 次）；上游错误状态码与 body 原样透传。Cookie 通道是私有 GraphQL 协议，无法承载原生
+- **上游选择与重试**：复用 Express Key 池（轮询/随机）与 location 钉定；429/5xx 与网络异常按
+  控制台 `retry_max` / `retry_backoff_seconds` 重试（总尝试次数 = `retry_max + 1`，
+  设 0 仍请求一次），有效的 `Retry-After` 秒数优先，最多等待 120 秒。每次重试按策略重新选 Key，
+  单 Key 或 Key 池轮转一遍后仍可继续重试，客户端断开即停止；上游错误状态码与 body 原样透传。
+  Cookie 通道是私有 GraphQL 协议，无法承载原生
   REST，故透传始终走 Express 通道（未配置 Express Key 时返回 403 与说明）。
+- **面板统计**：两个前缀的原生 POST 请求均计入总请求数，每个客户端请求只计一次；成功、
+  失败、拥堵重试分别计数。流式成功在转发完成时计入，中途失败计入错误。模型列表 GET 不计数。
 - **模型路径拼接与 SDK 完全一致**：裸模型名拼 `publishers/google/models/{model}`（Express 端点
   格式）；`projects/...` 完整资源路径（location 钉定生成或客户端自带）原样透传，不叠加前缀。
   > 📌 修复说明：旧版对钉定路径无条件叠加 `publishers/google/models/` 前缀，会请求
@@ -246,7 +251,9 @@ TCP+TLS 握手（每次约省 100~300ms 与相应 CPU）；429 重试场景收�
 配套优化：Cookie 通道重试不再重复构建请求体（含重复下载/压缩同一批输入
 图片）；batchGraphql 大响应解析改用 C 实现的 `raw_decode` 增量解析（1MB
 生图 base64 对象实测 778ms → 13ms），不再卡住事件循环；`/v1/models` 的
-小时级远程刷新加了防风暴（并发请求只触发一次，失败 5 分钟退避）。
+模型列表使用本地初始化和后台刷新：刷新期间仍立即返回缓存，并发请求只触发一次远程读取；
+成功后 1 小时再刷，失败后 5 分钟重试，保留上一次可用缓存。服务关闭时会取消后台任务，
+并释放 Express SDK、Gemini 透传、Cookie 通道及宽限期内待关闭的连接池。
 
 环境变量 `TRUST_PROXY_HEADERS=1`（可选，默认关）：部署在可信反向代理后面时，
 登录限速按 `X-Forwarded-For` 区分真实客户端 IP，避免"一个攻击者输错密码、
@@ -264,7 +271,7 @@ TCP+TLS 握手（每次约省 100~300ms 与相应 CPU）；429 重试场景收�
 | `FAKE_STREAMING_INTERVAL` | 否 | `1.0` | 假流式等待期间 keep-alive 间隔秒数。可在控制台热改。 |
 | `MODELS_CONFIG_URL` | 否 | 仓库 `vertexModels.json` | 远程模型列表地址；改远程文件即可刷新，无需重部署。 |
 | `SAFETY_SCORE` | 否 | `false` | 是否把 Gemini safety ratings 附加到输出。可在控制台热改。 |
-| `PROXY_URL` | 否 | 空 | 上游 HTTP/HTTPS/SOCKS 代理。**仅作初始值**：控制台「通道与凭证」页可热改并持久化（`proxy_url` 设置项）；保存过一次后（含清空保存 = 强制直连）环境变量不再覆盖。保存时自动校验格式（支持 http/https/socks5/socks5h/socks4）。 |
+| `PROXY_URL` | 否 | 空 | 上游 HTTP/HTTPS/SOCKS 代理。**仅作初始值**：控制台「通道与凭证」页可热改并持久化（`proxy_url` 设置项）；保存过一次后（含清空保存 = 强制直连）环境变量不再覆盖。保存时自动校验格式和端口（支持 http/https/socks5/socks5h）。 |
 | `SSL_CERT_FILE` | 否 | 空 | 自定义证书路径。 |
 | `VERTEX_BASE_URL` | 否 | 空 | **高级**：覆盖标准模式的上游 `base_url`，正常无需设置。要钉定区域请用控制台的「标准模式 location」（详见下方「标准模式的 location」）。 |
 | `GOOGLE_COOKIE` | 否 | 空 | Cookie 直连模式的 Google Cookie（初始值，后续可在控制台更新）。 |
@@ -520,8 +527,10 @@ curl http://localhost:8050/v1/chat/completions \
 
 ## 模型列表配置
 
-> ⚠️ **先看这条**：模型列表**默认从远程拉取** —— `https://raw.githubusercontent.com/bad-woman/vertex2openai/main/vertexModels.json`，只有远程全部地址都不可用时才回退到镜像里的本地 `vertexModels.json`。
-> 所以**只改本地文件（或只更新镜像）通常看不到新模型**，必须二选一：
+> 模型列表启动时先读取镜像内的本地 `vertexModels.json`，后台再从
+> `https://raw.githubusercontent.com/bad-woman/vertex2openai/main/vertexModels.json` 更新。
+> 网络失败或远程空列表不会清掉当前缓存，也不会阻塞启动和模型列表请求。
+> 后台更新成功后以远程列表为准；要持续提供自己的模型清单，可以二选一：
 > 1. 把更新后的 `vertexModels.json` 推到 GitHub `main`（推荐，改远程即可全部部署生效、无需重部署）；
 > 2. 或设环境变量 `MODELS_CONFIG_URL` 指向你自己维护的地址。
 
@@ -578,10 +587,16 @@ curl http://localhost:8050/v1/chat/completions \
 ## 本地开发与检查
 
 ```bash
-# 语法检查
-python -m compileall app
+# 安装运行和开发检查依赖
+pip install -r requirements-dev.txt
+
+# 完整离线检查：语法、静态分析、工作流、三组回归及 SDK 档案兼容
+python scripts/check_project.py
 
 # 本地启动
 cd app
 uvicorn main:app --host 0.0.0.0 --port 7860
 ```
+
+测试使用隔离临时状态和模拟上游，不需要真实 Key，也不会修改部署配置。
+CI 在 Python 3.11 / 3.12 上执行同一套检查，通过后才构建镜像。

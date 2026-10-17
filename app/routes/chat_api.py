@@ -55,7 +55,8 @@ def _resume_start_seq(fastapi_request: Request) -> int:
     try:
         leid = (fastapi_request.headers.get("last-event-id") or "").strip()
         if leid:
-            return max(0, int(leid))
+            # Last-Event-ID 是客户端已收到的最后一帧；查询参数仍是起点游标。
+            return max(0, int(leid) + 1)
     except (TypeError, ValueError):
         pass
     try:
@@ -83,7 +84,7 @@ async def _abort_placeholder(buf, stream_id: str, message: str, code: int = 500)
     await buf.append(frame_with_id(buf.next_seq, f"data: {json.dumps(err, ensure_ascii=False)}\n\n"))
     await buf.append(frame_with_id(buf.next_seq, DONE_FRAME))
     await buf.finish("error", error=message)
-    await resumable_store.drop(stream_id)
+    await resumable_store.drop(stream_id, expected=buf)
 
 
 async def _resumable_stream(fastapi_request: Request, request_obj: OpenAIRequest, api_key: str):
@@ -96,12 +97,7 @@ async def _resumable_stream(fastapi_request: Request, request_obj: OpenAIRequest
         fastapi_request.headers, api_key or "", _request_fingerprint(request_obj))
 
     buf, is_new = await resumable_store.create_if_absent(
-        stream_id, model=request_obj.model, kind="stream")
-    if not is_new and (buf.kind != "stream" or buf.fully_delivered):
-        # 已经完整交付过（或类型对不上）：这次算新一轮生成，撤掉旧缓冲重新占位。
-        await resumable_store.drop(stream_id)
-        buf, is_new = await resumable_store.create_if_absent(
-            stream_id, model=request_obj.model, kind="stream")
+        stream_id, model=request_obj.model, kind="stream", replace_delivered=True)
     if not is_new:
         # 命中在用的缓冲：重放已缓冲的部分并继续跟随上游直到本轮结束，不再请求上游。
         start = _resume_start_seq(fastapi_request)
@@ -134,7 +130,7 @@ async def _resumable_stream(fastapi_request: Request, request_obj: OpenAIRequest
         return resp
 
     pump_task = asyncio.create_task(pump_stream(buf, resp.body_iterator))
-    resumable_store.register_pump(stream_id, pump_task)
+    resumable_store.register_pump(stream_id, pump_task, buffer=buf)
     print(f"📦 [续传缓冲] {stream_id}（{id_src}）：后台泵已启动，上游读取与前端连接解绑。")
 
     start = _resume_start_seq(fastapi_request)
@@ -155,12 +151,7 @@ async def _resumable_json(fastapi_request: Request, request_obj: OpenAIRequest, 
         fastapi_request.headers, api_key or "", _request_fingerprint(request_obj))
 
     buf, is_new = await resumable_store.create_if_absent(
-        stream_id, model=request_obj.model, kind="json")
-    if not is_new and (buf.kind != "json" or buf.fully_delivered):
-        # 已完整交付过（或类型对不上）：这次算新一轮生成，撤掉旧缓冲重新占位。
-        await resumable_store.drop(stream_id)
-        buf, is_new = await resumable_store.create_if_absent(
-            stream_id, model=request_obj.model, kind="json")
+        stream_id, model=request_obj.model, kind="json", replace_delivered=True)
     if not is_new:
         # 命中在用的缓冲：已出结果的直接重放；上游还在算的，等同一个后台泵的结果。
         print(f"↩️ [重放命中] {stream_id}（{id_src}）：直接返回已缓冲的完整回复，不再请求上游。")
@@ -181,13 +172,18 @@ async def _resumable_json(fastapi_request: Request, request_obj: OpenAIRequest, 
         # 后台跑上游调用：这条前端连接断了，Google 的回复也要收完进缓冲。
         try:
             resp = await _call_upstream(request_obj, detached)
+        except asyncio.CancelledError:
+            if not buf.done:
+                await buf.finish("error", error="上游调用已取消。",
+                                 payload=create_openai_error_response(503, "上游调用已取消。", "upstream_error"),
+                                 status_code=503)
+            raise
         except Exception as e:
-            msg = f"{type(e).__name__}: {e}"
+            code, msg = extract_upstream_error(e)
             print(f"❌ [响应缓冲] {stream_id} 上游调用失败：{msg[:200]}")
             await buf.finish("error", error=msg,
-                             payload={"error": {"message": str(e)[:1024],
-                                                 "type": "upstream_error", "code": 500}},
-                             status_code=500)
+                             payload=create_openai_error_response(code, msg[:1024], "upstream_error"),
+                             status_code=code)
             return
         body = getattr(resp, "body", b"") or b""
         status = getattr(resp, "status_code", 200)
@@ -199,7 +195,7 @@ async def _resumable_json(fastapi_request: Request, request_obj: OpenAIRequest, 
                          payload=payload, status_code=status)
 
     pump_task = asyncio.create_task(_pump_json())
-    resumable_store.register_pump(stream_id, pump_task)
+    resumable_store.register_pump(stream_id, pump_task, buffer=buf)
 
     # 当前连接等待缓冲完成（等同于原来的直通等待；断线不影响后台泵）。
     # wait_for(seq=极大值) 等价于“等到 done 或超时”。

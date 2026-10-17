@@ -15,19 +15,20 @@
   2. _passthrough_request：钉定路径失败（404 Publisher model not found /
      403 requires billing）自动退回裸模型名重试一次（对齐 SDK 通道）。
 
-运行：/home/z/my-project/venv/bin/python /home/z/my-project/scripts/test_gemini_native_fix.py
+运行：python scripts/test_gemini_native_fix.py
 """
 import asyncio
 import json
 import os
 import sys
+import tempfile
 import types
+from pathlib import Path
 
 # 必须在 import 项目模块之前设置（runtime_state 模块级读取）
-_TEST_STATE_DIR = "/tmp/v2o_test_state"
-os.environ["STATE_DIR"] = _TEST_STATE_DIR
-os.makedirs(_TEST_STATE_DIR, exist_ok=True)
-sys.path.insert(0, "/home/z/my-project/vertex2openai/app")
+_TEST_STATE_DIR = tempfile.TemporaryDirectory(prefix="v2o-native-test-")
+os.environ["STATE_DIR"] = _TEST_STATE_DIR.name
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 import httpx
 import unittest.mock as mock

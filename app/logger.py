@@ -33,7 +33,7 @@ class ProxyStats:
             self.retry_counts += 1
 
     def add_success(self):
-        """直接计一次成功请求（Cookie 通道不产生 token 统计行，成功数单独计入）。"""
+        """直接计一次成功请求（Cookie / Gemini 原生透传不走 SDK token 统计）。"""
         with self.lock:
             self.success_requests += 1
 

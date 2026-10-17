@@ -43,6 +43,7 @@ from message_processing import (
 )
 from logger import stats
 from api_helpers import get_retry_settings
+from usage import map_usage
 from signature_store import SignatureRecord, SignatureState, signature_store
 from schema_validation import SchemaValidationError, validate_request_schemas
 
@@ -996,11 +997,7 @@ def _map_usage(usage_meta: dict | None) -> dict:
     不再打印 💰 统计行——大盘的 token 统计仅由标准（Express）通道计入；
     Cookie 通道的成功数改由 stats.add_success() 单独计入。
     """
-    usage_meta = usage_meta or {}
-    p = int(usage_meta.get("promptTokenCount", 0) or 0)
-    c = int(usage_meta.get("candidatesTokenCount", 0) or 0)
-    t = int(usage_meta.get("totalTokenCount", p + c) or (p + c))
-    return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": t}
+    return map_usage(usage_meta)
 
 
 # ========== OpenAI SSE 格式化 ==========

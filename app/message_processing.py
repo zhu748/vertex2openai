@@ -10,6 +10,7 @@ import config as app_config
 import model_capabilities as mc
 from runtime_state import app_state
 from runtime_state import get_effective_proxy_url
+from usage import map_usage
 from signature_store import (
     signature_store,
     SKIP_VALIDATOR_SENTINEL,
@@ -967,26 +968,27 @@ def fetch_remote_image(url: str, timeout: float = 10.0) -> Optional[Tuple[bytes,
         with httpx.Client(**client_args) as client:
             current = url
             for _ in range(MAX_REMOTE_IMAGE_REDIRECTS + 1):
-                resp = client.get(current, headers=_IMAGE_FETCH_HEADERS)
-                if resp.is_redirect:
-                    # 逐跳复查：只校验首个 URL 的话，一个 302 就能把请求带进内网。
-                    current = str(resp.next_request.url) if resp.next_request else ""
-                    nxt = urlparse(current)
-                    if nxt.scheme not in ("http", "https"):
-                        raise ValueError(f"重定向到不支持的协议：{nxt.scheme or '(空)'}")
-                    if check_host and _is_blocked_host(nxt.hostname or ""):
-                        raise ValueError("重定向指向内网/环回/链路本地，已拒绝")
-                    continue
+                with client.stream("GET", current, headers=_IMAGE_FETCH_HEADERS) as resp:
+                    if resp.is_redirect:
+                        # 每跳复查，且重定向响应体无需下载。
+                        current = str(resp.next_request.url) if resp.next_request else ""
+                        nxt = urlparse(current)
+                        if nxt.scheme not in ("http", "https"):
+                            raise ValueError(f"重定向到不支持的协议：{nxt.scheme or '(空)'}")
+                        if check_host and _is_blocked_host(nxt.hostname or ""):
+                            raise ValueError("重定向指向内网/环回/链路本地，已拒绝")
+                        continue
 
-                resp.raise_for_status()
-                mime = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
-                if mime and not mime.startswith("image/"):
-                    raise ValueError(f"响应不是图片（content-type={mime}）")
-                data = resp.content
-                if len(data) > MAX_REMOTE_IMAGE_BYTES:
-                    raise ValueError(
-                        f"图片超过 {MAX_REMOTE_IMAGE_BYTES // (1024 * 1024)}MB 上限（{len(data)} 字节）")
-                return data, mime or "image/jpeg"
+                    resp.raise_for_status()
+                    mime = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+                    if mime and not mime.startswith("image/"):
+                        raise ValueError(f"响应不是图片（content-type={mime}）")
+                    data = bytearray()
+                    for chunk in resp.iter_bytes(chunk_size=64 * 1024):
+                        if len(data) + len(chunk) > MAX_REMOTE_IMAGE_BYTES:
+                            raise ValueError(f"图片超过 {MAX_REMOTE_IMAGE_BYTES // (1024 * 1024)}MB 上限")
+                        data.extend(chunk)
+                    return bytes(data), mime or "image/jpeg"
             raise ValueError("重定向次数过多")
     except Exception as e:
         print(f"⚠️ [图片处理] 获取远程图片失败，已跳过：{url[:120]}，原因：{e}")
@@ -1277,19 +1279,7 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
     else: 
          choices.append({"index": 0, "message": {"role": "assistant", "content": None}, "finish_reason": "stop"})
 
-    usage_data = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-    if hasattr(gemini_response_obj, "usage_metadata"):
-        um = gemini_response_obj.usage_metadata
-        if hasattr(um, "prompt_token_count"): usage_data["prompt_tokens"] = um.prompt_token_count
-        if hasattr(um, "candidates_token_count"):
-            usage_data["completion_tokens"] = um.candidates_token_count
-            if hasattr(um, "total_token_count"): usage_data["total_tokens"] = um.total_token_count
-            else: usage_data["total_tokens"] = usage_data["prompt_tokens"] + usage_data["completion_tokens"]
-        elif hasattr(um, "total_token_count"): 
-             usage_data["total_tokens"] = um.total_token_count
-             if usage_data["prompt_tokens"] > 0 and usage_data["total_tokens"] > usage_data["prompt_tokens"]:
-                 usage_data["completion_tokens"] = usage_data["total_tokens"] - usage_data["prompt_tokens"]
-        else: usage_data["total_tokens"] = usage_data["prompt_tokens"] 
+    usage_data = map_usage(getattr(gemini_response_obj, "usage_metadata", None))
 
     return {
         "id": base_id, "object": "chat.completion", "created": response_timestamp,

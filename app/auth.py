@@ -5,6 +5,11 @@ from typing import Optional
 from config import API_KEY
 
 
+def constant_time_equal(candidate: str, expected: str) -> bool:
+    """UTF-8 字节比较，避免 compare_digest(str) 遇到非 ASCII 口令抛异常。"""
+    return secrets.compare_digest(candidate.encode("utf-8"), expected.encode("utf-8"))
+
+
 def validate_api_key(api_key_to_validate: str) -> bool:
     """校验调用本代理服务的 Bearer Token。
 
@@ -14,7 +19,7 @@ def validate_api_key(api_key_to_validate: str) -> bool:
     """
     if not API_KEY:
         return False
-    return secrets.compare_digest(api_key_to_validate, API_KEY)
+    return constant_time_equal(api_key_to_validate, API_KEY)
 
 
 async def get_api_key(authorization: Optional[str] = Header(None)):

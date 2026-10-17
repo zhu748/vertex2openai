@@ -29,24 +29,24 @@ jobs:
   # 把「构建成功但启动即崩溃」的镜像挡在仓库门外。
   test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.11', '3.12']
     steps:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: ${{ matrix.python-version }}
           cache: pip
+          cache-dependency-path: |
+            app/requirements.txt
+            requirements-dev.txt
       - name: Install dependencies
-        run: pip install -r app/requirements.txt
-      - name: Syntax check (compileall)
-        run: python -m compileall -q app
-      - name: Import smoke test（main 模块可加载）
-        run: python -c "import sys; sys.path.insert(0, 'app'); import main; print('import OK:', main.app.title)"
-      - name: Workflow sanity check
-        run: |
-          pip install -q pyyaml
-          python .github/scripts/check_workflows.py
+        run: pip install -r requirements-dev.txt
+      - name: Offline regression and project checks
+        run: python scripts/check_project.py
 
   build-and-push:
     needs: test

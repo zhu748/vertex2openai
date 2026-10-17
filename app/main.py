@@ -1,4 +1,5 @@
 import asyncio
+import math
 import os
 import secrets
 import threading
@@ -9,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from pydantic import BaseModel
 
-from auth import get_api_key
+from auth import constant_time_equal, get_api_key
 from express_key_manager import ExpressKeyManager
 from routes import models_api, chat_api
 from routes import gemini_native
@@ -24,8 +25,23 @@ from model_loader import get_express_models
 from cookie_auth import validate_cookie
 import express_key_probe
 from resumable import resumable_store
+from client_pool import close_all_clients
+from model_loader import get_models_config, schedule_models_refresh, close_models_refresh
 
 express_key_manager = ExpressKeyManager()
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _start_background_task(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+
+    def finished(completed):
+        _background_tasks.discard(completed)
+        if not completed.cancelled() and completed.exception() is not None:
+            print(f"⚠️ [后台任务] {type(completed.exception()).__name__}: {completed.exception()}")
+    task.add_done_callback(finished)
+    return task
 
 
 async def _probe_express_projects_on_startup() -> None:
@@ -44,7 +60,6 @@ async def _probe_express_projects_on_startup() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    from model_loader import refresh_models_config_cache
     print("🚀 [服务启动] agentplatform2api 适配器已启动（Express API Key / Cookie 直连 双通道）。")
 
     # S-1：默认口令 + 公开托管 + 明文 Cookie 是很危险的组合，必须让人看见。
@@ -66,7 +81,9 @@ async def lifespan(app: FastAPI):
     else:
         print("⚠️ [密钥配置] 未配置任何 Express API Key（控制台「通道与凭证」页可随时添加）。"
               "若不启用 Cookie 直连模式，聊天请求将会报错。")
-    await refresh_models_config_cache()
+    # 本地模型列表立即可用；远程刷新不再阻塞启动和健康检查。
+    await get_models_config()
+    schedule_models_refresh()
 
     # 网络出口状态：让“代理到底启没启用”一眼可见（控制台「通道与凭证」页可热改）。
     _proxy_now = get_effective_proxy_url()
@@ -99,16 +116,21 @@ async def lifespan(app: FastAPI):
 
     # 启动时自动探测各 Key 归属的 GCP Project ID（location 钉定要用）。
     # 放后台任务里跑：探测走外网，绝不能阻塞服务启动。
-    _probe_task = asyncio.create_task(_probe_express_projects_on_startup())
+    _start_background_task(_probe_express_projects_on_startup())
     # 过期缓冲清理器（弱网续传用，见 resumable.py）
-    _sweeper_task = asyncio.create_task(resumable_store.sweeper_loop())
+    _start_background_task(resumable_store.sweeper_loop())
     try:
         yield
     finally:
-        for _t in (_probe_task, _sweeper_task):
+        tasks = list(_background_tasks)
+        for _t in tasks:
             if not _t.done():
                 _t.cancel()
-        resumable_store.cancel_all_pumps()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await resumable_store.aclose()
+        await close_models_refresh()
+        await close_all_clients()
 
 app = FastAPI(title="agentplatform2api", lifespan=lifespan)
 
@@ -127,7 +149,11 @@ app.state.express_key_manager = express_key_manager
 
 @app.middleware("http")
 async def stats_tracker_middleware(request: Request, call_next):
-    if "chat/completions" in request.url.path:
+    is_native_request = (
+        request.method == "POST"
+        and request.url.path.startswith(("/v1beta/models/", "/v1/models/"))
+    )
+    if "chat/completions" in request.url.path or is_native_request:
         stats.increment_total()
         try:
             response = await call_next(request)
@@ -1420,7 +1446,7 @@ PROXY_TEST_TARGET = "https://aiplatform.googleapis.com/"
 PROXY_TEST_TIMEOUT_SECONDS = 8.0
 
 # 代理 URL 允许的协议（httpx[socks] 原生支持这些）
-_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h", "socks4"}
+_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
 
 
 # ============================================================
@@ -1455,6 +1481,8 @@ _SETTING_SPECIAL_KEYS = {"proxy_url", "express_ua_profile", "express_ua_custom",
 
 def _check_setting_value(key: str, v) -> str | None:
     """校验单个设置值；返回错误消息或 None（合法）。"""
+    if isinstance(v, float) and not math.isfinite(v):
+        return f"{key} 必须是有限数字。"
     enum = _SETTING_ENUMS.get(key)
     if enum is not None:
         if not (isinstance(v, str) and v in enum):
@@ -1469,6 +1497,8 @@ def _check_setting_value(key: str, v) -> str | None:
         # bool 是 int 的子类，先排除（true 会被当成 1 混过数字检查）
         if isinstance(v, bool) or not isinstance(v, (int, float)):
             return f"{key} 必须是数字（内置默认 {default}），收到的是「{v!r}」"
+        if isinstance(default, int) and (not isinstance(v, int) and not v.is_integer()):
+            return f"{key} 必须是整数。"
         lo, hi = _SETTING_NUMERIC_RANGE.get(key, (None, None))
         if lo is not None and not (lo <= v <= hi):
             return f"{key} 超出允许范围 [{lo}, {hi}]，收到的是 {v!r}"
@@ -1521,6 +1551,9 @@ def validate_proxy_url_format(proxy_url: str) -> str:
             return f"协议必须是 {'/'.join(sorted(_PROXY_SCHEMES))}，收到的是「{scheme or '（无协议）'}」"
         if not parts.hostname:
             return "缺少主机地址，正确格式：协议://用户名:密码@主机:端口"
+        # 访问 port 属性才会校验非法字符及 0–65535 范围。
+        if parts.port is not None and parts.port < 1:
+            return "代理端口必须在 1–65535 范围内。"
         return ""
     except Exception:
         return "无法解析的代理地址，正确格式：协议://用户名:密码@主机:端口"
@@ -1598,7 +1631,7 @@ async def login(body: LoginBody, request: Request):
         return JSONResponse(status_code=429,
                             content={"error": f"尝试过于频繁，请 {remain} 秒后再试"})
 
-    if config.API_KEY and secrets.compare_digest(body.password, config.API_KEY):
+    if config.API_KEY and constant_time_equal(body.password, config.API_KEY):
         _clear_login_failure(ip)
         resp = JSONResponse(content={"ok": True})
         resp.set_cookie(
@@ -1664,7 +1697,7 @@ async def update_settings_api(request: Request, _auth: bool = Depends(require_au
     try:
         patch = await request.json()
     except Exception:
-        patch = {}
+        return JSONResponse(status_code=400, content={"error": "请求体必须是合法 JSON 对象。"})
     if not isinstance(patch, dict):
         return JSONResponse(status_code=400, content={"error": "请求体必须是 JSON 对象。"})
     # 出站代理单独校验格式：畸形代理一旦存入，所有上游请求会统一失败
@@ -1682,7 +1715,7 @@ async def update_settings_api(request: Request, _auth: bool = Depends(require_au
     if "express_ua_profile" in patch:
         from express_fingerprint import EXPRESS_UA_PROFILES
         v = patch["express_ua_profile"]
-        if v not in EXPRESS_UA_PROFILES:
+        if not isinstance(v, str) or v not in EXPRESS_UA_PROFILES:
             return JSONResponse(status_code=400, content={
                 "error": f"express_ua_profile 必须是 {'/'.join(EXPRESS_UA_PROFILES)} 之一，收到的是「{v}」",
                 "field": "express_ua_profile",
@@ -1692,6 +1725,13 @@ async def update_settings_api(request: Request, _auth: bool = Depends(require_au
             "error": "express_ua_custom 必须是字符串。",
             "field": "express_ua_custom",
         })
+    if "express_ua_custom" in patch:
+        custom_ua = patch["express_ua_custom"]
+        if not custom_ua.isascii() or any(ord(c) < 32 or ord(c) == 127 for c in custom_ua):
+            return JSONResponse(status_code=400, content={
+                "error": "express_ua_custom 必须为不含控制字符的 ASCII 请求头。",
+                "field": "express_ua_custom",
+            })
     # 其余键的通用类型/枚举/数值范围校验（防“一个畸形值让假流式全体 500”）
     verr = _validate_settings_patch(patch)
     if verr:
@@ -1726,7 +1766,7 @@ async def save_model_override(model_name: str, request: Request, _auth: bool = D
     try:
         patch = await request.json()
     except Exception:
-        patch = {}
+        return JSONResponse(status_code=400, content={"error": "请求体必须是合法 JSON 对象。"})
     if not isinstance(patch, dict):
         return JSONResponse(status_code=400, content={"error": "请求体必须是 JSON 对象。"})
     # 模型专属键同样做类型/枚举校验（与全局设置共用一套规则）
@@ -1792,7 +1832,7 @@ async def save_express_keys(body: ExpressKeysBody, _auth: bool = Depends(require
     # 新加进来、还没有 Project ID 的 Key 立刻在后台探一次
     pending = [r["key"] for r in saved if not r.get("project_id")]
     if pending:
-        asyncio.create_task(express_key_probe.probe_all(keys=pending))
+        _start_background_task(express_key_probe.probe_all(keys=pending))
     payload = _express_keys_payload()
     payload["status"] = "success"
     return JSONResponse(content=payload)

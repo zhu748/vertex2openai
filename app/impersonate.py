@@ -17,6 +17,7 @@
 """
 
 from contextlib import asynccontextmanager
+import codecs
 import threading
 from typing import Any, AsyncIterator, Callable
 
@@ -160,7 +161,7 @@ class _CurlRespShim:
     消费 curl 流。
     """
 
-    __slots__ = ("_r", "status_code", "_buffered", "_from_stream")
+    __slots__ = ("_r", "status_code", "_buffered", "_from_stream", "_consumed")
 
     def __init__(self, resp, from_stream: bool = False):
         self._r = resp
@@ -169,6 +170,7 @@ class _CurlRespShim:
         # curl_cffi 的流式响应未读时 .content 是 b''（不是 None），
         # 不能拿“content 是否为空”判断是否已缓冲，必须显式标记来源。
         self._from_stream = from_stream
+        self._consumed = False
 
     @property
     def text(self) -> str:
@@ -178,13 +180,16 @@ class _CurlRespShim:
         return self._r.json()
 
     async def aread(self) -> bytes:
-        if self._buffered:            # 流式路径已消费过（可能部分）→ 返回缓冲
+        if self._consumed or self._buffered:
             return bytes(self._buffered)
         if not self._from_stream:     # 非流式响应：curl 已缓冲完整 body
             return self._r.content or b""
         # 未消费过的流：直接读全部（带硬超时兜底，防 curl 死等）
         import asyncio as _asyncio
-        return await _asyncio.wait_for(self._r.acontent(), timeout=60.0)
+        content = await _asyncio.wait_for(self._r.acontent(), timeout=60.0)
+        self._buffered.extend(content or b"")
+        self._consumed = True
+        return bytes(self._buffered)
 
     def aiter_text(self) -> AsyncIterator[str]:
         """与 httpx 调用约定一致：普通方法返回异步生成器（不需要 await）。
@@ -193,11 +198,21 @@ class _CurlRespShim:
         shim 必须保持同一形态。每块顺带写入自缓冲（供 aread 幂等语义使用）。
         """
         async def _gen():
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+            if self._consumed:
+                yield bytes(self._buffered).decode("utf-8", errors="replace")
+                return
             async for chunk in self._r.aiter_content():
                 if not chunk:
                     continue
                 self._buffered.extend(chunk)
-                yield chunk.decode("utf-8", errors="replace")
+                text = decoder.decode(chunk)
+                if text:
+                    yield text
+            self._consumed = True
+            tail = decoder.decode(b"", final=True)
+            if tail:
+                yield tail
         return _gen()
 
     async def aclose(self) -> None:
@@ -344,6 +359,13 @@ class _UpstreamClientPool:
         for c in stale:
             schedule_graceful_close(_make_upstream_closer(c))
         return client
+
+    async def aclose(self) -> None:
+        with self._lock:
+            clients = list(self._entries.values())
+            self._entries.clear()
+        for client in clients:
+            await _make_upstream_closer(client)()
 
 
 def _make_upstream_closer(client: Any) -> Callable[[], Any]:

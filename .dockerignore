@@ -4,6 +4,17 @@
 .git
 .github
 data/
+.venv/
+venv/
+__pycache__/
+**/__pycache__/
+.pytest_cache/
+.ruff_cache/
+.env
+.env.*
+web_state.json
+app/web_state.json
+scripts/
 *.md
 LICENSE
 docker-compose.yml

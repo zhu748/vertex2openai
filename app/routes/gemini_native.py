@@ -26,7 +26,7 @@ cachedContent / responseSchema 等全部字段天然 100% 兼容，因为请求�
 - 出站可观测性：上游响应摘要日志（状态码 + content-type，
   debug_outbound 时附完整 URL）、SSE 形态异常告警、流式转发完成/中止日志。
 - 上游响应（含错误）状态码与 body 原样转发；流式以原始字节流转发 SSE。
-- 429/5xx 自动换下一个 Express Key 重试（最多 3 次）；钉定路径失败
+- 429/5xx 按控制台次数与间隔重新选 Key 重试，单 Key / 池轮转后仍可重试；钉定路径失败
   （404 Publisher model not found / 403 requires billing）自动退回
   裸模型名重试一次，与 OpenAI 兼容通道的 fallback 行为对齐。
 - 模型列表用内部模型清单映射成 Gemini 原生格式（models/get 也支持）。
@@ -37,7 +37,7 @@ cachedContent / responseSchema 等全部字段天然 100% 兼容，因为请求�
 
 import asyncio
 import json
-import secrets
+import math
 import time
 from typing import Any, Optional
 from urllib.parse import quote
@@ -46,8 +46,10 @@ import httpx
 from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from auth import validate_api_key
+from api_helpers import get_retry_settings
+from auth import constant_time_equal
 from config import API_KEY
+from logger import stats
 from runtime_state import app_state, get_effective_proxy_url
 import config as app_config
 from upstreams.express_sdk import resolve_express_model_path
@@ -76,9 +78,6 @@ _SUPPORTED_ACTIONS = {"generateContent", "streamGenerateContent", "countTokens",
 # 上游透传客户端超时：流式长思考可能持续数分钟，read 放宽。
 _UPSTREAM_TIMEOUT = httpx.Timeout(connect=30.0, read=600.0, write=60.0, pool=10.0)
 
-# 429/5xx 换 Key 重试次数（不含首次）
-_KEY_RETRY_MAX = 2
-
 
 # ============================================================
 # 认证：兼容 Bearer / x-goog-api-key / ?key= 三种原生写法
@@ -87,7 +86,7 @@ async def _require_native_key(request: Request, key: Optional[str]) -> bool:
     """校验客户端凭据是否等于本服务 API_KEY（常量时间比较）。"""
     if not key:
         return False
-    return bool(API_KEY) and secrets.compare_digest(str(key), API_KEY)
+    return bool(API_KEY) and constant_time_equal(str(key), API_KEY)
 
 
 async def get_gemini_auth(
@@ -247,8 +246,9 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
     _relay_stream 都**不关闭**共享客户端，只负责关闭上游响应。
 
     两类重试互相独立、不共用预算：
-    - Key 轮换重试（429/500/503）：最多 _KEY_RETRY_MAX 次，每次换下一个
-      Express Key，受 retry-after / 退避间隔控制；
+    - Key 重选重试（429/5xx/网络异常）：读取控制台 retry_max，每次按策略
+      重新选择 Express Key，单 Key 或一轮用完后也继续重试，受 retry-after /
+      retry_backoff_seconds 控制；
     - 钉定失败兜底（403/404 且报错像项目/区域问题，见 _looks_like_pin_failure）：
       不换 Key、不占上面的预算，仅把模型路径退回裸模型名再试一次——
       与 SDK 通道（api_helpers.execute_gemini_call 的 fallback_model）对齐，
@@ -280,46 +280,52 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
     client = passthrough_client_slot.get(_new_client)
 
     is_stream = action == "streamGenerateContent"
-    tried_keys: set[str] = set()
-    key_attempts = 0           # 429/5xx 已重试次数（不含首次）
-    pin_fallback_used = False  # 钉定失败 → 裸模型名兜底（最多一次）
+    retry_max, backoff_seconds = get_retry_settings()
+    record = None
+    key_attempts = 0           # 上游错误已重试次数（不含首次）
+    pin_fallback_used = False  # 每次选 Key 后最多兜底一次
 
     while True:
         if await fastapi_request.is_disconnected():
             return Response(status_code=499)
 
+        if record is None:
+            record = manager.get_express_record()
+            if record is None:
+                break
+            if key_attempts:
+                # 仅实际发起的重试计入大盘，不把退避中断计为重试。
+                stats.add_retry()
+            express_key = record["key"]
+            pin_fallback_used = False
+
         if pin_fallback_used:
             # 钉定兜底轮：复用同一把 Key（换的是模型路径，不是 Key）
             model_path = model
         else:
-            record = manager.get_express_record()
-            if record is None:
-                break
-            express_key = record["key"]
-            if express_key in tried_keys:
-                # Key 池已试遍，不再空转
-                break
-            tried_keys.add(express_key)
             model_path = _resolve_upstream_model_path(model, record.get("project_id", ""))
 
         try:
             upstream = await _passthrough_once(
                 client, express_key, model_path, action, query, payload,
                 stream=is_stream)
-        except httpx.TimeoutException:
-            last_error_status = 504
-            last_error_body = (b'{"error":{"code":504,"message":"Upstream timeout",'
-                               b'"status":"DEADLINE_EXCEEDED"}}')
-            if key_attempts >= _KEY_RETRY_MAX:
-                break
-            key_attempts += 1
-            continue
         except Exception as e:
-            last_error_status = 502
-            last_error_body = str(e).encode()
-            if key_attempts >= _KEY_RETRY_MAX:
+            last_error_headers = {}
+            if isinstance(e, httpx.TimeoutException):
+                last_error_status = 504
+                last_error_body = (b'{"error":{"code":504,"message":"Upstream timeout",'
+                                   b'"status":"DEADLINE_EXCEEDED"}}')
+            else:
+                last_error_status = 502
+                last_error_body = str(e).encode()
+            if key_attempts >= retry_max:
                 break
+            print(f"⚠️ [Gemini 透传] 上游连接异常（{type(e).__name__}），"
+                  f"{backoff_seconds:.1f}s 后重试（{key_attempts + 1}/{retry_max}）。")
+            if not await _wait_for_retry(fastapi_request, backoff_seconds):
+                return Response(status_code=499)
             key_attempts += 1
+            record = None
             continue
 
         # 出站可观测性：此前「选 Key 之后 → 响应/重试」之间零日志，上游挂起
@@ -336,8 +342,9 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
                   "客户端若按 SSE 解析将等不到 data: 行（v1 端点曾出现此形态，"
                   "现已钉 v1beta1；若复现请把 debug_outbound 打开后上报 URL）。")
 
-        # 429/5xx：预算内换下一个 Express Key 重试
-        if upstream.status_code in (429, 500, 503) and key_attempts < _KEY_RETRY_MAX:
+        # 429/5xx：按控制台预算重选 Key，不能因单 Key / 池已用遍而提前退出。
+        retryable_status = upstream.status_code == 429 or 500 <= upstream.status_code < 600
+        if retryable_status and key_attempts < retry_max:
             last_error_status = upstream.status_code
             last_error_headers = {k: v for k, v in upstream.headers.items()
                                   if k.lower() == "retry-after"}
@@ -347,16 +354,13 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
             except Exception:
                 last_error_body = b""
             await upstream.aclose()
-            retry_after = upstream.headers.get("retry-after")
-            wait = 1.5 * (key_attempts + 1)
-            try:
-                wait = min(float(retry_after) if retry_after else wait, 8.0)
-            except ValueError:
-                pass
-            print(f"⚠️ [Gemini 透传] 上游 HTTP {upstream.status_code}（第 {key_attempts + 1} 次），"
-                  f"换下一个 Express Key，{wait:.1f}s 后重试。")
-            await asyncio.sleep(wait)
+            wait = _retry_delay(upstream.headers.get("retry-after"), backoff_seconds)
+            print(f"⚠️ [Gemini 透传] 上游 HTTP {upstream.status_code}，"
+                  f"{wait:.1f}s 后重新选择 Express Key 重试（{key_attempts + 1}/{retry_max}）。")
+            if not await _wait_for_retry(fastapi_request, wait):
+                return Response(status_code=499)
             key_attempts += 1
+            record = None
             continue
 
         # 成功 / 不可重试错误 / Key 轮换预算耗尽 → 透传
@@ -389,6 +393,8 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
             continue
 
         # 原样透传（保留上游真实状态码与 body）
+        if status < 400:
+            stats.add_success()
         return Response(content=body, status_code=status, media_type=ctype,
                         headers=headers or None)
 
@@ -398,6 +404,27 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
         media_type="application/json",
         headers=last_error_headers or None,
     )
+
+
+def _retry_delay(retry_after: Optional[str], backoff_seconds: float) -> float:
+    """有效的 Retry-After 秒数优先；非法值退回控制台设置，最多等待 120 秒。"""
+    try:
+        delay = float(retry_after)
+    except (TypeError, ValueError):
+        return backoff_seconds
+    return min(delay, 120.0) if math.isfinite(delay) and delay >= 0 else backoff_seconds
+
+
+async def _wait_for_retry(request: Request, delay: float) -> bool:
+    """退避期间检测断连，避免客户端离开后继续调用上游。"""
+    deadline = time.monotonic() + delay
+    while True:
+        if await request.is_disconnected():
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return True
+        await asyncio.sleep(min(remaining, 0.5))
 
 
 async def _relay_stream(upstream: httpx.Response) -> StreamingResponse:
@@ -427,8 +454,11 @@ async def _relay_stream(upstream: httpx.Response) -> StreamingResponse:
             # 先打日志再关连接：客户端断开（任务被取消）时 finally 里的
             # await 也可能被再取消，保证中止日志一定落盘。
             if completed:
+                stats.add_success()
                 print(f"📤 [Gemini 透传] 流式转发完成（共 {total} 字节）。")
             else:
+                # 响应头已发送为 200，中间件无法根据状态码捕获流中失败。
+                stats.add_error()
                 print(f"✂️ [Gemini 透传] 流式中止（已转发 {total} 字节；"
                       "客户端断开或上游/网络异常）。")
             await upstream.aclose()

@@ -2,6 +2,7 @@ import json
 import time
 import math
 import asyncio
+from contextlib import suppress
 import httpx
 import re
 from typing import List, Dict, Any, Callable, Optional
@@ -23,6 +24,7 @@ from runtime_state import app_state
 
 # 引入报错重试统计器
 from logger import stats
+from usage import map_usage
 
 
 def _safety_score_enabled() -> bool:
@@ -42,12 +44,14 @@ def get_retry_settings() -> tuple[int, float]:
     """
     try:
         retry_max = int(app_state.get_setting("retry_max", app_config.DEFAULT_SETTINGS["retry_max"]))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         retry_max = app_config.DEFAULT_SETTINGS["retry_max"]
     try:
         backoff = float(app_state.get_setting(
             "retry_backoff_seconds", app_config.DEFAULT_SETTINGS["retry_backoff_seconds"]))
     except (TypeError, ValueError):
+        backoff = float(app_config.DEFAULT_SETTINGS["retry_backoff_seconds"])
+    if not math.isfinite(backoff):
         backoff = float(app_config.DEFAULT_SETTINGS["retry_backoff_seconds"])
     return max(0, min(50, retry_max)), max(0.0, min(120.0, backoff))
 
@@ -94,11 +98,13 @@ def extract_upstream_error(e: Exception) -> tuple[int, str]:
 
 def is_retryable_exception(e):
     error_str = str(e).lower()
-    if isinstance(e, httpx.HTTPStatusError) and e.response.status_code in [429, 503, 502]:
+    if isinstance(e, (httpx.TimeoutException, httpx.NetworkError)):
         return True
-    if hasattr(e, "code") and e.code in [429, 503, 502]:
+    code = e.response.status_code if isinstance(e, httpx.HTTPStatusError) else getattr(e, "code", None)
+    if isinstance(code, int) and (code == 429 or 500 <= code < 600):
         return True
-    if "429" in error_str or "503" in error_str or "too many requests" in error_str or "quota" in error_str:
+    if any(marker in error_str for marker in (
+            "429", "503", "too many requests", "quota", "resource exhausted", "resource_exhausted")):
         return True
     return False
 
@@ -303,13 +309,8 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
 
 def _extract_usage(resp: Any) -> tuple[int, int, int]:
     """从 SDK 响应里取 (prompt, completion, total) token 数。"""
-    um = getattr(resp, "usage_metadata", None)
-    if not um:
-        return 0, 0, 0
-    p_tk = getattr(um, "prompt_token_count", 0) or 0
-    c_tk = getattr(um, "candidates_token_count", 0) or 0
-    t_tk = getattr(um, "total_token_count", None) or (p_tk + c_tk)
-    return p_tk, c_tk, t_tk
+    usage = map_usage(getattr(resp, "usage_metadata", None))
+    return usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"]
 
 
 def _record_usage(resp: Any) -> dict:
@@ -321,8 +322,8 @@ def _record_usage(resp: Any) -> dict:
         print(f"🚦 [流量等级] 上游实际 traffic_type={value}")
 
     p_tk, c_tk, t_tk = _extract_usage(resp)
+    stats.add_tokens(p_tk, c_tk)
     if p_tk or c_tk:
-        stats.add_tokens(p_tk, c_tk)
         print(f"💰 [算力消耗统计] 提示词: {p_tk} | 思考与生成: {c_tk} | 总计: {t_tk} Tokens")
     return {"prompt_tokens": p_tk, "completion_tokens": c_tk, "total_tokens": t_tk}
 
@@ -696,6 +697,8 @@ async def gemini_fake_stream_generator(
     is_auto_attempt: bool,
     prefill_text: str = "",
     fastapi_request: Optional[Any] = None,
+    fallback_model: Optional[str] = None,
+    fallback_client_factory: Optional[Callable[[], Any]] = None,
 ):
     print(f"🌊 [假流式] 已开始调用 Gemini 模型 {model_for_api_call}，客户端请求模型名为 {request_obj.model}。")
 
@@ -719,7 +722,8 @@ async def gemini_fake_stream_generator(
     last_error = None
 
     try:
-        for attempt in range(max_retries + 1):
+        attempt = 0
+        while attempt <= max_retries:
             if await _client_gone():
                 print(f"ℹ️ [客户端断开] 假流式请求前检测到客户端已断开，停止调用模型 {model_for_api_call}。")
                 return
@@ -754,6 +758,13 @@ async def gemini_fake_stream_generator(
                 raise
             except Exception as e_call:
                 last_error = e_call
+                if (fallback_model and model_for_api_call != fallback_model
+                        and is_location_pin_failure(e_call)):
+                    model_for_api_call = fallback_model
+                    if fallback_client_factory:
+                        gemini_client_instance = fallback_client_factory()
+                    print(f"↩️ [上游端点] 假流式钉定失败，退回裸模型名 {fallback_model} 重试。")
+                    continue
                 if is_retryable_exception(e_call) and attempt < max_retries:
                     stats.add_retry()
                     print(f"⚠️ [自动重试] 假流式上游繁忙（{e_call.__class__.__name__}），"
@@ -771,14 +782,13 @@ async def gemini_fake_stream_generator(
                                                "created": int(time.time()), "model": request_obj.model,
                                                "choices": [{"delta": {"content": ""}, "index": 0, "finish_reason": None}]}
                             yield f"data: {json.dumps(keep_alive_data)}\n\n"
+                    attempt += 1
                     continue
                 raise
 
         if raw_gemini_response is None:
             raise last_error or ValueError("上游未返回任何响应（重试已耗尽）。")
         
-        _record_usage(raw_gemini_response)
-
         openai_response_dict = convert_to_openai_format(raw_gemini_response, request_obj.model)
         _prepend_prefill(openai_response_dict, prefill_text)
 
@@ -791,6 +801,7 @@ async def gemini_fake_stream_generator(
                 block_message += f" (Message: {raw_gemini_response.prompt_feedback.block_reason_message})"
             raise ValueError(block_message)
 
+        _record_usage(raw_gemini_response)
         async for chunk_sse in _chunk_openai_response_dict_for_sse(
             openai_response_dict=openai_response_dict
         ):
@@ -815,6 +826,11 @@ async def gemini_fake_stream_generator(
             yield f"data: {json_payload_error}\n\n"
             yield "data: [DONE]\n\n"
         if is_auto_attempt: raise
+    finally:
+        if api_call_task is not None and not api_call_task.done():
+            api_call_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await api_call_task
             
 def is_location_pin_failure(err: Any) -> bool:
     """错误是否像"钉定的 projects/locations 路径不对"（而非模型或网络本身的问题）。
@@ -884,6 +900,8 @@ async def execute_gemini_call(
                     current_client, model_to_call, actual_prompt_for_call,
                     gen_config_dict, request_obj, is_auto_attempt, prefill_text=prefill_text,
                     fastapi_request=fastapi_request,
+                    fallback_model=fallback_model,
+                    fallback_client_factory=_get_fallback_client,
                 ), media_type="text/event-stream"
             )
         else: # True Streaming
@@ -896,11 +914,13 @@ async def execute_gemini_call(
                 # 立即吐一个 SSE 心跳，尽快建立连接（429 重试期间也保活，防前端超时中断）
                 yield ": keep-alive\n\n"
                 # 总尝试次数 = retry_max + 1，retry_max=0 时仍会请求一次
-                for attempt in range(max_retries + 1):
+                attempt = 0
+                while attempt <= max_retries:
                     # 客户端断开则停止重试，避免无谓的上游调用
                     if await _client_gone():
                         print(f"ℹ️ [客户端断开] 真流式请求前检测到客户端已断开，停止调用模型 {model_to_call}。")
                         return
+                    stream_gen_obj = None
                     try:
                         stream_gen_obj = await current_client.aio.models.generate_content_stream(
                             model=model_to_call,
@@ -944,8 +964,8 @@ async def execute_gemini_call(
                                 _tail = {"id": response_id_for_stream, "object": "chat.completion.chunk", "created": int(time.time()), "model": request_obj.model, "choices": [{"index": 0, "delta": {"content": tail}, "finish_reason": None}]}
                                 yield f"data: {json.dumps(_tail, ensure_ascii=False)}\n\n"
 
+                        stats.add_tokens(final_p_tk, final_c_tk)
                         if final_p_tk > 0 or final_c_tk > 0:
-                            stats.add_tokens(final_p_tk, final_c_tk)
                             print(f"💰 [算力消耗统计] 提示词: {final_p_tk} | 思考与生成: {final_c_tk} | 总计: {final_t_tk} Tokens")
 
                         # P1-8：Express 真流式此前从不发 usage 块，客户端只能显示 0
@@ -963,11 +983,7 @@ async def execute_gemini_call(
                         print(f"ℹ️ [客户端断开] 真流式响应期间客户端已断开，模型 {model_to_call} 的请求已安全终止。")
                         raise
                     except Exception as e_stream_call:
-                        error_str = str(e_stream_call).lower()
-                        is_retryable = (
-                            "429" in error_str or "503" in error_str or "too many requests" in error_str
-                            or "quota" in error_str or "resource exhausted" in error_str
-                        )
+                        is_retryable = is_retryable_exception(e_stream_call)
 
                         # location 钉定路径不对 → 退回裸模型名再试一次（仅在还没输出内容时）
                         if (fallback_model and model_to_call != fallback_model
@@ -1001,6 +1017,7 @@ async def execute_gemini_call(
                                     print(f"ℹ️ [客户端断开] 重试等待期间检测到客户端已断开，停止调用模型 {model_to_call}。")
                                     return
                                 yield ": keep-alive\n\n"
+                            attempt += 1
                             continue
 
                         err_msg_detail_stream = f"Gemini 流式请求异常（模型：{model_to_call}）：{type(e_stream_call).__name__} - {str(e_stream_call)}"
@@ -1019,6 +1036,11 @@ async def execute_gemini_call(
                             yield f"data: {json.dumps(err_resp)}\n\n"
                             yield "data: [DONE]\n\n"
                         return
+                    finally:
+                        close = getattr(stream_gen_obj, "aclose", None)
+                        if close:
+                            with suppress(Exception):
+                                await close()
 
             return StreamingResponse(_gemini_real_stream_generator_inner(), media_type="text/event-stream")
     else: # Non-streaming
@@ -1026,7 +1048,8 @@ async def execute_gemini_call(
         max_retries, backoff_sec = get_retry_settings()
         response_obj_call = None
         # 总尝试次数 = retry_max + 1，retry_max=0 时仍会请求一次
-        for attempt in range(max_retries + 1):
+        attempt = 0
+        while attempt <= max_retries:
             if await _client_gone():
                 print(f"ℹ️ [客户端断开] 非流式请求前检测到客户端已断开，停止调用模型 {model_to_call}。")
                 return JSONResponse(
@@ -1059,6 +1082,7 @@ async def execute_gemini_call(
                     wait_time = backoff_sec   # F-5：同上，统一用控制台配置的退避
                     print(f"⚠️ [自动重试] 上游繁忙或触发配额限制（{e_call.__class__.__name__}）。第 {attempt + 1} 次退避重试，等待 {wait_time} 秒。")
                     await asyncio.sleep(wait_time)
+                    attempt += 1
                     continue
                 raise
 
