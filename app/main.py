@@ -155,6 +155,36 @@ _login_failures: dict = {}
 _login_lock = threading.Lock()
 LOGIN_LOCK_BASE_SECONDS = 2
 LOGIN_LOCK_MAX_SECONDS = 300
+# 失败记录的保留时长与容量上限：防“每个失败过的 IP 永久占一条”的慢泄漏
+# （旧实现只在登录成功时 pop，爆破过的 IP 列表只增不减）。
+_LOGIN_FAILURES_TTL_SECONDS = 24 * 3600
+_LOGIN_FAILURES_MAX_ENTRIES = 10000
+# 反代部署下所有用户共享 request.client.host，一个攻击者就能把全站登录
+# 锁到 300s 退避。默认不信任 XFF（防伪造绕过限速），仅在确认部署于可信
+# 反代之后置 TRUST_PROXY_HEADERS=1 开启。
+_TRUST_PROXY_HEADERS = os.environ.get("TRUST_PROXY_HEADERS", "").strip() not in ("", "0", "false", "False")
+
+
+def _client_ip(request: Request) -> str:
+    """登录限速用的客户端 IP（可选信任 X-Forwarded-For 首跳）。"""
+    if _TRUST_PROXY_HEADERS:
+        xff = request.headers.get("x-forwarded-for", "")
+        if xff:
+            return xff.split(",")[0].strip() or (request.client.host if request.client else "unknown")
+    return request.client.host if request.client else "unknown"
+
+
+def _purge_stale_login_failures_locked(now: float) -> None:
+    """惰性清理过期失败记录 + 容量上限淘汰（调用方需已持锁）。"""
+    if len(_login_failures) > _LOGIN_FAILURES_MAX_ENTRIES // 2:
+        # 过了半满才做全量扫描，均摊成本可忽略
+        for ip in list(_login_failures):
+            if now - _login_failures[ip][1] > _LOGIN_FAILURES_TTL_SECONDS:
+                _login_failures.pop(ip, None)
+    while len(_login_failures) >= _LOGIN_FAILURES_MAX_ENTRIES:
+        # 仍满：淘汰最近失败时间最早（最陈旧）的条目，保留限速主体功能
+        oldest = min(_login_failures, key=lambda k: _login_failures[k][1])
+        _login_failures.pop(oldest, None)
 
 
 def _issue_session() -> str:
@@ -194,6 +224,10 @@ def _login_retry_after(ip: str) -> int:
         if not rec:
             return 0
         count, last = rec
+        # 记录已过期：当作无记录（计数归零），顺手清理
+        if time.time() - last > _LOGIN_FAILURES_TTL_SECONDS:
+            _login_failures.pop(ip, None)
+            return 0
         if count < 3:
             return 0
         wait = min(LOGIN_LOCK_BASE_SECONDS * (2 ** (count - 3)), LOGIN_LOCK_MAX_SECONDS)
@@ -203,6 +237,7 @@ def _login_retry_after(ip: str) -> int:
 
 def _record_login_failure(ip: str) -> None:
     with _login_lock:
+        _purge_stale_login_failures_locked(time.time())
         count, _ = _login_failures.get(ip, (0, 0.0))
         _login_failures[ip] = (count + 1, time.time())
 
@@ -850,11 +885,23 @@ async function fetchStats(){
   }catch(e){}
 }
 
+/* ---------- 通用转义（XSS 防护）：所有拼进 innerHTML 的服务端数据必须先过这里 ---------- */
+function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+
 /* ---------- Channel ---------- */
 async function updateMode(m){
+  const pill=$('mode-pill'), prev=pill.textContent;
+  // 先乐观切显示，请求失败则弹提示并回滚（旧版无错误处理，后端 500 时 UI 与实际状态脱节）
   $('cookie-box').classList.toggle('hidden', m!=='web_proxy');
-  $('mode-pill').textContent = m==='web_proxy' ? '通道 Cookie 直连' : '通道 Express API';
-  await fetch('/api/settings/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:m})});
+  pill.textContent = m==='web_proxy' ? '通道 Cookie 直连' : '通道 Express API';
+  try{
+    const r=await fetch('/api/settings/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:m})});
+    if(!r.ok){ throw new Error('HTTP '+r.status); }
+  }catch(e){
+    pill.textContent=prev;
+    $('cookie-box').classList.toggle('hidden', prev.includes('Cookie')?false:true);
+    toast('❌ 通道切换失败，已回滚：'+e.message);
+  }
 }
 function parseCookies(str){
   str=(str||'').trim();
@@ -915,7 +962,7 @@ function renderKeys(){
         ${keySrcPill(rec)}
         <span class="text-xs text-neutral-400">${rec.detected_at?('探测于 '+new Date(rec.detected_at*1000).toLocaleString()):''}</span>
       </div>
-      <div class="text-xs mt-1 ${(rec._msg_ok===false)?'text-rose-600':'text-neutral-500'}">${rec._msg||''}</div>
+      <div class="text-xs mt-1 ${(rec._msg_ok===false)?'text-rose-600':'text-neutral-500'}">${esc(rec._msg||'')}</div>
     </div>`).join('');
   $('keys-count').textContent = KEYS.length + ' 个';
   $('keys-empty').classList.toggle('hidden', KEYS.length>0);
@@ -1100,7 +1147,7 @@ async function loadParams(){
     CAPS=c.capabilities||{};
     OVERRIDES=c.overrides||{};
     $('model-sel').innerHTML='<option value="__global__">＊ 全局默认（对所有模型）</option>'
-      + (c.models||[]).map(m=>{const star=OVERRIDES[m]?' ★':''; return `<option value="${m}">${m}${star}</option>`;}).join('');
+      + (c.models||[]).map(m=>{const star=OVERRIDES[m]?' ★':''; return `<option value="${esc(m)}">${esc(m)}${star}</option>`;}).join('');
     renderCaps();
   }catch(e){}
 }
@@ -1176,7 +1223,7 @@ function chip(t, accent){ return `<span class="pill${accent?' pill-accent':''}">
 function fillARFor(cap){
   const sel=$('image_aspect_ratio');
   const list = (cap && cap.is_image && cap.image_aspect_ratios.length) ? cap.image_aspect_ratios : COMMON_ARS;
-  sel.innerHTML='<option value="">自动</option>' + list.map(a=>`<option value="${a}">${a}</option>`).join('');
+  sel.innerHTML='<option value="">自动</option>' + list.map(a=>`<option value="${esc(a)}">${esc(a)}</option>`).join('');
   sel.value = (curAR && list.includes(curAR)) ? curAR : "";
 }
 function renderCaps(){
@@ -1293,7 +1340,15 @@ function logLine(t){
 }
 try{
   const es=new EventSource('/stream-logs');
-  es.onmessage=e=>{ if(e.data.includes('keep-alive')) return; logwin.insertAdjacentHTML('beforeend',logLine(e.data)); if(autoscroll) logwin.scrollTop=logwin.scrollHeight; };
+  /* 日志窗口 DOM 上限：超出后移除最旧节点，防止控制台挂一晚后日志节点
+     无限增长把页面拖卡（服务端 history 限 100 条，前端原本不裁剪） */
+  const LOG_DOM_MAX=500;
+  es.onmessage=e=>{
+    if(e.data.includes('keep-alive')) return;
+    logwin.insertAdjacentHTML('beforeend',logLine(e.data));
+    while(logwin.firstElementChild && logwin.childElementCount>LOG_DOM_MAX) logwin.removeChild(logwin.firstElementChild);
+    if(autoscroll) logwin.scrollTop=logwin.scrollHeight;
+  };
 }catch(e){}
 
 /* ---------- Project ID auto-extract ---------- */
@@ -1301,7 +1356,7 @@ $('project-input').addEventListener('input',e=>{ const v=e.target.value.trim(); 
 $('image_aspect_ratio').addEventListener('change', e=>{ curAR=e.target.value; });
 
 /* init */
-fetchStats(); setInterval(fetchStats,3000); loadRuntime(); loadParams(); loadExpressKeys();
+fetchStats(); setInterval(()=>{ if(!document.hidden) fetchStats(); },3000); loadRuntime(); loadParams(); loadExpressKeys();
 </script>
 </body>
 </html>
@@ -1366,6 +1421,86 @@ PROXY_TEST_TIMEOUT_SECONDS = 8.0
 
 # 代理 URL 允许的协议（httpx[socks] 原生支持这些）
 _PROXY_SCHEMES = {"http", "https", "socks5", "socks5h", "socks4"}
+
+
+# ============================================================
+# 设置值类型校验（S-3/R-3）：以 DEFAULT_SETTINGS 的内置类型为基准
+# 自动推导每个键的期望形态。畸形值一旦存进 web_state.json，请求路径
+# 上的 int()/float()/比较运算会直接 TypeError → 相关功能全体 500，
+# 而且只能靠控制台再改回来救（例：fake_streaming_interval 存成字符串
+# 后所有假流式请求全挂）。这里在入口就拦下，并给出字段级错误提示。
+# ============================================================
+_SETTING_ENUMS = {
+    "prefill_mode": ("smart", "minimal", "off"),
+    "native_thinking_mode": ("request", "off", "console"),
+    "sampling_policy": ("auto", "deprecated", "allowed"),
+    "thinking_g3_level": ("", "minimal", "low", "medium", "high"),
+    "image_size": ("", "512", "1K", "2K", "4K"),
+    "cookie_impersonate": ("off", "chrome", "edge", "safari", "firefox", "safari_ios"),
+}
+# 数值键的允许范围（与读取侧的钳位逻辑一致，如 get_retry_settings 0-50/0-120）
+_SETTING_NUMERIC_RANGE = {
+    "retry_max": (0, 50),
+    "retry_backoff_seconds": (0.0, 120.0),
+    "fake_streaming_interval": (0.0, 30.0),
+    "img_compress_max_dim": (64, 8192),
+    "img_compress_max_mb": (0.05, 32.0),
+    "img_compress_quality": (10, 100),
+    "resumable_ttl_seconds": (60, 604800),
+    "resumable_max_streams": (1, 10000),
+}
+# 已有专项校验的键（代理格式 / 指纹档案白名单），通用层跳过避免重复
+_SETTING_SPECIAL_KEYS = {"proxy_url", "express_ua_profile", "express_ua_custom", "model_overrides"}
+
+
+def _check_setting_value(key: str, v) -> str | None:
+    """校验单个设置值；返回错误消息或 None（合法）。"""
+    enum = _SETTING_ENUMS.get(key)
+    if enum is not None:
+        if not (isinstance(v, str) and v in enum):
+            return f"{key} 必须是 {'/'.join(enum) or '空串'} 之一，收到的是「{v!r}」"
+        return None
+    default = config.DEFAULT_SETTINGS.get(key)
+    if isinstance(default, bool):
+        if not isinstance(v, bool):
+            return f"{key} 必须是布尔值（true/false），收到的是「{v!r}」"
+        return None
+    if isinstance(default, (int, float)):
+        # bool 是 int 的子类，先排除（true 会被当成 1 混过数字检查）
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return f"{key} 必须是数字（内置默认 {default}），收到的是「{v!r}」"
+        lo, hi = _SETTING_NUMERIC_RANGE.get(key, (None, None))
+        if lo is not None and not (lo <= v <= hi):
+            return f"{key} 超出允许范围 [{lo}, {hi}]，收到的是 {v!r}"
+        return None
+    if isinstance(default, str):
+        if not isinstance(v, str):
+            return f"{key} 必须是字符串，收到的是「{v!r}」"
+        return None
+    if default is None:
+        # default_temperature / default_top_p / default_max_tokens：None=不注入，或数字
+        if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))):
+            return f"{key} 必须是数字或 null（null=不注入默认值），收到的是「{v!r}」"
+        return None
+    return None
+
+
+def _validate_settings_patch(patch: dict, keys_scope=None) -> dict | None:
+    """批量校验设置键值形态。返回 {field, error} 或 None（全部合法）。
+
+    keys_scope 限定允许校验的键集合（如 set(PER_MODEL_KEYS)），
+    None = 全部 DEFAULT_SETTINGS 键。未知键由 update_settings /
+    set_model_override 静默忽略（保持旧行为），这里不报错。
+    """
+    for k, v in patch.items():
+        if keys_scope is not None and k not in keys_scope:
+            continue
+        if k not in config.DEFAULT_SETTINGS or k in _SETTING_SPECIAL_KEYS:
+            continue
+        err = _check_setting_value(k, v)
+        if err:
+            return {"field": k, "error": err}
+    return None
 
 
 def validate_proxy_url_format(proxy_url: str) -> str:
@@ -1455,7 +1590,7 @@ class LoginBody(BaseModel):
 
 @app.post("/api/login")
 async def login(body: LoginBody, request: Request):
-    ip = request.client.host if request.client else "unknown"
+    ip = _client_ip(request)
 
     # P2-2：失败三次后指数退避，避免对口令（同时也是 API Key）无限爆破
     remain = _login_retry_after(ip)
@@ -1557,6 +1692,10 @@ async def update_settings_api(request: Request, _auth: bool = Depends(require_au
             "error": "express_ua_custom 必须是字符串。",
             "field": "express_ua_custom",
         })
+    # 其余键的通用类型/枚举/数值范围校验（防“一个畸形值让假流式全体 500”）
+    verr = _validate_settings_patch(patch)
+    if verr:
+        return JSONResponse(status_code=400, content={"error": verr["error"], "field": verr["field"]})
     updated = app_state.update_settings(patch)
     return JSONResponse(content=updated)
 
@@ -1590,6 +1729,10 @@ async def save_model_override(model_name: str, request: Request, _auth: bool = D
         patch = {}
     if not isinstance(patch, dict):
         return JSONResponse(status_code=400, content={"error": "请求体必须是 JSON 对象。"})
+    # 模型专属键同样做类型/枚举校验（与全局设置共用一套规则）
+    verr = _validate_settings_patch(patch, keys_scope=set(config.PER_MODEL_KEYS))
+    if verr:
+        return JSONResponse(status_code=400, content={"error": verr["error"], "field": verr["field"]})
     saved = app_state.set_model_override(model_name, patch)
     return JSONResponse(content={"status": "success", "model": model_name, "override": saved})
 

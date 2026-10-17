@@ -11,7 +11,7 @@ RUN useradd --system --uid 1000 --create-home app
 
 # Install dependencies（单独一层，代码变动不触发重装）
 COPY app/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install -r requirements.txt
 
 # Copy application code and local model fallback
 COPY --chown=app:app app/ .

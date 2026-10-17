@@ -131,7 +131,7 @@ app/web_state.json
 # some_other_dir/specific_creds.json
 
 # Docker
-.dockerignore
+# .dockerignore 现已纳入版本控制（构建上下文瘦身需要随仓库分发）
 docker-compose.override.yml
 
 # Logs

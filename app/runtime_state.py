@@ -316,10 +316,29 @@ class AppState:
             return True
 
     def get_effective_settings(self, model_name: str) -> dict:
-        """该模型生效的设置：全局默认叠加该模型专属覆盖（仅 PER_MODEL_KEYS）。"""
+        """该模型生效的设置：全局默认叠加该模型专属覆盖（仅 PER_MODEL_KEYS）。
+
+        覆盖键查找做后缀归一：控制台按基础名（如 gemini-3.6-flash）保存的
+        专属参数，在 -search 等别名后缀的请求下也要生效——旧实现拿原始
+        请求名做精确查表，gemini-3.6-flash-search 匹配不到按基础名存的
+        覆盖，专属采样默认 / 生图尺寸 / 比例全部静默落空（Express 通道
+        经 api_helpers.create_generation_config 触发；Cookie 通道自己剥了
+        后缀所以没踩到）。先精确匹配（照顾手动存过后缀键的极端场景），
+        再退回剥掉已知别名后缀（-search / -1k/-2k/-4k/-512 / -think-*）
+        的基础名。
+        """
         base = self.get_settings()
         overrides = base.get("model_overrides") or {}
-        ov = overrides.get((model_name or "").strip())
+        key = (model_name or "").strip()
+        ov = overrides.get(key)
+        if not isinstance(ov, dict):
+            try:
+                from model_capabilities import _strip_known_suffixes
+                stripped = _strip_known_suffixes(key)
+                if stripped != key:
+                    ov = overrides.get(stripped)
+            except Exception:
+                ov = None
         if isinstance(ov, dict):
             for k in app_config.PER_MODEL_KEYS:
                 if k in ov:

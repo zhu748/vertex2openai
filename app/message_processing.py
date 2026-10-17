@@ -5,7 +5,6 @@ import time
 import uuid
 import random 
 import httpx
-import concurrent.futures
 from typing import List, Dict, Any, Optional, Tuple
 import config as app_config
 import model_capabilities as mc
@@ -262,17 +261,6 @@ def _requires_signature(model_name: str) -> bool:
     except Exception:
         return False
 
-
-def extract_reasoning_by_tags(full_text: str, tag_name: str) -> Tuple[str, str]:
-    if not tag_name or not isinstance(full_text, str):
-        return "", full_text if isinstance(full_text, str) else ""
-    open_tag = f"<{tag_name}>"
-    close_tag = f"</{tag_name}>"
-    pattern = re.compile(f"{re.escape(open_tag)}(.*?){re.escape(close_tag)}", re.DOTALL)
-    reasoning_parts = pattern.findall(full_text)
-    normal_text = pattern.sub("", full_text)
-    reasoning_content = "".join(reasoning_parts)
-    return reasoning_content.strip(), normal_text.strip()
 
 def _extract_markdown_images_to_parts(text: str) -> Tuple[List[types.Part], str]:
     parts = []

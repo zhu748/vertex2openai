@@ -61,11 +61,6 @@ class SignatureStore:
             self._data.move_to_end(call_id)
             self._evict(now)
 
-    def put(self, call_id: str, signature: Optional[bytes]) -> None:
-        """Backward-compatible signed-record writer."""
-        if signature:
-            self.put_record(call_id, SignatureRecord(SignatureState.SIGNED, signature))
-
     def put_unsigned_follower(self, call_id: str) -> None:
         self.put_record(call_id, SignatureRecord(SignatureState.UNSIGNED_FOLLOWER))
 
@@ -87,13 +82,6 @@ class SignatureStore:
             self._data.move_to_end(call_id)
             return record
 
-    def get(self, call_id: str) -> Optional[bytes]:
-        """Backward-compatible accessor returning bytes only for signed calls."""
-        record = self.get_record(call_id)
-        if record and record.state is SignatureState.SIGNED:
-            return record.signature
-        return None
-
     def _evict(self, now: float) -> None:
         while self._data:
             oldest_key = next(iter(self._data))
@@ -104,18 +92,6 @@ class SignatureStore:
             break
         while len(self._data) > self._max:
             self._data.popitem(last=False)
-
-    def stats(self) -> dict:
-        with self._lock:
-            states = {state.value: 0 for state in SignatureState}
-            for _, record in self._data.values():
-                states[record.state.value] += 1
-            return {"entries": len(self._data), "ttl_seconds": self._ttl,
-                    "max_entries": self._max, "states": states}
-
-    def clear(self) -> None:
-        with self._lock:
-            self._data.clear()
 
 
 signature_store = SignatureStore()

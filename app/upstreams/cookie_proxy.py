@@ -266,12 +266,6 @@ def classify_tool_traffic(messages: list, tools: Any = None) -> dict:
             "builtin_search": builtin_search, "custom_names": custom_names}
 
 
-def has_tool_traffic(messages: list, tools: Any = None) -> bool:
-    """兼容旧签名：请求里是否含任何函数调用相关内容。"""
-    tt = classify_tool_traffic(messages, tools)
-    return bool(tt["declared"] or tt["history"])
-
-
 _SCHEMA_TYPES = {
     "object": "OBJECT", "array": "ARRAY", "string": "STRING",
     "integer": "INTEGER", "number": "NUMBER", "boolean": "BOOLEAN",
@@ -802,7 +796,23 @@ def _build_batch_graphql_body(
 
 # ========== batchGraphql 流式响应解析 ==========
 
+_json_decoder = json.JSONDecoder()
+
+# 单个对象仍未完成时缓冲的上限：超过即视为流失步（上游畸形数据），
+# 整段丢弃重新找对象边界，防止缓冲无限膨胀把请求卡死。
+_MAX_INCOMPLETE_BUFFER = 64 * 1024 * 1024
+
+
 async def _iter_json_objects(response) -> AsyncGenerator[dict, None]:
+    """增量解析流里的连续 JSON 对象（生图响应是数 MB 的单个大对象）。
+
+    快路径用 json.JSONDecoder.raw_decode（C 实现）：定位首个 '{' 后一次
+    调用就解析出完整对象并返回结束位置。旧实现是纯 Python 逐字符括号
+    计数 + 每个对象后整段切片，数 MB 的 base64 生图响应会把事件循环
+    卡住数秒（O(n²) 切片 + 慢扫描），拖垮同进程所有并发请求；
+    raw_decode 把同样的工作降到毫秒级 C 扫描。对象不完整时
+    raw_decode 抛错，保留缓冲等下一块再试。
+    """
     buffer = ""
     async for chunk in response.aiter_text():
         if not chunk:
@@ -814,43 +824,19 @@ async def _iter_json_objects(response) -> AsyncGenerator[dict, None]:
             if start == -1:
                 buffer = ""
                 break
-
-            brace_count = 0
-            in_string = False
-            escape = False
-            end = -1
-
-            for i in range(start, len(buffer)):
-                c = buffer[i]
-                if escape:
-                    escape = False
-                    continue
-                if c == '\\':
-                    escape = True
-                    continue
-                if c == '"':
-                    in_string = not in_string
-                    continue
-                if not in_string:
-                    if c == '{':
-                        brace_count += 1
-                    elif c == '}':
-                        brace_count -= 1
-                        if brace_count == 0:
-                            end = i
-                            break
-
-            if end == -1:
-                buffer = buffer[start:]
-                break
-
-            json_str = buffer[start:end + 1]
-            buffer = buffer[end + 1:]
-
             try:
-                yield json.loads(json_str)
+                obj, end = _json_decoder.raw_decode(buffer, start)
             except json.JSONDecodeError:
-                pass
+                # 对象尚未到齐（或上游吐了畸形数据）：先丢掉 '{' 之前的
+                # 杂项前缀，等下一块；超上限则整段丢弃自恢复（防死等）。
+                buffer = buffer[start:]
+                if len(buffer) > _MAX_INCOMPLETE_BUFFER:
+                    print("⚠️ [Studio] 响应流中单个 JSON 对象超过 64MB 仍未完成，"
+                          "已丢弃该段缓冲并尝试重新同步。")
+                    buffer = ""
+                break
+            buffer = buffer[end:]
+            yield obj
 
 
 # 会被安全/合规拦截的 finishReason（映射为 OpenAI content_filter）
@@ -1208,12 +1194,15 @@ async def _execute_stream_request_generator(
 async def _collect_full_response(project_id, base_model_name, request_obj, headers, client_kwargs,
                                  retry_max, backoff_sec, fastapi_request) -> dict:
     """非流式地完整取回一次响应（供生图假流式复用）。返回 dict。"""
+    # 请求体只构建一次：构建内部含远程图片下载 + PIL 压缩，旧实现每次
+    # 重试都重建一遍 = 反复下载同一批图片。重试发同一个 body 本就是重试语义。
+    if await fastapi_request.is_disconnected():
+        return {"kind": "error", "message": "客户端已断开连接。"}
+    body = await build_batch_graphql_body_async(project_id, base_model_name, request_obj)
     for attempt in range(retry_max + 1):
         if await fastapi_request.is_disconnected():
             return {"kind": "error", "message": "客户端已断开连接。"}
         try:
-            body = await build_batch_graphql_body_async(
-                project_id, base_model_name, request_obj)
             req_headers = build_headers(_get_cookie_string()) or headers
             async with open_upstream_client(client_kwargs) as client:
                 response = await client.post(BATCH_GRAPHQL_URL, headers=req_headers, json=body)
@@ -1471,6 +1460,20 @@ class CookieProxyUpstream(BaseUpstream):
                 yield _sse_heartbeat()
                 native_fallback_state = {"latched": False}
 
+                # 请求体按「原生 / 降级」两形态各自只构建一次：构建内部含
+                # 远程图片下载 + PIL 压缩，旧实现每次重试都重建 = 反复下载
+                # 同一批图片。重试发同一个 body 本就是重试语义。
+                _body_cache: Dict[str, Any] = {}
+
+                async def _cached_body(native: bool) -> dict:
+                    key = "native" if native else "degraded"
+                    if key not in _body_cache:
+                        _body_cache[key] = await build_batch_graphql_body_async(
+                            project_id, base_model_name, request_obj,
+                            prefill_active=prefill_active,
+                            force_search=force_builtin_search, native_tools=native)
+                    return _body_cache[key]
+
                 for attempt in range(retry_max + 1):
                     # 客户端已断开则立即停止，避免无谓的上游调用与重试
                     if await fastapi_request.is_disconnected():
@@ -1478,25 +1481,14 @@ class CookieProxyUpstream(BaseUpstream):
                         return
 
                     use_native_tools = not native_fallback_state["latched"]
-                    if use_native_tools:
-                        body = await build_batch_graphql_body_async(
-                            project_id, base_model_name, request_obj, prefill_active=prefill_active,
-                            force_search=force_builtin_search)
-                    else:
-                        body = await build_batch_graphql_body_async(
-                            project_id, base_model_name, request_obj, prefill_active=prefill_active,
-                            force_search=force_builtin_search, native_tools=False)
+                    body = await _cached_body(use_native_tools)
                     fallback_body = None
                     if native_custom_tools and use_native_tools:
-                        # Building can download/compress images, so keep it lazy
-                        # until the native schema is actually rejected. Invoking
-                        # this factory also latches degraded mode across retries.
+                        # 降级 body 惰性构建（原生 Schema 首次被拒才建），
+                        # 构建后进缓存；调用本工厂同时把降级模式锁定到后续重试。
                         async def fallback_body():
                             native_fallback_state["latched"] = True
-                            return await build_batch_graphql_body_async(
-                                project_id, base_model_name, request_obj,
-                                prefill_active=prefill_active,
-                                force_search=force_builtin_search, native_tools=False)
+                            return await _cached_body(False)
                     req_headers = build_headers(_get_cookie_string()) or headers
                     if cookie_debug:
                         print(f"🔎 [Studio 调试] 出站 generationConfig: "
@@ -1714,6 +1706,18 @@ class CookieProxyUpstream(BaseUpstream):
         # ========== 非流式处理 ==========
         else:
             native_fallback_state = {"latched": False}
+            # 请求体两形态各自只构建一次（同流式路径：防重试反复下载图片）
+            _body_cache: Dict[str, Any] = {}
+
+            async def _cached_body(native: bool) -> dict:
+                key = "native" if native else "degraded"
+                if key not in _body_cache:
+                    _body_cache[key] = await build_batch_graphql_body_async(
+                        project_id, base_model_name, request_obj,
+                        prefill_active=prefill_active,
+                        force_search=force_builtin_search, native_tools=native)
+                return _body_cache[key]
+
             for attempt in range(retry_max + 1):
                 # 客户端已断开则立即停止，避免无谓的上游调用与重试
                 if await fastapi_request.is_disconnected():
@@ -1723,25 +1727,14 @@ class CookieProxyUpstream(BaseUpstream):
                     })
                 try:
                     use_native_tools = not native_fallback_state["latched"]
-                    if use_native_tools:
-                        body = await build_batch_graphql_body_async(
-                            project_id, base_model_name, request_obj, prefill_active=prefill_active,
-                            force_search=force_builtin_search)
-                    else:
-                        body = await build_batch_graphql_body_async(
-                            project_id, base_model_name, request_obj, prefill_active=prefill_active,
-                            force_search=force_builtin_search, native_tools=False)
+                    body = await _cached_body(use_native_tools)
                     fallback_body = None
                     if native_custom_tools and use_native_tools:
-                        # Building can download/compress images, so keep it lazy
-                        # until the native schema is actually rejected. Invoking
-                        # this factory also latches degraded mode across retries.
+                        # 降级 body 惰性构建（原生 Schema 首次被拒才建），
+                        # 构建后进缓存；调用本工厂同时把降级模式锁定到后续重试。
                         async def fallback_body():
                             native_fallback_state["latched"] = True
-                            return await build_batch_graphql_body_async(
-                                project_id, base_model_name, request_obj,
-                                prefill_active=prefill_active,
-                                force_search=force_builtin_search, native_tools=False)
+                            return await _cached_body(False)
                     req_headers = build_headers(_get_cookie_string()) or headers
                     if cookie_debug:
                         print(f"🔎 [Studio 调试] 出站 generationConfig: "

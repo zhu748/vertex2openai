@@ -42,6 +42,7 @@ import config as app_config
 from upstreams.express_sdk import resolve_express_model_path
 from model_loader import get_express_models
 from express_fingerprint import build_direct_headers
+from client_pool import passthrough_client_slot
 
 router = APIRouter()
 
@@ -158,6 +159,10 @@ async def _passthrough_once(client: httpx.AsyncClient, express_key: str,
         headers={
             "x-goog-api-key": express_key,
             "content-type": "application/json",
+            # 钉 identity：转发用的是 aiter_raw 原始字节，且只回传 content-type
+            # 不回传 content-encoding——若上游启用了压缩，客户端拿到的是“伪 json”
+            # 乱码。钉住 identity 让上游永不压缩，字节级保真才成立。
+            "accept-encoding": "identity",
             # 请求头指纹跟随控制台 express_ua_profile（sdk/node/gcloud/custom）。
             # 这里绝不能出现 python-httpx 或任何含 "vertex2openai" 的 UA——
             # 直接管自己叫代理等于在 Google 风控日志里自首。
@@ -171,9 +176,10 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
                                query: str, payload: Any):
     """选 Key → 透传 → 429/5xx 换 Key 重试。返回 fastapi Response。
 
-    客户端生命周期：非流式在本函数内创建/关闭；流式交给 _relay_stream
-    （转发生成器结束后关闭）——绝不能用 async with 包住返回值，
-    否则 StreamingResponse 还没消费，上游连接就被关了。
+    客户端生命周期：共享池化客户端（app/client_pool.py），同一代理形态下
+    全部透传请求复用同一连接池（keep-alive），重试也不重新握手；控制台
+    热改代理后新请求自动换新客户端，旧客户端延迟回收。因此本函数与
+    _relay_stream 都**不关闭**共享客户端，只负责关闭上游响应。
     """
     manager = fastapi_request.app.state.express_key_manager
     if manager.get_total_keys() == 0:
@@ -188,90 +194,97 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
     tried_keys: set[str] = set()
     last_error_body = b""
     last_error_status = 502
+    last_error_headers: dict[str, str] = {}
 
-    proxy_url = get_effective_proxy_url()
-    client_kwargs: dict[str, Any] = {"timeout": _UPSTREAM_TIMEOUT, "follow_redirects": False}
-    if proxy_url:
-        client_kwargs["proxy"] = proxy_url
+    def _new_client() -> httpx.AsyncClient:
+        client_kwargs: dict[str, Any] = {"timeout": _UPSTREAM_TIMEOUT, "follow_redirects": False}
+        proxy_url = get_effective_proxy_url()
+        if proxy_url:
+            client_kwargs["proxy"] = proxy_url
+        if app_config.SSL_CERT_FILE:
+            client_kwargs["verify"] = app_config.SSL_CERT_FILE
+        return httpx.AsyncClient(**client_kwargs)
+
+    client = passthrough_client_slot.get(_new_client)
 
     is_stream = action == "streamGenerateContent"
-    client = httpx.AsyncClient(**client_kwargs)
-    try:
-        for attempt in range(_KEY_RETRY_MAX + 1):
-            if await fastapi_request.is_disconnected():
-                await client.aclose()
-                return Response(status_code=499)
+    for attempt in range(_KEY_RETRY_MAX + 1):
+        if await fastapi_request.is_disconnected():
+            return Response(status_code=499)
 
-            record = manager.get_express_record()
-            if record is None:
-                break
-            express_key = record["key"]
-            if express_key in tried_keys:
-                # Key 池已试遍，不再空转
-                break
-            tried_keys.add(express_key)
+        record = manager.get_express_record()
+        if record is None:
+            break
+        express_key = record["key"]
+        if express_key in tried_keys:
+            # Key 池已试遍，不再空转
+            break
+        tried_keys.add(express_key)
 
-            model_path = _resolve_upstream_model_path(model, record.get("project_id", ""))
-            try:
-                upstream = await _passthrough_once(
-                    client, express_key, model_path, action, query, payload,
-                    stream=is_stream)
-            except httpx.TimeoutException:
-                last_error_status = 504
-                last_error_body = (b'{"error":{"code":504,"message":"Upstream timeout",'
-                                   b'"status":"DEADLINE_EXCEEDED"}}')
-                continue
-            except Exception as e:
-                last_error_status = 502
-                last_error_body = str(e).encode()
-                continue
+        model_path = _resolve_upstream_model_path(model, record.get("project_id", ""))
+        try:
+            upstream = await _passthrough_once(
+                client, express_key, model_path, action, query, payload,
+                stream=is_stream)
+        except httpx.TimeoutException:
+            last_error_status = 504
+            last_error_body = (b'{"error":{"code":504,"message":"Upstream timeout",'
+                               b'"status":"DEADLINE_EXCEEDED"}}')
+            continue
+        except Exception as e:
+            last_error_status = 502
+            last_error_body = str(e).encode()
+            continue
 
-            retryable = upstream.status_code in (429, 500, 503)
-            if not retryable or attempt >= _KEY_RETRY_MAX:
-                # 成功 / 不可重试错误 / 重试耗尽：原样透传（保留上游真实状态码与 body）
-                if is_stream:
-                    return await _relay_stream(client, upstream)
-                content = upstream.content
-                status = upstream.status_code
-                ctype = upstream.headers.get("content-type", "application/json")
-                await client.aclose()
-                return Response(content=content, status_code=status, media_type=ctype)
+        retryable = upstream.status_code in (429, 500, 503)
+        if not retryable or attempt >= _KEY_RETRY_MAX:
+            # 成功 / 不可重试错误 / 重试耗尽：原样透传（保留上游真实状态码与 body）
+            if is_stream:
+                return await _relay_stream(upstream)
+            content = upstream.content
+            status = upstream.status_code
+            ctype = upstream.headers.get("content-type", "application/json")
+            # retry-after 是客户端退避的关键依据，一并透传
+            passthrough = {k: v for k, v in upstream.headers.items()
+                           if k.lower() == "retry-after"}
+            return Response(content=content, status_code=status, media_type=ctype,
+                            headers=passthrough or None)
 
-            last_error_status = upstream.status_code
-            # 流式响应必须先消费才能安全释放（否则连接悬挂在缓冲区上）
-            try:
-                last_error_body = await upstream.aread()
-            except Exception:
-                last_error_body = b""
-            await upstream.aclose()
-            retry_after = upstream.headers.get("retry-after")
-            wait = 1.5 * (attempt + 1)
-            try:
-                wait = min(float(retry_after) if retry_after else wait, 8.0)
-            except ValueError:
-                pass
-            print(f"⚠️ [Gemini 透传] 上游 HTTP {upstream.status_code}（第 {attempt + 1} 次），"
-                  f"换下一个 Express Key，{wait:.1f}s 后重试。")
-            await asyncio.sleep(wait)
-    except Exception:
-        await client.aclose()
-        raise
+        last_error_status = upstream.status_code
+        last_error_headers = {k: v for k, v in upstream.headers.items()
+                              if k.lower() == "retry-after"}
+        # 流式响应必须先消费才能安全释放（否则连接悬挂在缓冲区上）
+        try:
+            last_error_body = await upstream.aread()
+        except Exception:
+            last_error_body = b""
+        await upstream.aclose()
+        retry_after = upstream.headers.get("retry-after")
+        wait = 1.5 * (attempt + 1)
+        try:
+            wait = min(float(retry_after) if retry_after else wait, 8.0)
+        except ValueError:
+            pass
+        print(f"⚠️ [Gemini 透传] 上游 HTTP {upstream.status_code}（第 {attempt + 1} 次），"
+              f"换下一个 Express Key，{wait:.1f}s 后重试。")
+        await asyncio.sleep(wait)
 
-    await client.aclose()
     return Response(
         content=last_error_body or b'{"error":{"code":502,"message":"Upstream unreachable","status":"UNAVAILABLE"}}',
         status_code=last_error_status,
         media_type="application/json",
+        headers=last_error_headers or None,
     )
 
 
-async def _relay_stream(client: httpx.AsyncClient, upstream: httpx.Response) -> StreamingResponse:
+async def _relay_stream(upstream: httpx.Response) -> StreamingResponse:
     """把上游 SSE（或 JSON array 流）以原始字节转发给客户端。
 
-    用 aiter_raw()（不解压、不解码）保证字节级保真；
-    上游响应与 HTTP 客户端都在转发生成器 finally 里释放
-    （消费完最后一个 chunk 才断开上游）。客户端断开时
-    Starlette 会取消生成器，finally 同样生效。
+    用 aiter_raw()（不解压、不解码）保证字节级保真；上游响应在转发
+    生成器 finally 里释放（消费完最后一个 chunk 才断开上游）。客户端
+    断开时 Starlette 会取消生成器，finally 同样生效。
+    注：httpx 客户端是共享池化的（client_pool.passthrough_client_slot），
+    由池统一管理生命周期，这里不关闭它。
     """
 
     async def _relay():
@@ -281,11 +294,12 @@ async def _relay_stream(client: httpx.AsyncClient, upstream: httpx.Response) -> 
                     yield chunk
         finally:
             await upstream.aclose()
-            await client.aclose()
 
     media_type = upstream.headers.get("content-type", "text/event-stream")
+    passthrough = {k: v for k, v in upstream.headers.items()
+                   if k.lower() == "retry-after"}
     return StreamingResponse(_relay(), status_code=upstream.status_code,
-                             media_type=media_type)
+                             media_type=media_type, headers=passthrough or None)
 
 
 # ============================================================

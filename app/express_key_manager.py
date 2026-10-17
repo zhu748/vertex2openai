@@ -21,10 +21,6 @@ class ExpressKeyManager:
         """当前启用的 Key 记录（每次调用直接读内存态，控制台改完立即生效）。"""
         return [r for r in app_state.get_express_keys() if r.get("enabled", True)]
 
-    @property
-    def express_keys(self) -> List[str]:
-        return [r["key"] for r in self.get_records()]
-
     def get_total_keys(self) -> int:
         return len(self.get_records())
 
@@ -61,23 +57,6 @@ class ExpressKeyManager:
         if app_state.get_setting("roundrobin", app_config.ROUNDROBIN):
             return self.get_roundrobin_express_record()
         return self.get_random_express_record()
-
-    # ---------- 向后兼容接口（只要 (序号, Key)） ----------
-
-    def get_random_express_key(self) -> Optional[Tuple[int, str]]:
-        rec = self.get_random_express_record()
-        return (rec["index"], rec["key"]) if rec else None
-
-    def get_roundrobin_express_key(self) -> Optional[Tuple[int, str]]:
-        rec = self.get_roundrobin_express_record()
-        return (rec["index"], rec["key"]) if rec else None
-
-    def get_express_api_key(self) -> Optional[Tuple[int, str]]:
-        rec = self.get_express_record()
-        return (rec["index"], rec["key"]) if rec else None
-
-    def get_all_keys_indexed(self) -> List[Tuple[int, str]]:
-        return list(enumerate(self.express_keys))
 
     def refresh_keys(self):
         self.round_robin_index = 0

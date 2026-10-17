@@ -1,0 +1,11 @@
+# 构建上下文瘦身：这些文件不需要进 Docker 镜像/上下文
+# （COPY 只取 app/ 与 vertexModels.json，但上下文里的大目录仍会被
+#  打包上传给 daemon，拖慢构建）
+.git
+.github
+data/
+*.md
+LICENSE
+docker-compose.yml
+Dockerfile
+.dockerignore

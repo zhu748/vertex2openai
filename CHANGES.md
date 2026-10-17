@@ -2,6 +2,62 @@
 
 基于原版 `vertex2openai-main`（2026-09-01），只做加法，未改原有架构。
 
+## 第八轮：性能与健壮性专项（客户端池化 + 事件循环减压 + 6 个正确性修复）
+
+全量代码审查（约 1 万行）后按投入产出比实施的十个方向：
+
+- **上游 HTTP 客户端全链路池化**（新增 `app/client_pool.py`，三条通道统一受益）：
+  - Express SDK 通道：旧实现**每个请求** new 一个 `genai.Client` 再丢弃——每次都对
+    `aiplatform.googleapis.com` 重新 TCP+TLS 握手（+100~300ms 延迟），底层 httpx 连接池
+    从不关闭、靠 GC 兜底攒 fd。现按（Key, 代理, 证书, base_url, 指纹档案）签名池化
+    （LRU 上限 6），控制台热改任一设置自动换新形态客户端；fallback 重试复用同实例。
+  - Gemini 原生透传：每请求 new `httpx.AsyncClient` → 单槽共享池（代理/证书签名）。
+  - Cookie 通道：`open_upstream_client` 保持上下文管理器签名不变（三个调用点零改动），
+    底层按（伪装档案, 代理, 超时）复用 httpx / curl_cffi 连接——**重试之间也不再重新握手**
+    （默认重试 10 次的 429 场景从 11 次握手降到 1 次）。已实测 curl_cffi 0.16.3 单
+    session 30 并发响应无串扰。
+  - 被淘汰的客户端一律**延迟 900 秒**再关闭（护住飞行中的长流式），到点同时关
+    同步/异步底层连接；genai Client 跨请求并发安全性已核实（httpx 连接池语义 +
+    tenacity 每调用本地 RetryCallState）。
+- **Cookie 通道请求体只构建一次**：旧实现每次重试都重建 body（内含远程图片下载 +
+  PIL 压缩 = 反复下载同一批图）；原生/降级两形态各自缓存，重试发同一份。
+- **大 JSON 解析移出慢路径**：`_iter_json_objects` 从纯 Python 逐字符括号计数 +
+  O(n²) 切片，改为 `json.JSONDecoder.raw_decode`（C 实现）增量解析——1MB 生图
+  base64 对象实测 **778ms → 13ms（58×）**，不再卡住事件循环拖垮并发；另加
+  64MB 失步自恢复上限。
+- **Gemini 透传钉 `accept-encoding: identity`**：转发用的是原始字节且不回传
+  content-encoding，上游一旦启用压缩客户端就会拿到"伪 json 乱码"；同时透传
+  `retry-after` 响应头（非流式 + 流式错误 + 重试耗尽三条路径）。
+- **修复 6 个正确性问题**：
+  1. `-search` 后缀请求匹配不到按基础名保存的模型专属参数（采样默认/生图尺寸/比例
+     全部静默落空，仅 Express 通道）→ `get_effective_settings` 查表后缀归一；
+  2. Express 流式失败从不计入大盘错误数（流式 200 + SSE 错误帧，中间件按状态码
+     看不见）→ 两个失败分支补 `stats.add_error()`（auto 模式仍由外层通道计数防双计）；
+  3. 控制台 Key 探测消息 `rec._msg` 未转义直接 innerHTML（上游错误文本可注入
+     存储型 XSS）→ 通用 `esc()` 转义，模型选项/比例选项同步加固；
+  4. `/api/settings` 只校验键白名单不校验值类型（`fake_streaming_interval` 存成
+     字符串 → 所有假流式请求 500 且难自救）→ 从 DEFAULT_SETTINGS 自动推导
+     类型/枚举/数值范围，`/api/model-overrides` 共用同一套校验；
+  5. `_login_failures` 永不过期（内存慢泄漏 + 被锁 IP 永久 300s 退避）→ 24h TTL
+     + 1 万条容量上限；新增可选 `TRUST_PROXY_HEADERS=1`（反代下按
+     X-Forwarded-For 区分客户端，防一人失败全站被锁）；
+  6. `/v1/models` 缓存过期后每个并发请求都串行触发一次远程刷新（20s 超时排队放大）
+     → 双重检查 + 成功 1h / 失败 5min 最小间隔。
+- **控制台前端健壮性**：日志窗口 DOM 上限 500 条（防挂一晚页面拖卡）、通道切换
+  失败自动回滚并提示、页面隐藏时暂停 3s 轮询。
+- **清理与瘦身**：删除约 150 行死代码（`StreamingReasoningProcessor` 整类、
+  `extract_reasoning_by_tags`、express_key_manager 四个无调用方的兼容方法、
+  `has_tool_traffic`、`ProxyStats.add_request`、signature_store 四个兼容存取方法、
+  无用 import）；`/v1` 流式 chunk 的 `json.dumps` 统一 `ensure_ascii=False`
+  （中文体积减半，与 Cookie 通道一致）。
+- **部署物**：新增 `.dockerignore`（构建上下文瘦身）；Dockerfile 去掉与
+  `PIP_NO_CACHE_DIR` 重复的 `--no-cache-dir`；compose 删除已废弃的 `version:` 行、
+  镜像地址更正为 `ghcr.io/zhu748/vertex2openai`。
+- **验证**：新增 `scripts/regression_test5.py` 39/39（客户端池三组、生图重试
+  body/客户端复用 E2E、设置校验 12 例、-search 归一、登录 TTL、刷新防风暴、
+  前端修复）；既有回归 test2 21/21、test3 33/33、test4 21/21 全部不破；
+  `compileall` + 真实启动冒烟（GET/HEAD /healthz 200）通过。
+
 ## 第七轮：Express API Key 通道请求头指纹（User-Agent / x-goog-api-client 接管）
 
 - **诊断**（本地 mock 上游抓包实测）：第六轮只伪装了 Cookie 通道，Express Key 通道仍有指纹盲区——

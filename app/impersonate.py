@@ -17,11 +17,13 @@
 """
 
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator
+import threading
+from typing import Any, AsyncIterator, Callable
 
 import httpx
 
 from runtime_state import app_state
+from client_pool import schedule_graceful_close
 
 # 控制台可选的伪装档案（curl_cffi 泛别名会跟随其内置的最新浏览器版本）
 SUPPORTED_PROFILES = ("off", "chrome", "edge", "safari", "firefox", "safari_ios")
@@ -220,17 +222,31 @@ def _httpx_timeout_to_curl(timeout: Any) -> float:
 async def open_upstream_client(client_kwargs: dict):
     """统一上游 HTTP 客户端工厂（cookie_proxy 三处调用点的唯一入口）。
 
-    - cookie_impersonate == "off"：完全退回 httpx.AsyncClient(**client_kwargs)，行为与历史版本逐字节一致；
-    - 否则用 curl_cffi AsyncSession(impersonate=档案, proxy=..., timeout=总超时)，
-      返回 _CurlClientShim，post/stream 接口与 httpx 同形。
+    **池化语义（重要）**：同一（伪装档案, 代理, 超时形态）的请求**共享**
+    底层客户端（httpx 连接池 / curl_cffi 连接复用），重试之间、请求
+    之间都不再重新 TCP+TLS 握手。旧实现每个请求（甚至每次重试）
+    新建客户端再丢弃，仅握手就多花 100~300ms/次，高并发下还攒出大量
+    等 GC 的未关闭连接。
+
+    - cookie_impersonate == "off"：httpx.AsyncClient(**client_kwargs)；
+    - 否则 curl_cffi AsyncSession(impersonate=档案, proxy=...) 包成
+      _CurlClientShim，post/stream 接口与 httpx 同形。
+
+    生命周期：客户端由池统一管理，本上下文管理器退出时**不关闭**它；
+    控制台热改代理/伪装档案后新请求自动换新客户端，旧客户端延迟回收
+    （不打断飞行中的流）。已验证 curl_cffi 0.16.3 单 session 30 并发
+    请求响应无串扰，跨请求共享安全。
 
     client_kwargs 是 httpx 语义（timeout/follow_redirects/proxy），由工厂内部转换。
     """
+    client = _upstream_client_pool.get(client_kwargs, _create_upstream_client)
+    yield client
+
+
+def _create_upstream_client(client_kwargs: dict):
     profile = get_impersonate_profile()
     if profile == "off":
-        async with httpx.AsyncClient(**client_kwargs) as client:
-            yield client
-        return
+        return httpx.AsyncClient(**client_kwargs)
 
     from curl_cffi.requests import AsyncSession
 
@@ -242,12 +258,77 @@ async def open_upstream_client(client_kwargs: dict):
     }
     if proxy:
         session_kwargs["proxy"] = proxy
-    session = AsyncSession(**session_kwargs)
-    shim = _CurlClientShim(session, total_timeout)
-    try:
-        yield shim
-    finally:
+    return _CurlClientShim(AsyncSession(**session_kwargs), total_timeout)
+
+
+# ============================================================
+# Cookie 通道客户端池：签名 → 客户端，跨请求复用
+# ============================================================
+_UPSTREAM_POOL_MAX = 4   # 实际组合 ≤ 2（代理 × 伪装档案），4 已冗余
+
+
+class _UpstreamClientPool:
+    """（伪装档案, 代理, 超时, 重定向, 证书）→ 客户端，LRU 上限 4。
+
+    客户端创建/登记在锁内完成（两个构造器都是纯内存操作，无 IO）；
+    被淘汰的客户端交给延迟关闭器（护住飞行中的流）。签名覆盖
+    client_kwargs 的全部关键字 + 伪装档案，任一变化自然分桶。
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._entries: dict[tuple, Any] = {}
+
+    @staticmethod
+    def _signature(client_kwargs: dict) -> tuple:
+        timeout = client_kwargs.get("timeout")
+        return (
+            get_impersonate_profile(),
+            str(client_kwargs.get("proxy") or ""),
+            repr(timeout),
+            bool(client_kwargs.get("follow_redirects", False)),
+            str(client_kwargs.get("verify") or ""),
+        )
+
+    def get(self, client_kwargs: dict, factory: Callable[[dict], Any]) -> Any:
+        sig = self._signature(client_kwargs)
+        with self._lock:
+            hit = self._entries.get(sig)
+            if hit is not None:
+                # LRU 触碰：pop 再放回，dict 插入序 = 最近使用序
+                self._entries.pop(sig)
+                self._entries[sig] = hit
+                return hit
+
+        client = factory(client_kwargs)
+        stale: list = []
+        with self._lock:
+            hit = self._entries.get(sig)
+            if hit is not None:
+                # 竞态窗口：别的协程先建好同签名客户端，用它
+                stale.append(client)
+                client = hit
+            else:
+                self._entries[sig] = client
+                while len(self._entries) > _UPSTREAM_POOL_MAX:
+                    oldest = next(iter(self._entries))
+                    if oldest == sig:
+                        break
+                    stale.append(self._entries.pop(oldest))
+
+        for c in stale:
+            schedule_graceful_close(_make_upstream_closer(c))
+        return client
+
+
+def _make_upstream_closer(client: Any) -> Callable[[], Any]:
+    async def _aclose():
         try:
-            await shim.aclose()
+            await client.aclose()
         except Exception:
             pass
+
+    return _aclose
+
+
+_upstream_client_pool = _UpstreamClientPool()

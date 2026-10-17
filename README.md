@@ -180,6 +180,24 @@ Express API Key 通道走官方 google-genai SDK，TLS 栈无法更换（SDK 强
 mock 上游抓包验证）。Key 探测同步把 API Key 从 URL query 挪到
 `x-goog-api-key` 头（官方 SDK 的真实形态）。
 
+## 性能：上游连接池化与大响应解析
+
+三条通道的上游 HTTP 客户端全部池化复用（`app/client_pool.py`），同配置下
+请求之间、重试之间共享连接池（HTTP keep-alive），不再每请求/每重试重新
+TCP+TLS 握手（每次约省 100~300ms 与相应 CPU）；429 重试场景收益最大
+（默认 10 次重试从 11 次握手降到 1 次）。控制台热改代理或指纹档案后，
+新请求自动换新形态客户端，旧客户端延迟 15 分钟回收，不打断飞行中的流。
+
+配套优化：Cookie 通道重试不再重复构建请求体（含重复下载/压缩同一批输入
+图片）；batchGraphql 大响应解析改用 C 实现的 `raw_decode` 增量解析（1MB
+生图 base64 对象实测 778ms → 13ms），不再卡住事件循环；`/v1/models` 的
+小时级远程刷新加了防风暴（并发请求只触发一次，失败 5 分钟退避）。
+
+环境变量 `TRUST_PROXY_HEADERS=1`（可选，默认关）：部署在可信反向代理后面时，
+登录限速按 `X-Forwarded-For` 区分真实客户端 IP，避免"一个攻击者输错密码、
+全站控制台被锁退避"。仅在你确认直连入口是自己的反代时开启（否则可被伪造
+头绕过限速）。
+
 ## 环境变量
 
 | 变量 | 必填 | 默认值 | 说明 |
@@ -198,6 +216,7 @@ mock 上游抓包验证）。Key 探测同步把 API Key 从 URL query 挪到
 | `GOOGLE_PROJECT_ID` | 否 | 空 | Cookie 直连模式的 Project ID（初始值，后续可在控制台更新）。 |
 | `EXPERIMENT_FLAGS` | 否 | 空 | 可选：batchGraphql 的 `experimentFlagsBinary`，一般无需设置。 |
 | `STATE_DIR` | 否 | `.` | `web_state.json` 的存放目录。用 Docker 时请指向挂载卷，否则重建容器会丢失全部设置与 Cookie。 |
+| `TRUST_PROXY_HEADERS` | 否 | 空 | 部署在可信反向代理后时设 `1`：登录限速按 `X-Forwarded-For` 区分真实客户端，避免一人失败全站被锁退避。确认入口是自己的反代才开（否则可被伪造头绕过限速）。 |
 | `ALLOW_DEFAULT_KEY` | 否 | 空 | 仅用于在公开托管环境（如 HF Space）临时放行默认 `API_KEY`，正常部署不要设置。 |
 
 > 提示：`ROUNDROBIN`、`FAKE_STREAMING(_INTERVAL)`、`SAFETY_SCORE` 等环境变量仅作为**初始值**，运行时以控制台设置为准。

@@ -1,3 +1,4 @@
+import asyncio
 import time
 from fastapi import APIRouter, Depends, Request
 from typing import List, Dict, Any, Set
@@ -6,17 +7,33 @@ from model_loader import get_express_models, refresh_models_config_cache
 from runtime_state import app_state
 
 router = APIRouter()
-_last_model_fetch_time = 0
+
+# 整点刷新 + 防风暴（P-7）：旧实现缓存过期后**每个**并发 /v1/models 请求
+# 都各自触发一次远程刷新（model_loader 持锁串行，20s 超时 × N 排队放大）。
+# 现在双重检查 + 最小间隔：成功 → 1 小时后再刷（语义不变）；
+# 失败 → 5 分钟后允许重试（期间用旧缓存顶，不再每个请求都打上游）。
+_refresh_lock = asyncio.Lock()
+_next_refresh_allowed = 0.0
+
+
+async def _maybe_refresh_models() -> None:
+    global _next_refresh_allowed
+    if time.time() < _next_refresh_allowed:
+        return
+    async with _refresh_lock:
+        if time.time() < _next_refresh_allowed:   # 锁内再查：别的协程刚刷完
+            return
+        ok = False
+        try:
+            ok = await refresh_models_config_cache()
+        except Exception as e:
+            print(f"⚠️ [模型列表] 刷新异常（不影响本次列表返回）：{type(e).__name__}: {e}")
+        _next_refresh_allowed = time.time() + (3600.0 if ok else 300.0)
 
 
 @router.get("/v1/models")
 async def list_models(fastapi_request: Request, api_key: str = Depends(get_api_key)):
-    global _last_model_fetch_time
-
-    current_time = time.time()
-    if current_time - _last_model_fetch_time > 3600:
-        await refresh_models_config_cache()
-        _last_model_fetch_time = current_time
+    await _maybe_refresh_models()
 
     express_key_manager_instance = fastapi_request.app.state.express_key_manager
     
@@ -28,6 +45,7 @@ async def list_models(fastapi_request: Request, api_key: str = Depends(get_api_k
 
     final_model_list: List[Dict[str, Any]] = []
     processed_ids: Set[str] = set()
+    current_time = int(time.time())
 
     def add_model(base_id: str):
         suffixes = [""]

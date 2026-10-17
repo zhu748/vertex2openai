@@ -6,7 +6,6 @@ from typing import Any
 import google.genai
 from fastapi import Request
 from fastapi.responses import JSONResponse
-from google import genai
 
 from models import OpenAIRequest
 from upstreams.base import BaseUpstream
@@ -17,7 +16,7 @@ from api_helpers import (
 )
 from message_processing import (create_gemini_prompt, apply_prefill_compat,
                                 apply_console_injection, DEFAULT_IMAGE_PREFILL_NUDGE)
-from http_options import get_http_options
+from client_pool import get_pooled_express_client
 import model_capabilities as mc
 from runtime_state import app_state
 import config as app_config
@@ -223,11 +222,11 @@ class ExpressSDKUpstream(BaseUpstream):
         # 多账号：location 钉定用**这个 Key 自己的**项目，而不是 Cookie 通道的全局项目
         model_to_call = resolve_express_model_path(base_model_name, _inj_settings,
                                                    key_project_id=key_record.get("project_id", ""))
-        client_to_use = genai.Client(
-            vertexai=True,
-            api_key=express_api_key,
-            http_options=get_http_options(),
-        )
+        # 池化复用（app/client_pool.py）：同一（Key, 代理, 证书, base_url, 指纹档案）
+        # 的请求共享底层 httpx 连接池，免掉每请求一次 TCP+TLS 握手（100~300ms）。
+        # 控制台热改代理/指纹后签名变化，新请求自动拿新形态客户端；
+        # 旧客户端延迟回收，不打断飞行中的流。调用方不得关闭它。
+        client_to_use = get_pooled_express_client(express_api_key)
         _log_resolved_endpoint(client_to_use)
         print(f"🌐 [上游端点] 使用官方 Gemini Express Mode SDK 调用模型 {base_model_name}。")
         if model_to_call != base_model_name:
@@ -310,13 +309,10 @@ class ExpressSDKUpstream(BaseUpstream):
             client_to_use, model_to_call, prompt_func, gen_config_dict, request_obj,
             fastapi_request=fastapi_request, prefill_text=prefill_text,
             # 钉定路径万一不对（Project ID 与 Key 不同项目、该区域没有此模型），
-            # 自动退回裸模型名重试一次。
+            # 自动退回裸模型名重试一次。退回重试复用同一个池化客户端
+            # （同 Key 同签名 → 同实例，零额外开销）。
             fallback_model=(base_model_name if model_to_call != base_model_name else None),
             fallback_client_factory=(
-                lambda: genai.Client(
-                    vertexai=True,
-                    api_key=express_api_key,
-                    http_options=get_http_options(),
-                )
+                lambda: get_pooled_express_client(express_api_key)
             ),
         )

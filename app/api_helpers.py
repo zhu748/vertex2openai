@@ -12,13 +12,11 @@ from google.genai import types
 from models import OpenAIRequest, OpenAIMessage
 from message_processing import (
     convert_to_openai_format,
-    extract_reasoning_by_tags,
     _create_safety_ratings_html,
     strip_prefill_overlap,
     PrefillDeduper,
 )
 import config as app_config
-from config import VERTEX_REASONING_TAG
 
 import model_capabilities as mc
 from runtime_state import app_state
@@ -53,100 +51,6 @@ def get_retry_settings() -> tuple[int, float]:
         backoff = float(app_config.DEFAULT_SETTINGS["retry_backoff_seconds"])
     return max(0, min(50, retry_max)), max(0.0, min(120.0, backoff))
 
-class StreamingReasoningProcessor:
-    def __init__(self, tag_name: str = VERTEX_REASONING_TAG):
-        self.tag_name = tag_name
-        self.open_tag = f"<{tag_name}>"
-        self.close_tag = f"</{tag_name}>"
-        self.tag_buffer = ""
-        self.inside_tag = False
-        self._reasoning_chunks = []
-        self.partial_tag_buffer = "" 
-
-    def process_chunk(self, content: str) -> tuple[str, str]:
-        if self.partial_tag_buffer:
-            content = self.partial_tag_buffer + content
-            self.partial_tag_buffer = ""
-        self.tag_buffer += content
-        
-        processed_content_chunks = []
-        current_reasoning_chunks = []
-        
-        while self.tag_buffer:
-            if not self.inside_tag:
-                open_pos = self.tag_buffer.find(self.open_tag)
-                if open_pos == -1:
-                    partial_match = False
-                    for i in range(1, min(len(self.open_tag), len(self.tag_buffer) + 1)):
-                        if self.tag_buffer[-i:] == self.open_tag[:i]:
-                            partial_match = True
-                            if len(self.tag_buffer) > i:
-                                processed_content_chunks.append(self.tag_buffer[:-i])
-                                self.partial_tag_buffer = self.tag_buffer[-i:]
-                            else: 
-                                self.partial_tag_buffer = self.tag_buffer
-                            self.tag_buffer = ""
-                            break
-                    if not partial_match:
-                        processed_content_chunks.append(self.tag_buffer)
-                        self.tag_buffer = ""
-                    break
-                else:
-                    processed_content_chunks.append(self.tag_buffer[:open_pos])
-                    self.tag_buffer = self.tag_buffer[open_pos + len(self.open_tag):]
-                    self.inside_tag = True
-            else: 
-                close_pos = self.tag_buffer.find(self.close_tag)
-                if close_pos == -1:
-                    partial_match = False
-                    for i in range(1, min(len(self.close_tag), len(self.tag_buffer) + 1)):
-                        if self.tag_buffer[-i:] == self.close_tag[:i]:
-                            partial_match = True
-                            if len(self.tag_buffer) > i:
-                                new_reasoning = self.tag_buffer[:-i]
-                                self._reasoning_chunks.append(new_reasoning)
-                                if new_reasoning: current_reasoning_chunks.append(new_reasoning)
-                                self.partial_tag_buffer = self.tag_buffer[-i:]
-                            else: 
-                                self.partial_tag_buffer = self.tag_buffer
-                            self.tag_buffer = ""
-                            break
-                    if not partial_match:
-                        if self.tag_buffer:
-                            self._reasoning_chunks.append(self.tag_buffer)
-                            current_reasoning_chunks.append(self.tag_buffer)
-                            self.tag_buffer = ""
-                    break
-                else:
-                    final_reasoning_chunk = self.tag_buffer[:close_pos]
-                    self._reasoning_chunks.append(final_reasoning_chunk)
-                    if final_reasoning_chunk: current_reasoning_chunks.append(final_reasoning_chunk)
-                    
-                    self.tag_buffer = self.tag_buffer[close_pos + len(self.close_tag):]
-                    self.inside_tag = False
-                    
-        return "".join(processed_content_chunks), "".join(current_reasoning_chunks)
-    
-    def flush_remaining(self) -> tuple[str, str]:
-        remaining_content_chunks = []
-        if self.partial_tag_buffer:
-            remaining_content_chunks.append(self.partial_tag_buffer)
-            self.partial_tag_buffer = ""
-            
-        if not self.inside_tag:
-            if self.tag_buffer: remaining_content_chunks.append(self.tag_buffer)
-        else:
-            if self.tag_buffer: self._reasoning_chunks.append(self.tag_buffer)
-            self.inside_tag = False
-            
-        remaining_content = "".join(remaining_content_chunks)
-        remaining_reasoning = "".join(self._reasoning_chunks)
-        
-        self.tag_buffer = ""
-        self._reasoning_chunks.clear()
-        
-        return remaining_content, remaining_reasoning
-    
 
 def create_openai_error_response(status_code: int, message: str, error_type: str) -> Dict[str, Any]:
     safe_message = re.sub(r"([?&]key=)[^&\s'\"]+", r"\1***HIDDEN_API_KEY***", message)
@@ -645,12 +549,12 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
         "id": response_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model_name,
         "choices": [{"index": candidate_index, "delta": delta_payload, "finish_reason": openai_finish_reason}]
     }
-    return f"data: {json.dumps(chunk_data)}\n\n"
+    return f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
 
 def create_final_chunk(model: str, response_id: str, candidate_count: int = 1) -> str:
     choices = [{"index": i, "delta": {}, "finish_reason": "stop"} for i in range(candidate_count)]
     final_chunk_data = {"id": response_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model, "choices": choices}
-    return f"data: {json.dumps(final_chunk_data)}\n\n"
+    return f"data: {json.dumps(final_chunk_data, ensure_ascii=False)}\n\n"
 
 async def _chunk_openai_response_dict_for_sse(
     openai_response_dict: Dict[str, Any],
@@ -905,6 +809,9 @@ async def gemini_fake_stream_generator(
         err_resp_sse = create_openai_error_response(500, sse_err_msg_display, "server_error")
         json_payload_error = json.dumps(err_resp_sse)
         if not is_auto_attempt:
+            # 流式响应已是 200，中间件按状态码计不到这次失败，这里补记
+            # （auto 模式抛给外层通道接管，由外层统一计数，避免双计）
+            stats.add_error()
             yield f"data: {json_payload_error}\n\n"
             yield "data: [DONE]\n\n"
         if is_auto_attempt: raise
@@ -1101,6 +1008,9 @@ async def execute_gemini_call(
                         s_err = str(e_stream_call); s_err = s_err[:1024]+"..." if len(s_err)>1024 else s_err
                         if is_auto_attempt:
                             raise e_stream_call
+                        # 流式响应已是 200，中间件按状态码计不到这次失败，
+                        # 这里补记（auto 模式抛给外层通道接管，由外层计数）
+                        stats.add_error()
                         # 已经输出过内容：不再重发错误体，只补结束标记，避免污染已有输出
                         if has_yielded:
                             yield "data: [DONE]\n\n"
