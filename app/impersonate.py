@@ -106,11 +106,32 @@ _BROWSER_HEADERS: dict[str, dict[str, str]] = {
 }
 
 
-def apply_browser_headers(headers: dict | None) -> dict:
-    """按当前伪装档案补齐浏览器头（不覆盖已有键；伪装关闭时原样返回拷贝）。
+# Chrome 对 XHR/fetch 请求的稳定头发送序（HTTP/2 下 HPACK 按序编码，
+# 服务端可见）。真实 Cloud Console 前端的 batchGraphql 请求就是这套序：
+#   client hints (sec-ch-ua*) → content-type → authorization →
+#   Google 专用头 → user-agent → accept → origin/referer →
+#   sec-fetch-* → accept-language → cookie 殿后
+# 浏览器外壳头的**顺序**本身是指纹：Python dict 按插入序发送，
+# 「authorization 第一、cookie 第二」一眼就是脚本拼的 dict。
+_CHROME_HEADER_ORDER = (
+    "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
+    "content-type", "authorization", "x-goog-authuser", "x-same-domain",
+    "user-agent", "accept", "origin", "referer",
+    "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site",
+    "accept-language", "cookie",
+)
 
-    Google 专用头（authorization/cookie/content-type/x-goog-*/origin/referer/
-    x-same-domain）永远以调用方传入的为准，浏览器头只做增量补齐。
+
+def apply_browser_headers(headers: dict | None) -> dict:
+    """按当前伪装档案补齐浏览器头并**按 Chrome 线序重排**。
+
+    - 不覆盖已有键（Google 专用头 authorization/cookie/content-type/
+      x-goog-* / origin / referer 永远以调用方传入的为准）；
+    - 合并后按 _CHROME_HEADER_ORDER 重排（在基准序列里的头按 Chrome
+      真实顺序发送，不在序列里的保持原相对序殿后）——伪装关闭时
+      原样返回拷贝，完全旧兼容。
+    - firefox 档案没有 sec-ch-ua*，重排后仍是浏览器合理形态
+      （user-agent/accept 在前、cookie 殿后），不构成异常信号。
     """
     merged = dict(headers or {})
     if not impersonation_active():
@@ -118,7 +139,11 @@ def apply_browser_headers(headers: dict | None) -> dict:
     profile = get_impersonate_profile()
     for k, v in _BROWSER_HEADERS.get(profile, _BROWSER_HEADERS["chrome"]).items():
         merged.setdefault(k, v)
-    return merged
+    ordered = {k: merged[k] for k in _CHROME_HEADER_ORDER if k in merged}
+    for k, v in merged.items():
+        if k not in ordered:
+            ordered[k] = v
+    return ordered
 
 
 # ============================================================

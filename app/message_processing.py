@@ -892,6 +892,16 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
 MAX_REMOTE_IMAGE_BYTES = 20 * 1024 * 1024   # 单张图上限，防止超大响应打爆内存
 MAX_REMOTE_IMAGE_REDIRECTS = 3
 
+# 图片抓取的出站外观：普通浏览器 UA + 图片 Accept。
+# 这条出站路径打的是任意图床/CDN（用户给的 URL），不是 Google API——
+# 但 python-httpx/<ver> 的默认 UA 会被不少图床（imgur 等）直接 403，
+# 浏览器形态既提升抓取成功率，也不暴露服务端技术栈。
+_IMAGE_FETCH_HEADERS = {
+    "user-agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"),
+    "accept": "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8,*/*;q=0.5",
+}
+
 
 def _is_blocked_host(host: str) -> bool:
     """目标是否指向内网/环回/链路本地等不该被代理访问的地址。
@@ -957,7 +967,7 @@ def fetch_remote_image(url: str, timeout: float = 10.0) -> Optional[Tuple[bytes,
         with httpx.Client(**client_args) as client:
             current = url
             for _ in range(MAX_REMOTE_IMAGE_REDIRECTS + 1):
-                resp = client.get(current)
+                resp = client.get(current, headers=_IMAGE_FETCH_HEADERS)
                 if resp.is_redirect:
                     # 逐跳复查：只校验首个 URL 的话，一个 302 就能把请求带进内网。
                     current = str(resp.next_request.url) if resp.next_request else ""

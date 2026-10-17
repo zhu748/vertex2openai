@@ -18,8 +18,13 @@ cachedContent / responseSchema 等全部字段天然 100% 兼容，因为请求�
 - 认证兼容三种原生写法：Authorization: Bearer、x-goog-api-key、?key=
   （值必须等于本服务的 API_KEY，否则 401）。
 - Key 池轮询/随机、location 钉定、出站代理全部复用现有 Express 通道逻辑。
+- 模型路径拼接对齐 SDK 的 t_model()：完整资源路径（projects/ 等开头）
+  原样透传，不再叠加 publishers 前缀（旧版双重前缀会让上游直接返回
+  404 空 body，客户端只能显示 Unknown error: 404）。
 - 上游响应（含错误）状态码与 body 原样转发；流式以原始字节流转发 SSE。
-- 429/5xx 自动换下一个 Express Key 重试（最多 3 次）。
+- 429/5xx 自动换下一个 Express Key 重试（最多 3 次）；钉定路径失败
+  （404 Publisher model not found / 403 requires billing）自动退回
+  裸模型名重试一次，与 OpenAI 兼容通道的 fallback 行为对齐。
 - 模型列表用内部模型清单映射成 Gemini 原生格式（models/get 也支持）。
 
 限制：Cookie 通道（batchGraphql）是私有 GraphQL 协议，无法承载原生 REST
@@ -27,9 +32,11 @@ cachedContent / responseSchema 等全部字段天然 100% 兼容，因为请求�
 """
 
 import asyncio
+import json
 import secrets
 import time
 from typing import Any, Optional
+from urllib.parse import quote
 
 import httpx
 from fastapi import APIRouter, Depends, Header, Request
@@ -145,41 +152,94 @@ def _pick_express_key(fastapi_request: Request) -> Optional[dict]:
     return manager.get_express_record()
 
 
+def _build_upstream_url(model_path: str, action: str) -> str:
+    """把模型路径拼成上游 URL，规则对齐 google-genai SDK 的 t_model()：
+
+    - 裸模型名 → publishers/google/models/{model}（Express 端点格式）；
+    - 完整资源路径（projects/、publishers/、models/、tunedModels/、
+      endpoints/ 开头——包括 location 钉定生成的
+      projects/{p}/locations/{l}/publishers/google/models/{m} 与客户端
+      自带的完整路径）→ 原样拼接，**不能再叠 publishers 前缀**。
+
+    修复前的 bug：这里无条件拼 publishers/google/models/，location 钉定
+    生效时（express_location 默认 global）会请求
+    …/v1/publishers/google/models/projects/… 双重前缀的畸形 URL，
+    Google 前端直接返回 404 空 body（客户端只能显示 Unknown error: 404）
+    ——这正是「OpenAI 兼容接口正常、Gemini 原生透传一律 404」的根因
+    （OpenAI 路径走 SDK，t_model() 对 projects/ 开头原样透传，URL 正确）。
+    """
+    if model_path.startswith(("projects/", "publishers/", "models/",
+                              "tunedModels/", "endpoints/")):
+        model_segment = model_path
+    else:
+        model_segment = f"publishers/google/models/{model_path}"
+    return f"{EXPRESS_BASE}/{EXPRESS_API_VERSION}/{model_segment}:{action}"
+
+
 async def _passthrough_once(client: httpx.AsyncClient, express_key: str,
                             model_path: str, action: str, query: str,
-                            payload: Any, *, stream: bool) -> httpx.Response:
+                            payload: bytes, *, stream: bool) -> httpx.Response:
     """向上游发一次请求。stream=True 时返回**未消费**的响应
-    （供 aiter_raw 逐块转发）；stream=False 时返回已缓冲的响应。"""
-    url = (f"{EXPRESS_BASE}/{EXPRESS_API_VERSION}/publishers/google/models/"
-           f"{model_path}:{action}")
+    （供 aiter_bytes 逐块转发）；stream=False 时返回已缓冲的响应。
+
+    指纹保真三要点（MockTransport 与官方 SDK 抓包逐字节对照得出）：
+    1. 头集合与线序 = build_direct_headers(express_key)，即 SDK 原生形态；
+       不再钉 accept-encoding: identity——真实 SDK 走 httpx 默认的
+       `gzip, deflate`，钉 identity 反而是全网 SDK 用户里没有的异类形态。
+    2. payload 是客户端请求体**原始字节**：不解析重组，客户端的 SDK
+       序列化出什么样就转发什么样（等价于“客户端直连 Google”）。
+    3. 压缩由 httpx 透明处理：流式 aiter_bytes / 非流式 aread 都会自动
+       解压，且本服务不透传 content-encoding 头，客户端拿到的就是
+       上游解压后的原始载荷。"""
+    url = _build_upstream_url(model_path, action)
     if query:
         url = f"{url}?{query}"
     req = client.build_request(
-        "POST", url, json=payload,
-        headers={
-            "x-goog-api-key": express_key,
-            "content-type": "application/json",
-            # 钉 identity：转发用的是 aiter_raw 原始字节，且只回传 content-type
-            # 不回传 content-encoding——若上游启用了压缩，客户端拿到的是“伪 json”
-            # 乱码。钉住 identity 让上游永不压缩，字节级保真才成立。
-            "accept-encoding": "identity",
-            # 请求头指纹跟随控制台 express_ua_profile（sdk/node/gcloud/custom）。
-            # 这里绝不能出现 python-httpx 或任何含 "vertex2openai" 的 UA——
-            # 直接管自己叫代理等于在 Google 风控日志里自首。
-            **build_direct_headers(),
-        },
+        "POST", url, content=payload,
+        headers=build_direct_headers(express_key),
     )
     return await client.send(req, stream=stream)
 
 
+def _looks_like_pin_failure(status_code: int, body: bytes) -> bool:
+    """上游错误响应是否像「钉定的 projects/locations 路径不对」。
+
+    与 api_helpers.is_location_pin_failure（SDK 通道用）同一套判据，
+    只是把输入从异常对象换成透传拿到的 (status, body)：
+      403 requires billing / billing to be enabled → 项目未开计费或无权
+      404 Publisher model … not found                → 该项目/区域没有此模型
+      403 permission_denied + projects/              → 项目级权限问题
+    命中后退回裸模型名让后端自行路由（与 SDK 通道 fallback 行为一致），
+    最坏也只是回到旧行为（裸模型名报同样的错），不会更糟。
+    """
+    if status_code not in (403, 404):
+        return False
+    text = body.decode("utf-8", "ignore").lower()
+    if "requires billing" in text or "billing to be enabled" in text:
+        return True
+    if ("not found" in text or "404" in text) and "publisher model" in text:
+        return True
+    if "permission_denied" in text and "projects/" in text:
+        return True
+    return False
+
+
 async def _passthrough_request(fastapi_request: Request, model: str, action: str,
-                               query: str, payload: Any):
-    """选 Key → 透传 → 429/5xx 换 Key 重试。返回 fastapi Response。
+                               query: str, payload: bytes):
+    """选 Key → 透传 → 429/5xx 换 Key 重试 → 钉定失败兜底。返回 Response。
 
     客户端生命周期：共享池化客户端（app/client_pool.py），同一代理形态下
     全部透传请求复用同一连接池（keep-alive），重试也不重新握手；控制台
     热改代理后新请求自动换新客户端，旧客户端延迟回收。因此本函数与
     _relay_stream 都**不关闭**共享客户端，只负责关闭上游响应。
+
+    两类重试互相独立、不共用预算：
+    - Key 轮换重试（429/500/503）：最多 _KEY_RETRY_MAX 次，每次换下一个
+      Express Key，受 retry-after / 退避间隔控制；
+    - 钉定失败兜底（403/404 且报错像项目/区域问题，见 _looks_like_pin_failure）：
+      不换 Key、不占上面的预算，仅把模型路径退回裸模型名再试一次——
+      与 SDK 通道（api_helpers.execute_gemini_call 的 fallback_model）对齐，
+      避免「OpenAI 接口能自动兜底、原生透传却把 404 原样抛给客户端」。
     """
     manager = fastapi_request.app.state.express_key_manager
     if manager.get_total_keys() == 0:
@@ -191,7 +251,6 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
             status_detail="PERMISSION_DENIED",
         )
 
-    tried_keys: set[str] = set()
     last_error_body = b""
     last_error_status = 502
     last_error_headers: dict[str, str] = {}
@@ -208,20 +267,28 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
     client = passthrough_client_slot.get(_new_client)
 
     is_stream = action == "streamGenerateContent"
-    for attempt in range(_KEY_RETRY_MAX + 1):
+    tried_keys: set[str] = set()
+    key_attempts = 0           # 429/5xx 已重试次数（不含首次）
+    pin_fallback_used = False  # 钉定失败 → 裸模型名兜底（最多一次）
+
+    while True:
         if await fastapi_request.is_disconnected():
             return Response(status_code=499)
 
-        record = manager.get_express_record()
-        if record is None:
-            break
-        express_key = record["key"]
-        if express_key in tried_keys:
-            # Key 池已试遍，不再空转
-            break
-        tried_keys.add(express_key)
+        if pin_fallback_used:
+            # 钉定兜底轮：复用同一把 Key（换的是模型路径，不是 Key）
+            model_path = model
+        else:
+            record = manager.get_express_record()
+            if record is None:
+                break
+            express_key = record["key"]
+            if express_key in tried_keys:
+                # Key 池已试遍，不再空转
+                break
+            tried_keys.add(express_key)
+            model_path = _resolve_upstream_model_path(model, record.get("project_id", ""))
 
-        model_path = _resolve_upstream_model_path(model, record.get("project_id", ""))
         try:
             upstream = await _passthrough_once(
                 client, express_key, model_path, action, query, payload,
@@ -230,44 +297,73 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
             last_error_status = 504
             last_error_body = (b'{"error":{"code":504,"message":"Upstream timeout",'
                                b'"status":"DEADLINE_EXCEEDED"}}')
+            if key_attempts >= _KEY_RETRY_MAX:
+                break
+            key_attempts += 1
             continue
         except Exception as e:
             last_error_status = 502
             last_error_body = str(e).encode()
+            if key_attempts >= _KEY_RETRY_MAX:
+                break
+            key_attempts += 1
             continue
 
-        retryable = upstream.status_code in (429, 500, 503)
-        if not retryable or attempt >= _KEY_RETRY_MAX:
-            # 成功 / 不可重试错误 / 重试耗尽：原样透传（保留上游真实状态码与 body）
-            if is_stream:
-                return await _relay_stream(upstream)
-            content = upstream.content
-            status = upstream.status_code
-            ctype = upstream.headers.get("content-type", "application/json")
-            # retry-after 是客户端退避的关键依据，一并透传
-            passthrough = {k: v for k, v in upstream.headers.items()
-                           if k.lower() == "retry-after"}
-            return Response(content=content, status_code=status, media_type=ctype,
-                            headers=passthrough or None)
+        # 429/5xx：预算内换下一个 Express Key 重试
+        if upstream.status_code in (429, 500, 503) and key_attempts < _KEY_RETRY_MAX:
+            last_error_status = upstream.status_code
+            last_error_headers = {k: v for k, v in upstream.headers.items()
+                                  if k.lower() == "retry-after"}
+            # 流式响应必须先消费才能安全释放（否则连接悬挂在缓冲区上）
+            try:
+                last_error_body = await upstream.aread()
+            except Exception:
+                last_error_body = b""
+            await upstream.aclose()
+            retry_after = upstream.headers.get("retry-after")
+            wait = 1.5 * (key_attempts + 1)
+            try:
+                wait = min(float(retry_after) if retry_after else wait, 8.0)
+            except ValueError:
+                pass
+            print(f"⚠️ [Gemini 透传] 上游 HTTP {upstream.status_code}（第 {key_attempts + 1} 次），"
+                  f"换下一个 Express Key，{wait:.1f}s 后重试。")
+            await asyncio.sleep(wait)
+            key_attempts += 1
+            continue
 
-        last_error_status = upstream.status_code
-        last_error_headers = {k: v for k, v in upstream.headers.items()
-                              if k.lower() == "retry-after"}
-        # 流式响应必须先消费才能安全释放（否则连接悬挂在缓冲区上）
+        # 成功 / 不可重试错误 / Key 轮换预算耗尽 → 透传
+        if is_stream and upstream.status_code < 400:
+            return await _relay_stream(upstream)
+
+        # 错误（或非流式响应）：缓冲 body 再透传，顺带供钉定失败判定
         try:
-            last_error_body = await upstream.aread()
+            body = await upstream.aread()
         except Exception:
-            last_error_body = b""
+            body = b""
+        status = upstream.status_code
+        ctype = upstream.headers.get("content-type", "application/json")
+        # retry-after 是客户端退避的关键依据，一并透传
+        headers = {k: v for k, v in upstream.headers.items()
+                   if k.lower() == "retry-after"}
         await upstream.aclose()
-        retry_after = upstream.headers.get("retry-after")
-        wait = 1.5 * (attempt + 1)
-        try:
-            wait = min(float(retry_after) if retry_after else wait, 8.0)
-        except ValueError:
-            pass
-        print(f"⚠️ [Gemini 透传] 上游 HTTP {upstream.status_code}（第 {attempt + 1} 次），"
-              f"换下一个 Express Key，{wait:.1f}s 后重试。")
-        await asyncio.sleep(wait)
+
+        # 钉定路径失败 → 退回裸模型名再试一次（不占 Key 轮换预算）
+        if (not pin_fallback_used and model_path != model
+                and _looks_like_pin_failure(status, body)):
+            pin_fallback_used = True
+            last_error_status, last_error_body = status, body
+            last_error_headers = headers
+            print(f"↩️ [Gemini 透传] 钉定路径调用失败（HTTP {status}："
+                  f"{body[:120].decode('utf-8', 'ignore')}），"
+                  f"已退回裸模型名 {model} 重试一次。如持续出现，请确认「通道与凭证」里"
+                  f"该 Key 的 Project ID 正确且已开启计费，或把「标准模式 location」"
+                  f"设为“默认（后端自选）”。")
+            continue
+
+        # 原样透传（保留上游真实状态码与 body）
+        return Response(content=body, status_code=status, media_type=ctype,
+                        headers=headers or None)
 
     return Response(
         content=last_error_body or b'{"error":{"code":502,"message":"Upstream unreachable","status":"UNAVAILABLE"}}',
@@ -278,18 +374,22 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
 
 
 async def _relay_stream(upstream: httpx.Response) -> StreamingResponse:
-    """把上游 SSE（或 JSON array 流）以原始字节转发给客户端。
+    """把上游 SSE（或 JSON array 流）以解压后的字节转发给客户端。
 
-    用 aiter_raw()（不解压、不解码）保证字节级保真；上游响应在转发
-    生成器 finally 里释放（消费完最后一个 chunk 才断开上游）。客户端
-    断开时 Starlette 会取消生成器，finally 同样生效。
+    用 aiter_bytes()（透明解压）：上游可能按我们的 accept-encoding
+    (gzip, deflate) 压缩响应，这里解压后转发；本服务不透传
+    content-encoding 头，与非流式路径（aread() 同样自动解压）行为
+    一致，客户端拿到的就是上游的原始载荷字节。SSE 客户端按事件
+    解析，解压后的分块边界与上游压缩块边界不同也不影响。
+    上游响应在转发生成器 finally 里释放（消费完最后一个 chunk 才断开
+    上游）。客户端断开时 Starlette 会取消生成器，finally 同样生效。
     注：httpx 客户端是共享池化的（client_pool.passthrough_client_slot），
     由池统一管理生命周期，这里不关闭它。
     """
 
     async def _relay():
         try:
-            async for chunk in upstream.aiter_raw():
+            async for chunk in upstream.aiter_bytes():
                 if chunk:
                     yield chunk
         finally:
@@ -327,22 +427,29 @@ def _passthrough_endpoint():
                 status_detail="NOT_FOUND",
             )
 
-        # body 必须是合法 JSON 对象（Gemini 请求全是 JSON 对象）
+        # body 校验必须是合法 JSON 对象（Gemini 请求全是 JSON 对象），
+        # 但**转发原始字节**而不是解析重组——客户端的 SDK 把 body 序列化
+        # 成什么样（分隔符、键序、空白），上游收到的就是什么样，与
+        # “客户端直连 Google”的形态完全一致（反代最忌讳的就是重组后的
+        # body 与自称的 SDK 形态对不上号）。
+        raw_body = await request.body()
         try:
-            payload = await request.json()
+            parsed = json.loads(raw_body)
         except Exception:
             return _native_error(400, "请求体必须是 JSON 对象（Gemini 原生格式）。")
-        if not isinstance(payload, dict):
+        if not isinstance(parsed, dict):
             return _native_error(400, "请求体必须是 JSON 对象（Gemini 原生格式）。")
 
-        # 透传 query（alt=sse 等），但剔除本服务鉴权用的 key 参数
+        # 透传 query（alt=sse 等），但剔除本服务鉴权用的 key 参数。
+        # query_params 取出的是已解码值，重新下发前必须再编码，否则值里
+        # 带 & / = / 空格会把 URL 拼坏（alt=sse 之外的参数被截断）。
         qp = [(k, v) for k, v in request.query_params.multi_items() if k != "key"]
-        query = "&".join(f"{k}={v}" for k, v in qp)
+        query = "&".join(f"{quote(k, safe='')}={quote(v, safe='')}" for k, v in qp)
 
         is_stream = action == "streamGenerateContent"
         print(f"🔁 [Gemini 透传] {model}:{action} | {'流式' if is_stream else '非流式'}"
               f" | 原生协议透传（Express 通道）")
-        return await _passthrough_request(request, model, action, query, payload)
+        return await _passthrough_request(request, model, action, query, raw_body)
 
     return endpoint
 

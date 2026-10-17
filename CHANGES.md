@@ -2,6 +2,96 @@
 
 基于原版 `vertex2openai-main`（2026-09-01），只做加法，未改原有架构。
 
+## 第十轮：出站请求头指纹逐字节对齐官方 SDK（MockTransport 抓包实证 + 修复）
+
+**背景**：反代项目最大的自曝风险不在 UA（第八/九轮已接管），而在**与官方 SDK
+的细节偏差**——风控日志里一条请求的头集合、线序、序列化格式、压缩协商只要
+有一项与「自称的 SDK 形态」对不上，就等于自我标记。本轮用 `httpx.MockTransport`
+注入官方 google-genai 2.31.0（`vertexai=True + api_key`，与本项目 SDK 通道同款
+构造）抓取**字节级出站基准**，与本项目全部裸 httpx 出站点逐项对照，实测发现
+4 处 Google 可见偏差并全部修复（对照脚本 `scripts/probe_fingerprint_diff.py`
+可随时复验）：
+
+1. **透传通道 `accept-encoding: identity`**（最刺眼）：真实 SDK 走 httpx 默认的
+   `gzip, deflate`，钉 identity 是全网 SDK 用户里不存在的异类形态。修复：
+   删掉显式 identity，回归 httpx 默认；同时流式中继从 `aiter_raw` 改
+   `aiter_bytes`（透明解压），非流式 `aread` 本就自动解压，两条路径行为一致，
+   且本服务不透传 content-encoding 头，客户端拿到的仍是上游原始载荷。
+2. **透传通道 body 重组**：旧实现 `json=payload` 把客户端请求体解析后重新
+   序列化——httpx 的 `json=` 用紧凑分隔符（`{"a":1}` 无空格），而真实 Python
+   SDK 用 `json.dumps` 默认分隔符（`{"a": 1}` 带空格），声称是 Python SDK 却
+   发紧凑 JSON 就是自相矛盾。修复：**原始字节转发**（`content=raw_body`），
+   客户端的 SDK 把 body 序列化成什么样（分隔符/键序/空白）上游收到的就是
+   什么样，等价于「客户端直连 Google」。请求体仍先 parse 校验合法性。
+3. **头线序与大小写**：旧实现头 dict 顺序（x-goog-api-key → content-type →
+   accept-encoding → …）与 SDK 最终线序（Content-Type → x-goog-api-key →
+   user-agent → x-goog-api-client）不同，且 `content-type` 小写。修复：
+   `build_direct_headers(api_key)` 重构为 SDK 同款同序（含 GET 也带
+   `Content-Type: application/json` 的 SDK 特性），Gemini 透传与 Key 探测
+   两个出站点统一换用；Key 探测的 body 一并对齐 SDK 序列化（默认分隔符 +
+   pydantic 键序 parts→role）。修复后 **透传通道与官方 SDK 抓包「完全一致
+   （顺序+大小写+值）」**，Key 探测仅 content-length 因载荷不同而异。
+4. **Cookie 通道浏览器头线序**：`authorization` 第一、`cookie` 第二的 dict
+   插入序一眼就是脚本拼的。`apply_browser_headers` 新增 Chrome 真实 XHR 线序
+   重排（client hints → content-type → authorization → Google 专用头 →
+   user-agent → accept/origin/referer → sec-fetch-* → accept-language →
+   cookie 殿后）；off 档案完全旧兼容，firefox 档案重排后仍是合理浏览器形态。
+
+**顺手加固**：远程图片抓取补浏览器 UA + 图片 Accept（旧裸
+`python-httpx/<ver>` 会被 imgur 等图床 403）；透传 query 参数重下发前
+`quote` 再编码（旧实现裸拼 `k=v`，值含 `&`/`=`/空格会截断 alt 之外的参数）。
+
+**验证**：回归测试扩到 11 组 48/48 通过（新增 [10] 指纹保真——线序/头值/
+原始字节透传断言，[11] gzip SSE 透明解压断言）；Cookie 通道三档案线序
+人工核验；`compileall` 全量通过。
+
+## 第九轮：修复 Gemini 原生透传一律 404（OpenAI 兼容接口正常、原生格式不可用）
+
+**现象**：客户端走 `/v1beta/models/gemini-4-argon:streamGenerateContent` 报
+`Unknown error: 404`（上游 404 且**空 body**），同一模型走 `/v1/chat/completions`
+正常；日志显示已正常选出 Express Key（带 Project ID）。
+
+**根因**（真机 curl 三组对照定案）：`gemini_native._passthrough_once` 无条件给
+模型路径拼 `publishers/google/models/` 前缀。而 `express_location` **默认
+`global`** 且选中的 Key 带 Project ID 时，`resolve_express_model_path` 返回完整
+资源路径 `projects/{p}/locations/global/publishers/google/models/{m}`，叠加后变成
+
+```
+https://aiplatform.googleapis.com/v1/publishers/google/models/projects/…/models/gemini-4-argon:…
+```
+
+这种**双重前缀畸形路径**被 Google 前端直接 404（空 body，客户端无法解析只能
+显示 Unknown error: 404）。OpenAI 兼容路径走 SDK，`t_model()` 对 `projects/`
+开头的 model 原样透传、URL 正确，所以不受影响。实测对照：畸形路径 404 空 body，
+正确钉定路径与裸模型名路径均为 401（路径合法、假 Key 认证失败），证明 404 由
+路径形态决定。
+
+**修复**（`app/routes/gemini_native.py`）：
+
+- 新增 `_build_upstream_url`：模型路径拼接对齐 google-genai SDK 的 `t_model()`
+  语义——裸模型名拼 `publishers/google/models/{model}`（Express 端点格式）；
+  `projects/`、`publishers/`、`models/`、`tunedModels/`、`endpoints/` 开头的完整
+  资源路径（含 location 钉定生成的与客户端自带的）**原样拼接，不再叠加前缀**。
+  客户端自带完整 `projects/…` 路径的请求（旧版同样双重前缀）一并修好。
+- 补齐「钉定失败自动兜底」（对齐 SDK 通道 `execute_gemini_call` 的
+  `fallback_model`）：新增 `_looks_like_pin_failure`（与
+  `api_helpers.is_location_pin_failure` 同一套判据，输入换成
+  (status, body)），钉定路径返回 404 `Publisher model … not found` /
+  403 `requires billing` 时自动退回裸模型名重试一次（不换 Key、不占 429/5xx
+  的 Key 轮换预算），彻底消除「OpenAI 接口能自动兜底、原生透传把 404 原样
+  抛给客户端」的通道间行为差。
+- 重试循环重构为 while + 双计数器（`key_attempts` / `pin_fallback_used`），
+  行为与旧版逐项对齐：429/500/503 换 Key 退避重试最多 2 次（retry-after 优先）、
+  断连即停、错误状态码与 body 原样透传（含 retry-after 头）。流式错误响应从
+  流式中继改为缓冲后透传（客户端可见的状态码/body/头完全一致，错误体本来就
+  是一次性小包），成功流式仍走 `aiter_raw` 字节级中继不变。
+- 模块 docstring 同步更新。
+
+**验证**：新增回归测试 9 组 38/38 通过（URL 构造 5 形态 + 双重前缀反例、
+钉定+流式 200、未钉定、404 not found 兜底、403 billing 兜底、404 空 body
+不兜底原样透传、429 换 Key、客户端完整路径、无 Project ID 退裸名）；
+`compileall` 全量通过；真机 curl 验证三种 URL 形态的上游行为差异。
+
 ## 第八轮：性能与健壮性专项（客户端池化 + 事件循环减压 + 6 个正确性修复）
 
 全量代码审查（约 1 万行）后按投入产出比实施的十个方向：

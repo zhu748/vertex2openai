@@ -5,8 +5,9 @@
 多账号轮换时每个 Key 的项目都不一样，不能再共用 Cookie 通道那份全局 Project ID。
 
 探测方式：用「调模型的正确 URL」，把模型名换成一个不存在的模型名发一次请求：
-  POST https://aiplatform.googleapis.com/v1/publishers/google/models/{fake}:generateContent?key={key}
-（这正是 Express 标准模式实际在用的全局端点格式。）
+  POST https://aiplatform.googleapis.com/v1/publishers/google/models/{fake}:generateContent
+  （认证走 x-goog-api-key 头，与官方 SDK 同款同序；这正是 Express 标准模式
+   实际在用的全局端点格式。）
 模型不存在时 Google 返回 404，错误信息里会带上按该 Key 解析出的完整资源路径，
 形如 …projects/{project}/locations/…/publishers/google/models/{fake}… was not found，
 从中提取 project。请求在模型解析阶段即失败，不产生任何 token、不消耗配额；
@@ -15,6 +16,7 @@ Key 本身非法时则返回 400/401/403，顺带校验 Key 有效性。
 """
 
 import asyncio
+import json
 import re
 import time
 from typing import Optional, Tuple
@@ -57,20 +59,25 @@ async def probe_project_id(key: str) -> Tuple[Optional[str], str]:
     用不存在的模型名调一次 generateContent：Key 有效时上游返回 404，
     错误信息里带 `projects/{project}/...` 路径，从中提取项目；
     Key 无效时返回 400/401/403。全程不消耗配额。
+
+    指纹：头集合/线序走 build_direct_headers(key)（与官方 SDK 逐字节
+    一致，含 Content-Type 与 x-goog-api-key 的位置）；body 用
+    json.dumps 默认分隔符序列化（真实 SDK 的序列化形态，httpx 的
+    json= 参数是紧凑分隔符，Python SDK 从不这么发），键序对齐 SDK
+    pydantic 模型（Content: parts 在前 role 在后）。风控日志里这次
+    请求应与普通 SDK 调用无法区分。
     """
     key = (key or "").strip()
     if not key:
         return None, "Key 为空。"
     url = GENERATE_CONTENT_URL.format(model=PROBE_FAKE_MODEL)
-    body = {"contents": [{"role": "user", "parts": [{"text": "ping"}]}]}
+    # 键序对齐 SDK pydantic 字段序：parts → role（抓包对照）
+    body = {"contents": [{"parts": [{"text": "ping"}], "role": "user"}]}
     try:
         async with httpx.AsyncClient(**_client_args()) as client:
-            # key 改用 x-goog-api-key 头（官方 genai SDK 的真实形态；
-            # query 里的 key 虽然也能用，但 SDK 从不这么发，形态不一致就是指纹）。
-            # UA / x-goog-api-client 跟随控制台指纹档案，消除 python-httpx 特征。
             resp = await client.post(
-                url, json=body,
-                headers={**build_direct_headers(), "x-goog-api-key": key})
+                url, content=json.dumps(body),
+                headers=build_direct_headers(key))
     except Exception as e:
         return None, f"探测请求失败：{type(e).__name__} - {e}"
 

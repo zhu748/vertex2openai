@@ -138,6 +138,15 @@ curl -s https://你的域名/v1beta/models -H "x-goog-api-key: 你的API_KEY"
 - **上游选择**：复用 Express Key 池（轮询/随机）与 location 钉定；429/5xx 自动换下一个 Key 重试
   （最多 3 次）；上游错误状态码与 body 原样透传。Cookie 通道是私有 GraphQL 协议，无法承载原生
   REST，故透传始终走 Express 通道（未配置 Express Key 时返回 403 与说明）。
+- **模型路径拼接与 SDK 完全一致**：裸模型名拼 `publishers/google/models/{model}`（Express 端点
+  格式）；`projects/...` 完整资源路径（location 钉定生成或客户端自带）原样透传，不叠加前缀。
+  > 📌 修复说明：旧版对钉定路径无条件叠加 `publishers/google/models/` 前缀，会请求
+  > `…/v1/publishers/google/models/projects/…` 双重前缀的畸形 URL，Google 前端直接返回
+  > 404 空 body（客户端显示 `Unknown error: 404`）——这正是「OpenAI 兼容接口正常、
+  > Gemini 原生格式一律 404」的根因，已按 SDK `t_model()` 语义修复。
+- **钉定失败自动兜底**：钉定路径返回 404 `Publisher model … not found` 或 403
+  `requires billing` 时，自动退回裸模型名重试一次（不换 Key），与 OpenAI 兼容通道的
+  fallback 行为一致；其余错误仍原样透传。
 - **客户端接入示例**（google-genai / Cherry Studio / LobeChat 等）：API Base 填
   `https://你的域名/`，API Key 填本服务 `API_KEY`，选 "Gemini / Google" 供应商类型即可。
 
@@ -149,7 +158,9 @@ TLS 指纹（JA3/JA4）与真浏览器完全不同，且请求头里连 User-Age
 
 1. **TLS 指纹**：impersonate 成真实 Chrome / Edge / Safari / Firefox 的握手特征；
 2. **浏览器请求头**：User-Agent、sec-ch-ua、sec-fetch-*、accept-language，与所选档案配套
-   （Authorization / Cookie 等 Google 专用头不受影响）。
+   （Authorization / Cookie 等 Google 专用头不受影响），并按 **Chrome 真实 XHR 线序**
+   发送（client hints → content-type → authorization → … → cookie 殿后），
+   避开「authorization 第一、cookie 第二」这种脚本 dict 插入序特征。
 
 控制台「通道与凭证」页新增**「Cookie 通道指纹伪装」**卡片，可热切换档案
 （默认 chrome；选 off 完全回退旧版 httpx 行为），保存即生效、无需重启。
@@ -179,6 +190,21 @@ Express API Key 通道走官方 google-genai SDK，TLS 栈无法更换（SDK 强
 运行时读取 SDK 与 Python 真实版本号构造精确标签，让 SDK 原样放行（已用
 mock 上游抓包验证）。Key 探测同步把 API Key 从 URL query 挪到
 `x-goog-api-key` 头（官方 SDK 的真实形态）。
+
+**逐字节对齐**（第十轮）：用 `httpx.MockTransport` 注入官方 SDK 抓字节级
+基准并逐项对照，裸 httpx 出站点（Gemini 透传 / Key 探测）修复了四类偏差后
+与官方 SDK **完全一致（顺序+大小写+值）**：
+
+- 头线序/大小写与 SDK 同款同序（`Content-Type → x-goog-api-key → user-agent →
+  x-goog-api-client`，含 GET 也带 Content-Type 的 SDK 特性）；
+- 压缩协商回归 httpx 默认 `gzip, deflate`（旧版钉 `identity` 是全网 SDK
+  用户里不存在的异类形态），流式中继 `aiter_bytes` 透明解压；
+- 透传通道转发客户端请求体**原始字节**（不解析重组——httpx `json=` 的紧凑
+  分隔符与真实 SDK 的 `json.dumps` 默认分隔符不一致，重组即自曝）；
+- Cookie 通道浏览器头按 Chrome 线序重排（见上节）。
+
+对照/回归验证：`scripts/probe_fingerprint_diff.py`（SDK 基准抓包对比）与
+`scripts/test_gemini_native_fix.py`（含 [10] 指纹保真 / [11] gzip 解压断言）。
 
 ## 性能：上游连接池化与大响应解析
 
@@ -306,7 +332,7 @@ TCP+TLS 握手（每次约省 100~300ms 与相应 CPU）；429 重试场景收�
 
 **项目 ID 不需要单独配**：自动用「通道与凭证」页填的那个（或环境变量 `GOOGLE_PROJECT_ID`）——一个人通常只有一个 Express 项目。两者都没有时自动退回裸模型名（不会拼出半截路径）。
 
-**钉定失败会自动兜底**：若钉定路径返回"模型不存在 / 需要计费"，代理会**自动退回裸模型名重试一次**（＝旧行为）并在日志说明怎么修。实机验证：故意把 Project ID 换成一个未开计费的项目，非流式与流式都仍能正常出文。所以把默认值设成 `global` 不会让任何既有配置变糟。
+**钉定失败会自动兜底**：若钉定路径返回"模型不存在 / 需要计费"，代理会**自动退回裸模型名重试一次**（＝旧行为）并在日志说明怎么修（Express SDK 通道与 Gemini 原生透传通道均具备该兜底）。实机验证：故意把 Project ID 换成一个未开计费的项目，非流式与流式都仍能正常出文。所以把默认值设成 `global` 不会让任何既有配置变糟。
 
 几个必须知道的边界（都是实测）：
 

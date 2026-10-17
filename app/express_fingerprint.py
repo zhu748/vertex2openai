@@ -129,16 +129,36 @@ def build_sdk_channel_overrides() -> Dict[str, str]:
     return {"user-agent": ua, "x-goog-api-client": ua}
 
 
-def build_direct_headers() -> Dict[str, str]:
+def build_direct_headers(api_key: str = "") -> Dict[str, str]:
     """给所有裸 httpx 出站点用（Gemini 透传 / Key 探测 / 模型配置 / 代理测试）。
 
-    这些点没有 SDK 自动注入，所以连 sdk 档案也要显式带上官方 SDK 同款头；
-    否则发出去的是 python-httpx/<ver> —— 一眼脚本，而且缺 x-goog-api-client
-    在 Google 眼里同样是异常形态。（accept-encoding 无需操心：httpx 默认
-    就发 gzip, deflate，与 gcloud/urllib3 形态一致。）
+    返回与官方 SDK **同款、同线序**的头集合（MockTransport 抓包对照验证，
+    与真实 google-genai 请求逐字节一致）：
+      Content-Type: application/json   —— SDK 对所有请求（含 GET models.list）
+                                          无条件下发，缺了反而是异常形态；
+      x-goog-api-key                   —— 仅在传入 key 时携带（api_key 模式）；
+      user-agent / x-goog-api-client   —— 跟随控制台 express_ua_profile 档案。
+
+    线序原理：httpx 的 _merge_headers 先铺默认头 [accept, accept-encoding,
+    connection, user-agent]，再按本 dict 的顺序 in-place 覆盖 / 追加——
+    本函数的构造顺序 (Content-Type → x-goog-api-key → user-agent →
+    x-goog-api-client) 恰好落成 SDK 的最终线序：
+      host, accept, accept-encoding(gzip, deflate), connection,
+      Content-Type, x-goog-api-key, user-agent, x-goog-api-client, content-length
+    绝不能出现 python-httpx 或任何含 "vertex2openai" 的 UA——直接管自己
+    叫代理等于在 Google 风控日志里自首。
+
+    注：调用方发 JSON 时应传 content=json.dumps(body)（默认分隔符带空格，
+    与 SDK 的序列化一致），而不要用 httpx 的 json= 参数——后者用的是紧凑
+    分隔符（无空格），真实 Python SDK 从不这么发。
     """
     ua = _build_ua(get_express_ua_profile())
-    return {"user-agent": ua, "x-goog-api-client": ua}
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
+    if api_key:
+        headers["x-goog-api-key"] = api_key
+    headers["user-agent"] = ua
+    headers["x-goog-api-client"] = ua
+    return headers
 
 
 def describe_current_profile() -> str:
