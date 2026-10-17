@@ -180,9 +180,18 @@ Express API Key 通道走官方 google-genai SDK，TLS 栈无法更换（SDK 强
 | 档案 | 形态 | 适用场景 |
 |---|---|---|
 | `sdk`（默认） | `google-genai-sdk/<ver> gl-python/<ver>`（SDK 自动管理，零改动） | 无特殊需求 |
-| `node` | `google-genai-sdk/<ver> gl-node/22.14.0`（官方 Node.js SDK 形态） | JS 生态调用量最大、风控难一刀切；`VERTEX_BASE_URL` 指向的中转站封 python UA 时 |
+| `node` | 裸出站点：`google-genai-sdk/<ver> gl-node/22.14.0`（纯官方 Node.js SDK 形态）；**SDK 主通道：保持纯 python 形态**（见下） | JS 生态调用量最大、风控难一刀切；`VERTEX_BASE_URL` 指向的中转站封 python UA 时 |
 | `gcloud` | 追加 `gcloud/<ver> command/gcloud.ai-platform gccl/<ver>`（gcloud CLI 运维流量形态） | 伪装成 GCP 官方运维调用 |
 | `custom` | 自定义串，占位符 `{sdk}` `{python}` `{node}` 自动展开为当前精确标签 | 自由定制 |
+
+**node 档案为什么不动 SDK 主通道**（第十一轮实测修正）：SDK 的
+`append_library_version_headers` 会给任何含 gl-node 的 UA 强制追加
+gl-python，拼出 `gl-node + gl-python` 混合标签——而 Node SDK 从不带
+gl-python，真实世界没有任何客户端会发出这种组合，等于给风控留下一个
+**固定的异常特征**。因此 node 档案下 SDK 主通道保持官方纯 python 形态，
+只有裸 httpx 出站点（Gemini 透传 / Key 探测 / 模型配置）发纯 node 形态：
+同一 Key 上 python / node 两种**纯**形态并存，就像一个团队同时跑两种
+语言的应用一样平常。
 
 实现细节（为什么不会出现双重标签）：google-genai SDK 会强制给注入的
 `user-agent` / `x-goog-api-client` 追加自己的 `google-genai-sdk/<ver>` 与
@@ -202,6 +211,16 @@ mock 上游抓包验证）。Key 探测同步把 API Key 从 URL query 挪到
 - 透传通道转发客户端请求体**原始字节**（不解析重组——httpx `json=` 的紧凑
   分隔符与真实 SDK 的 `json.dumps` 默认分隔符不一致，重组即自曝）；
 - Cookie 通道浏览器头按 Chrome 线序重排（见上节）。
+
+**四档案线序实证 + 混合标签修复**（第十一轮）：补测了上轮的盲区——SDK
+主通道注入 node/gcloud/custom 档案后的真实线序（探针
+`scripts/probe_sdk_channel_profiles.py`），实测四档案线序/大小写均与官方
+默认一致；但发现 node 档案会被 SDK 强制追加 gl-python 形成真实客户端
+造不出来的混合标签（已按上节策略修复），custom 档案缺占位符时的标签
+拼接顺序也与真实 SDK 变换不同（真实 SDK 把 sdk+python 两标签**整体
+前置**，旧实现把 gl-python 放尾部）——已把 `_ensure_sdk_labels` 改为
+与 SDK 逐字符同款变换，保证 custom 无论怎么填，产出都是「真实 SDK 对
+同样输入的输出」。
 
 对照/回归验证：`scripts/probe_fingerprint_diff.py`（SDK 基准抓包对比）与
 `scripts/test_gemini_native_fix.py`（含 [10] 指纹保真 / [11] gzip 解压断言）。

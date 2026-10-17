@@ -551,7 +551,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div id="h_fp2" class="helpbox">
         <b>管什么</b>：Express API Key（官方 SDK）通道发出的 <code>User-Agent</code> 与 <code>x-goog-api-client</code> 两个头——Google 后端日志里每条请求的客户端标识就靠它们；同时修复 Gemini 原生透传 / Key 探测 / 代理测试这些裸 httpx 出站点原本暴露的 <code>python-httpx</code>（甚至自曝代理名）的 UA。<br>
         <b>为什么不伪装 TLS</b>：SDK 强依赖 httpx，TLS 栈换不了；但官方 API 端点本就接受各种语言的官方客户端，请求头才是风控看的重点。Cookie 通道的 TLS 伪装在上一张卡片。<br>
-        <b>档案说明</b>：<b>官方 Python SDK</b>＝默认零改动；<b>Node.js SDK</b>＝JS 生态形态（调用量最大、风控难一刀切；SDK 主通道会自动追加 gl-python 标签，纯 node 形态仅对 Gemini 透传等裸出站点完全生效）；<b>gcloud CLI</b>＝GCP 运维流量形态；<b>自定义</b>＝自由填写，占位符 <code>{sdk}</code> <code>{python}</code> <code>{node}</code> 自动展开为当前精确标签（缺标签会被自动补齐，避免 SDK 追加出双重标签）。<br>
+        <b>档案说明</b>：<b>官方 Python SDK</b>＝默认零改动；<b>Node.js SDK</b>＝JS 生态形态（调用量最大、风控难一刀切），<b>仅对 Gemini 透传等裸出站点完全生效</b>——SDK 主通道无法伪装成 node（SDK 会强制追加 gl-python，拼出真实客户端不可能出现的 gl-node+gl-python 混合标签），因此 SDK 主通道在此档案下保持官方纯 python 形态：同一 Key 上 python / node 两种纯形态并存，就像一个团队同时跑两种语言的应用一样平常；<b>gcloud CLI</b>＝GCP 运维流量形态；<b>自定义</b>＝自由填写，占位符 <code>{sdk}</code> <code>{python}</code> <code>{node}</code> 自动展开为当前精确标签（缺标签按真实 SDK 同款变换自动补齐，不会出现 SDK 造不出来的形态）。<br>
         <b>热生效</b>：保存即写入 <code>web_state.json</code>，下一个请求立刻生效。<br>
         <b>VERTEX_BASE_URL 指向第三方中转时</b>：中转站（尤其 Cloudflare）常按 UA 放行，选非 sdk 档案可绕开对 python UA 的封锁。
       </div>

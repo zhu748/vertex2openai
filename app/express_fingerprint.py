@@ -18,13 +18,21 @@ SDK 强制标签机制（google-genai 2.31.0 _api_client.append_library_version_
 档案（express_ua_profile，控制台「通道与凭证」页热改）：
   sdk    = 不注入，SDK 自动管理 = 官方 Python genai SDK 形态（默认，零改动）
   node   = 官方 Node.js SDK 形态（gl-node/22 LTS）。JS 生态调用量最大、
-           风控最难一刀切。注意：SDK 主通道会被强制追加 gl-python 标签
-           （混合形态）；Gemini 原生透传等裸 httpx 出站点则是纯 node 形态
+           风控最难一刀切。**仅作用于裸 httpx 出站点**（透传/Key 探测/
+           模型配置）：SDK 主通道无法伪装成 node——SDK 的 append_
+           library_version_headers 会强制追加 gl-python，拼出
+           gl-node+gl-python 混合标签，而真实世界没有任何客户端会发出这种
+           组合（Node SDK 从不带 gl-python），等于给风控留下一个固定异常
+           特征。因此 SDK 主通道在 node 档案下保持纯 python 形态：同一
+           Key 上 python / node 两种**纯**形态并存，是一个团队同时跑两种
+           语言应用时再平常不过的样子，远比每条请求都带混合标签安全
   gcloud = gcloud CLI 形态（追加 gcloud/command/gccl 标签 = GCP 官方运维
            流量的合法组合）
   custom = 自定义串（express_ua_custom，支持 {sdk} {python} {node} 占位符）。
-           占位符或串内必须让两个精确标签齐活，缺了会自动补——宁可补
-           也不要让 SDK 追加出双重标签
+           缺标签会自动补齐——补法与真实 SDK 的变换**一字不差**（library
+           标签缺失 = 把 sdk+python 两标签整体前置；仅 python 缺失 = 尾部
+           追加），保证最终串必然是真实 SDK 对同样输入的输出，不会出现
+           SDK 造不出来的形态
 
 裸 httpx 出站点（Gemini 原生透传 / Key 探测 / 模型配置拉取 / 代理连通测试）
 没有 SDK 自动注入，一律用 build_direct_headers()：sdk 档案时也显式带上
@@ -81,15 +89,21 @@ def get_express_ua_custom() -> str:
 
 
 def _ensure_sdk_labels(ua: str) -> str:
-    """把两个精确标签补齐（已存在则原样返回）。
+    """把精确标签补齐（已存在则原样返回）——变换与真实 SDK 逐字符一致。
 
-    这是骗过 SDK append_library_version_headers 的关键：标签只要「在场」
-    就放行，因此宁可自己补，也不让 SDK 再追加一份。
+    对齐 google-genai 2.31.0 append_library_version_headers 的真实逻辑：
+      library 标签（google-genai-sdk/<ver>）缺失 → 把 sdk+python 两个标签
+        **整体前置**（SDK 的 version_header_value 就是这个二元组），这是
+        真实用户经 HttpOptions.headers 传自定义 UA 时 SDK 产出的原样形态；
+      library 在场而 gl-python 缺失 → 尾部追加 gl-python。
+    这样无论用户怎么填，最终串都必然是「真实 SDK 对同样输入的输出」，
+    而不会出现 SDK 自己造不出来的标签排布。标签在场后 SDK 原样放行，
+    也就不会被再追加一份。
     """
     if sdk_label() not in ua:
-        ua = f"{sdk_label()} {ua}".strip()
+        return f"{sdk_label()} {python_label()} {ua}".strip()
     if python_label() not in ua:
-        ua = f"{ua} {python_label()}".strip()
+        return f"{ua} {python_label()}".strip()
     return ua
 
 
@@ -119,11 +133,16 @@ def _build_ua(profile: str) -> str:
 def build_sdk_channel_overrides() -> Dict[str, str]:
     """给 http_options.get_http_options() 的 HttpOptions.headers 用（SDK 主通道）。
 
-    sdk 档案返回 {}：不注入任何头，SDK 自动管理，行为与历史版本逐字节一致。
-    其它档案返回 user-agent / x-goog-api-client（两标签齐全，SDK 原样放行）。
+    sdk / node 档案返回 {}：不注入任何头，SDK 自动管理，行为与历史版本
+    逐字节一致（官方纯 python 形态）。node 不注入的原因见模块 docstring：
+    SDK 会给任何含 gl-node 的 UA 强制追加 gl-python → 混合标签是真实
+    客户端造不出来的固定异常特征；纯 python（SDK 通道）+ 纯 node
+    （裸出站点）两种形态并存反而平常。
+    其它档案（gcloud/custom）返回 user-agent / x-goog-api-client（两标签
+    齐全，SDK 原样放行，线序不变——探针实测四档案线序均与官方默认一致）。
     """
     profile = get_express_ua_profile()
-    if profile == "sdk":
+    if profile in ("sdk", "node"):
         return {}
     ua = _build_ua(profile)
     return {"user-agent": ua, "x-goog-api-client": ua}
@@ -166,6 +185,9 @@ def describe_current_profile() -> str:
     profile = get_express_ua_profile()
     if profile == "sdk":
         return "官方 Python SDK 原生形态（SDK 自动管理）"
+    if profile == "node":
+        return ("官方 Node.js SDK 形态（仅裸出站点：透传/探测/模型配置）；"
+                "SDK 主通道保持纯 python 形态（避免 gl-node+gl-python 混合标签）")
     if profile == "custom" and not get_express_ua_custom():
         return "自定义（当前为空 → 官方形态）"
     return f"{profile} 档案：{_build_ua(profile)}"

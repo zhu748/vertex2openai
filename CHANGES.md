@@ -2,6 +2,39 @@
 
 基于原版 `vertex2openai-main`（2026-09-01），只做加法，未改原有架构。
 
+## 第十一轮：Express SDK 主通道四档案线序实证 + 两处标签形态缺陷修复
+
+**背景**：第十轮验证了「官方 SDK vs 裸 httpx 出站点」逐字节一致，但 SDK
+主通道**注入 node/gcloud/custom 档案后**的最终线序从未实测。本轮补上这块
+盲区（新探针 `scripts/probe_sdk_channel_profiles.py`，按 `client_pool.py`
+同款构造注入 MockTransport 抓包），实测**四档案线序/大小写均与官方默认
+一致**，但抓出两处标签形态缺陷并修复：
+
+1. **node 档案混合标签**（最严重）：SDK 的 `append_library_version_headers`
+   会给任何含 gl-node 的 UA 强制追加 gl-python，拼出
+   `google-genai-sdk/<ver> gl-node/22.14.0 gl-python/<ver>`——Node SDK
+   从不带 gl-python，真实世界没有任何客户端会发出这种组合；每条请求都
+   带同一个混合标签，等于给风控留下一个**固定的异常特征**。修复：
+   `build_sdk_channel_overrides()` 对 node 档案返回 `{}`（不注入 = 官方
+   纯 python 形态）；纯 node 形态仍由裸 httpx 出站点（Gemini 透传 /
+   Key 探测 / 模型配置）发出。同一 Key 上 python / node 两种**纯**形态
+   并存（= 一个团队同时跑两种语言的应用）远比混合标签安全。
+2. **custom 档案标签拼接顺序**：旧 `_ensure_sdk_labels` 把 gl-python 补
+   在尾部；真实 SDK 对自定义 UA 的变换是「library 标签缺失 → sdk+python
+   **整体前置**；仅 python 缺失 → 尾部追加」。已对齐为逐字符同款变换，
+   保证 custom 无论怎么填，产出必然是「真实 SDK 对同样输入的输出」，
+   不会出现 SDK 自己造不出来的标签排布。
+
+**审计结论**（Express 通道指纹完善度）：sdk 档案与官方 SDK 逐字节一致；
+透传/Key 探测/模型配置/代理测试四个裸出站点与官方 SDK 完全一致（线序/
+大小写/值）；gcloud 档案标签组合合法；全代码检索无 `python-httpx` /
+自曝 UA 残留；HTTP/1.1 与官方 SDK 一致（h2 未安装，官方同样不发
+HTTP/2）；`resumable.py` 为 SSE 续传无出站请求。修复后 6 项档案策略
+断言全过（探针内置），回归测试 48/48，compileall 通过。
+
+**改动文件**：`app/express_fingerprint.py`（node 不注入 + 变换对齐 +
+docstring）、`app/main.py`（控制台帮助文本）、`README.md`、`CHANGES.md`。
+
 ## 第十轮：出站请求头指纹逐字节对齐官方 SDK（MockTransport 抓包实证 + 修复）
 
 **背景**：反代项目最大的自曝风险不在 UA（第八/九轮已接管），而在**与官方 SDK
