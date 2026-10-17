@@ -2,6 +2,34 @@
 
 基于原版 `vertex2openai-main`（2026-09-01），只做加法，未改原有架构。
 
+## 第六轮：Gemini 原生格式透传 + Cookie 通道指纹伪装
+
+- **Gemini 原生 REST 透传**（`app/routes/gemini_native.py` 新增）：
+  - 端点：`POST /v1beta|/v1/models/{model}:generateContent` / `:streamGenerateContent`
+    / `:countTokens` / `:embedContent`；`GET /v1beta/models`（Gemini 原生格式列表）与
+    `GET /v1beta/models/{model}`。请求体一个字节不改地转发到 Express 端点，原生字段
+    （tools / thinkingConfig / safetySettings / responseSchema / cachedContent…）100% 兼容。
+  - 鉴权兼容三种原生写法：`Authorization: Bearer` / `x-goog-api-key` / `?key=`（常量时间比较）。
+  - 复用 Express Key 池（轮询/随机）、location 钉定、出站代理；429/5xx 自动换 Key 重试（≤3 次）；
+    上游错误状态码与 body 原样透传；流式按 `aiter_raw()` 字节级转发 SSE。
+  - 路由防遮蔽：`GET /v1/models` 保持 OpenAI 格式不动，Gemini 原生列表只注册 `/v1beta/models`。
+  - 流式连接生命周期：客户端与上游响应用 `build_request + send(stream=…)`，流式时由转发生成器
+    的 finally 释放（修掉 `client.post()` 预读导致 `StreamConsumed`、以及 `async with` 提前关连接两个坑）。
+- **Cookie 通道 TLS/浏览器指纹伪装**（`app/impersonate.py` 新增，curl_cffi 0.16 终于用上）：
+  - 旧通道用 httpx：Python TLS 指纹 + 无 User-Agent，极易被风控识别为脚本流量。
+  - 现按档案（chrome 默认 / edge / safari / safari_ios / firefox / off）同时伪装 TLS 指纹
+    （ClientHello/cipher/扩展序）与浏览器头（UA/sec-ch-ua/sec-fetch-*/accept-language），
+    Google 专用头（Authorization/Cookie/origin）不受影响。
+  - `open_upstream_client()` 统一工厂替换 cookie_proxy 三处 `httpx.AsyncClient`；
+    off 档位逐字节回退旧 httpx 行为。控制台「通道与凭证」页新增伪装卡片（热切换）。
+  - 垫片踩坑记录（curl_cffi 0.16.3 实测）：① 流被 `aiter_content` 消费后再调 `acontent()` 会
+    **永久死等**（httpx 的 aread 幂等）→ 垫片自缓冲；② 流式响应未读时 `.content` 是 `b''`
+    而非 `None` → 显式 `from_stream` 标记；③ `aiter_text` 必须是"普通方法返回异步生成器"
+    才与 httpx 调用约定一致。
+- 回归测试 33 项全过（`scripts/regression_test3.py`：本地 mock Google 上游全链路——
+  鉴权×3、字节级透传、SSE 转发、模型列表双格式、伪装开/关行为等价性、aread/aiter_text 两种
+  真实用法），旧 21 项回归不破，compileall 通过。
+
 ## 第五轮：全面复查加固（安全 + CI/CD + 修复一个回退 Bug）
 
 - **修复：清空代理被环境变量抢回**（`app/runtime_state.py`）：

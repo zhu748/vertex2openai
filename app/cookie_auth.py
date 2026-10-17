@@ -75,15 +75,21 @@ def build_authorization_header(cookie_str: str) -> Optional[str]:
 def build_headers(cookie_str: str) -> Optional[Dict[str, str]]:
     """
     构建 batchGraphql 请求所需的完整 HTTP 头
-    
-    每次调用都重新计算 SAPISIDHASH（因为包含实时时间戳）
+
+    每次调用都重新计算 SAPISIDHASH（因为包含实时时间戳）。
+    浏览器外观头（User-Agent / sec-ch-ua / sec-fetch-* 等）由
+    impersonate.apply_browser_headers 按当前伪装档案补齐——真实
+    Cloud Console 前端就是带这一整套头发请求的，缺了很容易被风控
+    识别为脚本流量；伪装关闭（cookie_impersonate=off）时保持原样。
     """
+    from impersonate import apply_browser_headers
+
     auth = build_authorization_header(cookie_str)
     if not auth:
         print("⚠️ [Cookie 认证] Cookie 中未找到 SAPISID 族字段，无法计算认证头")
         return None
-    
-    headers = {
+
+    headers = apply_browser_headers({
         "authorization": auth,
         "cookie": cookie_str,
         "content-type": "application/json",
@@ -91,8 +97,8 @@ def build_headers(cookie_str: str) -> Optional[Dict[str, str]]:
         "x-same-domain": "1",
         "origin": "https://console.cloud.google.com",
         "referer": "https://console.cloud.google.com/",
-    }
-    
+    })
+
     return headers
 
 

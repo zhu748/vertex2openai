@@ -108,6 +108,53 @@ GET 返回（代理地址自动脱敏，凭据不外泄）：
 
 > Render 部署时把 Health Check Path 设为 `/healthz` 即可，30 秒冷启动期间不会误判不健康。
 
+## Gemini 原生格式端点（透传）
+
+除了 OpenAI 兼容接口，本服务还提供 **Gemini 原生 REST 端点**——请求体一个字节不改地透传到
+Express 端点，因此 tools / function calling / `thinkingConfig` / `safetySettings` / `responseSchema` /
+`cachedContent` 等全部原生字段天然 100% 兼容：
+
+```bash
+# 非流式
+curl -s https://你的域名/v1beta/models/gemini-3.6-pro:generateContent \
+  -H "x-goog-api-key: 你的API_KEY" -H "Content-Type: application/json" \
+  -d '{"contents":[{"role":"user","parts":[{"text":"你好"}]}]}'
+
+# SSE 流式（加 ?alt=sse，与官方 SDK 行为一致）
+curl -N https://你的域名/v1beta/models/gemini-3.6-pro:streamGenerateContent?alt=sse \
+  -H "x-goog-api-key: 你的API_KEY" ...
+
+# Token 计数 / 模型列表（Gemini 原生格式）
+curl -s https://你的域名/v1beta/models/gemini-3.6-pro:countTokens -H "x-goog-api-key: 你的API_KEY" -d '{"contents":[]}'
+curl -s https://你的域名/v1beta/models -H "x-goog-api-key: 你的API_KEY"
+```
+
+要点：
+
+- **鉴权三种写法任选**：`Authorization: Bearer <API_KEY>`、`x-goog-api-key: <API_KEY>`、`?key=<API_KEY>`
+  （与 OpenAI 端点同一把 Key，常量时间比较校验）。
+- **双前缀**：`/v1beta/...`（Generative Language 风格）与 `/v1/...`（Vertex 风格）都注册了 POST 透传；
+  模型列表只在 `/v1beta/models`（`/v1/models` 保持 OpenAI 格式，供 OpenAI 生态使用）。
+- **上游选择**：复用 Express Key 池（轮询/随机）与 location 钉定；429/5xx 自动换下一个 Key 重试
+  （最多 3 次）；上游错误状态码与 body 原样透传。Cookie 通道是私有 GraphQL 协议，无法承载原生
+  REST，故透传始终走 Express 通道（未配置 Express Key 时返回 403 与说明）。
+- **客户端接入示例**（google-genai / Cherry Studio / LobeChat 等）：API Base 填
+  `https://你的域名/`，API Key 填本服务 `API_KEY`，选 "Gemini / Google" 供应商类型即可。
+
+## Cookie 通道指纹伪装（curl_cffi）
+
+Cookie 直连通道模拟的是 Cloud Console 前端的 batchGraphql 请求，但普通 Python HTTP 库的
+TLS 指纹（JA3/JA4）与真浏览器完全不同，且请求头里连 User-Agent 都没有——"用浏览器接口
+却没有浏览器外壳"的请求很容易被风控识别。本服务用 curl_cffi（依赖内置）做两层伪装：
+
+1. **TLS 指纹**：impersonate 成真实 Chrome / Edge / Safari / Firefox 的握手特征；
+2. **浏览器请求头**：User-Agent、sec-ch-ua、sec-fetch-*、accept-language，与所选档案配套
+   （Authorization / Cookie 等 Google 专用头不受影响）。
+
+控制台「通道与凭证」页新增**「Cookie 通道指纹伪装」**卡片，可热切换档案
+（默认 chrome；选 off 完全回退旧版 httpx 行为），保存即生效、无需重启。
+Express 通道不需要伪装：官方 API Key + 官方 SDK 是"合法身份"的调用，伪装成浏览器反而可疑。
+
 ## 环境变量
 
 | 变量 | 必填 | 默认值 | 说明 |

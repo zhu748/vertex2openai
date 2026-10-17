@@ -52,6 +52,7 @@ from cookie_auth import (
     STREAM_GENERATE_QUERY_SIGNATURE,
     STREAM_GENERATE_OPERATION_NAME,
 )
+from impersonate import open_upstream_client
 
 # ========== 重试关键词 ==========
 # 可重试的错误关键词（429 限流类）
@@ -1102,7 +1103,7 @@ def _wants_usage(request_obj: OpenAIRequest) -> bool:
 # ========== 单次流式请求执行器（重构为真正的异步实时生成器） ==========
 
 async def _execute_stream_request_generator_once(
-    client: httpx.AsyncClient,
+    client: Any,
     headers: dict,
     body: dict,
     sampler: "_RawSampler | None" = None,
@@ -1177,7 +1178,7 @@ async def _execute_stream_request_generator_once(
 
 
 async def _execute_stream_request_generator(
-    client: httpx.AsyncClient,
+    client: Any,
     headers: dict,
     body: dict,
     sampler: "_RawSampler | None" = None,
@@ -1214,7 +1215,7 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
             body = await build_batch_graphql_body_async(
                 project_id, base_model_name, request_obj)
             req_headers = build_headers(_get_cookie_string()) or headers
-            async with httpx.AsyncClient(**client_kwargs) as client:
+            async with open_upstream_client(client_kwargs) as client:
                 response = await client.post(BATCH_GRAPHQL_URL, headers=req_headers, json=body)
 
             if response.status_code in (429, 503, 500) and attempt < retry_max:
@@ -1501,7 +1502,7 @@ class CookieProxyUpstream(BaseUpstream):
                         print(f"🔎 [Studio 调试] 出站 generationConfig: "
                               f"{json.dumps(body['variables'].get('generationConfig', {}), ensure_ascii=False)}")
 
-                    async with httpx.AsyncClient(**client_kwargs) as client:
+                    async with open_upstream_client(client_kwargs) as client:
                         has_yielded_to_client = False
                         got_text = False       # 是否收到过“正文”（text/image）
                         got_thought = False    # 是否收到过思考
@@ -1746,7 +1747,7 @@ class CookieProxyUpstream(BaseUpstream):
                         print(f"🔎 [Studio 调试] 出站 generationConfig: "
                               f"{json.dumps(body['variables'].get('generationConfig', {}), ensure_ascii=False)}")
 
-                    async with httpx.AsyncClient(**client_kwargs) as client:
+                    async with open_upstream_client(client_kwargs) as client:
                         response = await client.post(
                             BATCH_GRAPHQL_URL, headers=req_headers, json=body
                         )

@@ -159,6 +159,11 @@ DEFAULT_SETTINGS = {
     # 支持标准 URL 格式：http://user:pass@host:port / socks5://host:port 等（httpx[socks] 已内置）。
     # 清空 = 直连上游。两条通道（Express / Cookie）共用同一个出站代理。
     "proxy_url": PROXY_URL or "",
+    # ===== Cookie 通道 TLS/浏览器指纹伪装（curl_cffi，热开关）=====
+    # off = 关闭（回退 httpx 原始行为）；chrome（默认）/ edge / safari / firefox / safari_ios
+    # = 用 curl_cffi 伪装成真实浏览器的 TLS 指纹，并补齐 UA / sec-ch-ua / sec-fetch 等浏览器头。
+    # batchGraphql 是 Cloud Console 前端接口，Python TLS 指纹 + 无 UA 的裸请求极易被风控识别。
+    "cookie_impersonate": "chrome",
     # 弱网可靠传输（见 resumable.py）：服务端响应缓冲 + 序列号事件 + 断线重放/分片轮询。
     # 上游读取由后台泵任务驱动，与前端连接解绑；Google 的回复总能完整落缓冲。
     "resumable_enabled": True,            # 总开关；关掉则回到原有直通行为

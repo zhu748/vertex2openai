@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from auth import get_api_key
 from express_key_manager import ExpressKeyManager
 from routes import models_api, chat_api
+from routes import gemini_native
 
 from logger import rt_logger, stats
 import config
@@ -73,6 +74,20 @@ async def lifespan(app: FastAPI):
         print(f"🌐 [网络] 出站代理已启用：{mask_proxy_url(_proxy_now)}（控制台「通道与凭证」页可热改，保存后无需重启）。")
     else:
         print("🌐 [网络] 未配置出站代理，直连 Google 上游（控制台「通道与凭证」页可配置，或设环境变量 PROXY_URL）。")
+
+    # Cookie 通道指纹伪装状态（curl_cffi）
+    try:
+        from impersonate import get_impersonate_profile
+        _fp = get_impersonate_profile()
+        if _fp != "off":
+            print(f"🎭 [指纹伪装] Cookie 通道已启用 curl_cffi 浏览器伪装：{_fp}"
+                  "（TLS 指纹 + 浏览器请求头，控制台「通道与凭证」页可热改/off 关闭）。")
+        else:
+            print("🎭 [指纹伪装] Cookie 通道指纹伪装已关闭（httpx 原始行为，可在控制台「通道与凭证」页开启）。")
+    except Exception as _e:
+        print(f"⚠️ [指纹伪装] 状态读取失败：{_e}")
+    print("🔁 [Gemini 透传] 原生格式端点已开启：POST /v1beta/models/{model}:generateContent"
+          " / :streamGenerateContent / :countTokens（鉴权与 OpenAI 端点一致，三种原生 Key 写法均支持）。")
 
     # 启动时自动探测各 Key 归属的 GCP Project ID（location 钉定要用）。
     # 放后台任务里跑：探测走外网，绝不能阻塞服务启动。
@@ -446,6 +461,37 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       </div>
       <input id="proxy-input" class="inp log" placeholder="留空 = 直连。示例：socks5://user:pass@1.2.3.4:1080 或 http://user:pass@1.2.3.4:8080">
       <div id="proxy-test-result" class="text-xs mt-2 hidden leading-relaxed"></div>
+    </div>
+
+    <!-- Cookie 通道 TLS/浏览器指纹伪装（curl_cffi，热开关） -->
+    <div class="card p-5 mb-4">
+      <div class="flex items-center justify-between flex-wrap gap-2 mb-3">
+        <div>
+          <div class="text-sm font-semibold">Cookie 通道指纹伪装<span class="helpq" onclick="hlp(this,'h_fp')">?</span></div>
+          <div class="text-xs text-neutral-500 mt-0.5">curl_cffi 模拟真实浏览器 TLS 指纹 + 补齐浏览器请求头，降低 Google 风控识别。仅作用于 Cookie 直连通道</div>
+        </div>
+        <div class="flex items-center gap-2">
+          <span id="fp-status" class="pill" style="text-transform:none">—</span>
+          <button class="btn px-4 py-1.5 text-sm" onclick="saveFingerprint()">保存伪装设置</button>
+        </div>
+      </div>
+      <div id="h_fp" class="helpbox">
+        <b>为什么需要</b>：Cookie 通道模拟的是 Cloud Console 前端的 batchGraphql 请求，但普通 Python HTTP 库的 TLS 指纹（JA3/JA4）与真浏览器完全不同，且旧版请求头里连 User-Agent 都没有——“用浏览器接口却没有浏览器外壳”的请求很容易被风控盯上。<br>
+        <b>伪装内容</b>：① TLS 指纹（ClientHello / cipher suite / 扩展顺序等，impersonate 成所选浏览器的真实握手）；② 浏览器请求头（User-Agent、sec-ch-ua、sec-fetch-*、accept-language，与所选档案配套）。Authorization / Cookie 等 Google 专用头不受影响。<br>
+        <b>档案选择</b>：Chrome / Edge 同内核（Windows UA），Safari 是 macOS/iOS，Firefox 独立内核。没有特殊理由就选 Chrome。<br>
+        <b>热生效</b>：保存即写入 <code>web_state.json</code>，下一个请求立刻走伪装通道，无需重启。选 <b>off</b> 完全回到旧版 httpx 行为。<br>
+        <b>Express 通道不需要</b>：标准模式走官方 API Key + 官方 SDK，是“合法身份”的调用，伪装成浏览器反而可疑。
+      </div>
+      <div class="flex flex-wrap gap-2">
+        <select id="cookie-impersonate" class="inp" style="max-width:280px">
+          <option value="chrome">Chrome（推荐）</option>
+          <option value="edge">Edge</option>
+          <option value="safari">Safari (macOS)</option>
+          <option value="safari_ios">Safari (iOS)</option>
+          <option value="firefox">Firefox</option>
+          <option value="off">off（关闭伪装，回退 httpx）</option>
+        </select>
+      </div>
     </div>
   </section>
 
@@ -938,6 +984,28 @@ async function testProxy(){
   }
 }
 
+/* ---------- Cookie 通道指纹伪装 ---------- */
+const FP_LABELS = {chrome:'Chrome',edge:'Edge',safari:'Safari',safari_ios:'Safari iOS',firefox:'Firefox',off:'关闭'};
+function updateFpPill(v){
+  const p=$('fp-status'); if(!p) return;
+  const on = v && v !== 'off';
+  p.textContent = on ? ('已伪装：'+(FP_LABELS[v]||v)) : '关闭（httpx 原始行为）';
+  p.style.background = on ? '#ecfdf5' : '#f5f5f5';
+  p.style.color = on ? '#047857' : '#737373';
+}
+async function saveFingerprint(){
+  const v=$('cookie-impersonate').value;
+  try{
+    const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cookie_impersonate:v})});
+    if(r.ok){ updateFpPill(v); toast(v==='off'?'✅ 已关闭伪装（下一个请求生效）':'✅ 伪装已保存并热生效：'+(FP_LABELS[v]||v)); }
+    else{
+      let msg='保存失败';
+      try{ const d=await r.json(); if(d && d.error) msg=d.error; }catch(_){}
+      toast('❌ '+msg);
+    }
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+
 /* ---------- Params ---------- */
 function setV(id,v){ const el=$(id); if(!el) return; if(el.type==='checkbox') el.checked=!!v; else el.value=(v===null||v===undefined)?'':v; }
 async function loadParams(){
@@ -950,6 +1018,9 @@ async function loadParams(){
     // 出站代理：回填输入框并刷新状态徽标
     setV('proxy-input', s.proxy_url || '');
     updateProxyPill(!!(s.proxy_url||'').trim());
+    // Cookie 通道指纹伪装：回填下拉框并刷新徽标
+    setV('cookie-impersonate', s.cookie_impersonate || 'chrome');
+    updateFpPill(s.cookie_impersonate || 'chrome');
     // 向后兼容：旧版布尔开关映射到新的 native_thinking_mode 下拉
     if((!s.native_thinking_mode || s.native_thinking_mode==='request')){
       if(s.hide_thoughts) setV('native_thinking_mode','off');
@@ -1590,3 +1661,12 @@ async def stream_logs_endpoint(request: Request, _auth: bool = Depends(require_a
 
 app.include_router(models_api.router)
 app.include_router(chat_api.router)
+# Gemini 原生格式透传（/v1beta + /v1 的 generateContent / streamGenerateContent / countTokens）
+app.include_router(gemini_native.router)
+
+
+# Gemini 原生端点的鉴权/参数异常 → Google 风格 JSON 错误体
+# （依赖函数里不能直接 raise Response，故经自定义异常中转）
+@app.exception_handler(gemini_native.NativeAPIError)
+async def _gemini_native_error_handler(request, exc: "gemini_native.NativeAPIError"):
+    return exc.response
