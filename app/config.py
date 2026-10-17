@@ -164,6 +164,16 @@ DEFAULT_SETTINGS = {
     # = 用 curl_cffi 伪装成真实浏览器的 TLS 指纹，并补齐 UA / sec-ch-ua / sec-fetch 等浏览器头。
     # batchGraphql 是 Cloud Console 前端接口，Python TLS 指纹 + 无 UA 的裸请求极易被风控识别。
     "cookie_impersonate": "chrome",
+    # ===== Express API Key 通道请求头指纹（热改，见 express_fingerprint.py）=====
+    # SDK 通道 TLS 栈换不了（google-genai 强依赖 httpx），但请求头可完整接管：
+    #   sdk（默认）= 官方 Python genai SDK 原生形态（SDK 自动管理，零改动）
+    #   node       = 官方 Node.js SDK 形态（gl-node/22 LTS，JS 生态调用量最大）
+    #   gcloud     = gcloud CLI 形态（gcloud/command/gccl 标签）
+    #   custom     = 自定义串（express_ua_custom，支持 {sdk} {python} {node} 占位符）
+    # 同时作用于所有裸 httpx 出站点（Gemini 原生透传 / Key 探测 / 模型配置 /
+    # 代理测试），消除 python-httpx UA 与「vertex2openai-passthrough」自曝标签。
+    "express_ua_profile": "sdk",
+    "express_ua_custom": "",
     # 弱网可靠传输（见 resumable.py）：服务端响应缓冲 + 序列号事件 + 断线重放/分片轮询。
     # 上游读取由后台泵任务驱动，与前端连接解绑；Google 的回复总能完整落缓冲。
     "resumable_enabled": True,            # 总开关；关掉则回到原有直通行为

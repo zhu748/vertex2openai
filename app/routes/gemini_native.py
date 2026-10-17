@@ -41,6 +41,7 @@ from runtime_state import app_state, get_effective_proxy_url
 import config as app_config
 from upstreams.express_sdk import resolve_express_model_path
 from model_loader import get_express_models
+from express_fingerprint import build_direct_headers
 
 router = APIRouter()
 
@@ -157,8 +158,10 @@ async def _passthrough_once(client: httpx.AsyncClient, express_key: str,
         headers={
             "x-goog-api-key": express_key,
             "content-type": "application/json",
-            # Google 官方 SDK 的自我标识；伪装成浏览器对官方 API 反而更可疑
-            "user-agent": "google-genai-sdk/vertex2openai-passthrough",
+            # 请求头指纹跟随控制台 express_ua_profile（sdk/node/gcloud/custom）。
+            # 这里绝不能出现 python-httpx 或任何含 "vertex2openai" 的 UA——
+            # 直接管自己叫代理等于在 Google 风控日志里自首。
+            **build_direct_headers(),
         },
     )
     return await client.send(req, stream=stream)

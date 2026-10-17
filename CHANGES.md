@@ -2,6 +2,31 @@
 
 基于原版 `vertex2openai-main`（2026-09-01），只做加法，未改原有架构。
 
+## 第七轮：Express API Key 通道请求头指纹（User-Agent / x-goog-api-client 接管）
+
+- **诊断**（本地 mock 上游抓包实测）：第六轮只伪装了 Cookie 通道，Express Key 通道仍有指纹盲区——
+  - SDK 主通道 UA / x-goog-api-client 由 google-genai 自动管理（`google-genai-sdk/<ver> gl-python/<ver>`）；
+    SDK 有强制标签机制：注入值不含**当前精确的**两个标签就会被前置/追加（实测出现双重标签）。
+  - **4 处裸 httpx 出站点**发 `python-httpx/<ver>` UA（最显眼的脚本指纹）：Gemini 原生透传
+    （更糟：UA 硬编码 `google-genai-sdk/vertex2openai-passthrough` 自曝代理身份）、Key 探测、
+    模型配置拉取、代理连通性测试。
+  - Key 探测把 API Key 放 URL query（`?key=…`），官方 SDK 的真实形态是 `x-goog-api-key` 头。
+- **新模块 `app/express_fingerprint.py`**：运行时读取 google-genai 与 Python 真实版本号构造
+  精确标签，让 SDK 的 `append_library_version_headers` 三个分支全部落空、原样放行注入值。
+  档案（控制台「通道与凭证」页热改，默认 `sdk` = 零改动）：
+  - `sdk`：官方 Python SDK 形态（SDK 自动管理，行为与历史版本一致）；
+  - `node`：官方 Node.js SDK 形态（`gl-node/22.14.0`，JS 生态调用量最大；裸出站点为纯 node 形态，
+    SDK 主通道会被 SDK 追加 gl-python——已知限制，标签仍各出现一次）；
+  - `gcloud`：gcloud CLI 运维形态（追加 `gcloud/<ver> command/gcloud.ai-platform gccl/<ver>`）；
+  - `custom`：自定义串，占位符 `{sdk}` `{python}` `{node}` 自动展开，缺标签自动补齐（防双重标签）。
+- **接入点全覆盖**：`http_options.get_http_options()`（SDK 主通道注入）、`gemini_native._passthrough_once`
+  （删除自曝 UA）、`express_key_probe.probe_project_id`（Key 移到 header + UA 注入）、
+  `model_loader.fetch_and_parse_models_config`、`main.test_proxy`（代理测试请求头）。
+- **控制台**：「通道与凭证」页新增「Express 通道请求头指纹」卡片（下拉 + 自定义框 + 状态徽标）；
+  `/api/settings` 前置白名单校验（非法档案 400）；启动横幅打印当前指纹形态。
+- 回归测试：`scripts/regression_test4.py` 21/21（四档案 UA 构造、SDK 放行无双重标签 E2E、透传/探测/
+  代理测试抓包验证、Key 走 header、设置校验、sdk 档案零改动回归）；旧 test2 21/21、test3 33/33 不破。
+
 ## 第六轮：Gemini 原生格式透传 + Cookie 通道指纹伪装
 
 - **Gemini 原生 REST 透传**（`app/routes/gemini_native.py` 新增）：

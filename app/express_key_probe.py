@@ -23,6 +23,7 @@ import httpx
 
 import config as app_config
 from runtime_state import app_state, get_effective_proxy_url
+from express_fingerprint import build_direct_headers
 
 # 调模型的正确 URL（Express 全局端点格式），{model} 处填一个不存在的模型名来探测
 GENERATE_CONTENT_URL = (
@@ -64,7 +65,12 @@ async def probe_project_id(key: str) -> Tuple[Optional[str], str]:
     body = {"contents": [{"role": "user", "parts": [{"text": "ping"}]}]}
     try:
         async with httpx.AsyncClient(**_client_args()) as client:
-            resp = await client.post(url, params={"key": key}, json=body)
+            # key 改用 x-goog-api-key 头（官方 genai SDK 的真实形态；
+            # query 里的 key 虽然也能用，但 SDK 从不这么发，形态不一致就是指纹）。
+            # UA / x-goog-api-client 跟随控制台指纹档案，消除 python-httpx 特征。
+            resp = await client.post(
+                url, json=body,
+                headers={**build_direct_headers(), "x-goog-api-key": key})
     except Exception as e:
         return None, f"探测请求失败：{type(e).__name__} - {e}"
 

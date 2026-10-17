@@ -153,7 +153,32 @@ TLS 指纹（JA3/JA4）与真浏览器完全不同，且请求头里连 User-Age
 
 控制台「通道与凭证」页新增**「Cookie 通道指纹伪装」**卡片，可热切换档案
 （默认 chrome；选 off 完全回退旧版 httpx 行为），保存即生效、无需重启。
-Express 通道不需要伪装：官方 API Key + 官方 SDK 是"合法身份"的调用，伪装成浏览器反而可疑。
+Express 通道不需要浏览器伪装（官方 API 端点收浏览器头反而可疑），但它的
+**请求头指纹**可以接管，见下一节。
+
+## Express 通道请求头指纹（User-Agent / x-goog-api-client）
+
+Express API Key 通道走官方 google-genai SDK，TLS 栈无法更换（SDK 强依赖 httpx），
+但风控日志里每条请求的客户端标识来自 `User-Agent` 与 `x-goog-api-client` 两个头——
+这两个头可以完整接管。此外修复了若干裸 httpx 出站点（Gemini 原生透传 / Key 探测 /
+模型配置拉取 / 代理连通测试）原本暴露 `python-httpx/<ver>`（透传通道甚至自曝
+`vertex2openai-passthrough`）的问题。
+
+控制台「通道与凭证」页**「Express 通道请求头指纹」**卡片可热切换档案：
+
+| 档案 | 形态 | 适用场景 |
+|---|---|---|
+| `sdk`（默认） | `google-genai-sdk/<ver> gl-python/<ver>`（SDK 自动管理，零改动） | 无特殊需求 |
+| `node` | `google-genai-sdk/<ver> gl-node/22.14.0`（官方 Node.js SDK 形态） | JS 生态调用量最大、风控难一刀切；`VERTEX_BASE_URL` 指向的中转站封 python UA 时 |
+| `gcloud` | 追加 `gcloud/<ver> command/gcloud.ai-platform gccl/<ver>`（gcloud CLI 运维流量形态） | 伪装成 GCP 官方运维调用 |
+| `custom` | 自定义串，占位符 `{sdk}` `{python}` `{node}` 自动展开为当前精确标签 | 自由定制 |
+
+实现细节（为什么不会出现双重标签）：google-genai SDK 会强制给注入的
+`user-agent` / `x-goog-api-client` 追加自己的 `google-genai-sdk/<ver>` 与
+`gl-python/<ver>` 标签，除非注入值已包含**当前精确的**这两个标签。本服务
+运行时读取 SDK 与 Python 真实版本号构造精确标签，让 SDK 原样放行（已用
+mock 上游抓包验证）。Key 探测同步把 API Key 从 URL query 挪到
+`x-goog-api-key` 头（官方 SDK 的真实形态）。
 
 ## 环境变量
 

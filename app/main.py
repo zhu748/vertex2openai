@@ -86,6 +86,14 @@ async def lifespan(app: FastAPI):
             print("🎭 [指纹伪装] Cookie 通道指纹伪装已关闭（httpx 原始行为，可在控制台「通道与凭证」页开启）。")
     except Exception as _e:
         print(f"⚠️ [指纹伪装] 状态读取失败：{_e}")
+
+    # Express 通道请求头指纹状态（SDK 通道 + 全部裸 httpx 出站点）
+    try:
+        from express_fingerprint import describe_current_profile
+        print(f"🪪 [请求头指纹] Express API Key 通道：{describe_current_profile()}"
+              "（控制台「通道与凭证」页可热改；同时作用于 Gemini 原生透传 / Key 探测 / 模型配置 / 代理测试）。")
+    except Exception as _e:
+        print(f"⚠️ [请求头指纹] 状态读取失败：{_e}")
     print("🔁 [Gemini 透传] 原生格式端点已开启：POST /v1beta/models/{model}:generateContent"
           " / :streamGenerateContent / :countTokens（鉴权与 OpenAI 端点一致，三种原生 Key 写法均支持）。")
 
@@ -493,9 +501,36 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </select>
       </div>
     </div>
+    <!-- Express API Key 通道请求头指纹（热改） -->
+    <div class="card p-5 mb-4">
+      <div class="flex items-center justify-between flex-wrap gap-2 mb-3">
+        <div>
+          <div class="text-sm font-semibold">Express 通道请求头指纹<span class="helpq" onclick="hlp(this,'h_fp2')">?</span></div>
+          <div class="text-xs text-neutral-500 mt-0.5">接管官方 SDK 通道与全部出站请求的 User-Agent / x-goog-api-client，消除脚本特征。仅请求头（SDK 通道 TLS 栈无法更换）</div>
+        </div>
+        <div class="flex items-center gap-2">
+          <span id="fp2-status" class="pill" style="text-transform:none">—</span>
+          <button class="btn px-4 py-1.5 text-sm" onclick="saveExpressUa()">保存指纹设置</button>
+        </div>
+      </div>
+      <div id="h_fp2" class="helpbox">
+        <b>管什么</b>：Express API Key（官方 SDK）通道发出的 <code>User-Agent</code> 与 <code>x-goog-api-client</code> 两个头——Google 后端日志里每条请求的客户端标识就靠它们；同时修复 Gemini 原生透传 / Key 探测 / 代理测试这些裸 httpx 出站点原本暴露的 <code>python-httpx</code>（甚至自曝代理名）的 UA。<br>
+        <b>为什么不伪装 TLS</b>：SDK 强依赖 httpx，TLS 栈换不了；但官方 API 端点本就接受各种语言的官方客户端，请求头才是风控看的重点。Cookie 通道的 TLS 伪装在上一张卡片。<br>
+        <b>档案说明</b>：<b>官方 Python SDK</b>＝默认零改动；<b>Node.js SDK</b>＝JS 生态形态（调用量最大、风控难一刀切；SDK 主通道会自动追加 gl-python 标签，纯 node 形态仅对 Gemini 透传等裸出站点完全生效）；<b>gcloud CLI</b>＝GCP 运维流量形态；<b>自定义</b>＝自由填写，占位符 <code>{sdk}</code> <code>{python}</code> <code>{node}</code> 自动展开为当前精确标签（缺标签会被自动补齐，避免 SDK 追加出双重标签）。<br>
+        <b>热生效</b>：保存即写入 <code>web_state.json</code>，下一个请求立刻生效。<br>
+        <b>VERTEX_BASE_URL 指向第三方中转时</b>：中转站（尤其 Cloudflare）常按 UA 放行，选非 sdk 档案可绕开对 python UA 的封锁。
+      </div>
+      <div class="flex flex-wrap gap-2 items-center">
+        <select id="express-ua-profile" class="inp" style="max-width:280px" onchange="updateExpressCustomVis()">
+          <option value="sdk">官方 Python SDK（默认）</option>
+          <option value="node">官方 Node.js SDK（gl-node/22）</option>
+          <option value="gcloud">gcloud CLI（GCP 运维形态）</option>
+          <option value="custom">自定义…</option>
+        </select>
+        <input id="express-ua-custom" class="inp flex-1" style="min-width:260px" placeholder='自定义 UA，占位符 {sdk} {python} {node} 自动展开，例：{sdk} {python} mycorp-gateway/1.0'>
+      </div>
+    </div>
   </section>
-
-  <!-- Params -->
   <section id="view-params" class="hidden">
     <div class="card p-5 mb-4">
       <div class="flex items-center justify-between flex-wrap gap-3">
@@ -1006,6 +1041,34 @@ async function saveFingerprint(){
   }catch(e){ toast('❌ 网络请求失败'); }
 }
 
+/* ---------- Express 通道请求头指纹 ---------- */
+const FP2_LABELS = {sdk:'官方 Python SDK',node:'Node.js SDK',gcloud:'gcloud CLI',custom:'自定义'};
+function updateExpressPill(v,custom){
+  const p=$('fp2-status'); if(!p) return;
+  const isDefault = !v || v==='sdk' || (v==='custom' && !(custom||'').trim());
+  p.textContent = isDefault ? '官方默认（SDK 自动）' : ('已接管：'+(FP2_LABELS[v]||v)+(v==='custom'?' → '+custom:''));
+  p.style.background = isDefault ? '#f5f5f5' : '#ecfdf5';
+  p.style.color = isDefault ? '#737373' : '#047857';
+}
+function updateExpressCustomVis(){
+  const sel=$('express-ua-profile'), inp=$('express-ua-custom');
+  if(sel && inp) inp.style.display = sel.value==='custom' ? '' : 'none';
+}
+async function saveExpressUa(){
+  const v=$('express-ua-profile').value;
+  const c=$('express-ua-custom').value.trim();
+  try{
+    const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({express_ua_profile:v,express_ua_custom:c})});
+    if(r.ok){ updateExpressPill(v,c); updateExpressCustomVis();
+      toast(v==='sdk'||(v==='custom'&&!c)?'✅ 已恢复官方 SDK 原生形态（下一个请求生效）':'✅ 请求头指纹已保存并热生效：'+(FP2_LABELS[v]||v)); }
+    else{
+      let msg='保存失败';
+      try{ const d=await r.json(); if(d && d.error) msg=d.error; }catch(_){}
+      toast('❌ '+msg);
+    }
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+
 /* ---------- Params ---------- */
 function setV(id,v){ const el=$(id); if(!el) return; if(el.type==='checkbox') el.checked=!!v; else el.value=(v===null||v===undefined)?'':v; }
 async function loadParams(){
@@ -1021,6 +1084,11 @@ async function loadParams(){
     // Cookie 通道指纹伪装：回填下拉框并刷新徽标
     setV('cookie-impersonate', s.cookie_impersonate || 'chrome');
     updateFpPill(s.cookie_impersonate || 'chrome');
+    // Express 通道请求头指纹：回填下拉/自定义框并刷新徽标
+    setV('express-ua-profile', s.express_ua_profile || 'sdk');
+    setV('express-ua-custom', s.express_ua_custom || '');
+    updateExpressPill(s.express_ua_profile || 'sdk', s.express_ua_custom || '');
+    updateExpressCustomVis();
     // 向后兼容：旧版布尔开关映射到新的 native_thinking_mode 下拉
     if((!s.native_thinking_mode || s.native_thinking_mode==='request')){
       if(s.hide_thoughts) setV('native_thinking_mode','off');
@@ -1352,7 +1420,10 @@ async def test_proxy(body: ProxyTestBody, _auth: bool = Depends(require_auth)):
         if target:
             client_kwargs["proxy"] = target
         async with _httpx.AsyncClient(**client_kwargs) as client:
-            resp = await client.get(PROXY_TEST_TARGET)
+            # 指纹头跟随控制台 express_ua_profile：发往 Google 的探测请求
+            # 也不该带 python-httpx UA（风控日志里最显眼的脚本特征）。
+            from express_fingerprint import build_direct_headers
+            resp = await client.get(PROXY_TEST_TARGET, headers=build_direct_headers())
         latency_ms = int((time.time() - started) * 1000)
         # 任何 HTTP 状态码（包括 404/403）都证明「TCP+TLS+HTTP」整条链路通，
         # 即代理本身可用；只有连接异常（超时/拒绝/DNS 失败）才算连通失败。
@@ -1471,6 +1542,21 @@ async def update_settings_api(request: Request, _auth: bool = Depends(require_au
                 "error": "代理地址格式不合法：" + err,
                 "field": "proxy_url",
             })
+    # Express 通道请求头指纹：档案白名单 + 自定义串类型（畸形值会让所有
+    # Google 出站请求头形态异常，必须前置拦截）
+    if "express_ua_profile" in patch:
+        from express_fingerprint import EXPRESS_UA_PROFILES
+        v = patch["express_ua_profile"]
+        if v not in EXPRESS_UA_PROFILES:
+            return JSONResponse(status_code=400, content={
+                "error": f"express_ua_profile 必须是 {'/'.join(EXPRESS_UA_PROFILES)} 之一，收到的是「{v}」",
+                "field": "express_ua_profile",
+            })
+    if "express_ua_custom" in patch and not isinstance(patch["express_ua_custom"], str):
+        return JSONResponse(status_code=400, content={
+            "error": "express_ua_custom 必须是字符串。",
+            "field": "express_ua_custom",
+        })
     updated = app_state.update_settings(patch)
     return JSONResponse(content=updated)
 

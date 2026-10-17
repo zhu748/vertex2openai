@@ -6,6 +6,7 @@ from typing import List, Dict, Optional
 
 import config as app_config
 from runtime_state import get_effective_proxy_url
+from express_fingerprint import build_direct_headers
 
 _model_cache: Optional[Dict[str, List[str]]] = None
 _cache_lock = asyncio.Lock()
@@ -70,10 +71,13 @@ async def fetch_and_parse_models_config() -> Optional[Dict[str, List[str]]]:
         client_args["verify"] = app_config.SSL_CERT_FILE
 
     async with httpx.AsyncClient(**client_args) as client:
+        # 指纹头跟随控制台 express_ua_profile：GitHub CDN 虽不风控 UA，
+        # 但统一出站形态（也顺带避开个别镜像站封 python-httpx）。
+        fp_headers = build_direct_headers()
         for index, url in enumerate(urls_to_try, start=1):
             print(f"🌐 [模型配置] 正在获取远程模型配置（第 {index} 个地址）：{url}")
             try:
-                response = await client.get(url)
+                response = await client.get(url, headers=fp_headers)
                 response.raise_for_status()
                 normalized = _normalize_models_config(response.json())
                 if normalized is not None:
