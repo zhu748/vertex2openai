@@ -24,8 +24,9 @@ from typing import Optional, Tuple
 import httpx
 
 import config as app_config
-from runtime_state import app_state, get_effective_proxy_url
+from runtime_state import app_state, get_effective_proxy_uri_for_key
 from express_fingerprint import build_direct_headers
+from proxy_resolver import resolve_proxy_uri
 
 # 调模型的正确 URL（Express 全局端点格式），{model} 处填一个不存在的模型名来探测
 GENERATE_CONTENT_URL = (
@@ -35,9 +36,15 @@ PROBE_FAKE_MODEL = "vertex2openai-probe-nonexistent-model"
 PROBE_TIMEOUT_SECONDS = 15.0
 
 
-def _client_args() -> dict:
+def _client_args(key_proxy_raw: str = "") -> dict:
+    """探测请求的 httpx 参数：代理用**该 Key 自己的**出口（Key 级优先，全局兑底）。
+
+    多账号场景下不同 Key 可能挂不同代理，探测请求理应走该 Key 的
+    实际出口——否则可能出现「代理 A 能通但探测走了代理 B 失败」的
+    误判。vless 等分享链接在此转成本地 socks5。
+    """
     args = {"timeout": PROBE_TIMEOUT_SECONDS}
-    proxy_url = get_effective_proxy_url()
+    proxy_url = resolve_proxy_uri(key_proxy_raw or "")
     if proxy_url:
         args["proxy"] = proxy_url
     if app_config.SSL_CERT_FILE:
@@ -60,6 +67,8 @@ async def probe_project_id(key: str) -> Tuple[Optional[str], str]:
     错误信息里带 `projects/{project}/...` 路径，从中提取项目；
     Key 无效时返回 400/401/403。全程不消耗配额。
 
+    代理：走该 Key 自己的出站代理（含全局兑底），与真实调用同路径。
+
     指纹：头集合/线序走 build_direct_headers(key)（与官方 SDK 逐字节
     一致，含 Content-Type 与 x-goog-api-key 的位置）；body 用
     json.dumps 默认分隔符序列化（真实 SDK 的序列化形态，httpx 的
@@ -73,8 +82,12 @@ async def probe_project_id(key: str) -> Tuple[Optional[str], str]:
     url = GENERATE_CONTENT_URL.format(model=PROBE_FAKE_MODEL)
     # 键序对齐 SDK pydantic 字段序：parts → role（抓包对照）
     body = {"contents": [{"parts": [{"text": "ping"}], "role": "user"}]}
+    # 该 Key 的出站代理（Key 级优先 / direct / 全局兑底）
+    records = {r["key"]: r for r in app_state.get_express_keys()}
+    rec = records.get(key)
+    key_proxy_raw = get_effective_proxy_uri_for_key(rec)
     try:
-        async with httpx.AsyncClient(**_client_args()) as client:
+        async with httpx.AsyncClient(**_client_args(key_proxy_raw)) as client:
             resp = await client.post(
                 url, content=json.dumps(body),
                 headers=build_direct_headers(key))

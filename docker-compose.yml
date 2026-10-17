@@ -21,4 +21,14 @@ services:
       # Optional: fake streaming keeps client connections alive while waiting for non-streaming Gemini responses.
       - FAKE_STREAMING=false
       - FAKE_STREAMING_INTERVAL=1.0
+      # Optional: 全局出站代理（仅作初始值，控制台保存后以控制台为准）。
+      # 支持 http:// / https:// / socks5:// / socks5h:// 原生协议，
+      # 也可直接填 vless:// vmess:// trojan:// ss:// socks4:// hysteria2:// tuic://
+      # 分享链接（镜像内已置 sing-box，自动转成本地 socks5）。
+      # 每个 Express Key 还可在控制台「通道与凭证」页单独设代理（Key 级优先）。
+      # - PROXY_URL=vless://uuid@host:port?security=tls&type=ws&path=%2F&host=xxx&sni=xxx#name
+      # sing-box 二进制路径（默认自动探测 /usr/local/bin/sing-box）：
+      # - SINGBOX_BIN=/usr/local/bin/sing-box
+      # sing-box 空闲实例回收阈值（分钟，0 = 不回收，默认 30）：
+      # - SINGBOX_IDLE_MINUTES=30
     restart: unless-stopped

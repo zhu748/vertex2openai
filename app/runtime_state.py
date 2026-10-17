@@ -107,9 +107,11 @@ class AppState:
 
     # ---------- Express API Key（多账号，可热编辑） ----------
     # 记录形态：{"key":..., "project_id":..., "project_source":"auto|manual|", 
-    #            "detected_at": 时间戳, "note":..., "enabled": True}
+    #            "detected_at": 时间戳, "note":..., "enabled": True,
+    #            "proxy": "该 Key 专属出站代理 URI（空=跟随全局，direct=强制直连）"}
     # 一个 Key 对应一个谷歌账号/项目，所以 Project ID 必须**跟着 Key 走**，
     # 不能共用 Cookie 通道那份全局 Project ID（见 express_sdk.resolve_express_model_path）。
+    # proxy 同理：多账号常来自不同网络环境，各自挂各自的出口。
 
     @staticmethod
     def _normalize_express_record(item) -> dict:
@@ -130,6 +132,9 @@ class AppState:
             "detected_at": item.get("detected_at") or 0,
             "note": str(item.get("note", "") or "").strip(),
             "enabled": bool(item.get("enabled", True)),
+            # Key 级出站代理：支持 http/https/socks5/socks4/vless/vmess/trojan/ss/
+            # hysteria2/tuic 等 URI（见 proxy_resolver.py）；空 = 跟随全局，direct = 强制直连。
+            "proxy": str(item.get("proxy", "") or "").strip(),
         }
 
     def get_express_keys(self) -> list:
@@ -359,7 +364,10 @@ app_state = AppState()
 def get_effective_proxy_url() -> str:
     """当前生效的出站代理 URL：控制台保存过（含保存为空=直连）优先，否则用环境变量。
 
-    返回空字符串 = 直连。调用方直接判断 truthy 即可。
+    返回**原始 URI**（可能是 vless:// 等分享链接形态，尚未转换），
+    空字符串 = 直连。调用方直接判断 truthy 即可。
+    需要 httpx/curl_cffi 可消费的 URL 时走 proxy_resolver.resolve_proxy_uri()，
+    或直接用下面的 get_effective_proxy_uri_for_key()。
     注意不能用 `stored or env` 的写法：用户把代理清空保存（存 ""）时
     会被环境变量 PROXY_URL 抢回来，“恢复直连”就永远做不到了。
     """
@@ -373,26 +381,37 @@ def get_effective_proxy_url() -> str:
     return str(app_config.PROXY_URL or "").strip()
 
 
-def mask_proxy_url(url: str) -> str:
-    """代理 URL 脱敏：认证信息（用户名/密码）整体打码，保留协议与 host:port。
+def get_effective_proxy_uri_for_key(key_record=None) -> str:
+    """某次请求实际使用的出站代理原始 URI（Key 级优先，全局兑底）。
 
+    优先级：
+      ① Key 记录里的 proxy 字段（http/socks5/vless/vmess/trojan/ss/… 任一 URI）；
+      ② 填 direct/none/直连 → 强制直连（返回空串，全局代理不生效）；
+      ③ 留空 / 无记录 → 跟随全局 get_effective_proxy_url()。
+    返回的仍是原始 URI（未做 sing-box 转换），消费方再交给
+    proxy_resolver.resolve_proxy_uri() 拿到 httpx 可用的 URL。
+    """
+    key_proxy = ""
+    if isinstance(key_record, dict):
+        key_proxy = str(key_record.get("proxy", "") or "").strip()
+    if key_proxy:
+        from proxy_resolver import DIRECT_TOKENS
+        if key_proxy.lower() in DIRECT_TOKENS:
+            return ""
+        return key_proxy
+    return get_effective_proxy_url()
+
+
+def mask_proxy_url(url: str) -> str:
+    """代理 URI 脱敏（多协议版）：凭据（密码/UUID）整体打码，保留协议与 host:port。
+
+    同时覆盖标准 URL（http/socks5）与分享链接（vless/trojan/ss/…）两种形态；
+    vmess（整体 base64）退化为长度标识，解析失败退化为哈希指纹。
     用于启动日志、/healthz 等对外输出，避免凭据落进日志采集或监控截图。
     """
-    url = str(url or "").strip()
-    if not url:
-        return ""
     try:
-        from urllib.parse import urlsplit, urlunsplit
-        parts = urlsplit(url)
-        host = parts.hostname or ""
-        if not host:
-            return "(已配置，格式无法解析)"
-        port = f":{parts.port}" if parts.port else ""
-        if parts.username or parts.password:
-            masked_netloc = f"***@{host}{port}"
-        else:
-            masked_netloc = f"{host}{port}"
-        return urlunsplit((parts.scheme or "proxy", masked_netloc, "", "", ""))
+        from proxy_resolver import mask_proxy_uri
+        return mask_proxy_uri(url)
     except Exception:
         return "(已配置，格式无法解析)"
 

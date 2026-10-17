@@ -66,9 +66,14 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(self.client.post("/api/settings", json={"express_ua_custom": value}).status_code, 400)
 
     def test_proxy_ports_and_protocol_match_httpx_support(self):
-        for url in ("http://localhost:abc", "http://localhost:70000", "http://localhost:0", "socks4://localhost:1080"):
+        # 非法端口/协议仍被拒；socks4 现在经 sing-box 合法（第十六轮行为变更）
+        for url in ("http://localhost:abc", "http://localhost:70000", "http://localhost:0",
+                    "gopher://localhost:70", "vless://only-uuid"):
             self.assertTrue(main.validate_proxy_url_format(url), url)
-        self.assertEqual(main.validate_proxy_url_format("socks5://user:pass@localhost:1080"), "")
+        for url in ("socks5://user:pass@localhost:1080", "socks4://localhost:1080",
+                    "socks4a://localhost:1080", "vless://uuid@localhost:443?security=tls&type=ws",
+                    "direct", ""):
+            self.assertEqual(main.validate_proxy_url_format(url), "", url)
 
     def test_unicode_login_and_api_key_validation(self):
         with mock.patch.object(auth, "API_KEY", "口令🔑"):
@@ -122,15 +127,23 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
     async def test_current_sdk_httpx_and_cookie_pools_close(self):
         sdk = SimpleNamespace(close=mock.Mock(), aio=SimpleNamespace(aclose=mock.AsyncMock()))
         direct = SimpleNamespace(aclose=mock.AsyncMock())
+        direct2 = SimpleNamespace(aclose=mock.AsyncMock())
         cookie = SimpleNamespace(aclose=mock.AsyncMock())
         sdk_pool = client_pool.SdkClientPool()
-        slot = client_pool.HttpxClientSlot()
+        pool = client_pool.HttpxClientPool()
         cookie_pool = impersonate._UpstreamClientPool()
         with mock.patch.object(client_pool.genai, "Client", return_value=sdk):
             self.assertIs(sdk_pool.get("test-key"), sdk_pool.get("test-key"))
-        self.assertIs(slot.get(lambda: direct), direct)
+        # 直连桶复用："" 与 "direct" 哨兵解析后同为直连，共享同一客户端
+        self.assertIs(pool.get(lambda: direct, ""), direct)
+        self.assertIs(pool.get(lambda: direct, ""), direct)
+        self.assertIs(pool.get(lambda: direct2, "direct"), direct)
+        # 全局 socks5 代理签名独立成桶
+        with mock.patch("config.PROXY_URL", "socks5://1.2.3.4:1080"):
+            self.assertIs(pool.get(lambda: direct2, None), direct2)
+            self.assertIs(pool.get(lambda: direct2, None), direct2)
         cookie_pool.get({}, lambda kwargs: cookie)
-        await asyncio.gather(sdk_pool.aclose(), slot.aclose(), cookie_pool.aclose())
+        await asyncio.gather(sdk_pool.aclose(), pool.aclose(), cookie_pool.aclose())
         self.assertEqual(sdk_pool.size(), 0)
         sdk.close.assert_called_once()
         sdk.aio.aclose.assert_awaited_once()

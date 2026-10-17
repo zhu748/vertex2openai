@@ -10,6 +10,13 @@ class AppSettings(BaseSettings):
     MODELS_CONFIG_URL: str = ""
     ROUNDROBIN: bool = False
     SAFETY_SCORE: bool = False
+    # 出站代理（全局默认）：支持 http:// https:// socks5:// socks5h:// 原生协议，
+    # 以及 vless:// vmess:// trojan:// ss:// socks4:// hysteria2:// tuic:// 等分享链接
+    # （经内置 sing-box 转成本地 socks5，见 app/proxy_resolver.py）。
+    # 环境变量是全局初始值，控制台保存后以控制台为准；每个 Express Key 还可
+    # 在控制台单独设置代理（Key 级优先），Key 填 direct 则强制直连。
+    # sing-box 可执行文件可用环境变量 SINGBOX_BIN 指定；空闲实例回收间隔
+    # 用 SINGBOX_IDLE_MINUTES（默认 30，0 = 不回收）。
     PROXY_URL: Optional[str] = None
     SSL_CERT_FILE: Optional[str] = None
     # 标准（Express）模式的上游 base_url 覆盖。留空 = 用 SDK 默认（全局端点）。
@@ -156,8 +163,11 @@ DEFAULT_SETTINGS = {
     "express_location": "global",
     # ===== 出站代理（网络出口，控制台「通道与凭证」页可热改）=====
     # 初始值取环境变量 PROXY_URL；此后以控制台保存的值为准（持久化到 web_state.json）。
-    # 支持标准 URL 格式：http://user:pass@host:port / socks5://host:port 等（httpx[socks] 已内置）。
-    # 清空 = 直连上游。两条通道（Express / Cookie）共用同一个出站代理。
+    # 支持：标准 URL（http://user:pass@host:port / socks5://host:port 等），
+    # 以及 vless:// vmess:// trojan:// ss:// socks4:// hysteria2:// tuic:// 分享链接
+    # （经 sing-box 转本地 socks5，详见 app/proxy_resolver.py）。
+    # 清空 = 直连上游。两条通道（Express / Cookie）共用这一个**全局**代理；
+    # 每个 Express Key 可另设 Key 级代理（优先于全局，填 direct = 该 Key 直连）。
     "proxy_url": PROXY_URL or "",
     # ===== Cookie 通道 TLS/浏览器指纹伪装（curl_cffi，热开关）=====
     # off = 关闭（回退 httpx 原始行为）；chrome（默认）/ edge / safari / firefox / safari_ios

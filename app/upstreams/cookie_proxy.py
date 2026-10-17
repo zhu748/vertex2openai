@@ -24,6 +24,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from models import OpenAIRequest, normalize_content_part
 from upstreams.base import BaseUpstream
 from runtime_state import app_state, get_effective_proxy_url
+from proxy_resolver import ProxyResolveError, resolve_proxy_uri
 import config as app_config
 import model_capabilities as mc
 from message_processing import (
@@ -1406,13 +1407,27 @@ class CookieProxyUpstream(BaseUpstream):
 
         # ===== 4. HTTP 客户端配置 =====
         # 代理走统一读取口：控制台热改后立即生效（与 Express 通道同步）。
+        # Cookie 通道没有 Key 概念，永远用全局代理；vless/vmess/trojan/ss/
+        # socks4 等分享链接在这里 resolve 成本地 socks5（sing-box 转换，
+        # curl_cffi / httpx 均可直接消费）。
         client_kwargs = {
             "timeout": httpx.Timeout(connect=30.0, read=180.0, write=30.0, pool=10.0),
             "follow_redirects": True,
         }
-        _proxy_url = get_effective_proxy_url()
-        if _proxy_url:
-            client_kwargs["proxy"] = _proxy_url
+        _proxy_raw = get_effective_proxy_url()
+        if _proxy_raw:
+            try:
+                _proxy_url = resolve_proxy_uri(_proxy_raw)
+            except ProxyResolveError as e:
+                # 不静默直连（防真实 IP 泄露）：返回明确的 5xx。
+                print(f"❌ [Studio] 全局出站代理不可用：{e}")
+                return JSONResponse(
+                    status_code=502,
+                    content={"error": {"message": f"出站代理不可用：{e}",
+                                      "type": "proxy_error", "code": 502}},
+                )
+            if _proxy_url:
+                client_kwargs["proxy"] = _proxy_url
 
         # 重试配置（控制台可调）；语义与 Express 通道统一：总尝试次数 = retry_max + 1
         retry_max, backoff_sec = get_retry_settings()

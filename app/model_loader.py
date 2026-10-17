@@ -68,7 +68,14 @@ async def fetch_and_parse_models_config() -> Optional[Dict[str, List[str]]]:
             urls_to_try.append(fallback_url)
 
     client_args = {"timeout": 20.0}
-    proxy_url = get_effective_proxy_url()
+    # vless/vmess 等分享链接 → 本地 socks5（sing-box 转换）。模型列表刷新是
+    # 附属功能：转换失败按无代理直连重试（主调用通道各自对代理失败明确报错），
+    # 不让它拖垮本地兜底列表的加载。
+    try:
+        from proxy_resolver import resolve_proxy_uri
+        proxy_url = resolve_proxy_uri(get_effective_proxy_url())
+    except Exception:
+        proxy_url = ""
     if proxy_url:
         client_args["proxy"] = proxy_url
     if app_config.SSL_CERT_FILE:

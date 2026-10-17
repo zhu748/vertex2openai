@@ -2,6 +2,40 @@
 
 基于原版 `vertex2openai-main`（2026-09-01），只做加法，未改原有架构。
 
+## 第十六轮：出站代理多协议支持（sing-box）与 Key 级代理
+
+- **多协议代理**：出站代理除原有 `http/https/socks5/socks5h` 外，新增直接粘贴
+  分享链接的能力——`vless://`（含 REALITY / ws / grpc / h2 传输、utls 指纹）、
+  `vmess://`（base64 分享格式，ws/grpc/h2 传输）、`trojan://`、`ss://`（SIP002
+  base64 userinfo、明文 userinfo 与旧式整体 base64 三种形态）、`socks4://` /
+  `socks4a://`、`hysteria2://`（含 salamander 混淆）、`tuic://`。实现方式：
+  `app/proxy_resolver.py` 把分享 URI 解析成 sing-box outbound，首个请求时在本地
+  拉起 sing-box 子进程（127.0.0.1 动态端口 socks5 入站），httpx / curl_cffi 统一
+  连本地 socks5；原生协议不经过 sing-box，零额外开销。
+- **Key 级代理**：每个 Express Key 可在控制台「通道与凭证」页设置**专属代理**
+  （优先于全局；留空 = 跟随全局；填 `direct` / `none` / `直连` = 该 Key 强制直连）。
+  生效范围：Express SDK 通道、Gemini 原生透传（重试换 Key 时同步切换出口）、
+  Key 的 Project ID 探测。SDK 客户端池与透传客户端池的签名都纳入解析后代理，
+  热改代理 / 换 Key 换出口后自动重建连接池，旧客户端照旧延迟回收。
+- **通道覆盖**：全局代理对 Cookie 通道（batchGraphql，含 curl_cffi 伪装形态）、
+  图片抓取、模型列表刷新同样生效；vless 等分享链接在所有出站点统一转换。
+- **安全策略**：配置了分享链接协议但环境缺 sing-box 时，保存有静态校验提示、
+  测试按钮返回转换失败原因、真实请求返回明确的 5xx 与安装指引——**绝不静默
+  直连**，防止真实出口 IP 意外泄露。
+- **进程生命周期**：同一 URI 全进程只起一个 sing-box 实例且端口稳定复用（池
+  签名不抖动）；崩溃实例下次取用时自动重启；空闲超 `SINGBOX_IDLE_MINUTES`
+  （默认 30 分钟，0 = 不回收）自动回收；FastAPI 优雅停机与 atexit 双保险终止
+  全部子进程；配置与运行日志落在 `STATE_DIR/singbox/`。
+- **部署**：Docker 镜像内置 sing-box v1.14.3（amd64/arm64/armv7，构建时
+  `--build-arg SINGBOX_VERSION=` 可覆盖，`SINGBOX_MIRROR` 可走镜像前缀）；
+  非 Docker 部署自动探测 `$SINGBOX_BIN` → 常见路径 → PATH。
+- **控制台**：代理帮助文案更新（协议清单 + 直粘分享链接说明）；Key 卡片新增
+  「专属代理」输入框与协议 pill；「测试连通性」按钮对分享链接先做转换再实测
+  Google 端点延迟；保存 Key 时对代理字段做前置格式校验。
+- **脱敏**：`mask_proxy_url` 升级为多协议版——vless/trojan/ss 的 userinfo
+  （UUID/密码）打码，vmess 退化为长度标识，解析失败退化为哈希指纹，
+  日志与 `/healthz` 不泄露任何凭据。
+
 ## 第十五轮：模型请求、Key 轮换与重试边界修复
 
 - **SDK 轮换**：非流式、真流式、假流式的拥堵重试均重新选 Key，有备选时避开上一把；

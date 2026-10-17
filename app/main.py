@@ -26,6 +26,7 @@ from cookie_auth import validate_cookie
 import express_key_probe
 from resumable import resumable_store
 from client_pool import close_all_clients
+from proxy_resolver import singbox_available, singbox_version, singbox_manager
 from model_loader import get_models_config, schedule_models_refresh, close_models_refresh
 
 express_key_manager = ExpressKeyManager()
@@ -92,6 +93,21 @@ async def lifespan(app: FastAPI):
     else:
         print("🌐 [网络] 未配置出站代理，直连 Google 上游（控制台「通道与凭证」页可配置，或设环境变量 PROXY_URL）。")
 
+    # 多协议代理支持（socks4/vless/vmess/trojan/ss/hysteria2/tuic → 本地 sing-box 转换）：
+    # 提前报告 sing-box 可用性，用户填 vless:// 链接而环境缺 sing-box 时
+    # 能在启动日志里直接看到原因（请求时也会明确报错，绝不静默直连）。
+    try:
+        if singbox_available():
+            print(f"🛰️ [多协议代理] sing-box 就绪（{singbox_version() or '版本未知'}）："
+                  "vless/vmess/trojan/ss/socks4/hysteria2/tuic 分享链接可直接作为代理使用，"
+                  "首个请求时自动转换成本地 socks5。")
+        else:
+            print("⚠️ [多协议代理] 未找到 sing-box：vless/vmess/trojan/ss/socks4/hysteria2/tuic "
+                  "等协议不可用（http/socks5 不受影响）。Docker 镜像已内置；本地部署请安装 "
+                  "sing-box 或设 SINGBOX_BIN 指向可执行文件。")
+    except Exception as _e:
+        print(f"⚠️ [多协议代理] sing-box 状态探测失败：{_e}")
+
     # Cookie 通道指纹伪装状态（curl_cffi）
     try:
         from impersonate import get_impersonate_profile
@@ -131,6 +147,12 @@ async def lifespan(app: FastAPI):
         await resumable_store.aclose()
         await close_models_refresh()
         await close_all_clients()
+        # 终止全部 sing-box 子进程（vless/vmess 等协议转换进程；
+        # atexit 里还有一道兑底，这里保证 FastAPI 优雅停机时先收掉）。
+        try:
+            singbox_manager.shutdown_all()
+        except Exception:
+            pass
 
 app = FastAPI(title="agentplatform2api", lifespan=lifespan)
 
@@ -521,14 +543,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
       </div>
       <div id="h_proxy" class="helpbox">
-        <b>格式</b>：<code>协议://用户名:密码@IP:端口</code>。支持 <code>http://</code> / <code>https://</code> / <code>socks5://</code>（已内置 socks 支持，无需额外依赖）。<br>
+        <b>格式</b>：<code>协议://用户名:密码@IP:端口</code> 或直接粘贴分享链接。支持：<br>
+        · <b>原生协议</b>：<code>http://</code> / <code>https://</code> / <code>socks5://</code> / <code>socks5h://</code><br>
+        · <b>多协议（内置 sing-box 转换）</b>：<code>vless://</code> / <code>vmess://</code> / <code>trojan://</code> / <code>ss://</code> / <code>socks4://</code> / <code>hysteria2://</code> / <code>tuic://</code> —— 直接把机场/自建的分享链接粘进来即可，首个请求时自动转成本地 socks5<br>
         代理商给的 <code>socks5://IP:端口:用户名:密码</code> 是展示格式，要转成标准格式：<b>用户名密码放到 @ 前面</b>，例：<code>socks5://user:pass@1.2.3.4:1080</code>。<br>
+        <b>Key 级代理</b>：每个 Express Key 可在下方列表里单独设置出口（优先于这里的全局代理；填 <code>direct</code> = 该 Key 强制直连）。<br>
         <b>热生效</b>：保存即写入 <code>web_state.json</code> 并立即作用于全部出站请求（模型调用 / Cookie 通道 / Key 探测 / 模型列表刷新）；环境变量 <code>PROXY_URL</code> 只作为首次启动的初始值，控制台保存后以控制台为准。<br>
         <b>清空 = 直连</b>：删光输入框内容并保存，即恢复直连。<br>
-        <b>先测后存</b>：「测试连通性」按输入框<b>当前</b>的值测试（还没保存也能测），通过代理请求一次 Google 端点并汇报延迟；任何 HTTP 状态码都算链路可达。<br>
+        <b>先测后存</b>：「测试连通性」按输入框<b>当前</b>的值测试（还没保存也能测，vless 等协议同样支持），通过代理请求一次 Google 端点并汇报延迟；任何 HTTP 状态码都算链路可达。<br>
         <b>云部署提示</b>：Render / HuggingFace 等海外平台本就能直连 Google，通常无需配置；代理不稳定反而会拖垮服务，配置前请先用测试按钮确认代理质量。
       </div>
-      <input id="proxy-input" class="inp log" placeholder="留空 = 直连。示例：socks5://user:pass@1.2.3.4:1080 或 http://user:pass@1.2.3.4:8080">
+      <input id="proxy-input" class="inp log" placeholder="留空 = 直连。示例：socks5://user:pass@1.2.3.4:1080 / http://1.2.3.4:8080，或直接粘贴 vless:// vmess:// trojan:// ss:// 分享链接">
       <div id="proxy-test-result" class="text-xs mt-2 hidden leading-relaxed"></div>
     </div>
 
@@ -971,6 +996,14 @@ function keySrcPill(rec){
   if(rec.project_source==='manual') return '<span class="pill" style="text-transform:none">来源 manual</span>';
   return '<span class="pill" style="text-transform:none;color:#b45309">未探测</span>';
 }
+function keyProxyPill(rec){
+  const v=(rec.proxy||'').trim().toLowerCase();
+  if(!v) return '';
+  if(v==='direct'||v==='none'||v==='直连') return '<span class="pill" style="text-transform:none;background:#f5f5f5;color:#737373">强制直连</span>';
+  const proto=(rec.proxy||'').split(':')[0]||'proxy';
+  const native=['http','https','socks5','socks5h'].includes(v)?'#047857':'#1d4ed8';
+  return `<span class="pill" style="text-transform:none;color:${native}">专属代理 ${esc(proto+'://')}</span>`;
+}
 function renderKeys(){
   const box=$('keys-list');
   box.innerHTML = KEYS.map((rec,i)=>`
@@ -988,6 +1021,11 @@ function renderKeys(){
         ${keySrcPill(rec)}
         <span class="text-xs text-neutral-400">${rec.detected_at?('探测于 '+new Date(rec.detected_at*1000).toLocaleString()):''}</span>
       </div>
+      <div class="flex items-center gap-2 flex-wrap mt-2">
+        <span class="lbl whitespace-nowrap">专属代理</span>
+        <input class="inp log k-proxy" style="flex:1;min-width:220px" placeholder="留空 = 跟随全局出站代理；direct = 强制直连；支持 socks5/http/vless/vmess/trojan/ss/socks4 等链接" value="${(rec.proxy||'').replace(/"/g,'&quot;')}">
+        ${keyProxyPill(rec)}
+      </div>
       <div class="text-xs mt-1 ${(rec._msg_ok===false)?'text-rose-600':'text-neutral-500'}">${esc(rec._msg||'')}</div>
     </div>`).join('');
   $('keys-count').textContent = KEYS.length + ' 个';
@@ -1001,11 +1039,13 @@ function collectKeys(){
     KEYS[i].key = row.querySelector('.k-key').value.trim();
     const pid = row.querySelector('.k-project').value.trim();
     if(pid !== (KEYS[i].project_id||'')){ KEYS[i].project_id = pid; KEYS[i].project_source = pid?'manual':''; }
+    const kProxy = row.querySelector('.k-proxy');
+    if(kProxy) KEYS[i].proxy = kProxy.value.trim();
     KEYS[i].enabled = row.querySelector('.k-enabled').checked;
   });
   return KEYS.filter(r=>r.key);
 }
-function addKeyRow(){ collectKeys(); KEYS.push({key:'',project_id:'',project_source:'',enabled:true}); renderKeys(); }
+function addKeyRow(){ collectKeys(); KEYS.push({key:'',project_id:'',project_source:'',proxy:'',enabled:true}); renderKeys(); }
 function removeKeyRow(i){ collectKeys(); KEYS.splice(i,1); renderKeys(); }
 async function loadExpressKeys(){
   try{
@@ -1444,9 +1484,9 @@ class ProxyTestBody(BaseModel):
 
 PROXY_TEST_TARGET = "https://aiplatform.googleapis.com/"
 PROXY_TEST_TIMEOUT_SECONDS = 8.0
-
-# 代理 URL 允许的协议（httpx[socks] 原生支持这些）
-_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
+# 注：允许的协议清单与校验逻辑统一在 proxy_resolver.py 维护
+# （原生 http/https/socks5/socks5h + sing-box 转换协议 vless/vmess/trojan/ss/
+#  socks4/socks4a/hysteria2/tuic + direct 哨兵）。
 
 
 # ============================================================
@@ -1534,34 +1574,24 @@ def _validate_settings_patch(patch: dict, keys_scope=None) -> dict | None:
 
 
 def validate_proxy_url_format(proxy_url: str) -> str:
-    """校验代理 URL 格式，返回错误信息（空串 = 合法）。
+    """校验代理 URI 格式（多协议版），返回错误信息（空串 = 合法）。
 
     防止把畸形值存进设置：一旦存了，所有上游请求会统一失败，
     而 Express SDK 对非法 proxy 的报错往往很晦涩，用户很难定位。
-    空字符串 = 清空直连，合法。
+    空字符串 = 清空直连，合法；direct/none/直连 = 强制直连，合法。
+    协议清单与解析规则统一由 app/proxy_resolver.py 维护：
+    原生（http/https/socks5/socks5h）做 URL 结构校验；
+    sing-box 系（vless/vmess/trojan/ss/socks4/hysteria2/tuic）
+    试解析成 outbound，字段齐即合法（不启动 sing-box、不发包）。
     """
-    value = (proxy_url or "").strip()
-    if not value:
-        return ""
-    try:
-        from urllib.parse import urlsplit
-        parts = urlsplit(value)
-        scheme = (parts.scheme or "").lower()
-        if scheme not in _PROXY_SCHEMES:
-            return f"协议必须是 {'/'.join(sorted(_PROXY_SCHEMES))}，收到的是「{scheme or '（无协议）'}」"
-        if not parts.hostname:
-            return "缺少主机地址，正确格式：协议://用户名:密码@主机:端口"
-        # 访问 port 属性才会校验非法字符及 0–65535 范围。
-        if parts.port is not None and parts.port < 1:
-            return "代理端口必须在 1–65535 范围内。"
-        return ""
-    except Exception:
-        return "无法解析的代理地址，正确格式：协议://用户名:密码@主机:端口"
+    from proxy_resolver import validate_proxy_uri
+    return validate_proxy_uri(proxy_url)
 
 
 @app.post("/api/proxy/test")
 async def test_proxy(body: ProxyTestBody, _auth: bool = Depends(require_auth)):
     import httpx as _httpx
+    from proxy_resolver import resolve_proxy_uri, ProxyResolveError
 
     candidate = (body.proxy_url or "").strip()
     # 先做静态格式校验，畸形值立即返回（不用等 8 秒超时，错误信息也更直白）
@@ -1577,6 +1607,18 @@ async def test_proxy(body: ProxyTestBody, _auth: bool = Depends(require_auth)):
     # 前端为空时测当前已生效的代理；两者都空 = 测直连（验证平台能否直达 Google）。
     target = candidate or effective
     via_proxy = bool(target)
+    # 多协议转换：vless/vmess/trojan/ss/socks4/hysteria2/tuic 在此转成本地
+    # socks5（首个请求时惰性启动 sing-box）。转换失败（sing-box 缺失等）
+    # 给出可操作的安装指引；未发出任何请求、也绝不降级直连。
+    try:
+        resolved_target = resolve_proxy_uri(target)
+    except ProxyResolveError as e:
+        return JSONResponse(content={
+            "ok": False, "via_proxy": via_proxy,
+            "proxy": mask_proxy_url(target), "latency_ms": 0,
+            "error": str(e),
+            "message": "代理协议转换失败（未发出任何请求，未降级直连）：" + str(e),
+        })
 
     started = time.time()
     try:
@@ -1585,8 +1627,8 @@ async def test_proxy(body: ProxyTestBody, _auth: bool = Depends(require_auth)):
                                                    write=PROXY_TEST_TIMEOUT_SECONDS,
                                                    pool=PROXY_TEST_TIMEOUT_SECONDS),
                          "follow_redirects": False}
-        if target:
-            client_kwargs["proxy"] = target
+        if resolved_target:
+            client_kwargs["proxy"] = resolved_target
         async with _httpx.AsyncClient(**client_kwargs) as client:
             # 指纹头跟随控制台 express_ua_profile：发往 Google 的探测请求
             # 也不该带 python-httpx UA（风控日志里最显眼的脚本特征）。
@@ -1824,9 +1866,27 @@ async def save_express_keys(body: ExpressKeysBody, _auth: bool = Depends(require
 
     保存空列表是合法操作：之后即使环境变量 VERTEX_EXPRESS_API_KEY 仍有值，
     启动时也不会再把 Key 复种回来（见 runtime_state.import_env_express_keys_once）。
+    Key 级代理（proxy 字段）在此做静态格式校验：畸形代理一旦存进去，
+    该 Key 的所有请求都会统一失败且报错晦涩，必须前置拦截。
     """
     if not isinstance(body.keys, list):
         return JSONResponse(status_code=400, content={"error": "keys 必须是数组。"})
+    from proxy_resolver import validate_proxy_uri
+    for idx, item in enumerate(body.keys):
+        if not isinstance(item, dict):
+            continue
+        key_proxy = str(item.get("proxy", "") or "").strip()
+        err = validate_proxy_uri(key_proxy)
+        if err:
+            masked = ""
+            try:
+                from express_key_probe import mask_key
+                masked = mask_key(str(item.get("key", "") or ""))
+            except Exception:
+                pass
+            return JSONResponse(status_code=400, content={
+                "error": f"第 {idx + 1} 个 Key（{masked}）的专属代理格式不合法：{err}",
+            })
     saved = app_state.set_express_keys(body.keys)
     express_key_manager.refresh_keys()
     # 新加进来、还没有 Project ID 的 Key 立刻在后台探一次

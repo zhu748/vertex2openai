@@ -48,12 +48,13 @@ from retry_policy import retry_delay as _retry_delay, wait_for_retry as _wait_fo
 from auth import constant_time_equal
 from config import API_KEY
 from logger import stats
-from runtime_state import app_state, get_effective_proxy_url
+from runtime_state import app_state, get_effective_proxy_uri_for_key
 import config as app_config
 from upstreams.express_sdk import resolve_express_model_path
 from model_loader import get_express_models
 from express_fingerprint import build_direct_headers
-from client_pool import passthrough_client_slot
+from client_pool import passthrough_client_pool
+from proxy_resolver import ProxyResolveError, resolve_proxy_uri
 
 router = APIRouter()
 
@@ -265,16 +266,19 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
     last_error_status = 502
     last_error_headers: dict[str, str] = {}
 
-    def _new_client() -> httpx.AsyncClient:
+    def _new_client(proxy_raw: str = "") -> httpx.AsyncClient:
+        """按指定代理（原始 URI）建透传客户端。
+
+        调用前池签名已对同一 URI resolve 过一次（命中缓存），
+        这里的 resolve 必然拿到同一结果，不会二次启动 sing-box。
+        """
         client_kwargs: dict[str, Any] = {"timeout": _UPSTREAM_TIMEOUT, "follow_redirects": False}
-        proxy_url = get_effective_proxy_url()
+        proxy_url = resolve_proxy_uri(proxy_raw)
         if proxy_url:
             client_kwargs["proxy"] = proxy_url
         if app_config.SSL_CERT_FILE:
             client_kwargs["verify"] = app_config.SSL_CERT_FILE
         return httpx.AsyncClient(**client_kwargs)
-
-    client = passthrough_client_slot.get(_new_client)
 
     is_stream = action == "streamGenerateContent"
     retry_max, backoff_seconds = get_retry_settings()
@@ -298,6 +302,22 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
             if express_key != previous_key:
                 pin_fallback_used = False
             previous_key = express_key
+            # Key 级代理：该 Key 自己的出口优先，全局兑底（vless 等分享链接
+            # 在池签名里转本地 socks5）。解析失败（sing-box 缺失/链接非法）
+            # 不静默直连：预算内重选 Key，耗尽后返回明确错误。
+            current_proxy_uri = get_effective_proxy_uri_for_key(record)
+            try:
+                client = passthrough_client_pool.get(
+                    lambda: _new_client(current_proxy_uri), current_proxy_uri)
+            except ProxyResolveError as e:
+                print(f"❌ [Gemini 透传] 出站代理不可用：{e}")
+                if key_attempts >= retry_max:
+                    return _native_error(502, f"出站代理不可用：{e}", "UNAVAILABLE")
+                if not await _wait_for_retry(fastapi_request, backoff_seconds):
+                    return Response(status_code=499)
+                key_attempts += 1
+                record = None
+                continue
 
         if pin_fallback_used:
             # 钉定兜底轮：复用同一把 Key（换的是模型路径，不是 Key）
@@ -419,7 +439,7 @@ async def _relay_stream(upstream: httpx.Response) -> StreamingResponse:
     解析，解压后的分块边界与上游压缩块边界不同也不影响。
     上游响应在转发生成器 finally 里释放（消费完最后一个 chunk 才断开
     上游）。客户端断开时 Starlette 会取消生成器，finally 同样生效。
-    注：httpx 客户端是共享池化的（client_pool.passthrough_client_slot），
+    注：httpx 客户端是共享池化的（client_pool.passthrough_client_pool，
     由池统一管理生命周期，这里不关闭它。
     """
 

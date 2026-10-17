@@ -18,7 +18,8 @@ from message_processing import (create_gemini_prompt, apply_prefill_compat,
                                 apply_console_injection, DEFAULT_IMAGE_PREFILL_NUDGE)
 from client_pool import get_pooled_express_client
 import model_capabilities as mc
-from runtime_state import app_state
+from runtime_state import app_state, get_effective_proxy_uri_for_key
+from proxy_resolver import ProxyResolveError, mask_proxy_uri
 import config as app_config
 from schema_validation import SchemaValidationError, validate_request_schemas
 
@@ -227,11 +228,24 @@ class ExpressSDKUpstream(BaseUpstream):
         # 多账号：location 钉定用**这个 Key 自己的**项目，而不是 Cookie 通道的全局项目
         model_to_call = resolve_express_model_path(base_model_name, _inj_settings,
                                                    key_project_id=key_record.get("project_id", ""))
+        # Key 级出站代理（裁决：Key 自己的 proxy > direct > 全局兑底）。
         # 池化复用（app/client_pool.py）：同一（Key, 代理, 证书, base_url, 指纹档案）
         # 的请求共享底层 httpx 连接池，免掉每请求一次 TCP+TLS 握手（100~300ms）。
         # 控制台热改代理/指纹后签名变化，新请求自动拿新形态客户端；
         # 旧客户端延迟回收，不打断飞行中的流。调用方不得关闭它。
-        client_to_use = get_pooled_express_client(express_api_key)
+        # vless/vmess 等分享链接在池内统一转成本地 socks5；解析失败
+        # （sing-box 缺失/链接非法）在这里拦下，返回明确的 5xx 而非静默直连。
+        key_proxy_uri = get_effective_proxy_uri_for_key(key_record)
+        try:
+            client_to_use = get_pooled_express_client(express_api_key, key_proxy_uri)
+        except ProxyResolveError as e:
+            print(f"❌ [出站代理] {e}")
+            return JSONResponse(
+                status_code=502,
+                content=create_openai_error_response(502, f"出站代理不可用：{e}", "proxy_error"),
+            )
+        if key_proxy_uri:
+            print(f"🌐 [出站代理] 该 Key 使用专属出口：{mask_proxy_uri(key_proxy_uri)}")
         _log_resolved_endpoint(client_to_use)
         print(f"🌐 [上游端点] 使用官方 Gemini Express Mode SDK 调用模型 {base_model_name}。")
         if model_to_call != base_model_name:
@@ -318,7 +332,8 @@ class ExpressSDKUpstream(BaseUpstream):
             express_api_key = record["key"]
             model_path = resolve_express_model_path(
                 base_model_name, _inj_settings, key_project_id=record.get("project_id", ""))
-            return (get_pooled_express_client(express_api_key), model_path,
+            retry_proxy_uri = get_effective_proxy_uri_for_key(record)
+            return (get_pooled_express_client(express_api_key, retry_proxy_uri), model_path,
                     base_model_name if model_path != base_model_name else None)
 
         return await execute_gemini_call(
@@ -329,7 +344,7 @@ class ExpressSDKUpstream(BaseUpstream):
             # （同 Key 同签名 → 同实例，零额外开销）。
             fallback_model=(base_model_name if model_to_call != base_model_name else None),
             fallback_client_factory=(
-                lambda: get_pooled_express_client(express_api_key)
+                lambda: get_pooled_express_client(express_api_key, key_proxy_uri)
             ),
             retry_target_factory=retry_target_factory,
         )

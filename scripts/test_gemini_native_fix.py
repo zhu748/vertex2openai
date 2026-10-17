@@ -77,11 +77,11 @@ class StubManager:
 
 
 class StubSlot:
-    """client_pool.passthrough_client_slot 替身：永远返回给定的 mock 客户端。"""
+    """client_pool.passthrough_client_pool 替身：永远返回给定的 mock 客户端。"""
     def __init__(self, client):
         self.client = client
 
-    def get(self, factory):
+    def get(self, factory, proxy_uri=None):
         return self.client
 
 
@@ -140,7 +140,7 @@ def run_passthrough(model, action, query, payload, records, responder, settings)
     req = StubRequest(StubManager(records))
 
     async def _run():
-        with mock.patch.object(gemini_native, "passthrough_client_slot", slot), \
+        with mock.patch.object(gemini_native, "passthrough_client_pool", slot), \
              mock.patch.object(gemini_native.app_state, "get_settings",
                                return_value=dict(settings)):
             resp = await gemini_native._passthrough_request(

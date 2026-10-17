@@ -29,6 +29,7 @@ from google import genai
 
 import config as app_config
 from runtime_state import get_effective_proxy_url
+from proxy_resolver import resolve_proxy_uri
 from express_fingerprint import get_express_ua_profile, get_express_ua_custom
 from http_options import get_http_options
 
@@ -38,15 +39,30 @@ _SDK_POOL_MAX = 6
 _GRACE_CLOSE_SECONDS = 900.0
 
 
-def _sdk_signature() -> tuple:
+def _resolve_proxy_for_signature(key_proxy: Optional[str]) -> str:
+    """把（可能为 Key 级的）代理原始 URI 解析成 httpx 可用的 URL。
+
+    key_proxy=None → 跟随全局；"" → 直连；其余 = 该 URI。
+    vless/vmess 等分享链接在此转成本地 socks5（惰性启动 sing-box，
+    之后纯缓存查找）。同一 URI 在进程生命周期内端口稳定，
+    因此签名不会因重复解析而抖动。
+    解析失败（sing-box 缺失/链接非法）抛 ProxyResolveError，
+    由调用方转成明确的 5xx 响应——绝不静默直连。
+    """
+    raw = get_effective_proxy_url() if key_proxy is None else str(key_proxy or "").strip()
+    return resolve_proxy_uri(raw)
+
+
+def _sdk_signature(key_proxy: Optional[str] = None) -> tuple:
     """影响 genai.Client 出站形态的全部设置（任一变化 = 必须重建）。
 
     与 http_options.get_http_options() 消费的输入一一对应：
-    代理/证书 → client_args；base_url；指纹档案+自定义串 → headers。
+    代理（解析后 URL，含 Key 级代理）/ 证书 → client_args；
+    base_url；指纹档案+自定义串 → headers。
     """
     return (
-        "v1",
-        get_effective_proxy_url(),
+        "v2",
+        _resolve_proxy_for_signature(key_proxy),
         app_config.SSL_CERT_FILE or "",
         app_config.VERTEX_BASE_URL or "",
         get_express_ua_profile(),
@@ -54,13 +70,13 @@ def _sdk_signature() -> tuple:
     )
 
 
-def _direct_signature() -> tuple:
+def _direct_signature(proxy_uri: Optional[str] = None) -> tuple:
     """影响裸 httpx 客户端形态的设置（代理 / 自定义证书）。
 
     Gemini 透传的请求头指纹（express_ua_profile）是**逐请求**注入的
     （build_request headers），不进客户端构造参数，故不在签名内。
     """
-    return ("v1", get_effective_proxy_url(), app_config.SSL_CERT_FILE or "")
+    return ("v2", _resolve_proxy_for_signature(proxy_uri), app_config.SSL_CERT_FILE or "")
 
 
 class _GracefulCloser:
@@ -119,14 +135,19 @@ class SdkClientPool:
         self._maxsize = max(1, int(maxsize))
         self._clients: dict[str, tuple[tuple, Any]] = {}
 
-    def get(self, api_key: str) -> Any:
+    def get(self, api_key: str, key_proxy: Optional[str] = None) -> Any:
         """取（或建）该 Key 的池化 Client。只允许在事件循环内调用。
+
+        key_proxy：本次调用使用的出站代理**原始 URI**（Key 级优先/全局
+        兑底的裁决由调用方完成，见 runtime_state.get_effective_proxy_uri_for_key）。
+        None = 跟随全局；"" = 直连；其余 = 该 URI（vless:// 等分享链接
+        在签名/构造时统一转本地 socks5）。
 
         调用方**不要关闭**返回的 Client——它的生命周期由池管理
         （签名变化 / LRU 淘汰时延迟统一回收）。
         """
         api_key = api_key or ""
-        sig = _sdk_signature()
+        sig = _sdk_signature(key_proxy)
         with self._lock:
             entry = self._clients.get(api_key)
             if entry is not None and entry[0] == sig:
@@ -138,7 +159,8 @@ class SdkClientPool:
         client = genai.Client(
             vertexai=True,
             api_key=api_key,
-            http_options=get_http_options(),
+            http_options=get_http_options(
+                proxy_url=(key_proxy if key_proxy is not None else None)),
         )
 
         stale: list = []
@@ -189,44 +211,61 @@ def _make_sdk_closer(client: Any) -> Callable[[], Any]:
     return _close
 
 
-class HttpxClientSlot:
-    """单槽 httpx.AsyncClient 池（签名变化即整体换新）。
+class HttpxClientPool:
+    """httpx.AsyncClient 池（签名 → 客户端），LRU 上限 6。
 
-    Gemini 原生透传通道同一时刻只需要一个客户端形态（签名只含
-    代理/证书），用单槽 + 原子换新即可，不需要按 Key 分桶——
-    Express Key 走的是逐请求 header，不绑客户端。
+    Gemini 原生透传通道已支持 **Key 级代理**：不同 Key 可能挂不同出口，
+    同一时刻需要的客户端形态不再唯一，单槽换新会造成频繁重建——
+    改为按（解析后代理, 证书）分桶 LRU。签名变化（控制台热改代理 /
+    换 Key 换代理）时旧客户端延迟回收，不打断飞行中的流。
     """
 
-    def __init__(self):
+    def __init__(self, maxsize: int = 6):
         self._lock = threading.Lock()
-        self._entry: Optional[Tuple[tuple, Any]] = None
+        self._maxsize = max(1, int(maxsize))
+        self._entries: dict[tuple, Any] = {}
 
-    def get(self, factory: Callable[[], Any]) -> Any:
-        """取（或建）当前签名对应的共享客户端。调用方**不要关闭**它。"""
-        sig = _direct_signature()
+    def get(self, factory: Callable[[], Any], proxy_uri: Optional[str] = None) -> Any:
+        """取（或建）当前签名对应的共享客户端。调用方**不要关闭**它。
+
+        proxy_uri：该次调用的代理原始 URI（None=跟随全局，""=直连）。
+        factory 收到的 client_kwargs 已由调用方按同一代理构造。
+        """
+        sig = _direct_signature(proxy_uri)
         with self._lock:
-            if self._entry is not None and self._entry[0] == sig:
-                return self._entry[1]
+            hit = self._entries.get(sig)
+            if hit is not None:
+                # LRU 触碰：pop 再放回，dict 插入序 = 最近使用序
+                self._entries.pop(sig)
+                self._entries[sig] = hit
+                return hit
 
         client = factory()
+        stale: list = []
         with self._lock:
-            if self._entry is not None and self._entry[0] == sig:
+            hit = self._entries.get(sig)
+            if hit is not None:
                 # 竞态窗口：别的协程刚建好同签名客户端，用它；
                 # 我们手里这个没人用过，直接进宽限关闭。
-                stale, client = client, self._entry[1]
+                stale.append(client)
+                client = hit
             else:
-                stale = self._entry[1] if self._entry is not None else None
-                self._entry = (sig, client)
+                self._entries[sig] = client
+                while len(self._entries) > self._maxsize:
+                    oldest = next(iter(self._entries))
+                    if oldest == sig:
+                        break
+                    stale.append(self._entries.pop(oldest))
 
-        if stale is not None:
-            _closer.schedule(_make_httpx_closer(stale))
+        for c in stale:
+            _closer.schedule(_make_httpx_closer(c))
         return client
 
     async def aclose(self) -> None:
         with self._lock:
-            client = self._entry[1] if self._entry else None
-            self._entry = None
-        if client is not None:
+            clients = [c for c in self._entries.values()]
+            self._entries.clear()
+        for client in clients:
             await _make_httpx_closer(client)()
 
 
@@ -247,18 +286,24 @@ def schedule_graceful_close(close: Callable[[], Any]) -> None:
 
 # ---------- 模块级单例（全进程共享） ----------
 express_sdk_pool = SdkClientPool()
-passthrough_client_slot = HttpxClientSlot()
+passthrough_client_pool = HttpxClientPool()
 
 
-def get_pooled_express_client(api_key: str) -> Any:
-    """Express SDK 通道统一入口：express_sdk / fallback 工厂都用它。"""
-    return express_sdk_pool.get(api_key)
+def get_pooled_express_client(api_key: str, key_proxy: Optional[str] = None) -> Any:
+    """Express SDK 通道统一入口：express_sdk / fallback 工厂都用它。
+
+    key_proxy：本次调用的出站代理原始 URI（None=跟随全局，""=直连）。
+    调用方用 runtime_state.get_effective_proxy_uri_for_key(key_record)
+    完成「Key 级优先 / direct / 全局兑底」的裁决后再传入。
+    解析失败（如 sing-box 缺失）抛 ProxyResolveError。
+    """
+    return express_sdk_pool.get(api_key, key_proxy)
 
 
 async def close_all_clients() -> None:
     """在事件循环结束前释放当前连接池与延迟回收队列。"""
     from impersonate import _upstream_client_pool
 
-    await asyncio.gather(express_sdk_pool.aclose(), passthrough_client_slot.aclose(),
+    await asyncio.gather(express_sdk_pool.aclose(), passthrough_client_pool.aclose(),
                          _upstream_client_pool.aclose())
     await _closer.aclose()

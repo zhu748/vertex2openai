@@ -945,12 +945,21 @@ def fetch_remote_image(url: str, timeout: float = 10.0) -> Optional[Tuple[bytes,
     asyncio.to_thread 包住整个消息转换）。
 
     F-3 防护：只允许 http/https、拒绝内网与链路本地地址（重定向后逐跳复查）、
-    限制响应体积、校验 content-type。配置了 PROXY_URL 时出站本就经代理，
-    到不了内网，此时跳过地址检查。
+    限制响应体积、校验 content-type。配置了出站代理时（含经 sing-box
+    转换的 vless 等，代理侧已把控出口）本就到不了内网，此时跳过地址检查。
     """
     from urllib.parse import urlparse
+    from proxy_resolver import resolve_proxy_uri
 
-    check_host = not get_effective_proxy_url()
+    raw_proxy = get_effective_proxy_url()
+    check_host = not raw_proxy
+    # vless/vmess 等分享链接 → 本地 socks5；解析失败按无代理处理
+    # （图片抓取是附属功能，不能因代理问题拖垮整个请求；
+    #   上游主调用仍会在各自通道里对代理失败明确报错）。
+    try:
+        proxy_url = resolve_proxy_uri(raw_proxy)
+    except Exception:
+        proxy_url = ""
     try:
         parsed = urlparse(url)
         if parsed.scheme not in ("http", "https"):
@@ -959,7 +968,6 @@ def fetch_remote_image(url: str, timeout: float = 10.0) -> Optional[Tuple[bytes,
             raise ValueError("目标地址指向内网/环回/链路本地，已拒绝")
 
         client_args = {"timeout": timeout, "follow_redirects": False}
-        proxy_url = get_effective_proxy_url()
         if proxy_url:
             client_args["proxy"] = proxy_url
         if getattr(app_config, "SSL_CERT_FILE", None):

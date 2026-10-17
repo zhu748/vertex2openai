@@ -346,7 +346,7 @@ class KeyRotationTests(unittest.IsolatedAsyncioTestCase):
                 self.settings.update(roundrobin=True, fake_streaming=mode == "fake")
                 manager = ExpressKeyManager()
 
-                def client_for(key):
+                def client_for(key, key_proxy=None):
                     async def generate(**kwargs):
                         model = kwargs["model"]
                         calls.append((key, model))
