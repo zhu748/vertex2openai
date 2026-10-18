@@ -1205,7 +1205,7 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
 
                 if raw_gemini_finish_reason_str == "STOP": openai_finish_reason = "stop"
                 elif raw_gemini_finish_reason_str == "MAX_TOKENS": openai_finish_reason = "length"
-                elif raw_gemini_finish_reason_str == "SAFETY": openai_finish_reason = "content_filter"
+                elif raw_gemini_finish_reason_str in ("SAFETY", "PROHIBITED_CONTENT", "RECITATION", "BLOCKLIST", "SPII", "IMAGE_SAFETY"): openai_finish_reason = "content_filter"
                 elif raw_gemini_finish_reason_str in ["TOOL_CODE", "FUNCTION_CALL"]: openai_finish_reason = "tool_calls"
             
             parts_in_order = list(getattr(getattr(candidate, "content", None), "parts", None) or [])

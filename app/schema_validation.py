@@ -97,6 +97,11 @@ def validate_request_schemas(request: Any) -> None:
         function = tool.get("function")
         if not isinstance(function, dict):
             raise SchemaValidationError(f"tools[{index}].function must be an object")
+        name = function.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise SchemaValidationError(f"tools[{index}].function.name must be a non-empty string")
+        if any(ord(char) < 32 or ord(char) == 127 for char in name):
+            raise SchemaValidationError(f"tools[{index}].function.name must not contain control characters")
         parameters = function.get("parameters")
         if parameters is not None:
             validate_json_schema(parameters, label=f"tools[{index}].function.parameters")

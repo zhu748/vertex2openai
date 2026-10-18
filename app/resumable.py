@@ -8,7 +8,7 @@
   - 已经产出的增量只存在于那条 TCP 连接里，断了就永远找不回来，前端只能整轮重发
     （重新烧一次上游配额，且长回复在弱网下几乎不可能一次跑完）。
 
-方案（不依赖单条长连接、不用心跳保活）
+方案（缓冲与续传保证完整性，SSE 注释保活减少空闲断连）
 --------------------------------------
 1. **响应落缓冲**：每个请求在服务端建一个缓冲区，上游产出的每个 SSE 帧按到达顺序
    追加进去并分配**单调递增的序列号 seq**。上游的读取由一个**后台任务**驱动，
@@ -41,6 +41,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 import config as app_config
 from runtime_state import app_state
+from streaming import with_heartbeats, HEARTBEAT, HEARTBEAT_FRAME
 
 # 终止帧：与 OpenAI 流一致，客户端见到它即可判定「本轮完整结束」
 DONE_FRAME = "data: [DONE]\n\n"
@@ -113,8 +114,11 @@ class ResumableBuffer:
 
     # ---------- 写入端（后台泵任务持有） ----------
 
-    async def append(self, frame: str) -> int:
+    async def append(self, frame: str) -> Optional[int]:
         async with self._cond:
+            # 淘汰/完成后的副本必须保持不变；部分上游会在取消后仍交出最后一块。
+            if self.done:
+                return None
             self.events.append(frame)
             self._cond.notify_all()
             return len(self.events) - 1
@@ -122,6 +126,8 @@ class ResumableBuffer:
     async def finish(self, status: str = "done", error: Optional[str] = None,
                      payload: Optional[dict] = None, status_code: Optional[int] = None) -> None:
         async with self._cond:
+            if self.done:
+                return
             self.status = status
             self.error = error
             if payload is not None:
@@ -218,6 +224,7 @@ class ResumableStore:
 
     async def create(self, stream_id: str, model: str = "", kind: str = "stream") -> ResumableBuffer:
         async with self._lock:
+            await self._discard_locked(stream_id, "已开始新一轮生成。")
             buf = ResumableBuffer(stream_id, model=model, kind=kind)
             self._buffers[stream_id] = buf
             await self._evict_locked()
@@ -254,7 +261,7 @@ class ResumableStore:
     async def _discard_locked(self, stream_id: str, reason: str) -> bool:
         """移除缓冲时一并停止后台请求、唤醒仍在等结果的读者。"""
         task = self._pumps.pop(stream_id, None)
-        if task and not task.done():
+        if task and task is not asyncio.current_task() and not task.done():
             task.cancel()
         buf = self._buffers.pop(stream_id, None)
         if buf is not None and not buf.done:
@@ -390,18 +397,41 @@ async def pump_stream(buf: ResumableBuffer, body_iterator: AsyncIterator[Any]) -
     每个 data 帧按落缓冲的顺序分配单调序列号并写入 `id:` 行，
     前端凭 Last-Event-ID / resume_from 续传时与这里的序号对齐。
     """
+    stream_error = None
     try:
+        if buf.done:
+            return
         async for chunk in body_iterator:
+            if buf.done:
+                return
             text = _as_text(chunk)
             if not text:
                 continue
             if text.lstrip().startswith(":"):
                 # 注释帧（旧心跳等）不是事件：不进缓冲、不占序号，保持 id == 下标
                 continue
-            await buf.append(frame_with_id(buf.next_seq, text))
+            # The upstream generators report failures as ordinary SSE error
+            # frames followed by DONE. Completion of the iterator does not turn
+            # such a reply into a successful poll/replay result.
+            if '"error"' in text:
+                for line in text.splitlines():
+                    if not line.startswith("data:"):
+                        continue
+                    try:
+                        payload = json.loads(line[5:].strip())
+                    except (ValueError, TypeError):
+                        continue
+                    error = payload.get("error") if isinstance(payload, dict) else None
+                    if error:
+                        stream_error = str(error.get("message", "上游返回错误。")
+                                           if isinstance(error, dict) else error)[:1024]
+            if await buf.append(frame_with_id(buf.next_seq, text)) is None:
+                return
+        if buf.done:
+            return
         if not buf.events or not buf.events[-1].strip().endswith("[DONE]"):
             await buf.append(frame_with_id(buf.next_seq, DONE_FRAME))
-        await buf.finish("done")
+        await buf.finish("error" if stream_error else "done", error=stream_error)
         print(f"📦 [续传缓冲] {buf.id} 上游已读完，共 {len(buf.events)} 个事件已完整落缓冲。")
     except asyncio.CancelledError:
         if not buf.done:
@@ -431,9 +461,18 @@ async def sse_from_buffer(buf: ResumableBuffer, start_seq: int = 0) -> AsyncIter
     if start_seq > 0:
         print(f"↩️ [续传] {buf.id} 从事件 #{start_seq} 续传（缓冲区已有 {buf.next_seq} 个事件）。")
     delivered_done = False
-    async for _seq, frame in buf.iter_from(start_seq):
-        yield frame
-        if frame.strip().endswith("[DONE]"):
-            delivered_done = True
+    yield HEARTBEAT_FRAME
+    events = with_heartbeats(buf.iter_from(start_seq))
+    try:
+        async for item in events:
+            if item is HEARTBEAT:
+                yield HEARTBEAT_FRAME
+                continue
+            _seq, frame = item
+            yield frame
+            if frame.strip().endswith("[DONE]"):
+                delivered_done = True
+    finally:
+        await events.aclose()
     if delivered_done:
         buf.mark_delivered()

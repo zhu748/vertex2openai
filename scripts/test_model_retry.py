@@ -188,6 +188,62 @@ class StreamRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.stats.success_requests, 0)
         self.assertEqual(self.stats.error_requests, 1)
 
+    async def test_silent_stream_truncation_is_not_a_success_or_retried(self):
+        async def factory(**kwargs):
+            async def iterate():
+                yield types.GenerateContentResponse(candidates=[types.Candidate(
+                    content=types.Content(parts=[types.Part(text="partial")]))])
+            return iterate()
+        generate = mock.AsyncMock(side_effect=factory)
+        body = await self.stream(generate)
+        self.assertIn("partial", body)
+        self.assertIn('"code": 502', body)
+        self.assertEqual(body.count("data: [DONE]"), 1)
+        self.assertEqual(generate.await_count, 1)
+        self.assertEqual(self.stats.success_requests, 0)
+        self.assertEqual(self.stats.error_requests, 1)
+
+    async def test_each_candidate_needs_its_own_terminal_marker(self):
+        async def factory(**kwargs):
+            async def iterate():
+                yield types.GenerateContentResponse(candidates=[
+                    types.Candidate(index=0, content=types.Content(parts=[types.Part(text="first")]), finish_reason="STOP"),
+                    types.Candidate(index=1, content=types.Content(parts=[types.Part(text="partial")]))])
+            return iterate()
+        body = await self.stream(factory)
+        self.assertIn('"code": 502', body)
+        self.assertEqual(self.stats.success_requests, 0)
+
+    async def test_buffered_sdk_requires_terminal_marker(self):
+        for fake_stream in (False, True):
+            with self.subTest(fake_stream=fake_stream):
+                self.settings["fake_streaming"] = fake_stream
+                partial = text_response().model_copy(update={"candidates": [types.Candidate(
+                    content=types.Content(parts=[types.Part(text="partial")]))]})
+                client = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(
+                    generate_content=mock.AsyncMock(return_value=partial))))
+                obj = api_helpers.OpenAIRequest(model="gemini-3.6-flash", messages=[], stream=fake_stream)
+                if fake_stream:
+                    response = await api_helpers.execute_gemini_call(client, obj.model, lambda messages: [], {}, obj)
+                    body = "".join([frame async for frame in response.body_iterator])
+                    self.assertIn('"code": 502', body)
+                else:
+                    with self.assertRaises(Exception) as raised:
+                        await api_helpers.execute_gemini_call(client, obj.model, lambda messages: [], {}, obj)
+                    self.assertEqual(raised.exception.code, 502)
+                self.assertEqual(self.stats.success_requests, 0)
+
+    async def test_length_and_filter_terminations_are_preserved(self):
+        for reason, expected in (("MAX_TOKENS", "length"), ("SAFETY", "content_filter")):
+            async def factory(**kwargs):
+                async def iterate():
+                    yield text_response().model_copy(update={"candidates": [types.Candidate(
+                        content=types.Content(parts=[types.Part(text="answer")] ), finish_reason=reason)]})
+                return iterate()
+            body = await self.stream(factory)
+            self.assertIn(f'"finish_reason": "{expected}"', body)
+            self.assertNotIn('"error"', body)
+
     async def test_fake_stream_empty_response_is_an_error(self):
         self.settings["fake_streaming"] = True
         client = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(
@@ -280,7 +336,7 @@ class CookieRetryTests(unittest.IsolatedAsyncioTestCase):
         obj = api_helpers.OpenAIRequest(model="gemini-3.6-flash", messages=[])
         self.client.post.side_effect = [httpx.Response(502, headers={"retry-after": "2.5"}), httpx.Response(504), httpx.Response(200, json={})]
         with mock.patch.object(cookie_proxy, "wait_for_retry", return_value=True) as wait, \
-             mock.patch.object(cookie_proxy, "_extract_from_results", return_value=[("text", "answer")]):
+             mock.patch.object(cookie_proxy, "_extract_from_results", return_value=[("text", "answer"), ("finish", "STOP")]):
             response = await cookie_proxy.CookieProxyUpstream().chat_completions(obj, self.request)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.client.post.await_count, 3)

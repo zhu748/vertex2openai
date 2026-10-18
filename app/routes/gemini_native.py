@@ -39,6 +39,7 @@ import json
 from typing import Any, Optional
 from urllib.parse import parse_qs, quote
 
+import anyio
 import httpx
 from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -122,6 +123,7 @@ def _native_error(status: int, message: str, status_detail: Optional[str] = None
     detail = status_detail or {
         400: "INVALID_ARGUMENT", 401: "UNAUTHENTICATED", 403: "PERMISSION_DENIED",
         404: "NOT_FOUND", 429: "RESOURCE_EXHAUSTED", 500: "INTERNAL",
+        502: "UNAVAILABLE", 503: "UNAVAILABLE", 504: "DEADLINE_EXCEEDED",
     }.get(status, "UNKNOWN")
     return JSONResponse(status_code=status, content={
         "error": {"code": status, "message": message, "status": detail}
@@ -234,6 +236,12 @@ def _looks_like_pin_failure(status_code: int, body: bytes) -> bool:
     return False
 
 
+async def _close_upstream(upstream: httpx.Response) -> None:
+    # Starlette 用取消作用域终止断连请求；清理需要屏蔽该作用域的持续取消。
+    with anyio.CancelScope(shield=True):
+        await upstream.aclose()
+
+
 async def _passthrough_request(fastapi_request: Request, model: str, action: str,
                                query: str, payload: bytes):
     """选 Key → 透传 → 429/5xx 换 Key 重试 → 钉定失败兜底。返回 Response。
@@ -336,11 +344,10 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
             last_error_headers = {}
             if isinstance(e, httpx.TimeoutException):
                 last_error_status = 504
-                last_error_body = (b'{"error":{"code":504,"message":"Upstream timeout",'
-                                   b'"status":"DEADLINE_EXCEEDED"}}')
+                last_error_body = _native_error(504, "Upstream timeout", "DEADLINE_EXCEEDED").body
             else:
                 last_error_status = 502
-                last_error_body = str(e).encode()
+                last_error_body = _native_error(502, f"Upstream connection failed ({type(e).__name__})", "UNAVAILABLE").body
             if key_attempts >= retry_max or not is_retryable_exception(e):
                 break
             print(f"⚠️ [Gemini 透传] 上游连接异常（{type(e).__name__}），"
@@ -365,7 +372,7 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
                   "客户端若按 SSE 解析将等不到 data: 行（v1 端点曾出现此形态，"
                   "现已钉 v1beta1；若复现请把 debug_outbound 打开后上报 URL）。")
             if "sse" in parse_qs(query).get("alt", []):
-                await upstream.aclose()
+                await _close_upstream(upstream)
                 return _native_error(502, "上游未返回 SSE 流，无法完成 alt=sse 请求。", "UNAVAILABLE")
 
         # 429/5xx：按控制台预算重选 Key，不能因单 Key / 池已用遍而提前退出。
@@ -374,12 +381,14 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
             last_error_status = upstream.status_code
             last_error_headers = {k: v for k, v in upstream.headers.items()
                                   if k.lower() == "retry-after"}
-            # 流式响应必须先消费才能安全释放（否则连接悬挂在缓冲区上）
+            # 读错误正文供重试诊断；取消和读取失败也必须释放响应。
             try:
                 last_error_body = await upstream.aread()
             except Exception:
-                last_error_body = b""
-            await upstream.aclose()
+                last_error_body = _native_error(
+                    upstream.status_code, "上游错误响应未完整传输。").body
+            finally:
+                await _close_upstream(upstream)
             wait = _retry_delay(upstream.headers.get("retry-after"), backoff_seconds)
             print(f"⚠️ [Gemini 透传] 上游 HTTP {upstream.status_code}，"
                   f"{wait:.1f}s 后重试（{key_attempts + 1}/{retry_max}，单 Key 同样适用）。")
@@ -394,16 +403,20 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
             return await _relay_stream(upstream)
 
         # 错误（或非流式响应）：缓冲 body 再透传，顺带供钉定失败判定
-        try:
-            body = await upstream.aread()
-        except Exception:
-            body = b""
         status = upstream.status_code
         ctype = upstream.headers.get("content-type", "application/json")
         # retry-after 是客户端退避的关键依据，一并透传
         headers = {k: v for k, v in upstream.headers.items()
                    if k.lower() == "retry-after"}
-        await upstream.aclose()
+        try:
+            body = await upstream.aread()
+        except Exception:
+            # 已知的 HTTP 错误码仍保留，但空正文不能冒充完整错误响应。
+            status = status if status >= 400 else 502
+            body = _native_error(status, "上游响应未完整传输，请重试。").body
+            ctype = "application/json"
+        finally:
+            await _close_upstream(upstream)
 
         # 钉定路径失败 → 退回裸模型名再试一次（不占 Key 轮换预算）
         if (not pin_fallback_used and model_path != model
@@ -425,7 +438,7 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
                         headers=headers or None)
 
     return Response(
-        content=last_error_body or b'{"error":{"code":502,"message":"Upstream unreachable","status":"UNAVAILABLE"}}',
+        content=last_error_body or _native_error(last_error_status, "Upstream unreachable").body,
         status_code=last_error_status,
         media_type="application/json",
         headers=last_error_headers or None,
@@ -446,7 +459,11 @@ async def _relay_stream(upstream: httpx.Response) -> StreamingResponse:
     由池统一管理生命周期，这里不关闭它。
     """
 
+    started = False
+
     async def _relay():
+        nonlocal started
+        started = True
         total = 0
         completed = False
         try:
@@ -466,13 +483,28 @@ async def _relay_stream(upstream: httpx.Response) -> StreamingResponse:
                 stats.add_error()
                 print(f"✂️ [Gemini 透传] 流式中止（已转发 {total} 字节；"
                       "客户端断开或上游/网络异常）。")
-            await upstream.aclose()
+            await _close_upstream(upstream)
+
+    class NativeStreamingResponse(StreamingResponse):
+        async def __call__(self, scope, receive, send):
+            try:
+                await super().__call__(scope, receive, send)
+            finally:
+                # send() 可能在生成器第一次执行前或暂停于 yield 时失败；
+                # 两种情况下都由响应外层负责关闭，不能仅依赖生成器 finally。
+                with anyio.CancelScope(shield=True):
+                    try:
+                        await self.body_iterator.aclose()
+                    finally:
+                        if not started:
+                            stats.add_error()
+                        await _close_upstream(upstream)
 
     media_type = upstream.headers.get("content-type", "text/event-stream")
     passthrough = {k: v for k, v in upstream.headers.items()
                    if k.lower() == "retry-after"}
-    return StreamingResponse(_relay(), status_code=upstream.status_code,
-                             media_type=media_type, headers=passthrough or None)
+    return NativeStreamingResponse(_relay(), status_code=upstream.status_code,
+                                   media_type=media_type, headers=passthrough or None)
 
 
 # ============================================================

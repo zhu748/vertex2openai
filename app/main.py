@@ -706,6 +706,26 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <p id="sampling-note" class="text-xs text-neutral-500 mt-2"></p>
       </div>
 
+      <!-- 合成函数正文传输（可按模型覆盖） -->
+      <div class="card p-5">
+        <div class="flex items-center justify-between gap-3">
+          <span class="text-sm font-semibold">抗截断传输<span class="helpq" onclick="hlp(this,'h_at')">?</span></span>
+          <select id="anti_truncation_mode" class="inp" style="max-width:190px">
+            <option value="off">关闭</option>
+            <option value="nonstream">非流式抗截断</option>
+            <option value="stream">流式抗截断</option>
+          </select>
+        </div>
+        <p id="anti-truncation-note" class="text-xs text-neutral-500 mt-2">4 Argon / 3.8 Flash 默认开启流式抗截断，其它模型默认关闭；可按模型修改。</p>
+        <div id="h_at" class="helpbox">将正文放入临时函数的 <code>content</code> 参数，网关还原为普通回复，不执行任何函数。<br>
+          <b>非流式</b>：等上游完整返回再交付；客户端仍可开启 SSE。<br>
+          <b>流式</b>：Express 对支持的 Gemini 3+ 模型使用增量函数参数流（3.1 Flash-Lite 除外）；Cookie 通道、旧模型和混合真实工具请求在函数参数完整后还原。全局“假流式”开启时也会等待完整结果。<br>
+          生图、搜索、结构化输出、多候选以及明确指定 <code>tool_choice</code> 的请求自动跳过。普通自定义函数及其历史记录保留。<br>
+          优先级：请求的 <code>anti_truncation_mode</code> ＞ 抗截断模型别名 ＞ 模型专属 ＞ 全局。仅作用于 OpenAI 对话端点。<br>
+          <b>内置默认</b>：Gemini 4 Argon 和 Gemini 3.8 Flash 开启流式抗截断，其它模型关闭。需要关闭这两个模型时，请选择“关闭”并保存为该模型专属；清除专属设置会恢复内置默认。<br>
+          该方式不能保证消除截断或拒绝；输出 Token 上限、网络中断及上游限制仍然适用，也会增加少量提示词与函数格式开销。</div>
+      </div>
+
       <!-- 控制台注入（可按模型覆盖） -->
       <div class="card p-5">
         <div class="text-sm font-semibold mb-3">注入与续写 <span class="text-xs font-normal text-neutral-400">（留空＝不启用 / 用内置默认；均支持按模型专属）</span></div>
@@ -904,7 +924,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 const $ = id => document.getElementById(id);
 let CAPS = {}, chart = null, curAR = "";
 let GLOBAL_SETTINGS = {}, OVERRIDES = {};
-const PER_MODEL_KEYS = ['native_thinking_mode','thinking_g3_level','image_size','image_aspect_ratio','default_temperature','default_top_p','default_max_tokens','inject_system_instruction','inject_prefill','prefill_instruction','image_system_instruction','inject_prefill_for_image','sampling_policy','prefill_cot_guard'];
+const PER_MODEL_KEYS = ['anti_truncation_mode','native_thinking_mode','thinking_g3_level','image_size','image_aspect_ratio','default_temperature','default_top_p','default_max_tokens','inject_system_instruction','inject_prefill','prefill_instruction','image_system_instruction','inject_prefill_for_image','sampling_policy','prefill_cot_guard'];
 const COMMON_ARS = ["1:1","3:2","2:3","3:4","4:3","4:5","5:4","9:16","16:9","21:9","1:4","4:1","1:8","8:1","9:21"];
 
 function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),1800); }
@@ -1121,10 +1141,10 @@ async function testProxy(){
     const r=await fetch('/api/proxy/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxy_url:v})});
     const d=await r.json();
     if(d.ok){
-      box.innerHTML=`<span style="color:#047857">✅ ${d.message} · 延迟 ${d.latency_ms} ms${d.via_proxy?(' · 经 '+d.proxy):''}</span>`;
+      box.innerHTML=`<span style="color:#047857">✅ ${esc(d.message)} · 延迟 ${d.latency_ms} ms${d.via_proxy?(' · 经 '+esc(d.proxy)):''}</span>`;
       toast('✅ 连通成功（'+d.latency_ms+' ms）');
     }else{
-      box.innerHTML=`<span style="color:#be123c">❌ ${d.message} · ${d.latency_ms} ms<br>详细：${(d.error||'').replace(/</g,'&lt;')}</span>`;
+      box.innerHTML=`<span style="color:#be123c">❌ ${esc(d.message)} · ${d.latency_ms} ms<br>详细：${esc(d.error||'')}</span>`;
       toast('❌ 连通失败');
     }
   }catch(e){
@@ -1240,6 +1260,7 @@ function applyModelParamFields(model){
 async function saveModelOverride(){
   const m=$('model-sel').value; if(!m) return;
   const patch={
+    anti_truncation_mode:$('anti_truncation_mode').value,
     native_thinking_mode:$('native_thinking_mode').value,
     thinking_g3_level:$('thinking_g3_level').value,
     image_size:$('image_size').value,
@@ -1276,7 +1297,12 @@ async function clearModelOverride(){
   if(!OVERRIDES[m]){ toast('该模型没有专属参数'); return; }
   try{
     const r=await fetch('/api/model-overrides/'+encodeURIComponent(m),{method:'DELETE'});
-    if(r.ok){ delete OVERRIDES[m]; toast('已清除 '+m+' 专属参数，回退全局'); refreshModelSelStars(); applyModelParamFields(m); }
+    if(r.ok){
+      const d=await r.json();
+      if(d.override && Object.keys(d.override).length) OVERRIDES[m]=d.override;
+      else delete OVERRIDES[m];
+      toast('已恢复 '+m+' 默认参数'); refreshModelSelStars(); applyModelParamFields(m);
+    }
     else toast('清除失败');
   }catch(e){ toast('❌ 网络请求失败'); }
 }
@@ -1296,6 +1322,8 @@ function renderCaps(){
   const m=$('model-sel').value;
   if(m==='__global__'){
     applyModelParamFields(m);
+    $('anti_truncation_mode').disabled=false;
+    $('anti-truncation-note').textContent='全局默认关闭；4 Argon / 3.8 Flash 有内置的流式抗截断专属默认值，可切到模型修改。';
     $('caps-summary').innerHTML='<span class="text-xs text-neutral-500">全局默认作用域：下面的值对所有未设 ★ 专属的模型生效。切到具体模型可查看该模型的能力与专属值。</span>';
     ['thinking_g3_level','image_size','image_aspect_ratio'].forEach(id=>{const el=$(id); if(el) el.disabled=false;});
     $('wrap-g3level').style.opacity='1';
@@ -1306,6 +1334,10 @@ function renderCaps(){
   }
   const cap=CAPS[m]; if(!cap) return;
   applyModelParamFields(m);   // 按模型填入专属/全局参数值（含 curAR）
+  $('anti_truncation_mode').disabled=!cap.supports_anti_truncation;
+  $('anti-truncation-note').textContent=cap.supports_anti_truncation
+    ? '可按模型保存；刷新客户端模型列表也可直接选择 -antitruncation-stream / -antitruncation-nonstream。'
+    : '该模型不支持文本函数传输，不提供抗截断版本。';
   const th=cap.thinking||{};
   let sum=[chip('家族 '+cap.family, true)];
   if(th.kind==='level') sum.push(chip('思考档位 '+(th.levels||[]).join(' / ')));
@@ -1497,7 +1529,8 @@ PROXY_TEST_TIMEOUT_SECONDS = 8.0
 # 后所有假流式请求全挂）。这里在入口就拦下，并给出字段级错误提示。
 # ============================================================
 _SETTING_ENUMS = {
-    "prefill_mode": ("smart", "minimal", "off"),
+    "anti_truncation_mode": ("off", "nonstream", "stream"),
+    "prefill_mode": ("smart", "keep_turn", "minimal", "off"),
     "native_thinking_mode": ("request", "off", "console"),
     "sampling_policy": ("auto", "deprecated", "allowed"),
     "thinking_g3_level": ("", "minimal", "low", "medium", "high"),
@@ -1823,7 +1856,8 @@ async def save_model_override(model_name: str, request: Request, _auth: bool = D
 @app.delete("/api/model-overrides/{model_name}")
 async def delete_model_override(model_name: str, _auth: bool = Depends(require_auth)):
     ok = app_state.clear_model_override(model_name)
-    return JSONResponse(content={"status": "success" if ok else "not_found", "model": model_name})
+    return JSONResponse(content={"status": "success" if ok else "not_found", "model": model_name,
+                                 "override": app_state.get_model_overrides().get(model_name, {})})
 
 
 # ==========================================

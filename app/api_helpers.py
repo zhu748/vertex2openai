@@ -27,6 +27,8 @@ from runtime_state import app_state
 from logger import stats
 from usage import map_usage
 from retry_policy import error_status, exception_retry_delay, wait_for_retry
+from anti_truncation import AntiTruncationError, TextTransport
+from response_validation import IncompleteResponseError, has_finish_reason, require_complete_response
 
 
 def _safety_score_enabled() -> bool:
@@ -103,6 +105,8 @@ def extract_upstream_error(e: Exception) -> tuple[int, str]:
 
 
 def is_retryable_exception(e):
+    if isinstance(e, (AntiTruncationError, IncompleteResponseError)):
+        return False
     error_str = str(e).lower()
     code = error_status(e)
     if code is not None:
@@ -120,6 +124,7 @@ def is_retryable_exception(e):
 
 def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
     config: Dict[str, Any] = {}
+    settings = app_state.get_effective_settings(request.model)
     
     system_texts = []
     for msg in request.messages:
@@ -140,7 +145,7 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
         # 生图判定统一走能力档案（"nano-banana" 家族名字里不带 image，裸 "image" in 会漏判）
         _is_image_name = mc.get_profile(request.model)["is_image"]
         _allow_sys = (not _is_image_name) or bool(
-            app_state.get_setting("image_system_instruction", False))
+            settings.get("image_system_instruction", False))
         if _allow_sys:
             config["system_instruction"] = "\n".join(system_texts)
     
@@ -232,7 +237,6 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
             tools_list.append({"function_declarations": function_declarations})
 
     # 读取控制台设置与模型能力档案（优先级：单次请求 > 模型专属 > 全局 > 内置默认）
-    settings = app_state.get_effective_settings(request.model)
     # 控制台的「采样参数处理」可覆盖版本自动判定（新模型版本号更小却已废弃采样时用）
     profile = mc.apply_sampling_policy(mc.get_profile(request.model), settings)
     is_image_model = profile["is_image"]
@@ -381,7 +385,8 @@ class ToolCallIndexer:
     每次重试都要新建一个实例（重试会重发整轮，序号需要归零）。
     """
 
-    def __init__(self):
+    def __init__(self, keep_unsigned_parts: bool = True):
+        self.keep_unsigned_parts = keep_unsigned_parts
         self._next: Dict[int, int] = {}
         self._seen_tool_calls: set[int] = set()
         self._ordinary_parts: Dict[int, list] = {}
@@ -441,7 +446,7 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
 
             if raw_gemini_finish_reason_str == "STOP": openai_finish_reason = "stop"
             elif raw_gemini_finish_reason_str == "MAX_TOKENS": openai_finish_reason = "length"
-            elif raw_gemini_finish_reason_str == "SAFETY": openai_finish_reason = "content_filter"
+            elif raw_gemini_finish_reason_str in ("SAFETY", "PROHIBITED_CONTENT", "RECITATION", "BLOCKLIST", "SPII", "IMAGE_SAFETY"): openai_finish_reason = "content_filter"
             elif raw_gemini_finish_reason_str in ["TOOL_CODE", "FUNCTION_CALL"]: openai_finish_reason = "tool_calls"
 
         # Collect every parallel call and keep signatures on their exact tool-call
@@ -470,6 +475,11 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
                     else:
                         kind = "text"
                     metadata = ordinary_part_metadata(kind, text_value, sig)
+                    # Restored private text has no upstream Part signature to
+                    # replay. Repeating its entire accumulated text in metadata
+                    # on every token would make a native stream quadratic.
+                    if indexer and not indexer.keep_unsigned_parts and not sig:
+                        continue
                     if indexer:
                         ordinary_index = indexer.record_ordinary_part(output_index, metadata)
                     else:
@@ -722,6 +732,7 @@ async def gemini_fake_stream_generator(
     fallback_model: Optional[str] = None,
     fallback_client_factory: Optional[Callable[[], Any]] = None,
     retry_target_factory: Optional[Callable[[], Any]] = None,
+    text_transport: Optional[TextTransport] = None,
 ):
     print(f"🌊 [假流式] 已开始调用 Gemini 模型 {model_for_api_call}，客户端请求模型名为 {request_obj.model}。")
 
@@ -834,6 +845,11 @@ async def gemini_fake_stream_generator(
                 block_message += f" (Message: {raw_gemini_response.prompt_feedback.block_reason_message})"
             raise ValueError(block_message)
 
+        require_complete_response(raw_gemini_response)
+        if text_transport:
+            decoder = text_transport.decoder()
+            raw_gemini_response = decoder.restore_sdk(raw_gemini_response)
+            decoder.validate_end()
         if not is_gemini_response_valid(raw_gemini_response):
             raise ValueError("上游假流式响应无有效内容。")
         openai_response_dict = convert_to_openai_format(raw_gemini_response, request_obj.model)
@@ -842,6 +858,9 @@ async def gemini_fake_stream_generator(
         async for chunk_sse in _chunk_openai_response_dict_for_sse(
             openai_response_dict=openai_response_dict
         ):
+            if chunk_sse.strip() == "data: [DONE]" and wants_usage(request_obj):
+                yield make_usage_chunk(openai_response_dict["id"], request_obj.model,
+                                       openai_response_dict.get("usage", {}))
             yield chunk_sse
 
     except asyncio.CancelledError:
@@ -901,6 +920,7 @@ async def execute_gemini_call(
     fallback_model: Optional[str] = None,
     fallback_client_factory: Optional[Callable[[], Any]] = None,
     retry_target_factory: Optional[Callable[[], Any]] = None,
+    text_transport: Optional[TextTransport] = None,
 ):
     def _get_fallback_client():
         if fallback_client_factory is None:
@@ -938,7 +958,8 @@ async def execute_gemini_call(
         # 漏判会绕开下面的生图假流式保护，走真流式）
         is_image_request = mc.get_profile(request_obj.model)["is_image"]
 
-        if app_state.get_setting("fake_streaming", app_config.FAKE_STREAMING_ENABLED) or is_image_request:
+        if (app_state.get_setting("fake_streaming", app_config.FAKE_STREAMING_ENABLED) or is_image_request
+                or (text_transport and text_transport.mode == "nonstream")):
             if is_image_request:
                  print("🖼️ [生图保护] 图片模型请求已自动切换为假流式输出，以避免上游流式限制。")
             return StreamingResponse(
@@ -949,6 +970,7 @@ async def execute_gemini_call(
                     fallback_model=fallback_model,
                     fallback_client_factory=fallback_client_factory,
                     retry_target_factory=retry_target_factory,
+                    text_transport=text_transport,
                 ), media_type="text/event-stream"
             )
         else: # True Streaming
@@ -987,11 +1009,14 @@ async def execute_gemini_call(
                         # 预填充智能兼容：把预填充文本作为回复开头先发出（仅一次）；
                         # 同时启用流式去重器，模型若复述预填充开头会被自动裁掉（n>1 时不启用）。
                         # 每次 attempt 都重置 tool_calls 序号（重试会重发整轮）
-                        tool_indexer = ToolCallIndexer()
+                        tool_indexer = ToolCallIndexer(
+                            keep_unsigned_parts=text_transport is None or len(request_obj.tools or []) > 1)
+                        text_decoder = text_transport.decoder() if text_transport else None
                         deduper = PrefillDeduper(prefill_text) if (prefill_text and (request_obj.n or 1) == 1) else None
                         _pf = {"id": response_id_for_stream, "object": "chat.completion.chunk", "created": int(time.time()), "model": request_obj.model, "choices": [{"index": 0, "delta": {"role": "assistant", "content": prefill_text}, "finish_reason": None}]}
 
                         final_p_tk, final_c_tk, final_t_tk = 0, 0, 0
+                        seen_candidates, finished_candidates = set(), set()
 
                         async for chunk_item_call in stream_gen_obj:
                             if getattr(chunk_item_call, "usage_metadata", None):
@@ -1001,6 +1026,13 @@ async def execute_gemini_call(
                             feedback = getattr(chunk_item_call, "prompt_feedback", None)
                             if getattr(feedback, "block_reason", None):
                                 raise ValueError(f"请求被上游安全策略拦截：{feedback.block_reason}")
+                            for ci, candidate in enumerate(chunk_item_call.candidates or []):
+                                index = candidate.index if candidate.index is not None else ci
+                                seen_candidates.add(index)
+                                if has_finish_reason(candidate.finish_reason):
+                                    finished_candidates.add(index)
+                            if text_decoder:
+                                chunk_item_call = text_decoder.restore_sdk(chunk_item_call)
                             num_candidates = len(getattr(chunk_item_call, "candidates", None) or [])
                             for ci in range(num_candidates):
                                 sse_chunk = convert_chunk_to_openai(
@@ -1021,6 +1053,10 @@ async def execute_gemini_call(
                                 has_yielded = True
                                 yield sse_chunk
 
+                        if text_decoder:
+                            text_decoder.validate_end()
+                        if seen_candidates - finished_candidates:
+                            raise IncompleteResponseError("上游流式回复缺少候选结束标记，内容可能不完整。")
                         # 去重器可能还攒着开头文本（上游没发 finish chunk 的场景）
                         if deduper is not None and not deduper.done:
                             tail = deduper.flush()
@@ -1059,6 +1095,17 @@ async def execute_gemini_call(
                                 await close()
                         stream_gen_obj = None
                         is_retryable = is_retryable_exception(e_stream_call)
+
+                        # Older endpoints can reject the preview argument-stream
+                        # field. Remove only that field, once, before any output.
+                        fcc = gen_config_dict.get("tool_config", {}).get("function_calling_config", {})
+                        if (not has_yielded and fcc.get("stream_function_call_arguments")
+                                and error_status(e_stream_call) == 400
+                                and any(term in str(e_stream_call).lower().replace("_", "")
+                                        for term in ("streamfunctioncallarguments", "partialargs"))):
+                            fcc.pop("stream_function_call_arguments", None)
+                            print("↩️ [抗截断] 上游不支持增量参数流，改用完整函数参数还原。")
+                            continue
 
                         # location 钉定路径不对 → 退回裸模型名再试一次（仅在还没输出内容时）
                         if (fallback_model and model_to_call != fallback_model
@@ -1189,6 +1236,11 @@ async def execute_gemini_call(
                 block_msg+=f"（{response_obj_call.prompt_feedback.block_reason_message}）"
             raise ValueError(block_msg)
 
+        require_complete_response(response_obj_call)
+        if text_transport:
+            decoder = text_transport.decoder()
+            response_obj_call = decoder.restore_sdk(response_obj_call)
+            decoder.validate_end()
         if not is_gemini_response_valid(response_obj_call):
             error_details = f"Agent Platform 非流式响应无有效内容，模型：{model_to_call}。"
             if hasattr(response_obj_call, "candidates"):

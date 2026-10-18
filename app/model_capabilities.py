@@ -101,8 +101,9 @@ def sort_levels(levels) -> list:
 
 
 def _strip_known_suffixes(name: str) -> str:
-    """去掉别名后缀（-search / 分辨率 / 思考档位后缀），得到判断家族用的基础名。"""
-    n = name.lower()
+    """去掉抗截断 / -search / 分辨率 / 思考档位别名，得到判断家族用的基础名。"""
+    from anti_truncation import split_model_alias
+    n, _ = split_model_alias(name.lower())
     for suf in ("-search", "-1k", "-2k", "-4k", "-512"):
         if n.endswith(suf):
             n = n[: -len(suf)]
@@ -449,6 +450,7 @@ def capabilities_summary(model_name: str, settings: Optional[Dict[str, Any]] = N
     传入该模型生效的 settings 时，会把「采样参数处理」开关算进去，
     否则控制台显示的能力会和实际下发的参数对不上。
     """
+    from anti_truncation import supports_transport
     prof = get_profile(model_name)
     if settings:
         prof = apply_sampling_policy(prof, settings)
@@ -466,4 +468,5 @@ def capabilities_summary(model_name: str, settings: Optional[Dict[str, Any]] = N
         "image_aspect_ratios": sorted(prof.get("image_aspect_ratios", set())),
         "image_sizes": sorted(prof.get("image_sizes", set())),
         "supports_search": prof["supports_search"],
+        "supports_anti_truncation": supports_transport(model_name),
     }

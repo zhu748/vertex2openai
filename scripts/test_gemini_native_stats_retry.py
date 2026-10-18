@@ -16,7 +16,9 @@ os.environ["STATE_DIR"] = _STATE_DIR.name
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 import httpx
+import anyio
 from fastapi.testclient import TestClient
+from starlette.requests import ClientDisconnect
 
 import config
 import main
@@ -327,6 +329,43 @@ class NativeStatsRetryTests(unittest.TestCase):
         self.assertEqual(len(self.requests), 1)
         self.assert_stats(success=0, error=1)
 
+    def test_network_failure_returns_native_json_instead_of_plain_text(self):
+        self.settings["retry_max"] = 0
+        def responder(request):
+            raise httpx.ConnectError("socket failed", request=request)
+        self.responder = responder
+        response = self.post()
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["error"]["code"], 502)
+        self.assert_stats(success=0, error=1)
+
+    def test_broken_error_body_keeps_status_with_a_readable_json_error(self):
+        self.settings["retry_max"] = 0
+        closed = []
+        class Broken(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield b'{"error":'
+                raise httpx.ReadError("error body interrupted")
+            async def aclose(self):
+                closed.append(True)
+        self.responder = lambda request: httpx.Response(503, stream=Broken())
+        response = self.post("streamGenerateContent")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], 503)
+        self.assertTrue(closed)
+        self.assert_stats(success=0, error=1)
+
+    def test_key_pool_removed_after_empty_429_keeps_error_code_consistent(self):
+        def responder(request):
+            self.manager.records.clear()
+            return httpx.Response(429, content=b"")
+        self.responder = responder
+        response = self.post()
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.json()["error"]["code"], 429)
+        self.assertEqual(response.json()["error"]["status"], "RESOURCE_EXHAUSTED")
+        self.assert_stats(success=0, error=1)
+
     def test_upstream_base_url_trailing_slash_is_normalized(self):
         with mock.patch.object(gemini_native, "EXPRESS_BASE", "https://example.test/"):
             self.assertEqual(gemini_native._build_upstream_url("gemini-test", "countTokens"),
@@ -340,6 +379,82 @@ class RetryWaitTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(await gemini_native._wait_for_retry(request, 60))
         sleep.assert_awaited_once()
         self.assertLessEqual(sleep.await_args.args[0], 0.5)
+
+
+class NativeResponseLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancelled_error_body_read_always_closes_response(self):
+        for code, retries in ((400, 0), (429, 1)):
+            with self.subTest(code=code, retries=retries):
+                started, closed = asyncio.Event(), asyncio.Event()
+                class Waiting(httpx.AsyncByteStream):
+                    async def __aiter__(self):
+                        started.set()
+                        await asyncio.Event().wait()
+                        yield b"unused"
+                    async def aclose(self):
+                        await asyncio.sleep(0)
+                        closed.set()
+                upstream = httpx.Response(code, stream=Waiting())
+                manager = KeyManager()
+                request = types.SimpleNamespace(
+                    app=types.SimpleNamespace(state=types.SimpleNamespace(express_key_manager=manager)),
+                    is_disconnected=mock.AsyncMock(return_value=False))
+                async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: upstream)) as client:
+                    with mock.patch.object(gemini_native, "get_retry_settings", return_value=(retries, 0)), \
+                         mock.patch.object(gemini_native, "_resolve_upstream_model_path", return_value="gemini-test"), \
+                         mock.patch.object(gemini_native, "get_effective_proxy_uri_for_key", return_value=""), \
+                         mock.patch.object(gemini_native, "passthrough_client_pool", types.SimpleNamespace(get=lambda *args: client)):
+                        task = asyncio.create_task(gemini_native._passthrough_request(
+                            request, "gemini-test", "streamGenerateContent", "alt=sse", b"{}"))
+                        await asyncio.wait_for(started.wait(), 1)
+                        task.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await task
+                self.assertTrue(closed.is_set())
+                self.assertTrue(upstream.is_closed)
+
+    async def test_asgi_send_failure_before_or_after_first_read_closes_upstream(self):
+        for fail_at in ("http.response.start", "http.response.body"):
+            with self.subTest(fail_at=fail_at):
+                closed = asyncio.Event()
+                class Waiting(httpx.AsyncByteStream):
+                    async def __aiter__(self):
+                        yield b'data: {"text":"partial"}\n\n'
+                        await asyncio.Event().wait()
+                    async def aclose(self):
+                        await asyncio.sleep(0)
+                        closed.set()
+                upstream = httpx.Response(200, stream=Waiting(), headers={"content-type": "text/event-stream"})
+                stats = ProxyStats()
+                async def send(message):
+                    if message["type"] == fail_at:
+                        raise OSError("disconnected")
+                with mock.patch.object(gemini_native, "stats", stats):
+                    response = await gemini_native._relay_stream(upstream)
+                    with self.assertRaises((OSError, ClientDisconnect)):
+                        await response({"type": "http", "asgi": {"spec_version": "2.4"}}, mock.AsyncMock(), send)
+                self.assertTrue(closed.is_set())
+                self.assertTrue(upstream.is_closed)
+                self.assertEqual(stats.error_requests, 1)
+                self.assertEqual(stats.success_requests, 0)
+
+    async def test_cancel_scope_does_not_interrupt_upstream_close(self):
+        closed = asyncio.Event()
+        class Waiting(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                await asyncio.Event().wait()
+                yield b"unused"
+            async def aclose(self):
+                await asyncio.sleep(0)
+                closed.set()
+        upstream = httpx.Response(200, stream=Waiting(), headers={"content-type": "text/event-stream"})
+        with mock.patch.object(gemini_native, "stats", ProxyStats()):
+            response = await gemini_native._relay_stream(upstream)
+            with anyio.CancelScope() as scope:
+                async def send(message):
+                    scope.cancel()
+                await response({"type": "http", "asgi": {"spec_version": "2.4"}}, mock.AsyncMock(), send)
+        self.assertTrue(closed.is_set())
 
 
 if __name__ == "__main__":

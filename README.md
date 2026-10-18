@@ -31,6 +31,7 @@ Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风
   - **模型参数面板**：按所选模型显示其支持能力，并在线调整思考强度、生图分辨率与比例、采样默认值、输入图压缩、重试、假流式/轮询/安全分显示、预填充兼容模式（详见下文）。
   - **实时监控**：运行日志推流、健康度图表（成功/错误/拥堵重试）、Express 通道 Token 消耗统计（包含思考 Token；Cookie 私有接口通常不返回可靠用量）。成功计数不依赖上游是否返回 Token 用量。
 - **Gemini 能力与适配**
+  - **按模型选择抗截断传输**：文本模型列表自动提供流式/非流式抗截断别名，控制台也可保存模型专属默认值；Express 支持原生增量函数参数流，Cookie 通道支持完整函数参数还原，详见下文。
   - 文本对话、流式（SSE）与非流式。
   - OpenAI tools / function calling ↔ Gemini function calling 适配（含 Gemini 3.x 多轮所需的 thought signature 编解码）；Express 与 Cookie 直连通道均支持自定义函数声明、调用与结果回传。
   - **安全分类对齐**：两条通道下发同一套安全设置（`HARM_CATEGORY_HATE_SPEECH`、`DANGEROUS_CONTENT`、`SEXUALLY_EXPLICIT`、`HARASSMENT`、`JAILBREAK`），阈值最宽松，避免通道间行为不一致。
@@ -581,6 +582,78 @@ curl http://localhost:8050/v1/chat/completions \
 > - `gemini-3.1-flash-image` / `gemini-3-pro-image`：GA 版本（不带 `-preview`），对应的 `-preview` 版本已于 2026-06-25 停用。
 
 `/v1/models` 会自动为**非生图**的 Gemini 模型生成带 `-search` 后缀的别名。新增模型只需把 ID 加进此列表即可（能力自动归类，无需改代码）。
+
+---
+
+## 抗截断模型选项
+
+刷新客户端的 `/v1/models` 列表后，每个兼容的文本模型都会提供以下入口。无需额外运行 Node.js/Go 网关，也无需在客户端配置正则：
+
+普通模型入口的内置默认：**`gemini-4-argon`（Gemini 4a / Argon）和 `gemini-3.8-flash` 开启流式抗截断，其它模型关闭**。不需要选择后缀别名，这两个模型的原始名称即会启用。已有手动保存的该模型 `anti_truncation_mode` 仍优先于内置值；旧配置里只有采样等其它专属参数时，不会覆盖掉新的抗截断默认值。
+
+| 模型名称示例 | 行为 |
+|---|---|
+| `gemini-3.6-flash` | 普通入口，默认关闭抗截断；可使用控制台设置的默认模式 |
+| `gemini-3.6-flash-antitruncation-nonstream` | 上游完整返回后还原正文；客户端开启 `stream` 时仍以 SSE 交付 |
+| `gemini-3.6-flash-antitruncation-stream` | 上游支持时增量还原正文；客户端关闭 `stream` 时返回普通 JSON |
+
+手动填写 `-antitruncation` 短后缀也可使用流式模式。别名只在本地解析，上游收到的仍是原始模型 ID。
+
+在控制台「模型参数」中选择模型，将「抗截断传输」设为关闭、非流式或流式，再点「保存为该模型专属」，即可让普通模型名也使用该模式；也可选择全局默认作用域保存。单次请求可传：
+
+```json
+{
+  "model": "gemini-3.6-flash",
+  "anti_truncation_mode": "stream",
+  "stream": true,
+  "messages": [{"role": "user", "content": "请完整解释这个算法"}]
+}
+```
+
+优先级为 **请求 `anti_truncation_mode` > 模型别名 > 模型专属设置 > 全局默认**。传 `"off"` 可明确关闭本轮包装。
+
+要持久关闭默认启用的两个模型，请在对应模型下选择“关闭”并保存专属设置。清除模型专属设置会恢复该模型的内置默认（这两个模型恢复为流式，其它模型回退全局）。
+
+### 实现与兼容范围
+
+代理为每次请求声明一个随机命名的正文传输函数，要求模型把正文写入其 `content` 字符串。返回时在原生响应解析阶段将该函数还原为普通 assistant 文本；**不执行函数，也不把临时函数调用交给客户端**。真实自定义函数的声明、调用和思考签名保持独立，仍由原有工具链处理。
+
+| 请求路径/能力 | 流式抗截断的实际交付方式 |
+|---|---|
+| Express + 支持增量函数参数的 Gemini 3+ 文本模型 | 发送 `streamFunctionCallArguments`，直接读取 `partialArgs` 中的字符串片段并输出 `delta.content` |
+| Gemini 3.1 Flash-Lite、旧模型、旧 SDK | 等完整函数参数返回后还原；不发送不支持的增量参数字段 |
+| Cookie / batchGraphql | 等完整函数参数返回后还原；不假设私有协议支持原生增量参数流 |
+| 请求声明真实工具或携带工具历史 | 保留真实工具；正文函数参数完整后还原，不启用增量函数参数流 |
+| 全局假流式、非流式抗截断模式 | 等上游完整响应后交付 |
+| `/v1beta/models/...`、`/v1/models/...` 原生 POST 透传 | 保持原始请求和响应，不应用此选项；原生模型目录不加入本地抗截断别名 |
+
+Google 的增量函数参数流有模型限制，详情见[官方说明](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/multimodal/function-calling#streaming_function_call_arguments)。上游明确以 400 拒绝该字段时，且尚未交付内容，Express 会移除该字段再使用完整参数模式。
+
+生图、音频、Live、嵌入等非文本生成模型不添加抗截断别名。搜索、结构化输出、多候选、旧版 `functions` 协议，以及显式 `tool_choice=none/required/指定函数` 的请求会自动跳过包装并记录原因，以保留客户端约定。搜索模型不再额外组合抗截断别名。
+
+包装在现有控制台注入与预填充处理之后进行，原有预填充拼回和去重仍适用。429 使用原来的单 Key/多 Key 重试预算；输出已开始后不重发整轮。缺少上游结束标记、正文参数类型错误、重复正文调用等情况返回明确错误；`MAX_TOKENS` 和安全过滤结束原因分别保留为 `length`、`content_filter`，不会伪装成完整成功。
+
+普通 OpenAI 兼容请求同样检查上游结束标记，覆盖 Express / Cookie 的真流式、假流式和非流式路径；收到部分内容后静默断流会报告 502，不计为成功，也不会自动重发整轮。原生 Gemini 接口继续保持正文透传；网络错误返回 Google 风格错误 JSON，断连和错误处理会关闭上游响应。
+
+OpenAI 对话 SSE 在上游安静等待、长思考或完整函数参数尚未返回时，每约 10 秒发送一次注释保活。Cookie 的非流式抗截断和全局假流式也会先建立 SSE，再等待上游完成。保活不会取消或重发上游调用，不占续传事件 ID，也不会保存进响应缓冲；关闭直通连接会取消等待中的生成，开启续传时仍由后台任务继续收集回复。
+
+开启续传后，准备阶段前端断开也会保留同一次上游调用。使用相同请求体与原幂等请求头，附 `Last-Event-ID`（已收到的最后一个事件 ID）或 `?resume_from=`（下一帧序号）重连，会继续读取原缓冲；已发送过的回复同样可以显式续传。缓冲已过期返回 404，游标超过当前缓冲末尾返回 409；要重新生成，请移除续传游标。JSON 对象字段顺序不影响同请求识别，消息与数组顺序仍参与匹配。
+
+`GET /v1/resumable/{id}` 对流式缓冲返回事件分片；对非流式缓冲在 `done=true` 时返回 `payload`（完整正文）和 `status_code`（上游状态码，轮询请求本身仍返回 200）。JSON 响应和轮询均在 ASGI 完成发送后标记交付，发送抛错时可重放原回复；这一标记不等同于客户端的应用层收件确认。缓冲完成或被淘汰后内容固定，迟到的上游结果不会覆盖终态。
+
+控制台更新的 Cookie / Project ID 优先于环境变量；环境变量只在尚未保存对应配置时作为初始值。按模型更新部分参数时会保留其它已保存字段，避免调整思考档位时把该模型明确关闭的抗截断重新打开。生图 system 指令开关在两条通道都按模型专属设置生效。
+
+这是可选的输出传输方式，**不能保证消除所有截断或模型拒绝**，也不增加模型输出 Token 上限。临时函数声明和控制消息会增加少量输入开销。当前验证使用模拟上游，真实模型/项目支持情况需要部署后确认。输入 Unicode 转码和实验性上下文图片化未纳入本次实现。
+
+### 思路与来源
+
+本功能的合成函数传输思路参考：
+
+- [ken050210/vertex-streaming-anti-truncation](https://github.com/ken050210/vertex-streaming-anti-truncation)：原生 `partialArgs` 流式还原及模型传输版本划分。
+- [Xeltra233/Antigravity-gateway](https://github.com/Xeltra233/Antigravity-anti-truncation-gateway)：动态合成正文工具、真实工具隔离与回复还原；另查阅了其 [experimental 分支](https://github.com/Xeltra233/Antigravity-gateway/tree/experimental)。
+- 原始讨论：[LINUX DO](https://linux.do/t/topic/2619263)、[Discord 抗截断思路](https://discord.com/channels/1134557553011998840/1543451029553545346)、[Discord 转码讨论](https://discord.com/channels/1134557553011998840/1475468066640105514)。Discord 原文需相应访问权限，本次未读取。
+
+感谢原作者及讨论参与者。本项目根据现有 Python SDK / batchGraphql 架构独立实现，未移植输入图片化或宣称上游限制被完全消除。
 
 ---
 

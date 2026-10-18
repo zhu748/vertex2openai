@@ -8,6 +8,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 
 from models import OpenAIRequest
+from anti_truncation import prepare_transport, split_model_alias
 from upstreams.base import BaseUpstream
 from api_helpers import (
     create_generation_config,
@@ -30,7 +31,7 @@ OPENAI_SEARCH_SUFFIX = "-openaisearch"
 
 
 def _normalize_model_name(model_name: str) -> tuple[str, bool, str | None]:
-    base_model_name = model_name.strip()
+    base_model_name, _ = split_model_alias(model_name)
     if base_model_name == LEGACY_EXPRESS_PREFIX.strip():
         return "", False, "模型名称不能为空。"
 
@@ -157,7 +158,7 @@ def resolve_express_model_path(base_model_name: str, settings: dict,
 
     项目 ID 的取值顺序（多账号支持）：
       ① 本次选中的那个 Express Key **自己的** Project ID（启动时自动探测或人工填写）；
-      ② 环境变量 GOOGLE_PROJECT_ID / 「通道与凭证」里的全局 Project ID（旧行为兜底）；
+      ② 「通道与凭证」保存的全局 Project ID（未保存时取 GOOGLE_PROJECT_ID）；
       ③ 都没有 → 退回裸模型名（并提示），绝不拼出半截路径。
     ①在多账号轮换时是必须的：Key 与项目一一对应，用别人的项目会 403（需要计费/无权）。
     """
@@ -169,7 +170,6 @@ def resolve_express_model_path(base_model_name: str, settings: dict,
         return base_model_name
 
     project = (str(key_project_id or "").strip()
-               or app_config.GOOGLE_PROJECT_ID
                or app_state.get_project_id() or "").strip()
     if not project:
         print("⚠️ [上游端点] 已选择钉定 location，但该 Key 没有可用的 Project ID"
@@ -301,7 +301,13 @@ class ExpressSDKUpstream(BaseUpstream):
             if prefill_active and app_state.get_setting("prefill_suppress_thinking", True):
                 print("🧠 [预填充兼容] 已按模型压制原生思考（可在控制台关闭），让预设思维链接管。")
 
+        request_obj, text_transport = prepare_transport(
+            request_obj, base_model_name, _inj_settings, search=is_grounded_search,
+            native_stream=not app_state.get_setting("fake_streaming", False),
+            prefill=prefill_active or bool(prefill_text))
         gen_config_dict = create_generation_config(request_obj)
+        if text_transport and text_transport.native_stream:
+            gen_config_dict["tool_config"]["function_calling_config"]["stream_function_call_arguments"] = True
         thinking_config = _build_thinking_config(base_model_name, request_obj, is_image_model,
                                                  prefill_active=prefill_active)
         if thinking_config:
@@ -355,4 +361,5 @@ class ExpressSDKUpstream(BaseUpstream):
                 lambda: get_pooled_express_client(express_api_key, key_proxy_uri)
             ),
             retry_target_factory=retry_target_factory,
+            text_transport=text_transport,
         )

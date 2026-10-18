@@ -464,8 +464,13 @@ class ConfigShapeTests(unittest.TestCase):
 
     def test_http_options_direct(self):
         from http_options import get_http_options
-        opts = get_http_options(proxy_url="direct")
-        self.assertIsNone(opts)               # 直连 + 无其他覆盖 → None（旧行为）
+        # This assertion is specifically the no-overrides case. A developer's
+        # custom CA/base URL must not turn it into a different configuration.
+        with mock.patch("config.SSL_CERT_FILE", None), \
+             mock.patch("config.VERTEX_BASE_URL", None), \
+             mock.patch("http_options.build_sdk_channel_overrides", return_value={}):
+            opts = get_http_options(proxy_url="direct")
+            self.assertIsNone(opts)           # 直连 + 无其他覆盖 → None（旧行为）
         opts_native = get_http_options(proxy_url="socks5://u:p@1.2.3.4:1080")
         self.assertEqual(opts_native.client_args["proxy"], "socks5://u:p@1.2.3.4:1080")
         self.assertEqual(opts_native.async_client_args["proxy"], "socks5://u:p@1.2.3.4:1080")

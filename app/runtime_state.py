@@ -93,7 +93,7 @@ class AppState:
 
     def get_google_cookie(self) -> str:
         with self._lock:
-            return self._state.get("google_cookie", "")
+            return self._state.get("google_cookie", app_config.GOOGLE_COOKIE or "")
 
     def set_project_id(self, project_id: str):
         with self._lock:
@@ -103,7 +103,7 @@ class AppState:
 
     def get_project_id(self) -> str:
         with self._lock:
-            return self._state.get("google_project_id", "")
+            return self._state.get("google_project_id", app_config.GOOGLE_PROJECT_ID or "")
 
     # ---------- Express API Key（多账号，可热编辑） ----------
     # 记录形态：{"key":..., "project_id":..., "project_source":"auto|manual|", 
@@ -234,7 +234,16 @@ class AppState:
             if isinstance(stored, dict):
                 for k, v in stored.items():
                     if k in merged:
-                        merged[k] = copy.deepcopy(v)
+                        if k == "model_overrides":
+                            # Saved model settings override individual built-in
+                            # fields. A legacy override map (or an unrelated
+                            # sampling override) must not erase model defaults.
+                            if isinstance(v, dict):
+                                for model, override in v.items():
+                                    if isinstance(override, dict):
+                                        merged[k].setdefault(model, {}).update(copy.deepcopy(override))
+                        else:
+                            merged[k] = copy.deepcopy(v)
             return merged
 
     def get_setting(self, key: str, default=None):
@@ -281,11 +290,8 @@ class AppState:
     # ---------- 按模型参数覆盖 ----------
 
     def get_model_overrides(self) -> dict:
-        with self._lock:
-            stored = self._state.get("settings")
-            if isinstance(stored, dict) and isinstance(stored.get("model_overrides"), dict):
-                return copy.deepcopy(stored["model_overrides"])
-            return {}
+        """Model-specific built-ins plus saved field overrides, matching execution/UI."""
+        return self.get_settings()["model_overrides"]
 
     def set_model_override(self, model_name: str, patch: dict) -> dict:
         model_name = (model_name or "").strip()
@@ -297,12 +303,15 @@ class AppState:
             settings = dict(settings) if isinstance(settings, dict) else {}
             overrides = settings.get("model_overrides")
             overrides = dict(overrides) if isinstance(overrides, dict) else {}
-            overrides[model_name] = clean
+            previous = overrides.get(model_name)
+            previous = dict(previous) if isinstance(previous, dict) else {}
+            previous.update(copy.deepcopy(clean))
+            overrides[model_name] = previous
             settings["model_overrides"] = overrides
             self._state["settings"] = settings
             self._save()
             print(f"🔧 [状态管理器] 已保存模型 {model_name} 的专属参数（{len(clean)} 项）。")
-            return clean
+            return self.get_model_overrides().get(model_name, {})
 
     def clear_model_override(self, model_name: str) -> bool:
         model_name = (model_name or "").strip()

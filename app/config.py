@@ -66,6 +66,8 @@ VERTEX_REASONING_TAG = REASONING_TAG
 # 环境变量仅作为“初始值”。
 # ============================================================
 DEFAULT_SETTINGS = {
+    # 全局默认关闭；下方 model_overrides 为 4 Argon / 3.8 Flash 单独开启。
+    "anti_truncation_mode": "off",        # off | nonstream | stream
     # 思考
     "thinking_g3_level": "",              # 空=按模型各自默认(3.6-flash=medium/pro=high/flash-lite=minimal)；也可强制 minimal|low|medium|high
     # 生图
@@ -90,7 +92,7 @@ DEFAULT_SETTINGS = {
     "fake_streaming_interval": FAKE_STREAMING_INTERVAL_SECONDS,
     "roundrobin": ROUNDROBIN,
     "safety_score": SAFETY_SCORE,
-    # 预填充兼容模式: smart|minimal|off
+    # 预填充兼容模式: smart|keep_turn|minimal|off
     # 默认 smart。两种模式的优劣**取决于预填充的结尾形态**，用某真实酒馆预设
     # （预填充为一段完整句子 + 一个未闭合的思维链开标签）实测 gemini-3.6-flash × 3：
     #   smart      重复开标签 0/3，思考语言正确 3/3   ← 真实预设的常见形态
@@ -191,12 +193,16 @@ DEFAULT_SETTINGS = {
     "resumable_max_streams": 200,         # 缓冲总数上限，超限淘汰最旧的已完成缓冲
     # 按模型单独保存的参数覆盖：{ "模型ID": { 键: 值, ... } }
     # 仅覆盖“与模型相关”的参数（见 PER_MODEL_KEYS）；优先级 请求 > 模型专属 > 全局 > 内置。
-    "model_overrides": {},
+    "model_overrides": {
+        "gemini-4-argon": {"anti_truncation_mode": "stream"},
+        "gemini-3.8-flash": {"anti_truncation_mode": "stream"},
+    },
 }
 
 # 允许按模型单独保存（覆盖全局默认）的参数键。
 # 其余为基础设施级（图压缩/重试/假流式/预填充/安全分/调试等），保持全局唯一。
 PER_MODEL_KEYS = [
+    "anti_truncation_mode",
     "native_thinking_mode",
     "thinking_g3_level",
     "image_size",
