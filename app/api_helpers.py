@@ -1,42 +1,55 @@
-import json
-import time
-import math
+"""SDK 调用、响应转换与 OpenAI 流式输出编排。"""
 import asyncio
 import inspect
+import json
+import math
+import time
 from contextlib import suppress
-import httpx
-from curl_cffi.requests.exceptions import ConnectionError as CurlConnectionError, Timeout as CurlTimeout
-import re
-from typing import List, Dict, Any, Callable, Optional
+from typing import Any, Callable, Dict, List, Optional
 
+import config as app_config
+import model_capabilities as mc
+from anti_truncation import TextTransport
+from express_endpoint import is_location_pin_failure
 from fastapi.responses import JSONResponse, StreamingResponse
 from google.genai import types
 
-from models import OpenAIRequest, OpenAIMessage
-from message_processing import (
-    convert_to_openai_format,
-    _create_safety_ratings_html,
-    strip_prefill_overlap,
-    PrefillDeduper,
-    parse_gemini_response_for_reasoning_and_content,
-    build_tool_call_id,
-    thought_signature_extra,
-    ordinary_part_metadata,
-    _convert_image_to_markdown,
-    _signature_bytes,
-)
-from signature_store import SignatureState
-import config as app_config
-
-import model_capabilities as mc
-from runtime_state import app_state
-
 # 引入报错重试统计器
 from logger import stats
-from usage import map_usage
-from retry_policy import error_status, exception_retry_delay, wait_for_retry
-from anti_truncation import AntiTruncationError, TextTransport
-from response_validation import IncompleteResponseError, has_finish_reason, require_complete_response
+from message_processing import (
+    _convert_image_to_markdown,
+    _create_safety_ratings_html,
+    convert_to_openai_format,
+    parse_gemini_response_for_reasoning_and_content,
+)
+from models import OpenAIMessage, OpenAIRequest
+from prefill import PrefillDeduper, strip_prefill_overlap
+from response_validation import (
+    IncompleteResponseError,
+    has_finish_reason,
+    require_complete_response,
+    require_unblocked_response,
+)
+from retry_policy import (
+    exception_retry_delay,
+    get_retry_settings,
+    is_retryable_exception,
+    wait_for_retry,
+)
+from runtime_state import app_state
+from signature_store import SignatureState
+from thought_signatures import (
+    build_tool_call_id,
+    ordinary_part_metadata,
+    signature_bytes,
+    thought_signature_extra,
+)
+from upstream_errors import (
+    create_openai_error_response,
+    error_status,
+    extract_upstream_error,
+)
+from usage import make_usage_chunk, map_usage, wants_usage
 
 
 def _safety_score_enabled() -> bool:
@@ -44,312 +57,6 @@ def _safety_score_enabled() -> bool:
         return bool(app_state.get_setting("safety_score", app_config.SAFETY_SCORE))
     except Exception:
         return bool(app_config.SAFETY_SCORE)
-
-
-class SafetyBlockedError(ValueError):
-    """上游安全策略拦截了请求内容（promptFeedback.blockReason）。
-
-    携带 code=400：被拦截是**请求内容**问题而非服务器故障，旧实现抛裸
-    ValueError 会被 extract_upstream_error 兜底成 500（内容审查当内部错误）。
-    error_status() 会探测 .code 属性，流式/非流式两条路径自动拿到 400。
-    """
-
-    code = 400
-
-
-
-def get_retry_settings() -> tuple[int, float, float]:
-    """读取重试配置。
-
-    **语义（全项目统一）**：`retry_max` 是「失败后的重试次数」，
-    总请求次数 = retry_max + 1。所以循环一律写 `range(retry_max + 1)`。
-    旧实现在 Express 通道写成 `range(retry_max)`，retry_max=0 时一次请求都不发（P0-2）。
-
-    重试间隔为**固定值 + 抖动**，不随次数指数放大：实际等待在
-    [backoff - jitter/2, backoff + jitter/2] 内均匀采样（见 retry_policy.retry_delay）。
-    返回 (retry_max, backoff, jitter) 三元组。
-    """
-    try:
-        retry_max = int(app_state.get_setting("retry_max", app_config.DEFAULT_SETTINGS["retry_max"]))
-    except (TypeError, ValueError, OverflowError):
-        retry_max = app_config.DEFAULT_SETTINGS["retry_max"]
-    try:
-        backoff = float(app_state.get_setting(
-            "retry_backoff_seconds", app_config.DEFAULT_SETTINGS["retry_backoff_seconds"]))
-    except (TypeError, ValueError):
-        backoff = float(app_config.DEFAULT_SETTINGS["retry_backoff_seconds"])
-    if not math.isfinite(backoff):
-        backoff = float(app_config.DEFAULT_SETTINGS["retry_backoff_seconds"])
-    try:
-        jitter = float(app_state.get_setting(
-            "retry_jitter_seconds", app_config.DEFAULT_SETTINGS["retry_jitter_seconds"]))
-    except (TypeError, ValueError):
-        jitter = float(app_config.DEFAULT_SETTINGS["retry_jitter_seconds"])
-    if not math.isfinite(jitter):
-        jitter = float(app_config.DEFAULT_SETTINGS["retry_jitter_seconds"])
-    return (max(0, min(50, retry_max)), max(0.0, min(120.0, backoff)),
-            max(0.0, min(60.0, jitter)))
-
-
-def create_openai_error_response(status_code: int, message: str, error_type: str) -> Dict[str, Any]:
-    safe_message = re.sub(r"([?&]key=)[^&\s'\"]+", r"\1***HIDDEN_API_KEY***", message)
-    return {
-        "error": {
-            "message": safe_message,
-            "type": error_type,
-            "code": status_code,
-            "param": None
-        }
-    }
-
-def extract_upstream_error(e: Exception) -> tuple[int, str]:
-    """从上游异常里尽力提取 (HTTP 状态码, 简明消息)。
-
-    google-genai 的 ClientError/ServerError 带 .code 与结构化 message；
-    其余异常回退 500 + 类名+摘要。用于把 404/403/400 等如实透传给客户端，
-    避免笼统的 500 Internal Server Error。
-    """
-    code = error_status(e)
-    if code is None and isinstance(e, (TimeoutError, httpx.TimeoutException, CurlTimeout)):
-        code = 504
-    elif code is None and isinstance(e, (httpx.NetworkError, httpx.RemoteProtocolError, CurlConnectionError)):
-        code = 502
-    msg = str(e)
-    # 从形如 "{'error': {'code':404,'message':...}}" 的 message 里提取更干净的说明
-    try:
-        m = re.search(r"'message':\s*'([^']+)'", msg) or re.search(r'"message":\s*"([^"]+)"', msg)
-        if m:
-            msg = m.group(1)
-    except Exception:
-        pass
-    if not isinstance(code, int) or not (400 <= code <= 599):
-        low = str(e).lower()
-        if "not found" in low or "404" in low:
-            code = 404
-        elif "permission" in low or "403" in low or "denied" in low:
-            code = 403
-        elif "invalid" in low or "400" in low:
-            code = 400
-        else:
-            code = 500
-    return code, msg
-
-
-def is_retryable_exception(e):
-    if isinstance(e, (AntiTruncationError, IncompleteResponseError)):
-        return False
-    error_str = str(e).lower()
-    code = error_status(e)
-    if code is not None:
-        return code == 429 or 500 <= code < 600
-    if isinstance(e, (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError,
-                      CurlTimeout, CurlConnectionError)):
-        return True
-    if isinstance(e, (ValueError, TypeError, AttributeError, httpx.LocalProtocolError)):
-        return False
-    if any(marker in error_str for marker in (
-            "429", "503", "too many requests", "quota", "resource exhausted", "resource_exhausted",
-            "try again later", "rate limit", "overloaded", "temporarily unavailable", "internal error")):
-        return True
-    return False
-
-def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
-    config: Dict[str, Any] = {}
-    settings = app_state.get_effective_settings(request.model)
-    
-    system_texts = []
-    for msg in request.messages:
-        if msg.role == "system" and msg.content:
-            if isinstance(msg.content, str):
-                system_texts.append(msg.content)
-            elif isinstance(msg.content, list):
-                for part in msg.content:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        system_texts.append(part.get("text", ""))
-                    elif hasattr(part, "text") and isinstance(part.text, str):
-                        system_texts.append(part.text)
-                        
-    # P1-9：旧代码无条件剥离生图模型的 system_instruction，且没有注释理由。
-    # 官方并未禁止生图模型使用系统指令，但为避免直接改变既有行为，
-    # 改成控制台开关 image_system_instruction（默认关，保持旧行为）。
-    if system_texts:
-        # 生图判定统一走能力档案（"nano-banana" 家族名字里不带 image，裸 "image" in 会漏判）
-        _is_image_name = mc.get_profile(request.model)["is_image"]
-        _allow_sys = (not _is_image_name) or bool(
-            settings.get("image_system_instruction", False))
-        if _allow_sys:
-            config["system_instruction"] = "\n".join(system_texts)
-    
-    if request.temperature is not None: config["temperature"] = request.temperature
-    if request.max_tokens is not None: 
-        config["max_output_tokens"] = request.max_tokens
-    elif getattr(request, "max_completion_tokens", None) is not None:
-        config["max_output_tokens"] = request.max_completion_tokens
-        
-    if request.top_p is not None: config["top_p"] = request.top_p
-    if request.top_k is not None: config["top_k"] = request.top_k
-    # P1-3：OpenAI 允许 stop 为字符串，统一规范成数组
-    if request.stop is not None:
-        config["stop_sequences"] = [request.stop] if isinstance(request.stop, str) else list(request.stop)
-    if request.seed is not None: config["seed"] = request.seed
-    if request.n is not None: config["candidate_count"] = request.n
-    
-    # 第三轮：惩罚参数默认剥离 —— 前端仍可传这两个字段，但反代不发给 Google
-    # （新版 Gemini 收到非零 presence_penalty / frequency_penalty 直接 400）。
-    # 这里不再下发；model_capabilities.sanitize_sampling 按档案做最终兜底剥离。
-    for _pk in ("presence_penalty", "frequency_penalty"):
-        _pv = getattr(request, _pk, None)
-        if _pv:  # 只有非零值才值得提示（0 不会触发 400）
-            if app_state.get_setting("debug_outbound", False):
-                print(f"🔎 [出站调试] 已剥离 {_pk}={_pv}：新版 Gemini 不接受非零惩罚参数，该值不会发给 Google。")
-        
-    # P1-3：OpenAI 语义 logprobs=bool + top_logprobs=int；Gemini 语义 response_logprobs=bool + logprobs=int。
-    _logprobs = getattr(request, "logprobs", None)
-    _top_logprobs = getattr(request, "top_logprobs", None)
-    if getattr(request, "response_logprobs", None) is not None:
-        config["response_logprobs"] = request.response_logprobs
-    if isinstance(_logprobs, bool):
-        if _logprobs:
-            config["response_logprobs"] = True
-            config["logprobs"] = _top_logprobs if isinstance(_top_logprobs, int) else 1
-    elif isinstance(_logprobs, int):
-        config["logprobs"] = _logprobs
-    elif isinstance(_top_logprobs, int):
-        config["logprobs"] = _top_logprobs
-
-    if getattr(request, "response_format", None) is not None:
-        fmt = request.response_format
-        fmt_type = fmt.get("type", "") if isinstance(fmt, dict) else getattr(fmt, "type", "")
-        if fmt_type == "json_object":
-            config["response_mime_type"] = "application/json"
-        elif fmt_type == "json_schema":
-            # OpenAI 结构化输出：{"type":"json_schema","json_schema":{"name":...,"schema":{...}}}
-            config["response_mime_type"] = "application/json"
-            json_schema_obj = fmt.get("json_schema") if isinstance(fmt, dict) else getattr(fmt, "json_schema", None)
-            schema = None
-            if isinstance(json_schema_obj, dict):
-                schema = json_schema_obj.get("schema")
-            if isinstance(schema, dict):
-                schema = {k: v for k, v in schema.items() if k != "$schema"}
-                config["response_schema"] = schema
-    
-    # 官方 2026 最新基准配置
-    safety_threshold = "BLOCK_NONE"
-    
-    config["safety_settings"] = [
-        types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold=safety_threshold),
-        types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold=safety_threshold),
-        types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold=safety_threshold),
-        types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold=safety_threshold),
-        types.SafetySetting(category="HARM_CATEGORY_JAILBREAK", threshold=safety_threshold)
-    ]
-    
-    tools_list = []
-    if request.tools:
-        function_declarations = []
-        for tool in request.tools:
-            if tool.get("type") == "function":
-                func_data = tool.get("function")
-                if func_data:
-                    declaration = {
-                        "name": func_data.get("name"),
-                        "description": func_data.get("description"),
-                    }
-                    parameters = func_data.get("parameters")
-                    if isinstance(parameters, dict) and "$schema" in parameters:
-                        parameters = parameters.copy()
-                        del parameters["$schema"]
-                    if parameters is not None:
-                        declaration["parameters"] = parameters
-                    declaration = {k: v for k, v in declaration.items() if v is not None}
-                    if declaration.get("name"): 
-                        function_declarations.append(declaration)
-        if function_declarations:
-            tools_list.append({"function_declarations": function_declarations})
-
-    # 读取控制台设置与模型能力档案（优先级：单次请求 > 模型专属 > 全局 > 内置默认）
-    # 控制台的「采样参数处理」可覆盖版本自动判定（新模型版本号更小却已废弃采样时用）
-    profile = mc.apply_sampling_policy(mc.get_profile(request.model), settings)
-    is_image_model = profile["is_image"]
-
-    if is_image_model:
-        config["response_modalities"] = ["TEXT", "IMAGE"]
-
-        # Nano Banana 家族专属（用户决策 2026-10-13）：
-        # - 追加 4 个图像安全分类，阈值全 OFF（官方示例基准）
-        # - media_resolution=HIGH：提升输入多媒体的理解精细度（非输出尺寸）
-        # 旧生图模型维持现状，不加。
-        if "nano-banana" in (request.model or "").lower():
-            config["safety_settings"].extend([
-                types.SafetySetting(category="HARM_CATEGORY_IMAGE_HATE", threshold="OFF"),
-                types.SafetySetting(category="HARM_CATEGORY_IMAGE_DANGEROUS_CONTENT", threshold="OFF"),
-                types.SafetySetting(category="HARM_CATEGORY_IMAGE_HARASSMENT", threshold="OFF"),
-                types.SafetySetting(category="HARM_CATEGORY_IMAGE_SEXUALLY_EXPLICIT", threshold="OFF"),
-            ])
-            config["media_resolution"] = types.MediaResolution.MEDIA_RESOLUTION_HIGH
-
-        # 宽高比：两通道共用解析（请求额外字段 > OpenAI size 映射 > 提示词 > 控制台默认，按模型白名单校验）
-        target_ar = mc.resolve_aspect_ratio(request.model, request, settings)
-
-        # 分辨率：请求 > 控制台默认，按模型白名单校验并回退
-        image_size = mc.resolve_image_size(request.model, request, settings)
-        image_config_args = {"image_size": image_size}
-        if target_ar:
-            image_config_args["aspect_ratio"] = target_ar
-
-        config["image_config"] = types.ImageConfig(**image_config_args)
-        # 生图模型不支持自定义函数调用；只有客户端明确声明搜索工具时才保留
-        # google_search。普通生图请求与 tool_choice=none 都不得偷偷启用搜索。
-        _search_names = {"google_search", "googlesearch", "web_search", "websearch", "search"}
-        _declared_search = any(
-            str(((tool.get("function") or {}).get("name") or "")).lower() in _search_names
-            for tool in (request.tools or []) if isinstance(tool, dict)
-        )
-        _tools_disabled = isinstance(request.tool_choice, str) and request.tool_choice.lower() == "none"
-        tools_list = ([{"google_search": {}}]
-                      if _declared_search and not _tools_disabled and profile.get("supports_search")
-                      else [])
-
-        # 生图不支持的键（采样类由 sanitize 统一剥离，这里清理其余）
-        for key in ["response_mime_type", "response_schema", "response_logprobs", "logprobs"]:
-            config.pop(key, None)
-    else:
-        # 文本/多模态：客户端未显式传采样值时，应用控制台默认（仅注入该模型支持的键）
-        if config.get("temperature") is None and settings.get("default_temperature") is not None:
-            config["temperature"] = settings["default_temperature"]
-        if config.get("top_p") is None and settings.get("default_top_p") is not None:
-            config["top_p"] = settings["default_top_p"]
-        if config.get("max_output_tokens") is None and settings.get("default_max_tokens") is not None:
-            config["max_output_tokens"] = settings["default_max_tokens"]
-
-    # 按模型家族剥离不支持的采样参数（例如 Gemini 3.x 弃用 temperature/top_p/top_k、不支持 candidate_count）
-    mc.sanitize_sampling(config, profile)
-
-    if tools_list:
-        config["tools"] = tools_list
-
-    tool_config = None
-    if request.tool_choice and not is_image_model:
-        choice = request.tool_choice
-        mode = None
-        allowed_functions = None
-        if isinstance(choice, str):
-            if choice == "none": mode = "NONE"
-            elif choice == "auto": mode = "AUTO"
-            elif choice == "required": mode = "ANY"
-        elif isinstance(choice, dict) and choice.get("type") == "function":
-            func_name = choice.get("function", {}).get("name")
-            if func_name:
-                mode = "ANY"
-                allowed_functions = [func_name]
-        if mode:
-            config_dict = {"mode": mode}
-            if allowed_functions: config_dict["allowed_function_names"] = allowed_functions
-            tool_config = {"function_calling_config": config_dict}
-    
-    if tool_config: config["tool_config"] = tool_config
-        
-    return config
 
 
 def _extract_usage(resp: Any) -> tuple[int, int, int]:
@@ -371,23 +78,6 @@ def _record_usage(resp: Any) -> dict:
     if p_tk or c_tk:
         print(f"💰 [算力消耗统计] 提示词: {p_tk} | 思考与生成: {c_tk} | 总计: {t_tk} Tokens")
     return {"prompt_tokens": p_tk, "completion_tokens": c_tk, "total_tokens": t_tk}
-
-
-def wants_usage(request_obj: Any) -> bool:
-    """客户端是否通过 stream_options.include_usage 要求在流末尾附带用量（P1-8）。"""
-    opts = getattr(request_obj, "stream_options", None)
-    if opts is None and getattr(request_obj, "model_extra", None):
-        opts = request_obj.model_extra.get("stream_options")
-    if isinstance(opts, dict):
-        return bool(opts.get("include_usage"))
-    return False
-
-
-def make_usage_chunk(response_id: str, model: str, usage: dict) -> str:
-    """OpenAI 风格的用量尾块（choices 为空，仅携带 usage）。"""
-    chunk = {"id": response_id, "object": "chat.completion.chunk", "created": int(time.time()),
-             "model": model, "choices": [], "usage": usage}
-    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
 
 def is_gemini_response_valid(response: Any) -> bool:
@@ -489,7 +179,7 @@ def _build_chunk_payload(chunk: Any, model_name: str, response_id: str, candidat
         if hasattr(candidate, "content") and hasattr(candidate.content, "parts") and candidate.content.parts:
             for part in candidate.content.parts:
                 fc = getattr(part, "function_call", None)
-                sig = _signature_bytes(part, fc)
+                sig = signature_bytes(part, fc)
                 if fc is None:
                     text_value = getattr(part, "text", None)
                     if text_value is None and getattr(part, "inline_data", None) is not None:
@@ -710,31 +400,8 @@ def _prepend_prefill(openai_dict: Dict[str, Any], prefill_text: str) -> Dict[str
     return openai_dict
 
 
-def _dedup_sse_chunk_content(sse_line: str, deduper: PrefillDeduper, force_flush: bool = False) -> Optional[str]:
-    """真流式预填充去重：改写单条 SSE chunk 的 delta.content。
-
-    - 去重器工作期间，正文会先被攒下（返回 None 表示该 chunk 可整条跳过）；
-      判定完成后原样透传，零额外延迟。
-    - force_flush=True 或 chunk 带 finish_reason 时，把攒着的文本一并放出，
-      避免正文落在 finish 之后（部分客户端在 finish 后停止读取）。
-
-    保留字符串接口供既有调用方；热路径请用 _dedup_chunk_payload（凭 dict
-    直改，免去一次序列化/反序列化往返）。
-    """
-    if deduper.done and not force_flush:
-        return sse_line
-    try:
-        payload = json.loads(sse_line[len("data: "):].strip())
-        out = _dedup_chunk_payload(payload, deduper, force_flush)
-        if out is None:
-            return None
-        return f"data: {json.dumps(out, ensure_ascii=False)}\n\n"
-    except Exception:
-        return sse_line
-
-
 def _dedup_chunk_payload(payload: dict, deduper: PrefillDeduper, force_flush: bool = False) -> Optional[dict]:
-    """_dedup_sse_chunk_content 的 dict 版：直接改写 payload，返回 None 表示整条跳过。"""
+    """改写 delta.content 做预填充去重；返回 None 表示整条跳过。"""
     if deduper.done and not force_flush:
         return payload
     try:
@@ -894,15 +561,7 @@ async def gemini_fake_stream_generator(
         if raw_gemini_response is None:
             raise last_error or ValueError("上游未返回任何响应（重试已耗尽）。")
         
-        if hasattr(raw_gemini_response, "prompt_feedback") and \
-           hasattr(raw_gemini_response.prompt_feedback, "block_reason") and \
-           raw_gemini_response.prompt_feedback.block_reason:
-            block_message = f"Response blocked by Gemini safety filter: {raw_gemini_response.prompt_feedback.block_reason}"
-            if hasattr(raw_gemini_response.prompt_feedback, "block_reason_message") and \
-               raw_gemini_response.prompt_feedback.block_reason_message:
-                block_message += f" (Message: {raw_gemini_response.prompt_feedback.block_reason_message})"
-            raise ValueError(block_message)
-
+        require_unblocked_response(raw_gemini_response)
         require_complete_response(raw_gemini_response)
         if text_transport:
             decoder = text_transport.decoder()
@@ -946,24 +605,6 @@ async def gemini_fake_stream_generator(
             api_call_task.cancel()
             with suppress(asyncio.CancelledError, Exception):
                 await api_call_task
-            
-def is_location_pin_failure(err: Any) -> bool:
-    """错误是否像"钉定的 projects/locations 路径不对"（而非模型或网络本身的问题）。
-
-    典型两种：
-      404 `Publisher model projects/X/locations/Y/... was not found`  → 该项目/区域没有这个模型
-      403 `This API method requires billing to be enabled ... project #X` → 项目没开计费/无权
-    命中时可以把模型名退回**裸模型名**再试一次，让后端自行路由——
-    这样即使用户填的 Project ID 与 API Key 不属于同一项目，也只是回到旧行为，不会更糟。
-    """
-    e = str(err).lower()
-    if "requires billing" in e or "billing to be enabled" in e:
-        return True
-    if ("not found" in e or "404" in e) and "publisher model" in e:
-        return True
-    if "permission_denied" in e and "projects/" in e:
-        return True
-    return False
 
 
 async def execute_gemini_call(
@@ -1083,9 +724,7 @@ async def execute_gemini_call(
                                 final_p_tk, final_c_tk, final_t_tk = _extract_usage(chunk_item_call)
 
                             # 支持 n>1：按候选序号逐个输出
-                            feedback = getattr(chunk_item_call, "prompt_feedback", None)
-                            if getattr(feedback, "block_reason", None):
-                                raise SafetyBlockedError(f"请求被上游安全策略拦截：{feedback.block_reason}")
+                            require_unblocked_response(chunk_item_call)
                             for ci, candidate in enumerate(chunk_item_call.candidates or []):
                                 index = candidate.index if candidate.index is not None else ci
                                 seen_candidates.add(index)
@@ -1287,15 +926,7 @@ async def execute_gemini_call(
                     502, "上游未返回任何响应（重试已耗尽）。", "upstream_error"),
             )
 
-        if hasattr(response_obj_call, "prompt_feedback") and \
-           hasattr(response_obj_call.prompt_feedback, "block_reason") and \
-           response_obj_call.prompt_feedback.block_reason:
-            block_msg = f"Agent Platform 安全策略拦截了请求：{response_obj_call.prompt_feedback.block_reason}"
-            if hasattr(response_obj_call.prompt_feedback,"block_reason_message") and \
-               response_obj_call.prompt_feedback.block_reason_message:
-                block_msg+=f"（{response_obj_call.prompt_feedback.block_reason_message}）"
-            raise SafetyBlockedError(block_msg)
-
+        require_unblocked_response(response_obj_call)
         require_complete_response(response_obj_call)
         if text_transport:
             decoder = text_transport.decoder()

@@ -1,5 +1,4 @@
 """冒烟测试：启动完整服务，验证核心端点与修复点。"""
-import json
 import os
 import sys
 
@@ -81,10 +80,8 @@ with TestClient(main.app) as c:
         check("空 resume_from 不报 400", r2.status_code != 400, f"got {r2.status_code}")
 
     # ---- 消息转换修复点（Commit 1）----
-    from message_processing import (  # noqa: E402
-        _decode_data_url_image, _rindex_by_identity, create_gemini_prompt,
-        _extract_markdown_images_to_parts,
-    )
+    from image_processing import decode_data_url_image
+    from message_processing import create_gemini_prompt, _extract_markdown_images_to_parts
     from models import OpenAIMessage  # noqa: E402
 
     # 畸形 base64 不再 500
@@ -97,7 +94,7 @@ with TestClient(main.app) as c:
 
     # 体积上限生效
     try:
-        _decode_data_url_image("A" * (30 * 1024 * 1024))
+        decode_data_url_image("A" * (30 * 1024 * 1024))
         check("内联图片 20MiB 上限拦截", False, "未抛异常")
     except ValueError:
         check("内联图片 20MiB 上限拦截", True)

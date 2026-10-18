@@ -19,16 +19,19 @@ from fastapi.responses import StreamingResponse
 from fastapi.testclient import TestClient
 
 import anti_truncation as at
-import api_helpers
+import generation_config
 import config
+import express_endpoint
 import main
+from routes import settings_api
+import console_auth
 import resumable
 import streaming
 from logger import ProxyStats
 from models import OpenAIRequest
 from routes import chat_api
 from runtime_state import AppState, app_state
-from upstreams import cookie_proxy, express_sdk
+from upstreams import cookie_proxy, express_sdk, cookie_request
 
 
 MODEL = "gemini-3.6-flash"
@@ -189,16 +192,16 @@ class SettingsTests(unittest.TestCase):
         with mock.patch.object(config, "GOOGLE_COOKIE", "SAPISID=env-test"), \
              mock.patch.object(config, "GOOGLE_PROJECT_ID", "env-project"), \
              mock.patch.object(cookie_proxy, "app_state", state), \
-             mock.patch.object(express_sdk, "app_state", state):
+             mock.patch.object(express_endpoint, "app_state", state):
             self.assertEqual(cookie_proxy._get_cookie_string(), "SAPISID=env-test")
             self.assertEqual(cookie_proxy._get_project_id(), "env-project")
             state.set_google_cookie("SAPISID=console-test")
             state.set_project_id("console-project")
             self.assertEqual(cookie_proxy._get_cookie_string(), "SAPISID=console-test")
             self.assertEqual(cookie_proxy._get_project_id(), "console-project")
-            path = express_sdk.resolve_express_model_path(MODEL, {"express_location": "global"})
+            path = express_endpoint.resolve_express_model_path(MODEL, {"express_location": "global"})
             self.assertIn("projects/console-project/", path)
-            owned = express_sdk.resolve_express_model_path(MODEL, {"express_location": "global"}, "key-project")
+            owned = express_endpoint.resolve_express_model_path(MODEL, {"express_location": "global"}, "key-project")
             self.assertIn("projects/key-project/", owned)
             state.set_google_cookie("")
             state.set_project_id("")
@@ -215,11 +218,11 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(state.get_effective_settings("gemini-4-argon")["anti_truncation_mode"], "both")
 
     def test_keep_turn_can_be_saved_from_dashboard(self):
-        main.app.dependency_overrides[main.require_auth] = lambda: True
+        main.app.dependency_overrides[console_auth.require_auth] = lambda: True
         self.addCleanup(main.app.dependency_overrides.clear)
         client = TestClient(main.app)
         self.addCleanup(client.close)
-        with mock.patch.object(main.app_state, "update_settings", return_value={}) as save:
+        with mock.patch.object(settings_api.app_state, "update_settings", return_value={}) as save:
             result = client.post("/api/settings", json={"prefill_mode": "keep_turn"})
             self.assertEqual(result.status_code, 200)
             save.assert_called_once_with({"prefill_mode": "keep_turn"})
@@ -231,8 +234,8 @@ class SettingsTests(unittest.TestCase):
             settings = dict(config.DEFAULT_SETTINGS, image_system_instruction=enabled)
             with mock.patch.object(app_state, "get_effective_settings", return_value=settings), \
                  mock.patch.object(app_state, "get_setting", side_effect=lambda k, d=None: not enabled if k == "image_system_instruction" else d):
-                sdk = api_helpers.create_generation_config(obj)
-                cookie = cookie_proxy._build_batch_graphql_body("project", obj.model, obj)
+                sdk = generation_config.create_generation_config(obj)
+                cookie = cookie_request.build_request_body("project", obj.model, obj)
             self.assertEqual("system_instruction" in sdk, enabled)
             self.assertEqual("systemInstruction" in cookie["variables"], enabled)
 

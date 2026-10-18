@@ -21,8 +21,12 @@ from pydantic import ValidationError
 
 import anti_truncation as at
 import api_helpers
+import retry_policy
 import config
 import main
+from routes import settings_api
+import console_auth
+import settings_validation
 import model_capabilities as mc
 import resumable
 from models import OpenAIRequest
@@ -120,8 +124,8 @@ class PrepareTests(unittest.TestCase):
     def test_model_reset_api_reports_builtin_fallback_for_dashboard(self):
         state = self.isolated_state()
         state.set_model_override("gemini-4-argon", {"anti_truncation_mode": "off"})
-        with mock.patch.object(main, "app_state", state):
-            result = asyncio.run(main.delete_model_override("gemini-4-argon", True))
+        with mock.patch.object(settings_api, "app_state", state):
+            result = asyncio.run(settings_api.delete_model_override("gemini-4-argon", True))
         payload = json.loads(result.body)
         self.assertEqual(payload["override"], {"anti_truncation_mode": "both"})
 
@@ -198,9 +202,9 @@ class PrepareTests(unittest.TestCase):
 
     def test_settings_validation_inheritance_and_capabilities(self):
         for mode in ("off", "stream", "nonstream", "both"):
-            self.assertIsNone(main._validate_settings_patch({"anti_truncation_mode": mode}))
+            self.assertIsNone(settings_validation.validate_settings_patch({"anti_truncation_mode": mode}))
         for mode in (True, "yes", 1, None):
-            self.assertIsNotNone(main._validate_settings_patch({"anti_truncation_mode": mode}))
+            self.assertIsNotNone(settings_validation.validate_settings_patch({"anti_truncation_mode": mode}))
             if mode is not None:
                 with self.assertRaises(ValidationError):
                     request(anti_truncation_mode=mode)
@@ -222,12 +226,12 @@ class CatalogHTTPTests(unittest.IsolatedAsyncioTestCase):
                     MODEL + "-antitruncation-stream"]
         for patch in (
             mock.patch.object(self.state, "_save"),
-            mock.patch.object(main, "app_state", self.state),
+            mock.patch.object(settings_api, "app_state", self.state),
             mock.patch.object(models_api, "app_state", self.state),
             mock.patch.object(models_api, "get_express_models", mock.AsyncMock(return_value=self.raw)),
             mock.patch.object(main.app.state, "express_key_manager",
                               SimpleNamespace(get_total_keys=lambda: 1)),
-            mock.patch.dict(main.app.dependency_overrides, {main.require_auth: lambda: True}),
+            mock.patch.dict(main.app.dependency_overrides, {console_auth.require_auth: lambda: True}),
         ):
             patch.start()
             self.addCleanup(patch.stop)
@@ -353,7 +357,7 @@ class DecoderTests(unittest.TestCase):
         decoder.restore_sdk(response(function("owned", {"content": "a"}), finish=None))
         with self.assertRaises(at.AntiTruncationError):
             decoder.validate_end()
-        self.assertFalse(api_helpers.is_retryable_exception(at.AntiTruncationError("bad JSON")))
+        self.assertFalse(retry_policy.is_retryable_exception(at.AntiTruncationError("bad JSON")))
 
     def test_length_and_content_filter_are_preserved(self):
         for finish in ("MAX_TOKENS", "SAFETY", "PROHIBITED_CONTENT"):

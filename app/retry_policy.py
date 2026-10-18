@@ -1,23 +1,91 @@
-"""HTTP / SDK 共用的重试状态码、等待间隔与断连检测。"""
+"""共享重试配置、可重试性判断、等待与断连检测。"""
+
 import asyncio
 from email.utils import parsedate_to_datetime
 import math
 import random
 import time
-from typing import Optional
+from typing import Optional, TypeVar
+
+import httpx
+from curl_cffi.requests.exceptions import ConnectionError as CurlConnectionError, Timeout as CurlTimeout
+
+import config as app_config
+from response_validation import AntiTruncationError, IncompleteResponseError
+from runtime_state import app_state
+from upstream_errors import error_status
+
+Number = TypeVar("Number", int, float)
 
 
-def error_status(error: Exception) -> Optional[int]:
-    response = getattr(error, "response", None)
-    for value in (getattr(error, "code", None), getattr(error, "status_code", None),
-                  getattr(response, "status_code", None)):
-        if isinstance(value, int) and 400 <= value <= 599:
-            return value
-    return None
+def _retry_setting(key: str, number_type: type[Number], maximum: Number) -> Number:
+    default = app_config.DEFAULT_SETTINGS[key]
+    try:
+        value = number_type(app_state.get_setting(key, default))
+    except (TypeError, ValueError, OverflowError):
+        value = number_type(default)
+    if isinstance(value, float) and not math.isfinite(value):
+        value = number_type(default)
+    return max(number_type(0), min(maximum, value))
 
 
-def retry_delay(retry_after: Optional[str], default: float, attempt: int = 0,
-                jitter: float = 1.0) -> float:
+def get_retry_settings() -> tuple[int, float, float]:
+    """读取有界重试预算、固定间隔与抖动；异常旧值回退到内置默认。
+
+    retry_max 表示失败后的重试次数，总尝试次数为 retry_max + 1。
+    """
+    return (
+        _retry_setting("retry_max", int, 50),
+        _retry_setting("retry_backoff_seconds", float, 120.0),
+        _retry_setting("retry_jitter_seconds", float, 60.0),
+    )
+
+
+def is_retryable_status(code: int) -> bool:
+    return code == 429 or 500 <= code <= 599
+
+
+def is_retryable_exception(e: Exception) -> bool:
+    if isinstance(e, (AntiTruncationError, IncompleteResponseError)):
+        return False
+    error_str = str(e).lower()
+    code = error_status(e)
+    if code is not None:
+        return is_retryable_status(code)
+    if isinstance(
+        e,
+        (
+            httpx.TimeoutException,
+            httpx.NetworkError,
+            httpx.RemoteProtocolError,
+            CurlTimeout,
+            CurlConnectionError,
+        ),
+    ):
+        return True
+    if isinstance(e, (ValueError, TypeError, AttributeError, httpx.LocalProtocolError)):
+        return False
+    if any(
+        marker in error_str
+        for marker in (
+            "429",
+            "503",
+            "too many requests",
+            "quota",
+            "resource exhausted",
+            "resource_exhausted",
+            "try again later",
+            "rate limit",
+            "overloaded",
+            "temporarily unavailable",
+            "internal error",
+        )
+    ):
+        return True
+    return False
+
+
+def retry_delay(retry_after: Optional[str], default: float, attempt: int = 0, jitter: float = 1.0) -> float:
     """计算一次重试的等待秒数：**固定间隔 + 小幅抖动**，不随重试次数增长。
 
     - default：基础间隔秒数（控制台 retry_backoff_seconds，默认 5）；
@@ -54,11 +122,9 @@ def retry_delay(retry_after: Optional[str], default: float, attempt: int = 0,
     return min(delay, cap) if math.isfinite(delay) and delay >= 0 else fallback()
 
 
-def exception_retry_delay(error: Exception, default: float, attempt: int = 0,
-                          jitter: float = 1.0) -> float:
+def exception_retry_delay(error: Exception, default: float, attempt: int = 0, jitter: float = 1.0) -> float:
     headers = getattr(getattr(error, "response", None), "headers", None)
-    return retry_delay(headers.get("retry-after") if headers is not None else None,
-                       default, attempt, jitter)
+    return retry_delay(headers.get("retry-after") if headers is not None else None, default, attempt, jitter)
 
 
 async def wait_for_retry(request, delay: float) -> bool:

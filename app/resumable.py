@@ -97,7 +97,7 @@ async def within_request_deadline(buf, operation):
         await buf.fail("上游任务已取消。", 503)
         raise
     except Exception as exc:
-        from api_helpers import extract_upstream_error
+        from upstream_errors import extract_upstream_error
         code, message = extract_upstream_error(exc)
         await buf.fail(message, code)
         raise

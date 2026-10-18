@@ -11,12 +11,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def main() -> int:
     checks = [
-        ("语法", ["-m", "compileall", "-q", "app", "scripts", ".github/scripts"]),
-        ("静态检查", ["-m", "ruff", "check", "app", "scripts", "--select", "E9,F63,F7,F82,B012"]),
+        ("语法", ["-m", "compileall", "-q", "app", "tests", "scripts", ".github/scripts"]),
+        ("静态检查", ["-m", "ruff", "check", "app", "tests", "scripts", "--select", "E9,F63,F7,F82,B012,F401,F811,F841"]),
         ("工作流", [".github/scripts/check_workflows.py"]),
     ]
     checks.extend((path.name, [str(path.relative_to(ROOT))])
-                  for path in sorted((ROOT / "scripts").glob("test_*.py")))
+                  for path in sorted((ROOT / "tests").glob("test_*.py")))
     checks.append(("SDK 档案兼容", ["scripts/probe_sdk_channel_profiles.py"]))
     failures = []
     for name, args in checks:

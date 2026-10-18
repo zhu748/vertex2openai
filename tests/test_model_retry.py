@@ -20,6 +20,9 @@ from google.genai import types
 from google import genai
 
 import api_helpers
+import express_endpoint
+import retry_policy
+import upstream_errors
 import config
 from express_key_manager import ExpressKeyManager
 from logger import ProxyStats
@@ -117,7 +120,7 @@ class StreamRetryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_permanent_status_overrides_quota_text(self):
         for code in (400, 401, 403, 404):
-            self.assertFalse(api_helpers.is_retryable_exception(api_error(code, "quota model-429")))
+            self.assertFalse(retry_policy.is_retryable_exception(api_error(code, "quota model-429")))
 
     async def test_no_enabled_key_stops_retry_without_counting_unsent_attempts(self):
         self.settings["retry_max"] = 5
@@ -303,9 +306,9 @@ class CookieRetryTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(cookie_proxy, "_get_project_id", return_value="test-project"),
             mock.patch.object(cookie_proxy, "build_headers", return_value={"authorization": "test-auth"}),
             mock.patch.object(cookie_proxy, "open_upstream_client", side_effect=open_client),
-            mock.patch.object(cookie_proxy, "build_batch_graphql_body_async", return_value={"variables": {}}),
-            mock.patch.object(cookie_proxy, "_iter_json_objects", side_effect=objects),
-            mock.patch.object(cookie_proxy, "_extract_from_results", return_value=[("error", {"code": 429, "message": "quota exhausted"})]),
+            mock.patch.object(cookie_proxy, "build_request_body_async", return_value={"variables": {}}),
+            mock.patch.object(cookie_proxy, "iter_json_objects", side_effect=objects),
+            mock.patch.object(cookie_proxy, "extract_events", return_value=[("error", {"code": 429, "message": "quota exhausted"})]),
             mock.patch.object(cookie_proxy.app_state, "get_setting",
                               side_effect=lambda key, default=None: self.settings.get(key, default)),
             mock.patch.object(cookie_proxy.app_state, "get_effective_settings",
@@ -324,7 +327,7 @@ class CookieRetryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_permanent_api_error_with_quota_word_is_not_retried(self):
         obj = api_helpers.OpenAIRequest(model="gemini-3.6-flash", messages=[])
-        with mock.patch.object(cookie_proxy, "_extract_from_results", return_value=[("error", {"code": 403, "message": "quota denied"})]):
+        with mock.patch.object(cookie_proxy, "extract_events", return_value=[("error", {"code": 403, "message": "quota denied"})]):
             response = await cookie_proxy.CookieProxyUpstream().chat_completions(obj, self.request)
         self.assertEqual(response.status_code, 403)
         self.assertEqual(self.client.post.await_count, 1)
@@ -342,7 +345,7 @@ class CookieRetryTests(unittest.IsolatedAsyncioTestCase):
         obj = api_helpers.OpenAIRequest(model="gemini-3.6-flash", messages=[])
         self.client.post.side_effect = [httpx.Response(502, headers={"retry-after": "2.5"}), httpx.Response(504), httpx.Response(200, json={})]
         with mock.patch.object(cookie_proxy, "wait_for_retry", return_value=True) as wait, \
-             mock.patch.object(cookie_proxy, "_extract_from_results", return_value=[("text", "answer"), ("finish", "STOP")]):
+             mock.patch.object(cookie_proxy, "extract_events", return_value=[("text", "answer"), ("finish", "STOP")]):
             response = await cookie_proxy.CookieProxyUpstream().chat_completions(obj, self.request)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.client.post.await_count, 3)
@@ -549,22 +552,22 @@ class RetryPolicyTests(unittest.TestCase):
             self.assertEqual(retry_delay("2", 5), 2)
 
     def test_permanent_local_errors_are_not_retryable(self):
-        self.assertFalse(api_helpers.is_retryable_exception(ValueError("bad quota model-429")))
-        self.assertFalse(api_helpers.is_retryable_exception(httpx.LocalProtocolError("Invalid header")))
-        self.assertTrue(api_helpers.is_retryable_exception(CurlTimeout("Operation timed out")))
-        self.assertEqual(api_helpers.extract_upstream_error(CurlTimeout("Operation timed out"))[0], 504)
+        self.assertFalse(retry_policy.is_retryable_exception(ValueError("bad quota model-429")))
+        self.assertFalse(retry_policy.is_retryable_exception(httpx.LocalProtocolError("Invalid header")))
+        self.assertTrue(retry_policy.is_retryable_exception(CurlTimeout("Operation timed out")))
+        self.assertEqual(upstream_errors.extract_upstream_error(CurlTimeout("Operation timed out"))[0], 504)
 
     def test_error_status_survives_httpx_and_timeout_exceptions(self):
         response = httpx.Response(429, request=httpx.Request("POST", "https://example.test"))
-        self.assertEqual(api_helpers.extract_upstream_error(httpx.HTTPStatusError("rate limit", request=response.request, response=response))[0], 429)
-        self.assertEqual(api_helpers.extract_upstream_error(httpx.ReadTimeout("timeout"))[0], 504)
+        self.assertEqual(upstream_errors.extract_upstream_error(httpx.HTTPStatusError("rate limit", request=response.request, response=response))[0], 429)
+        self.assertEqual(upstream_errors.extract_upstream_error(httpx.ReadTimeout("timeout"))[0], 504)
 
     def test_model_whitespace_and_full_resource_paths(self):
         for name in ("", "   ", "-search", "[EXPRESS] "):
             self.assertIsNotNone(express_sdk._normalize_model_name(name)[2])
         self.assertEqual(express_sdk._normalize_model_name(" [EXPRESS]  gemini-test-search ")[:2], ("gemini-test", True))
         for path in ("tunedModels/custom", "endpoints/custom"):
-            self.assertEqual(express_sdk.resolve_express_model_path(path, {"express_location": "global"}, "project"), path)
+            self.assertEqual(express_endpoint.resolve_express_model_path(path, {"express_location": "global"}, "project"), path)
 
 
 if __name__ == "__main__":

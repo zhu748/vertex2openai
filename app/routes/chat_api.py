@@ -12,7 +12,7 @@ import time
 from runtime_state import app_state
 from upstreams.express_sdk import ExpressSDKUpstream
 from upstreams.cookie_proxy import CookieProxyUpstream
-from api_helpers import extract_upstream_error, create_openai_error_response
+from upstream_errors import extract_upstream_error, create_openai_error_response
 from logger import stats
 from streaming import keepalive_sse
 from admission import limit_generation, ManagedStreamingResponse

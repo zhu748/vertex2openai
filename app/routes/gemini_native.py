@@ -46,7 +46,8 @@ import httpx
 from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from api_helpers import get_retry_settings, is_retryable_exception, extract_upstream_error
+from retry_policy import get_retry_settings, is_retryable_exception, is_retryable_status
+from upstream_errors import extract_upstream_error
 from response_validation import IncompleteResponseError, has_finish_reason
 from admission import limit_generation, GenerationCapacityError
 from retry_policy import retry_delay as _retry_delay, wait_for_retry as _wait_for_retry
@@ -55,7 +56,7 @@ from config import API_KEY
 from logger import stats
 from runtime_state import app_state, get_effective_proxy_uri_for_key
 import config as app_config
-from upstreams.express_sdk import resolve_express_model_path
+from express_endpoint import resolve_express_model_path, is_location_pin_failure
 from model_loader import get_express_models
 from express_fingerprint import build_direct_headers
 from client_pool import passthrough_client_pool
@@ -227,26 +228,8 @@ async def _passthrough_once(client: httpx.AsyncClient, express_key: str,
 
 
 def _looks_like_pin_failure(status_code: int, body: bytes) -> bool:
-    """上游错误响应是否像「钉定的 projects/locations 路径不对」。
-
-    与 api_helpers.is_location_pin_failure（SDK 通道用）同一套判据，
-    只是把输入从异常对象换成透传拿到的 (status, body)：
-      403 requires billing / billing to be enabled → 项目未开计费或无权
-      404 Publisher model … not found                → 该项目/区域没有此模型
-      403 permission_denied + projects/              → 项目级权限问题
-    命中后退回裸模型名让后端自行路由（与 SDK 通道 fallback 行为一致），
-    最坏也只是回到旧行为（裸模型名报同样的错），不会更糟。
-    """
-    if status_code not in (403, 404):
-        return False
-    text = body.decode("utf-8", "ignore").lower()
-    if "requires billing" in text or "billing to be enabled" in text:
-        return True
-    if ("not found" in text or "404" in text) and "publisher model" in text:
-        return True
-    if "permission_denied" in text and "projects/" in text:
-        return True
-    return False
+    """仅项目/模型权限错误允许切回裸模型路径，复用 SDK 判据。"""
+    return status_code in (403, 404) and is_location_pin_failure(body.decode("utf-8", "ignore"))
 
 
 async def _close_upstream(upstream: httpx.Response) -> None:
@@ -394,7 +377,7 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
                 return _native_error(502, "上游未返回 SSE 流，无法完成 alt=sse 请求。", "UNAVAILABLE")
 
         # 429/5xx：按控制台预算重选 Key，不能因单 Key / 池已用遍而提前退出。
-        retryable_status = upstream.status_code == 429 or 500 <= upstream.status_code < 600
+        retryable_status = is_retryable_status(upstream.status_code)
         if retryable_status and key_attempts < retry_max:
             last_error_status = upstream.status_code
             last_error_headers = {k: v for k, v in upstream.headers.items()

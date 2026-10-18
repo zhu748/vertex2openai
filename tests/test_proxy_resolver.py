@@ -27,7 +27,6 @@ from proxy_resolver import (
     validate_proxy_uri,
     ProxyResolveError,
 )
-import runtime_state
 from runtime_state import app_state, get_effective_proxy_uri_for_key
 
 # 结构取自真实 vless 节点的脱敏样本（NL，ws + tls + chrome 指纹）

@@ -52,7 +52,6 @@ def main() -> int:
         print(f"✅ 异步 resolve 一致：{mask_proxy_uri(uri)} → {local}")
 
         # ---------- 2. 经本地 socks5 真实请求 ----------
-        port = int(local.rsplit(":", 1)[1])
         try:
             async with httpx.AsyncClient(proxy=local, timeout=httpx.Timeout(15.0)) as client:
                 resp = await client.get("https://aiplatform.googleapis.com/")

@@ -73,3 +73,20 @@ class OpenAIRequest(BaseModel):
     stream_options: dict[str, Any] | None = None
 
     model_config = ConfigDict(extra='allow')
+
+
+def message_text(content: Any) -> str:
+    """从 OpenAIMessage.content（str 或分段 list）里提取纯文本。"""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, dict) and p.get("type") == "text":
+                parts.append(p.get("text", ""))
+            elif hasattr(p, "text") and isinstance(getattr(p, "text", None), str):
+                parts.append(p.text)
+        return "".join(parts)
+    return ""

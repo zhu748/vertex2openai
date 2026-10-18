@@ -1,4 +1,4 @@
-"""Gemini 原生接口统计和重试回归：python scripts/test_gemini_native_stats_retry.py。
+"""Gemini 原生接口统计和重试回归：python tests/test_gemini_native_stats_retry.py。
 
 通过实际 FastAPI 路由和统计中间件发请求，上游完全使用 MockTransport。
 """

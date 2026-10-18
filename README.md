@@ -214,8 +214,9 @@ TCP+TLS 握手（每次约省 100~300ms 与相应 CPU）；429 重试场景收�
 回收宽限期覆盖最长允许请求及配置热更新期间的旧请求，停机时立即统一关闭。
 
 配套优化：Cookie 通道重试不再重复构建请求体（含重复下载/压缩同一批输入
-图片）；batchGraphql 大响应解析改用 C 实现的 `raw_decode` 增量解析（1MB
-生图 base64 对象实测 778ms → 13ms），不再卡住事件循环；`/v1/models` 的
+图片）；batchGraphql 流式响应按对象边界增量收集，完整后只解码一次 JSON，
+避免大图片被切成小块时反复扫描；完整正文直接用 C 解码器解析。单对象超过
+64MiB 或 JSON 截断时返回明确错误；`/v1/models` 的
 模型列表使用本地初始化和后台刷新：刷新期间仍立即返回缓存，并发请求只触发一次远程读取；
 成功后 1 小时再刷，失败后 5 分钟重试，保留上一次可用缓存。服务关闭时会取消后台任务，
 并释放 Express SDK、Gemini 透传、Cookie 通道及宽限期内待关闭的连接池。
@@ -680,7 +681,7 @@ Gemini 原生 `streamGenerateContent?alt=sse` 默认增加安全的事件间注�
 
 429（Resource Exhausted）常因上游限额不足或请求频率过高。项目已内置退避重试，另建议：
 - 服务端默认将上游并发限制为 32，后台生成也计入；可在控制台调整。
-- 退避使用有上限的指数增长与随机抖动，有效 `Retry-After` 优先，最多等待 120 秒。
+- 重试使用固定间隔加随机抖动；有效 `Retry-After` 按配置窗口钳位，间隔不随次数增长。
 - 控制客户端并发频率，重试沿用同一个幂等键。
 - 适当减小最大输出 Token。
 - 配置多个有效 Express Key 并开启轮询。
@@ -702,12 +703,19 @@ Gemini 原生 `streamGenerateContent?alt=sse` 默认增加安全的事件间注�
 
 ## 本地开发与检查
 
+目录职责和扩展位置见 [代码结构与维护约定](docs/architecture.md)。
+应用入口为 `app/main.py`，管理路由位于 `app/routes/`，页面位于 `app/templates/`；
+离线回归集中在 `tests/`，`scripts/` 保留检查入口与诊断工具。
+
 ```bash
 # 安装运行和开发检查依赖
 pip install -r requirements-dev.txt
 
 # 完整检查：语法、静态分析、工作流、所有回归及 SDK 档案兼容
 python scripts/check_project.py
+
+# 单独运行一组回归
+python tests/test_generation_config.py
 
 # 本地启动
 cd app

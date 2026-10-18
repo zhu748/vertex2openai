@@ -45,20 +45,23 @@ class SignatureRecord:
 class SignatureStore:
     """Thread-safe tool_call_id -> :class:`SignatureRecord` TTL/LRU cache."""
 
-    def __init__(self, ttl_seconds: int = DEFAULT_TTL_SECONDS,
-                 max_entries: int = DEFAULT_MAX_ENTRIES):
+    def __init__(self, ttl_seconds: int = DEFAULT_TTL_SECONDS, max_entries: int = DEFAULT_MAX_ENTRIES):
         self._ttl = ttl_seconds
         self._max = max_entries
         self._lock = threading.Lock()
         self._data: "OrderedDict[str, tuple[float, SignatureRecord]]" = OrderedDict()
+        # Reads reorder the LRU, while absolute expiry follows the last write.
+        self._expiry: "OrderedDict[str, float]" = OrderedDict()
 
     def put_record(self, call_id: str, record: SignatureRecord) -> None:
         if not call_id:
             return
-        now = time.monotonic()
         with self._lock:
+            now = time.monotonic()
             self._data[call_id] = (now, record)
             self._data.move_to_end(call_id)
+            self._expiry[call_id] = now
+            self._expiry.move_to_end(call_id)
             self._evict(now)
 
     def put_unsigned_follower(self, call_id: str) -> None:
@@ -70,28 +73,30 @@ class SignatureStore:
     def get_record(self, call_id: str) -> Optional[SignatureRecord]:
         if not call_id:
             return None
-        now = time.monotonic()
         with self._lock:
+            now = time.monotonic()
             item = self._data.get(call_id)
             if item is None:
                 return None
             ts, record = item
             if now - ts > self._ttl:
                 self._data.pop(call_id, None)
+                self._expiry.pop(call_id, None)
                 return None
             self._data.move_to_end(call_id)
             return record
 
     def _evict(self, now: float) -> None:
-        while self._data:
-            oldest_key = next(iter(self._data))
-            ts, _ = self._data[oldest_key]
+        while self._expiry:
+            oldest_key, ts = next(iter(self._expiry.items()))
             if now - ts > self._ttl:
+                self._expiry.popitem(last=False)
                 self._data.pop(oldest_key, None)
                 continue
             break
         while len(self._data) > self._max:
-            self._data.popitem(last=False)
+            oldest_key, _ = self._data.popitem(last=False)
+            self._expiry.pop(oldest_key, None)
 
 
 signature_store = SignatureStore()

@@ -148,7 +148,6 @@ async def main() -> None:
     show_and_check("custom={sdk} {python} mycorp-gateway/1.0", box, baseline)
 
     # 断言区：修复后的期望行为
-    from runtime_state import app_state
     from express_fingerprint import (build_sdk_channel_overrides,
                                      build_direct_headers, _build_ua,
                                      sdk_label, python_label, node_label)

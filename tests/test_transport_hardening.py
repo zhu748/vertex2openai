@@ -1,5 +1,4 @@
 """Actual SDK/wire behavior, proxy isolation, memory growth and durable saves."""
-import asyncio
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -26,7 +25,10 @@ import config
 import cookie_auth
 import impersonate
 import main
-import message_processing
+from routes import credentials_api
+from routes import settings_api
+import console_auth
+import image_processing
 import proxy_resolver
 import retry_policy
 import runtime_state
@@ -223,10 +225,10 @@ class BrowserWireTests(unittest.IsolatedAsyncioTestCase):
 
 class ImageTests(unittest.TestCase):
     def test_proxy_does_not_disable_private_address_checks(self):
-        with mock.patch.object(message_processing, "get_effective_proxy_url", return_value="http://proxy:8080"), \
+        with mock.patch.object(image_processing, "get_effective_proxy_url", return_value="http://proxy:8080"), \
              mock.patch.object(proxy_resolver, "resolve_proxy_uri", return_value="http://proxy:8080"), \
-             mock.patch.object(message_processing.httpx, "Client") as client:
-            self.assertIsNone(message_processing.fetch_remote_image("http://127.0.0.1/private.png"))
+             mock.patch.object(image_processing.httpx, "Client") as client:
+            self.assertIsNone(image_processing.fetch_remote_image("http://127.0.0.1/private.png"))
         client.assert_not_called()
 
     def test_private_redirect_is_rejected_even_through_proxy(self):
@@ -235,13 +237,13 @@ class ImageTests(unittest.TestCase):
             captured.append(request)
             return httpx.Response(302, headers={"location": "http://127.0.0.1/private.png"})
         client = httpx.Client(transport=httpx.MockTransport(handle))
-        resolver = message_processing._public_image_addresses
+        resolver = image_processing._public_image_addresses
         def addresses(host):
             return ["93.184.216.34"] if host == "images.example" else resolver(host)
-        with mock.patch.object(message_processing, "get_effective_proxy_url", return_value="http://proxy:8080"), \
-             mock.patch.object(message_processing, "_public_image_addresses", side_effect=addresses), \
-             mock.patch.object(message_processing.httpx, "Client", return_value=client):
-            self.assertIsNone(message_processing.fetch_remote_image("https://images.example/image.png"))
+        with mock.patch.object(image_processing, "get_effective_proxy_url", return_value="http://proxy:8080"), \
+             mock.patch.object(image_processing, "_public_image_addresses", side_effect=addresses), \
+             mock.patch.object(image_processing.httpx, "Client", return_value=client):
+            self.assertIsNone(image_processing.fetch_remote_image("https://images.example/image.png"))
         self.assertEqual(len(captured), 1)
 
 
@@ -253,10 +255,10 @@ class ImageTests(unittest.TestCase):
                 return httpx.Response(302, headers={"location": "/next.png"})
             return httpx.Response(200, content=b"image", headers={"content-type": "image/png"})
         client = httpx.Client(transport=httpx.MockTransport(handle))
-        with mock.patch.object(message_processing, "get_effective_proxy_url", return_value=""), \
-             mock.patch.object(message_processing, "_public_image_addresses", return_value=["93.184.216.34"]), \
-             mock.patch.object(message_processing.httpx, "Client", return_value=client):
-            self.assertEqual(message_processing.fetch_remote_image("https://images.example/one.png"), (b"image", "image/png"))
+        with mock.patch.object(image_processing, "get_effective_proxy_url", return_value=""), \
+             mock.patch.object(image_processing, "_public_image_addresses", return_value=["93.184.216.34"]), \
+             mock.patch.object(image_processing.httpx, "Client", return_value=client):
+            self.assertEqual(image_processing.fetch_remote_image("https://images.example/one.png"), (b"image", "image/png"))
         self.assertEqual([r.url.host for r in captured], ["93.184.216.34"] * 2)
         self.assertEqual(captured[-1].url.path, "/next.png")
         self.assertEqual(captured[-1].headers["host"], "images.example")
@@ -266,15 +268,15 @@ class ImageTests(unittest.TestCase):
         public = [(2, 1, 6, "", ("93.184.216.34", 0))]
         private = [(2, 1, 6, "", ("127.0.0.1", 0))]
         with mock.patch("socket.getaddrinfo", side_effect=[public, private]), \
-             mock.patch.object(message_processing, "get_effective_proxy_url", return_value=""), \
-             mock.patch.object(message_processing.httpx, "Client") as client:
-            self.assertIsNone(message_processing.fetch_remote_image("https://rebound.example/image"))
+             mock.patch.object(image_processing, "get_effective_proxy_url", return_value=""), \
+             mock.patch.object(image_processing.httpx, "Client") as client:
+            self.assertIsNone(image_processing.fetch_remote_image("https://rebound.example/image"))
         client.return_value.__enter__.return_value.stream.assert_not_called()
 
     def test_proxy_failure_does_not_fall_back_to_direct_image_fetch(self):
         with mock.patch.object(proxy_resolver, "resolve_proxy_uri", side_effect=proxy_resolver.ProxyResolveError("offline")), \
-             mock.patch.object(message_processing.httpx, "Client") as client:
-            self.assertIsNone(message_processing.fetch_remote_image("https://images.example/one.png"))
+             mock.patch.object(image_processing.httpx, "Client") as client:
+            self.assertIsNone(image_processing.fetch_remote_image("https://images.example/one.png"))
         client.assert_not_called()
 
 
@@ -306,8 +308,8 @@ class PersistenceTests(unittest.TestCase):
         state.update_settings({"retry_max": 3})
         client = TestClient(main.app)
         self.addCleanup(client.close)
-        client.cookies.set(main.AUTH_COOKIE, main._issue_session())
-        with mock.patch.object(main, "app_state", state), \
+        client.cookies.set(console_auth.AUTH_COOKIE, console_auth.issue_session())
+        with mock.patch.object(settings_api, "app_state", state), \
              mock.patch.object(runtime_state.os, "replace", side_effect=PermissionError("read-only")):
             response = client.post("/api/settings", json={"retry_max": 9})
         self.assertEqual(response.status_code, 503)
@@ -321,8 +323,8 @@ class PersistenceTests(unittest.TestCase):
         state.set_cookie_credentials("SAPISID=old; SID=old", "old-project")
         client = TestClient(main.app)
         self.addCleanup(client.close)
-        client.cookies.set(main.AUTH_COOKIE, main._issue_session())
-        with mock.patch.object(main, "app_state", state), \
+        client.cookies.set(console_auth.AUTH_COOKIE, console_auth.issue_session())
+        with mock.patch.object(credentials_api, "app_state", state), \
              mock.patch.object(runtime_state.os, "replace", side_effect=PermissionError("read-only")):
             response = client.post("/api/cookie", json={"cookie": "SAPISID=new; SID=new", "project_id": "new-project"})
         self.assertEqual(response.status_code, 503)

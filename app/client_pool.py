@@ -23,7 +23,7 @@ base_url、请求头指纹档案）。控制台热改任一项，新请求立即
 import asyncio
 import inspect
 import threading
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, Optional
 
 from google import genai
 

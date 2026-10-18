@@ -18,11 +18,18 @@ from fastapi.testclient import TestClient
 from google.genai import types
 
 import api_helpers
+import retry_policy
 import auth
 import client_pool
 import impersonate
 import main
+from routes import settings_api
+import config
+import console_auth
+import lifecycle
+import proxy_resolver
 import message_processing
+import image_processing
 import model_loader
 import resumable
 from logger import ProxyStats
@@ -33,12 +40,12 @@ from usage import map_usage
 
 class ConfigTests(unittest.TestCase):
     def setUp(self):
-        main.app.dependency_overrides[main.require_auth] = lambda: True
+        main.app.dependency_overrides[console_auth.require_auth] = lambda: True
         self.addCleanup(main.app.dependency_overrides.clear)
         self.client = TestClient(main.app)
         self.addCleanup(self.client.close)
-        self.save = mock.patch.object(main.app_state, "update_settings").start()
-        self.override = mock.patch.object(main.app_state, "set_model_override").start()
+        self.save = mock.patch.object(settings_api.app_state, "update_settings").start()
+        self.override = mock.patch.object(settings_api.app_state, "set_model_override").start()
         self.addCleanup(mock.patch.stopall)
 
     def test_malformed_json_is_rejected_without_saving(self):
@@ -61,6 +68,22 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 400)
         self.save.assert_not_called()
 
+    def test_invalid_generation_defaults_are_rejected_for_both_scopes(self):
+        invalid = {
+            "default_max_tokens": (0, -1, 1.5, True),
+            "default_temperature": (-0.1, False),
+            "default_top_p": (-0.01, 1.01, True),
+        }
+        for path in ("/api/settings", "/api/model-overrides/gemini-test"):
+            for key, values in invalid.items():
+                for value in values:
+                    with self.subTest(path=path, key=key, value=value):
+                        response = self.client.post(path, json={key: value})
+                        self.assertEqual(response.status_code, 400)
+                        self.assertEqual(response.json()["field"], key)
+        self.save.assert_not_called()
+        self.override.assert_not_called()
+
     def test_invalid_header_values_are_rejected(self):
         for value in ("tool\r\nInjected: value", "中文", "tool\x00"):
             self.assertEqual(self.client.post("/api/settings", json={"express_ua_custom": value}).status_code, 400)
@@ -69,17 +92,17 @@ class ConfigTests(unittest.TestCase):
         # 非法端口/协议仍被拒；socks4 现在经 sing-box 合法（第十六轮行为变更）
         for url in ("http://localhost:abc", "http://localhost:70000", "http://localhost:0",
                     "gopher://localhost:70", "vless://only-uuid"):
-            self.assertTrue(main.validate_proxy_url_format(url), url)
+            self.assertTrue(proxy_resolver.validate_proxy_uri(url), url)
         for url in ("socks5://user:pass@localhost:1080", "socks4://localhost:1080",
                     "socks4a://localhost:1080", "vless://uuid@localhost:443?security=tls&type=ws",
                     "direct", ""):
-            self.assertEqual(main.validate_proxy_url_format(url), "", url)
+            self.assertEqual(proxy_resolver.validate_proxy_uri(url), "", url)
 
     def test_unicode_login_and_api_key_validation(self):
         with mock.patch.object(auth, "API_KEY", "口令🔑"):
             self.assertTrue(auth.validate_api_key("口令🔑"))
             self.assertFalse(auth.validate_api_key("错误"))
-        with mock.patch.object(main.config, "API_KEY", "口令🔑"):
+        with mock.patch.object(config, "API_KEY", "口令🔑"):
             self.assertEqual(self.client.post("/api/login", json={"password": "口令🔑"}).status_code, 200)
             self.assertEqual(self.client.post("/api/login", json={"password": "错误"}).status_code, 401)
         with mock.patch.object(gemini_native, "API_KEY", "口令🔑"):
@@ -152,15 +175,15 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_lifespan_awaits_background_tasks_and_pool_cleanup(self):
         tasks = set()
-        with mock.patch.object(main, "_background_tasks", tasks), \
-             mock.patch.object(main.app_state, "import_env_express_keys_once"), \
-             mock.patch.object(main, "get_models_config", return_value={"models": []}), \
-             mock.patch.object(main, "schedule_models_refresh"), \
-             mock.patch.object(main, "_probe_express_projects_on_startup"), \
-             mock.patch.object(main, "close_all_clients") as close_clients, \
-             mock.patch.object(main, "close_models_refresh") as close_models:
+        with mock.patch.object(lifecycle, "_background_tasks", tasks), \
+             mock.patch.object(lifecycle.app_state, "import_env_express_keys_once"), \
+             mock.patch.object(lifecycle, "get_models_config", return_value={"models": []}), \
+             mock.patch.object(lifecycle, "schedule_models_refresh"), \
+             mock.patch.object(lifecycle, "_probe_express_projects_on_startup"), \
+             mock.patch.object(lifecycle, "close_all_clients") as close_clients, \
+             mock.patch.object(lifecycle, "close_models_refresh") as close_models:
             async with main.lifespan(main.app):
-                extra = main._start_background_task(asyncio.Event().wait())
+                extra = lifecycle.start_background_task(asyncio.Event().wait())
                 await asyncio.sleep(0)
             self.assertTrue(extra.cancelled())
             self.assertFalse(tasks)
@@ -365,19 +388,19 @@ class SdkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.stats.success_requests, 1)
 
     async def test_retry_classification_includes_timeouts_and_server_errors(self):
-        self.assertTrue(api_helpers.is_retryable_exception(httpx.ReadTimeout("timeout")))
-        self.assertTrue(api_helpers.is_retryable_exception(httpx.ConnectError("network")))
-        self.assertTrue(api_helpers.is_retryable_exception(Exception("Resource exhausted")))
+        self.assertTrue(retry_policy.is_retryable_exception(httpx.ReadTimeout("timeout")))
+        self.assertTrue(retry_policy.is_retryable_exception(httpx.ConnectError("network")))
+        self.assertTrue(retry_policy.is_retryable_exception(Exception("Resource exhausted")))
         for code in (429, 500, 502, 503, 504):
             error = Exception("upstream error")
             error.code = code
-            self.assertTrue(api_helpers.is_retryable_exception(error))
-        self.assertFalse(api_helpers.is_retryable_exception(ValueError("invalid argument")))
+            self.assertTrue(retry_policy.is_retryable_exception(error))
+        self.assertFalse(retry_policy.is_retryable_exception(ValueError("invalid argument")))
 
     async def test_nonfinite_persisted_retry_settings_use_defaults(self):
         self.settings.update(retry_max=float("inf"), retry_backoff_seconds=float("nan"),
                              retry_jitter_seconds=float("nan"))
-        count, delay, jitter = api_helpers.get_retry_settings()
+        count, delay, jitter = retry_policy.get_retry_settings()
         self.assertEqual(count, 10)
         self.assertEqual(delay, 5)
         self.assertEqual(jitter, 1)
@@ -398,12 +421,12 @@ class ImageFetchTests(unittest.TestCase):
 
         client = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(
             200, headers={"content-type": "image/png"}, stream=ImageStream())))
-        with mock.patch.object(message_processing.httpx, "Client", return_value=client), \
-             mock.patch.object(message_processing, "_is_blocked_host", return_value=False), \
-             mock.patch.object(message_processing, "_public_image_addresses", return_value=["93.184.216.34"]), \
-             mock.patch.object(message_processing, "get_effective_proxy_url", return_value=""), \
-             mock.patch.object(message_processing, "MAX_REMOTE_IMAGE_BYTES", 64 * 1024):
-            self.assertIsNone(message_processing.fetch_remote_image("https://example.test/image"))
+        with mock.patch.object(image_processing.httpx, "Client", return_value=client), \
+             mock.patch.object(image_processing, "_is_blocked_host", return_value=False), \
+             mock.patch.object(image_processing, "_public_image_addresses", return_value=["93.184.216.34"]), \
+             mock.patch.object(image_processing, "get_effective_proxy_url", return_value=""), \
+             mock.patch.object(image_processing, "MAX_REMOTE_IMAGE_BYTES", 64 * 1024):
+            self.assertIsNone(image_processing.fetch_remote_image("https://example.test/image"))
         self.assertEqual(len(read), 2)
         self.assertEqual(closed, [True])
 

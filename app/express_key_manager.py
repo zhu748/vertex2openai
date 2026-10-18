@@ -1,5 +1,5 @@
 import random
-from typing import List, Optional, Tuple
+from typing import List, Optional
 import config as app_config
 from runtime_state import app_state
 

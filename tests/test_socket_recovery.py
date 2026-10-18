@@ -1,6 +1,5 @@
 """Loopback HTTP disconnect/reconnect tests with a real Uvicorn ASGI server."""
 import asyncio
-import json
 import os
 from pathlib import Path
 import socket

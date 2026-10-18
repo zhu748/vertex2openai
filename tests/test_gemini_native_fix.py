@@ -15,7 +15,7 @@
   2. _passthrough_request：钉定路径失败（404 Publisher model not found /
      403 requires billing）自动退回裸模型名重试一次（对齐 SDK 通道）。
 
-运行：python scripts/test_gemini_native_fix.py
+运行：python tests/test_gemini_native_fix.py
 """
 import asyncio
 import json

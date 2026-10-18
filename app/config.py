@@ -84,7 +84,7 @@ DEFAULT_SETTINGS = {
     "img_compress_quality": 85,
     # 重试
     # 语义：retry_max = 失败后的**重试**次数，总请求次数 = retry_max + 1。
-    # 两条通道统一走 api_helpers.get_retry_settings() 读取（retry_max 钳位 0–50）。
+    # 两条通道统一走 retry_policy.get_retry_settings() 读取（retry_max 钳位 0–50）。
     # 重试间隔为**固定值 + 抖动**（不再随次数指数放大）：实际等待在
     # [retry_backoff_seconds - retry_jitter_seconds/2,
     #  retry_backoff_seconds + retry_jitter_seconds/2] 内均匀采样；
@@ -135,7 +135,7 @@ DEFAULT_SETTINGS = {
     # 官方未禁止生图模型使用系统指令，但旧代码一直剥离；打开前请先真机验证目标模型。
     "image_system_instruction": False,
     # 轻量前端（RikkaHub 等）注入：留空 = 不启用，酒馆用户不受影响。
-    # 这两项解决的是"前端本身没有预设系统"的场景，见 message_processing.apply_console_injection。
+    # 这两项解决的是"前端本身没有预设系统"的场景，见 prefill.apply_console_injection。
     "inject_system_instruction": "",
     "inject_prefill": "",
     # 生图模型是否也注入预填充。实测预填充对生图有很强的引导力
@@ -166,7 +166,7 @@ DEFAULT_SETTINGS = {
     # 默认 global：多数 Gemini 模型只在 global 提供（如 gemini-2.5-pro），
     # 让后端自选区域会偶发 404。留空 = 回到"后端自选"的旧行为。
     # 钉定失败（项目不匹配/该区域无此模型）会自动退回裸模型名重试一次，见
-    # api_helpers.is_location_pin_failure —— 所以这个默认值不会把任何人变糟。
+    # express_endpoint.is_location_pin_failure —— 所以这个默认值不会把任何人变糟。
     "express_location": "global",
     # ===== 出站代理（网络出口，控制台「通道与凭证」页可热改）=====
     # 初始值取环境变量 PROXY_URL；此后以控制台保存的值为准（持久化到 web_state.json）。

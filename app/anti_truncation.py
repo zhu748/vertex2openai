@@ -14,6 +14,7 @@ from fastapi.responses import StreamingResponse
 from google.genai import types
 
 from models import OpenAIMessage
+from response_validation import AntiTruncationError
 
 
 SUFFIX_MODES = {
@@ -21,10 +22,6 @@ SUFFIX_MODES = {
     "-antitruncation-stream": "stream",
     "-antitruncation": "stream",  # short alias accepted for manual clients
 }
-
-
-class AntiTruncationError(ValueError):
-    code = 502
 
 
 class TransportSelectionError(ValueError):
