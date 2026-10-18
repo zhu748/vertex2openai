@@ -32,6 +32,10 @@ Express SDK 或 Cookie 上游；Gemini 原生请求通过 Express REST 透传。
 | `app/prefill.py` | 消息注入、预填充兼容、标签守卫与输出去重 |
 | `app/api_helpers.py` | SDK 响应适配、流式输出、调用与重试编排 |
 | `app/retry_policy.py`、`app/streaming.py` | 重试配置、可重试性、等待、断连检查和流式心跳 |
+| `app/first_reply.py` | 每次尝试的首回复期限、有效输出识别、可重试超时及原生流预读 |
+| `app/request_connection.py` | 请求体结束后独占 ASGI receive，及时广播实际断连 |
+| `app/request_tracking.py` | 请求生命周期、分离连接/生成计数、首字时序、输出诊断与有界历史 |
+| `app/static/request-monitor.js` | 请求监控列表、筛选、分页、详情和关联日志交互 |
 | `app/usage.py` | SDK / REST 用量映射、用量开关与 OpenAI 用量尾块 |
 | `app/resumable.py`、`app/admission.py` | 有界响应缓冲、后台生成、期限与并发准入 |
 | `app/client_pool.py`、`app/impersonate.py`、`app/proxy_resolver.py` | 连接复用、传输适配和代理解析 |
@@ -51,6 +55,16 @@ Express 使用 `generation_config.py` 构造 SDK 参数，Cookie 保留 batchGra
 Gemini 原生请求保留自己的协议和错误体，不经过 OpenAI 消息及参数转换。
 Cookie 和原生路由直接引用共享错误、重试和端点模块，无需通过 SDK 调用实现复用这些规则。
 SDK 的真流式、假流式和非流式统一检查上游请求拦截；这类错误使用 400，不参与重试。
+
+首回复期限在每次实际上游尝试时开始，默认 15 秒；思考、正文、工具调用、图片都结束计时。
+流式元数据在首回复前有界暂存，心跳不参与计时；超时先关闭本次读取，再进入原有重试预算。
+原生 SSE 预读有效事件时仍向客户端保活；非 SSE JSON 数组检查完整对象后继续按原字节转发。
+假流式和非流式只能观察完整上游响应，按模型单独调整此期限。
+
+中间件只在请求体结束后启动独立断连读取器，将信号缓存供应用及 Starlette 复用，避免多个消费者抢读。
+缓冲登记前端连接，最后一个读者断开时快照续传窗口（默认 10 秒）；窗口外相同新请求在锁内替换占位，
+锁外等旧任务清理后才启动新上游。显式旧游标超窗返回 410，不创建带旧偏移的新生成。
+没有新的相同请求时继续受原总期限、TTL 与容量预算管理，断连窗口本身不触发取消。
 
 Cookie 执行器只编排认证、重试、协议降级与交付，不再承担请求构造和响应解析。
 流式 JSON 对象按边界增量收集、完整后解码一次；完整正文使用 C 解码器直接解析。
@@ -73,6 +87,7 @@ Cookie 执行器只编排认证、重试、协议降级与交付，不再承担�
 | 调整 SDK 参数 | `generation_config.py` | 请求优先级、结构化输出、工具声明和模型能力裁剪 |
 | 新增模型 | `vertexModels.json`、`model_capabilities.py` | 模型清单、思考配置、采样和生图支持 |
 | 调整重试或流式交付 | `retry_policy.py`、对应上游与路由 | 单 Key 429、已输出内容、断连、清理及统计 |
+| 调整请求监控 | `request_tracking.py`、`middleware.py`、`admission.py` | 并发关联、真实发送失败、后台续传、首字与历史预算 |
 
 后台任务通过 `lifecycle.start_background_task()` 登记，生成缓冲任务由
 `resumable_store` 管理。连接池中的客户端由池统一关闭，单次调用不关闭共享客户端。

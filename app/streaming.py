@@ -116,3 +116,45 @@ async def keepalive_sse(source, request=None, interval=None):
             if close is not None:
                 with suppress(Exception):
                     await close()
+
+
+async def prepare_sse(operation, request, error_body, on_error):
+    """Keep preparation and first-reply retries alive without losing fast HTTP errors."""
+    from fastapi.responses import StreamingResponse
+    from admission import ManagedStreamingResponse
+
+    setup = asyncio.create_task(operation())
+
+    async def cleanup():
+        if not setup.done():
+            setup.cancel()
+        response = (await asyncio.gather(setup, return_exceptions=True))[0]
+        if isinstance(response, StreamingResponse):
+            await getattr(response, "aclose", response.body_iterator.aclose)()
+
+    try:
+        done, _ = await asyncio.wait({setup}, timeout=0.05)
+        if done:
+            return setup.result()
+    except BaseException:
+        await cleanup()
+        raise
+
+    async def frames():
+        try:
+            response = await setup
+            if isinstance(response, StreamingResponse):
+                async for frame in response.body_iterator:
+                    yield frame
+            else:
+                on_error()
+                yield b"data: " + error_body(response) + b"\n\n"
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            on_error()
+            yield b"data: " + error_body(exc) + b"\n\n"
+
+    return ManagedStreamingResponse(keepalive_sse(frames(), request), media_type="text/event-stream",
+                                    headers={"Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no"},
+                                    cleanup=cleanup)

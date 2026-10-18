@@ -37,6 +37,7 @@ cachedContent / responseSchema 等字段保持原请求体，兼容性取决于�
 
 import json
 import asyncio
+import codecs
 import time
 from typing import Any, Optional
 from urllib.parse import parse_qs, quote
@@ -54,6 +55,9 @@ from retry_policy import retry_delay as _retry_delay, wait_for_retry as _wait_fo
 from auth import constant_time_equal
 from config import API_KEY
 from logger import stats
+from request_tracking import configure as track_configure, upstream_attempt, upstream_chunk
+from first_reply import FirstReplyGuard, native_has_reply
+from streaming import prepare_sse
 from runtime_state import app_state, get_effective_proxy_uri_for_key
 import config as app_config
 from express_endpoint import resolve_express_model_path, is_location_pin_failure
@@ -336,22 +340,52 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
         else:
             model_path = _resolve_upstream_model_path(model, record.get("project_id", ""))
 
+        upstream = None
+        prefetched = None
         try:
-            upstream = await _passthrough_once(
+            upstream_attempt()
+            first_reply = FirstReplyGuard(model)
+            upstream = await first_reply.wait(_passthrough_once(
                 client, express_key, model_path, action, query, payload,
-                stream=is_stream)
+                stream=is_stream))
+            if not is_stream:
+                upstream_chunk()
+                if upstream.status_code < 400:
+                    first_reply.accept()
+            elif upstream.status_code < 400:
+                is_sse = "sse" in parse_qs(query).get("alt", [])
+                if is_sse and "text/event-stream" in upstream.headers.get("content-type", "").lower():
+                    source = _native_sse_frames(upstream, reply_guard=first_reply)
+                    prefetched = await first_reply.prefetch(source, lambda _frame: first_reply.ready)
+                elif not is_sse and first_reply.seconds:
+                    source = _native_json_chunks(upstream, first_reply)
+                    prefetched = await first_reply.prefetch(source, lambda _chunk: first_reply.ready)
+        except asyncio.CancelledError:
+            if upstream is not None:
+                with anyio.CancelScope(shield=True):
+                    await _close_upstream(upstream)
+            raise
         except Exception as e:
-            last_error_headers = {}
-            if isinstance(e, httpx.TimeoutException):
+            if upstream is not None:
+                await _close_upstream(upstream)
+            last_error_headers = {k: v for k, v in upstream.headers.items()
+                                  if k.lower() == "retry-after"} if upstream is not None else {}
+            if isinstance(e, NativeStreamError):
+                last_error_status, last_error_body = e.code, e.payload
+            elif isinstance(e, (TimeoutError, httpx.TimeoutException)):
                 last_error_status = 504
-                last_error_body = _native_error(504, "Upstream timeout", "DEADLINE_EXCEEDED").body
+                last_error_body = _native_error(504, str(e) or "Upstream timeout", "DEADLINE_EXCEEDED").body
+            elif isinstance(e, IncompleteResponseError):
+                last_error_status = 502
+                last_error_body = _native_error(502, str(e), "UNAVAILABLE").body
             else:
                 last_error_status = 502
                 last_error_body = _native_error(502, f"Upstream connection failed ({type(e).__name__})", "UNAVAILABLE").body
             if key_attempts >= retry_max or not is_retryable_exception(e):
                 break
-            wait = _retry_delay(None, backoff_seconds, key_attempts, jitter_seconds)
-            print(f"⚠️ [Gemini 透传] 上游连接异常（{type(e).__name__}），"
+            wait = _retry_delay(last_error_headers.get("retry-after"), backoff_seconds, key_attempts,
+                                jitter_seconds, error=e)
+            print(f"⚠️ [Gemini 透传] 上游请求失败（HTTP {last_error_status}，{type(e).__name__}），"
                   f"{wait:.1f}s 后重试（{key_attempts + 1}/{retry_max}）。")
             if not await _wait_for_retry(fastapi_request, wait):
                 return Response(status_code=499)
@@ -403,7 +437,7 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
         if is_stream and upstream.status_code < 400:
             return await _relay_stream(
                 upstream, keepalive="sse" in parse_qs(query).get("alt", []),
-                deadline=deadline)
+                deadline=deadline, source=prefetched)
 
         # 错误（或非流式响应）：缓冲 body 再透传，顺带供钉定失败判定
         status = upstream.status_code
@@ -457,10 +491,37 @@ class NativeStreamError(RuntimeError):
         super().__init__(str(error))
 
 
-async def _native_sse_frames(upstream):
+async def _native_json_chunks(upstream, reply_guard):
+    """Inspect complete JSON array items until output, preserving all raw bytes."""
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    parser = json.JSONDecoder()
+    pending = ""
+    async for chunk in upstream.aiter_bytes():
+        if not reply_guard.ready:
+            pending += decoder.decode(chunk)
+            while pending:
+                pending = pending.lstrip("[\r\n\t ,")
+                try:
+                    obj, end = parser.raw_decode(pending)
+                except ValueError:
+                    break
+                pending = pending[end:]
+                if native_has_reply(obj):
+                    reply_guard.accept()
+                    pending = ""
+                    break
+        yield chunk
+
+
+async def _native_sse_frames(upstream, reply_guard=None):
     seen, finished = set(), set()
     received = False
-    frames = sse_frames(upstream.aiter_bytes())
+    async def observed_bytes():
+        async for chunk in upstream.aiter_bytes():
+            if chunk:
+                upstream_chunk()
+            yield chunk
+    frames = sse_frames(observed_bytes())
     try:
         async for frame in frames:
             data = b"\n".join(line[5:].lstrip() for line in frame.splitlines() if line.startswith(b"data:"))
@@ -478,6 +539,8 @@ async def _native_sse_frames(upstream):
                         raise NativeStreamError(obj)
                     if not isinstance(obj.get("candidates", []), list):
                         raise IncompleteResponseError("上游 SSE candidates 格式错误。")
+                    if reply_guard and native_has_reply(obj):
+                        reply_guard.accept()
                     for index, candidate in enumerate(obj.get("candidates") or []):
                         if not isinstance(candidate, dict) or not isinstance(candidate.get("content", {}), dict):
                             raise IncompleteResponseError("上游 SSE 候选格式错误。")
@@ -495,7 +558,7 @@ async def _native_sse_frames(upstream):
         await frames.aclose()
 
 
-async def _relay_stream(upstream: httpx.Response, *, keepalive=False, deadline=None) -> StreamingResponse:
+async def _relay_stream(upstream: httpx.Response, *, keepalive=False, deadline=None, source=None) -> StreamingResponse:
     """把上游 SSE（或 JSON array 流）以解压后的字节转发给客户端。
 
     用 aiter_bytes()（透明解压）：上游可能按我们的 accept-encoding
@@ -521,7 +584,7 @@ async def _relay_stream(upstream: httpx.Response, *, keepalive=False, deadline=N
             remaining = (deadline or time.monotonic() + request_timeout_seconds()) - time.monotonic()
             async with asyncio.timeout(max(0.001, remaining)):
                 if keepalive:
-                    events = with_heartbeats(_native_sse_frames(upstream))
+                    events = with_heartbeats(source if source is not None else _native_sse_frames(upstream))
                     yield HEARTBEAT_FRAME.encode()
                     async for item in events:
                         if item is HEARTBEAT:
@@ -530,8 +593,9 @@ async def _relay_stream(upstream: httpx.Response, *, keepalive=False, deadline=N
                             total += len(item)
                             yield item
                 else:
-                    async for chunk in upstream.aiter_bytes():
+                    async for chunk in source if source is not None else upstream.aiter_bytes():
                         if chunk:
+                            upstream_chunk()
                             total += len(chunk)
                             yield chunk
             completed = True
@@ -564,6 +628,8 @@ async def _relay_stream(upstream: httpx.Response, *, keepalive=False, deadline=N
                 try:
                     await self.body_iterator.aclose()
                 finally:
+                    if source is not None:
+                        await source.aclose()
                     await _close_upstream(upstream)
 
         async def __call__(self, scope, receive, send):
@@ -573,12 +639,9 @@ async def _relay_stream(upstream: httpx.Response, *, keepalive=False, deadline=N
                 # send() 可能在生成器第一次执行前或暂停于 yield 时失败；
                 # 两种情况下都由响应外层负责关闭，不能仅依赖生成器 finally。
                 with anyio.CancelScope(shield=True):
-                    try:
-                        await self.body_iterator.aclose()
-                    finally:
-                        if not started:
-                            stats.add_error()
-                        await _close_upstream(upstream)
+                    if not started:
+                        stats.add_error()
+                    await self.aclose()
 
     media_type = upstream.headers.get("content-type", "text/event-stream")
     passthrough = {k: v for k, v in upstream.headers.items()
@@ -721,6 +784,8 @@ def _passthrough_endpoint():
         query = "&".join(f"{quote(k, safe='')}={quote(v, safe='')}" for k, v in qp)
 
         is_stream = action == "streamGenerateContent"
+        track_configure(model=model, protocol="gemini", channel="express", stream=is_stream,
+                        mode="stream" if is_stream else "json")
         print(f"🔁 [Gemini 透传] {model}:{action} | {'流式' if is_stream else '非流式'}"
               f" | 原生协议透传（Express 通道）")
         try:
@@ -732,8 +797,25 @@ def _passthrough_endpoint():
                 return _native_error(400, "原生续传需要 streamGenerateContent?alt=sse。")
             if sse and resume and resumable_enabled():
                 return await _resumable_native(request, _auth, model, action, query, raw_body, parsed)
-            async with asyncio.timeout(request_timeout_seconds()):
-                return await _passthrough_request(request, model, action, query, raw_body)
+            async def execute():
+                async with asyncio.timeout(request_timeout_seconds()):
+                    return await _passthrough_request(request, model, action, query, raw_body)
+
+            def error_body(result):
+                if isinstance(result, Exception):
+                    code, message = extract_upstream_error(result)
+                    return _native_error(code, message).body
+                try:
+                    if json.loads(result.body).get("error"):
+                        return result.body
+                except (ValueError, TypeError, AttributeError):
+                    pass
+                code = result.status_code if result.status_code >= 400 else 502
+                return _native_error(code, f"上游返回非 SSE 响应（HTTP {result.status_code}）。").body
+
+            if sse:
+                return await prepare_sse(execute, request, error_body, stats.add_error)
+            return await execute()
         except TimeoutError:
             return _native_error(504, "本轮请求超过总执行期限。")
         except GenerationCapacityError as exc:

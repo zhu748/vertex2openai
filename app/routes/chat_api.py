@@ -17,6 +17,7 @@ from logger import stats
 from streaming import keepalive_sse
 from admission import limit_generation, ManagedStreamingResponse
 from response_validation import IncompleteResponseError
+from request_tracking import configure as track_configure
 
 # 第二轮：弱网可靠传输 —— 服务端响应缓冲 + 序列号事件 + 断线重放 / 分片轮询。
 # 上游读取由后台泵驱动，与前端连接解绑；已收到的事件保存在有界缓冲。
@@ -169,7 +170,11 @@ async def _resumable_stream(fastapi_request: Request, request_obj: OpenAIRequest
     stream_id = buf.id
     if not is_new:
         # 命中在用的缓冲：重放已缓冲的部分并继续跟随上游直到本轮结束，不再请求上游。
-        print(f"↩️ [续传命中] {stream_id}（{id_src}）：直接重放/续传，不再请求上游。")
+        age = round(time.monotonic() - buf.started_monotonic, 1)
+        print(f"↩️ [续传命中] {stream_id}（{id_src}）：直接重放/续传，不再请求上游。"
+              f"状态={buf.status}，已运行 {age} 秒，已缓冲 {buf.next_seq} 个事件。"
+              "取消前端不会停止后台生成；需要重新生成可为新请求更换 Idempotency-Key，"
+              "或使用 X-Resumable: false 关闭本次续传。")
         return StreamingResponse(
             sse_from_buffer(buf, start),
             media_type="text/event-stream",
@@ -312,7 +317,14 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
     统计由 main.py 的中间件按响应状态码统一计入，这里不重复计数。
     """
     try:
-        if resumable_enabled():
+        track_configure(model=request.model, protocol="openai", stream=bool(request.stream),
+                        channel="cookie" if app_state.is_web_proxy_enabled() else "express")
+        # 普通聊天客户端通常把“取消后重发”理解为重新生成；允许单次请求
+        # 直通，避免相同请求体反复接回一个仍在等待的后台任务。
+        resume_disabled = fastapi_request.headers.get("x-resumable", "").strip().lower() in ("0", "false", "no")
+        if resume_disabled and resume_cursor(fastapi_request)[2]:
+            raise ResumeRequestError(400, "X-Resumable: false 不能与续传 ID 或游标同时使用。")
+        if resumable_enabled() and not resume_disabled:
             if request.stream:
                 return await _resumable_stream(fastapi_request, request, api_key)
             return await _resumable_json(fastapi_request, request, api_key)

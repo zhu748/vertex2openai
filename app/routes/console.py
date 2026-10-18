@@ -4,7 +4,7 @@ import asyncio
 from functools import lru_cache
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
@@ -23,6 +23,7 @@ from console_auth import (
     require_auth,
 )
 from logger import rt_logger, stats
+from request_tracking import request_registry
 
 
 router = APIRouter()
@@ -84,7 +85,23 @@ async def logout(request: Request):
 
 @router.get("/api/stats")
 async def get_stats_api(_auth: bool = Depends(require_auth)):
-    return JSONResponse(content=stats.get_json_stats())
+    return JSONResponse(content={**stats.get_json_stats(), "requests": request_registry.list(limit=0)["summary"]})
+
+
+@router.get("/api/requests")
+async def list_requests(_auth: bool = Depends(require_auth), status: str = "all",
+                        q: str = Query("", max_length=200), offset: int = Query(0, ge=0),
+                        limit: int = Query(50, ge=1, le=100)):
+    return JSONResponse(content=request_registry.list(status=status, query=q, offset=offset, limit=limit),
+                        headers={"Cache-Control": "no-store"})
+
+
+@router.get("/api/requests/{request_id}")
+async def request_detail(request_id: str, _auth: bool = Depends(require_auth)):
+    trace = request_registry.get(request_id)
+    if not trace:
+        return JSONResponse(status_code=404, content={"error": "请求记录不存在或已超过保留期限。"})
+    return JSONResponse(content=trace.snapshot(detail=True), headers={"Cache-Control": "no-store"})
 
 
 @router.get("/stream-logs")

@@ -50,6 +50,8 @@ from upstream_errors import (
     extract_upstream_error,
 )
 from usage import make_usage_chunk, map_usage, wants_usage
+from request_tracking import configure as track_configure, upstream_attempt, upstream_chunk, record_usage
+from first_reply import FirstReplyGuard, sdk_has_reply, timed_call
 
 
 def _safety_score_enabled() -> bool:
@@ -62,6 +64,7 @@ def _safety_score_enabled() -> bool:
 def _extract_usage(resp: Any) -> tuple[int, int, int]:
     """从 SDK 响应里取 (prompt, completion, total) token 数。"""
     usage = map_usage(getattr(resp, "usage_metadata", None))
+    record_usage(usage)
     return usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"]
 
 
@@ -499,12 +502,13 @@ async def gemini_fake_stream_generator(
                 stats.add_retry()
                 retry_pending = False
 
+            upstream_attempt()
             api_call_task = asyncio.create_task(
-                gemini_client_instance.aio.models.generate_content(
+                timed_call(request_obj.model, gemini_client_instance.aio.models.generate_content(
                     model=model_for_api_call,
                     contents=prompt_for_api_call,
                     config=gen_config_dict_for_api_call,
-                )
+                ))
             )
 
             # 等待期间持续吐 keep-alive，避免前端因长时间无字节而超时
@@ -523,6 +527,7 @@ async def gemini_fake_stream_generator(
 
             try:
                 raw_gemini_response = await api_call_task
+                upstream_chunk()
                 break
             except asyncio.CancelledError:
                 raise
@@ -661,6 +666,9 @@ async def execute_gemini_call(
 
         if (app_state.get_setting("fake_streaming", app_config.FAKE_STREAMING_ENABLED) or is_image_request
                 or (text_transport and text_transport.mode == "nonstream")):
+            track_configure(mode="fake_stream", upstream_model=model_to_call,
+                            thinking_level=(gen_config_dict.get("thinking_config") or {}).get("thinking_level"),
+                            max_output_tokens=gen_config_dict.get("max_output_tokens"))
             if is_image_request:
                  print("🖼️ [生图保护] 图片模型请求已自动切换为假流式输出，以避免上游流式限制。")
             return StreamingResponse(
@@ -675,12 +683,21 @@ async def execute_gemini_call(
                 ), media_type="text/event-stream"
             )
         else: # True Streaming
+            track_configure(mode="stream", upstream_model=model_to_call,
+                            thinking_level=(gen_config_dict.get("thinking_config") or {}).get("thinking_level"),
+                            include_thoughts=(gen_config_dict.get("thinking_config") or {}).get("include_thoughts"),
+                            max_output_tokens=gen_config_dict.get("max_output_tokens"))
             response_id_for_stream = f"chatcmpl-realstream-{int(time.time())}"
             async def _gemini_real_stream_generator_inner():
                 # 钉定失败要在这里改写模型名与客户端，必须声明 nonlocal。
                 nonlocal model_to_call, current_client, fallback_model
                 max_retries, backoff_sec, jitter_sec = get_retry_settings()
                 has_yielded = False  # 是否已向客户端输出过内容
+                thinking = gen_config_dict.get("thinking_config") or {}
+                print(f"🌊 [流式模式] {request_obj.model}：真流式，"
+                      f"思考档位={thinking.get('thinking_level', '默认')}，"
+                      f"回传思考={thinking.get('include_thoughts', '默认')}，"
+                      f"输出上限={gen_config_dict.get('max_output_tokens', '上游默认')}。")
                 # 立即吐一个 SSE 心跳，尽快建立连接（429 重试期间也保活，防前端超时中断）
                 yield ": keep-alive\n\n"
                 # 总尝试次数 = retry_max + 1，retry_max=0 时仍会请求一次
@@ -694,6 +711,7 @@ async def execute_gemini_call(
                         return
                     stream_gen_obj = None
                     target_unavailable = False
+                    attempt_started = time.monotonic()
                     try:
                         if retry_pending:
                             if not await _select_retry_target():
@@ -701,11 +719,13 @@ async def execute_gemini_call(
                                 raise last_error or RuntimeError("没有可用的 Express API Key。")
                             stats.add_retry()
                             retry_pending = False
-                        stream_gen_obj = await current_client.aio.models.generate_content_stream(
+                        upstream_attempt()
+                        first_reply = FirstReplyGuard(request_obj.model)
+                        stream_gen_obj = await first_reply.wait(current_client.aio.models.generate_content_stream(
                             model=model_to_call,
                             contents=actual_prompt_for_call,
                             config=gen_config_dict
-                        )
+                        ))
 
                         # 预填充智能兼容：把预填充文本作为回复开头先发出（仅一次）；
                         # 同时启用流式去重器，模型若复述预填充开头会被自动裁掉（n>1 时不启用）。
@@ -718,8 +738,19 @@ async def execute_gemini_call(
 
                         final_p_tk, final_c_tk, final_t_tk = 0, 0, 0
                         seen_candidates, finished_candidates = set(), set()
+                        received_chunks = 0
+                        content_chars, reasoning_chars, tool_deltas = 0, 0, 0
+                        finish_reasons = set()
+                        deferred_finishes = []
+                        pending_metadata = []
+                        pending_metadata_bytes = 0
 
-                        async for chunk_item_call in stream_gen_obj:
+                        async for chunk_item_call in first_reply.iterate(stream_gen_obj, sdk_has_reply):
+                            upstream_chunk()
+                            received_chunks += 1
+                            if received_chunks == 1:
+                                elapsed = time.monotonic() - attempt_started
+                                print(f"📥 [首个上游分片] {request_obj.model}：第 {attempt + 1} 次尝试等待 {elapsed:.1f} 秒收到分片；分片可能仅含思考或用量。")
                             if getattr(chunk_item_call, "usage_metadata", None):
                                 final_p_tk, final_c_tk, final_t_tk = _extract_usage(chunk_item_call)
 
@@ -743,10 +774,33 @@ async def execute_gemini_call(
                                         continue  # 正文暂存于去重器，跳过空 chunk
                                 choice = (chunk_payload.get("choices") or [{}])[0]
                                 delta = choice.get("delta") or {}
+                                if delta.get("content"):
+                                    if not content_chars:
+                                        elapsed = time.monotonic() - attempt_started
+                                        print(f"✍️ [首段正文] {request_obj.model}：第 {attempt + 1} 次尝试等待 {elapsed:.1f} 秒开始输出正文。")
+                                    content_chars += len(delta["content"])
+                                reasoning_chars += len(delta.get("reasoning_content") or "")
+                                tool_deltas += len(delta.get("tool_calls") or [])
+                                if choice.get("finish_reason"):
+                                    finish_reasons.add(choice["finish_reason"])
                                 signature = ((delta.get("extra_content") or {}).get("google") or {}).get("thought_signature")
                                 if not (delta.get("content") or delta.get("reasoning_content")
                                         or delta.get("tool_calls") or signature or choice.get("finish_reason")):
                                     continue
+                                if choice.get("finish_reason") and not (content_chars or reasoning_chars or tool_deltas):
+                                    # 有些前端收到 finish_reason 就结束读取；先校验空响应，
+                                    # 避免成功结束帧遮住后续的明确错误。
+                                    deferred_finishes.append(chunk_payload)
+                                    continue
+                                if not first_reply.ready:
+                                    pending_metadata_bytes += len(json.dumps(chunk_payload, ensure_ascii=False).encode("utf-8"))
+                                    if pending_metadata_bytes > 2 * 1024 * 1024:
+                                        raise IncompleteResponseError("首回复前的元数据缓冲超过 2 MiB。")
+                                    pending_metadata.append(chunk_payload)
+                                    continue
+                                for metadata in pending_metadata:
+                                    yield f"data: {json.dumps(metadata, ensure_ascii=False)}\n\n"
+                                pending_metadata.clear()
                                 if prefill_text and not has_yielded:
                                     yield f"data: {json.dumps(_pf, ensure_ascii=False)}\n\n"
                                 has_yielded = True
@@ -763,14 +817,26 @@ async def execute_gemini_call(
                                 if prefill_text and not has_yielded:
                                     yield f"data: {json.dumps(_pf)}\n\n"
                                 has_yielded = True
+                                content_chars += len(tail)
                                 _tail = {"id": response_id_for_stream, "object": "chat.completion.chunk", "created": int(time.time()), "model": request_obj.model, "choices": [{"index": 0, "delta": {"content": tail}, "finish_reason": None}]}
                                 yield f"data: {json.dumps(_tail, ensure_ascii=False)}\n\n"
 
-                        if not has_yielded:
-                            raise ValueError("上游流式响应无有效内容。")
-                        stats.add_tokens(final_p_tk, final_c_tk)
                         if final_p_tk > 0 or final_c_tk > 0:
                             print(f"💰 [算力消耗统计] 提示词: {final_p_tk} | 思考与生成: {final_c_tk} | 总计: {final_t_tk} Tokens")
+                        reasons = ','.join(sorted(finish_reasons)) or '无'
+                        print(f"📊 [流式完成] {request_obj.model}：正文 {content_chars} 字符，思考 {reasoning_chars} 字符，"
+                              f"工具增量 {tool_deltas}，结束原因={reasons}。")
+                        # 结束标记或签名单独到达也会设置 has_yielded，但它们不是回复内容。
+                        # 安全拦截允许空正文；只有思考的合法响应保留，同时明确提示诊断。
+                        if not (content_chars or reasoning_chars or tool_deltas or 'content_filter' in finish_reasons):
+                            hint = "请降低思考档位或提高输出 token 上限。" if 'length' in finish_reasons else "请检查上游响应与生成参数。"
+                            raise IncompleteResponseError(f"上游流式响应没有正文、思考或工具调用（结束原因：{reasons}）。{hint}")
+                        if reasoning_chars and not (content_chars or tool_deltas):
+                            print(f"⚠️ [空正文] {request_obj.model}：上游仅返回思考，客户端可能显示为空。"
+                                  f"结束原因={reasons}；请检查思考档位和输出 token 上限。")
+                        stats.add_tokens(final_p_tk, final_c_tk)
+                        for payload in deferred_finishes:
+                            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
                         # P1-8：Express 真流式此前从不发 usage 块，客户端只能显示 0
                         if wants_usage(request_obj):
@@ -824,7 +890,11 @@ async def execute_gemini_call(
                             # F-5：退避时长改读控制台的 retry_backoff_seconds，
                             # 原先硬编码 2**(attempt%4)，控制台设置对真流式完全没作用。
                             wait_time = exception_retry_delay(e_stream_call, backoff_sec, attempt, jitter_sec)
-                            print(f"⚠️ [自动重试] Agent Platform Express Mode 流式请求返回 429/503 或配额繁忙。第 {attempt + 1} 次退避重试，等待 {wait_time} 秒。")
+                            code, _ = extract_upstream_error(e_stream_call)
+                            elapsed = time.monotonic() - attempt_started
+                            print(f"⚠️ [自动重试] Agent Platform Express Mode 流式请求失败（HTTP {code}，"
+                                  f"{type(e_stream_call).__name__}，本次已等待 {elapsed:.1f} 秒）。"
+                                  f"第 {attempt + 1} 次退避重试，等待 {wait_time:.1f} 秒。")
                             if await _client_gone():
                                 print(f"ℹ️ [客户端断开] 重试前检测到客户端已断开，停止调用模型 {model_to_call}。")
                                 return
@@ -863,6 +933,7 @@ async def execute_gemini_call(
 
             return StreamingResponse(_gemini_real_stream_generator_inner(), media_type="text/event-stream")
     else: # Non-streaming
+        track_configure(mode="json", upstream_model=model_to_call)
         # 手动退避重试循环（替代 tenacity），以便在每次重试前检测客户端断开
         max_retries, backoff_sec, jitter_sec = get_retry_settings()
         response_obj_call = None
@@ -885,11 +956,13 @@ async def execute_gemini_call(
                         raise last_error or RuntimeError("没有可用的 Express API Key。")
                     stats.add_retry()
                     retry_pending = False
-                response_obj_call = await current_client.aio.models.generate_content(
+                upstream_attempt()
+                response_obj_call = await timed_call(request_obj.model, current_client.aio.models.generate_content(
                     model=model_to_call,
                     contents=actual_prompt_for_call,
                     config=gen_config_dict,
-                )
+                ))
+                upstream_chunk()
                 break
             except asyncio.CancelledError:
                 print(f"ℹ️ [客户端断开] 非流式响应期间客户端已断开，模型 {model_to_call} 的请求已安全终止。")

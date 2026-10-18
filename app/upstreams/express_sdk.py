@@ -19,6 +19,7 @@ import model_capabilities as mc
 from runtime_state import app_state, get_effective_proxy_uri_for_key
 from proxy_resolver import ProxyResolveError, mask_proxy_uri, resolve_proxy_uri_async
 from schema_validation import SchemaValidationError, validate_request_schemas
+from request_tracking import configure as track_configure
 
 LEGACY_EXPRESS_PREFIX = "[EXPRESS] "
 LEGACY_PAY_PREFIX = "[PAY]"
@@ -167,6 +168,7 @@ class ExpressSDKUpstream(BaseUpstream):
             )
 
         express_api_key = key_record["key"]
+        track_configure(project_id=key_record.get("project_id", ""))
         _inj_settings = app_state.get_effective_settings(base_model_name)
         # 多账号：location 钉定用**这个 Key 自己的**项目，而不是 Cookie 通道的全局项目
         model_to_call = resolve_express_model_path(
@@ -267,6 +269,7 @@ class ExpressSDKUpstream(BaseUpstream):
             model_path = resolve_express_model_path(
                 base_model_name, _inj_settings, key_project_id=record.get("project_id", "")
             )
+            track_configure(project_id=record.get("project_id", ""), upstream_model=model_path)
             retry_proxy_uri = get_effective_proxy_uri_for_key(record)
             await resolve_proxy_uri_async(retry_proxy_uri)
             key_proxy_uri = retry_proxy_uri

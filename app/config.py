@@ -92,6 +92,7 @@ DEFAULT_SETTINGS = {
     "retry_max": 10,
     "retry_backoff_seconds": 5,
     "retry_jitter_seconds": 1,
+    "first_reply_timeout_seconds": 15.0,  # 每次上游尝试等待模型首回复；0=关闭，可按模型覆盖
     # 开关（初始值取环境变量）
     "fake_streaming": FAKE_STREAMING_ENABLED,
     "fake_streaming_interval": FAKE_STREAMING_INTERVAL_SECONDS,
@@ -192,9 +193,10 @@ DEFAULT_SETTINGS = {
     "express_ua_profile": "sdk",
     "express_ua_custom": "",
     # 弱网可靠传输（见 resumable.py）：服务端响应缓冲 + 序列号事件 + 断线重放/分片轮询。
-    # 上游读取由后台泵任务驱动，与前端连接解绑；Google 的回复总能完整落缓冲。
+    # 上游由后台泵读取，与前端连接解绑；受执行期限、续传窗口和容量预算约束。
     "resumable_enabled": True,            # 总开关；关掉则回到原有直通行为
     "resumable_ttl_seconds": 1800,        # 已完成的缓冲保留时长（秒），超时清掉
+    "resumable_disconnect_grace_seconds": 10.0,  # 最后客户端断开后，相同请求可复用的窗口
     "resumable_max_streams": 200,         # 缓冲总数上限，超限淘汰最旧的已完成缓冲
     "resumable_max_buffer_mb": 64,       # 单次回复的编码字节上限
     "resumable_max_total_mb": 256,       # 全部已登记副本的编码字节预算
@@ -211,6 +213,7 @@ DEFAULT_SETTINGS = {
 # 允许按模型单独保存（覆盖全局默认）的参数键。
 # 其余为基础设施级（图压缩/重试/假流式/预填充/安全分/调试等），保持全局唯一。
 PER_MODEL_KEYS = [
+    "first_reply_timeout_seconds",
     "anti_truncation_mode",
     "native_thinking_mode",
     "thinking_g3_level",

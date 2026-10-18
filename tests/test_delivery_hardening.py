@@ -15,7 +15,7 @@ os.environ["STATE_DIR"] = _STATE.name
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 import httpx
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.requests import ClientDisconnect
 
 import config
@@ -167,6 +167,55 @@ class GenerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("x-resume-id", response.headers["access-control-expose-headers"].lower())
         self.assertEqual(response.headers["x-accel-buffering"], "no")
+
+    async def test_opt_out_starts_fresh_while_identical_buffer_is_running(self):
+        release = asyncio.Event()
+        calls = 0
+
+        async def upstream(*args):
+            nonlocal calls
+            calls += 1
+            generation = calls
+
+            async def frames():
+                if generation == 1:
+                    await release.wait()
+                yield 'data: ' + json.dumps({"generation": generation}) + '\n\n'
+                yield resumable.DONE_FRAME
+            return StreamingResponse(frames())
+
+        with mock.patch.object(chat_api, "_call_upstream", side_effect=upstream), \
+             mock.patch.object(chat_api, "resumable_enabled", return_value=True):
+            first = await chat_api.chat_completions(request(), self.obj, "test-key")
+            buf = await self.store.get_exact(first.headers["x-resume-id"])
+            try:
+                fresh = await chat_api.chat_completions(request({"x-resumable": "FALSE"}), self.obj, "test-key")
+                self.assertIn('"generation": 2', await asyncio.wait_for(collect(fresh), 1))
+                self.assertNotIn("x-resume-id", fresh.headers)
+                self.assertFalse(buf.done)
+                self.assertEqual(calls, 2)
+            finally:
+                release.set()
+            self.assertIn('"generation": 1', await asyncio.wait_for(collect(first), 1))
+
+    async def test_nonstream_opt_out_does_not_create_or_replay_buffer(self):
+        obj = self.obj.model_copy(update={"stream": False})
+        with mock.patch.object(chat_api, "_call_upstream", return_value=JSONResponse({"answer": "fresh"})) as upstream, \
+             mock.patch.object(chat_api, "resumable_enabled", return_value=True):
+            for value in ("0", "no", " false "):
+                response = await chat_api.chat_completions(request({"x-resumable": value}), obj, "test-key")
+                self.assertEqual(json.loads(response.body), {"answer": "fresh"})
+            self.assertEqual(upstream.await_count, 3)
+        self.assertEqual(await self.store.list_meta(), [])
+
+    async def test_opt_out_rejects_resume_identifiers_without_calling_upstream(self):
+        for req in (request({"x-resumable": "false", "x-resume-id": "rid-old"}),
+                    request({"x-resumable": "false", "last-event-id": "0"}),
+                    request({"x-resumable": "false"}, {"resume_from": "0"})):
+            with self.subTest(req=req), mock.patch.object(chat_api, "_call_upstream") as upstream:
+                response = await chat_api.chat_completions(req, self.obj, "test-key")
+                self.assertEqual(response.status_code, 400)
+                upstream.assert_not_called()
 
 
 class BudgetTests(unittest.IsolatedAsyncioTestCase):

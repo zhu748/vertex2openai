@@ -1,0 +1,4 @@
+/* Rebuild with scripts/build_dashboard_css.sh after adding utility classes. */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;

@@ -118,6 +118,61 @@ class StreamRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(errors[0]["code"], 429)
         self.assertEqual(self.stats.error_requests, 1)
 
+    async def test_finish_only_response_is_not_a_successful_answer(self):
+        for reason in ("STOP", "MAX_TOKENS"):
+            with self.subTest(reason=reason):
+                async def factory(**kwargs):
+                    async def iterate():
+                        yield types.GenerateContentResponse(candidates=[types.Candidate(finish_reason=reason)])
+                    return iterate()
+
+                generate = mock.AsyncMock(side_effect=factory)
+                body = await self.stream(generate)
+                errors = [json.loads(line[6:])["error"] for line in body.splitlines()
+                          if line.startswith("data: {") and "error" in json.loads(line[6:])]
+                first_data = next(json.loads(line[6:]) for line in body.splitlines() if line.startswith("data: {"))
+                self.assertIn("error", first_data)
+                self.assertIn('"code": 502', body)
+                self.assertIn("没有正文、思考或工具调用", errors[0]["message"])
+                self.assertIn("data: [DONE]", body)
+                self.assertEqual(generate.await_count, 1)
+                self.assertEqual(self.stats.success_requests, 0)
+                if reason == "MAX_TOKENS":
+                    self.assertIn("输出 token 上限", errors[0]["message"])
+
+    async def test_signature_only_response_is_not_a_successful_answer(self):
+        async def factory(**kwargs):
+            async def iterate():
+                yield types.GenerateContentResponse(candidates=[types.Candidate(
+                    content=types.Content(parts=[types.Part(thought_signature=b"signature")]), finish_reason="STOP")])
+            return iterate()
+
+        body = await self.stream(factory)
+        self.assertIn('"code": 502', body)
+
+    async def test_thought_only_response_is_preserved_with_diagnostic(self):
+        async def factory(**kwargs):
+            async def iterate():
+                yield types.GenerateContentResponse(candidates=[types.Candidate(
+                    content=types.Content(parts=[types.Part(text="thinking", thought=True)]), finish_reason="MAX_TOKENS")])
+            return iterate()
+
+        with mock.patch("builtins.print") as output:
+            body = await self.stream(factory)
+        self.assertIn('"reasoning_content": "thinking"', body)
+        self.assertNotIn('"error":', body)
+        self.assertTrue(any("上游仅返回思考" in str(call) for call in output.call_args_list))
+
+    async def test_content_filter_can_end_without_text(self):
+        async def factory(**kwargs):
+            async def iterate():
+                yield types.GenerateContentResponse(candidates=[types.Candidate(finish_reason="SAFETY")])
+            return iterate()
+
+        body = await self.stream(factory)
+        self.assertIn('"finish_reason": "content_filter"', body)
+        self.assertNotIn('"error":', body)
+
     async def test_permanent_status_overrides_quota_text(self):
         for code in (400, 401, 403, 404):
             self.assertFalse(retry_policy.is_retryable_exception(api_error(code, "quota model-429")))

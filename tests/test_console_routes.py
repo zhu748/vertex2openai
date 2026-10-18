@@ -42,6 +42,8 @@ class ConsoleRoutesTests(unittest.TestCase):
     def test_every_management_route_requires_a_session(self):
         for method, path in (
             ("GET", "/api/stats"),
+            ("GET", "/api/requests"),
+            ("GET", "/api/requests/trace-missing"),
             ("GET", "/api/settings"),
             ("GET", "/api/settings/runtime"),
             ("POST", "/api/settings/mode"),
@@ -122,6 +124,24 @@ class ConsoleRoutesTests(unittest.TestCase):
                                 else self.state.get_model_overrides()["gemini-test"])
                     for key, value in patch.items():
                         self.assertEqual(settings[key], value)
+
+    def test_first_reply_and_disconnect_settings_are_saved_at_the_correct_scope(self):
+        self.login()
+        patch = {"first_reply_timeout_seconds": 25.5, "resumable_disconnect_grace_seconds": 3.5}
+        self.assertEqual(self.client.post('/api/settings', json=patch).status_code, 200)
+        self.assertEqual(self.client.post('/api/model-overrides/gemini-test',
+                         json={"first_reply_timeout_seconds": 0}).status_code, 200)
+        for key, value in patch.items():
+            self.assertEqual(self.client.get('/api/settings').json()[key], value)
+        self.assertEqual(self.state.get_effective_settings('gemini-test')["first_reply_timeout_seconds"], 0)
+        reloaded = AppState()
+        self.assertEqual(reloaded.get_setting('resumable_disconnect_grace_seconds'), 3.5)
+        self.assertEqual(reloaded.get_effective_settings('gemini-test')["first_reply_timeout_seconds"], 0)
+        response = self.client.post('/api/model-overrides/gemini-test',
+                                    json={"resumable_disconnect_grace_seconds": 2})
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn('resumable_disconnect_grace_seconds', response.json()['override'])
+        self.assertEqual(self.state.get_setting('resumable_disconnect_grace_seconds'), 3.5)
 
 
 if __name__ == "__main__":

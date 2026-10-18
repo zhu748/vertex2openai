@@ -5,14 +5,16 @@ selects the latest generation for legacy retries; Idempotency-Key explicitly
 identifies one logical operation. SSE event IDs contain generation + sequence,
 and X-Resume-Id directly addresses the retained generation, bound to its body.
 
-Frontend disconnects do not cancel admitted generation. TTL, byte budgets and a
-total execution deadline bound retention. Upstream loss cannot reconstruct an
+Frontend disconnects do not cancel admitted generation immediately. Repeating
+the request after its disconnect grace cancels and replaces that generation.
+TTL, byte budgets and a total execution deadline bound retention. Upstream loss cannot reconstruct an
 unreceived tail; it is reported as an error. ASGI send completion acknowledges
 server delivery only, not application-level receipt. Buffers are not shared
 between workers/replicas and do not survive a process restart.
 """
 
 import asyncio
+import anyio
 import hashlib
 import json
 import math
@@ -23,6 +25,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 import config as app_config
 from runtime_state import app_state
 from streaming import with_heartbeats, HEARTBEAT, HEARTBEAT_FRAME
+from request_tracking import current_trace
 
 # 终止帧：与 OpenAI 流一致，客户端见到它即可判定「本轮完整结束」
 DONE_FRAME = "data: [DONE]\n\n"
@@ -75,13 +78,30 @@ async def resolve_buffer(store, request, api_key: str, fingerprint: str, *, mode
             raise ResumeRequestError(404, "续传缓冲不存在或已过期；重新生成请移除续传 ID 与游标。")
         if buf.fingerprint_key and buf.fingerprint_key != fingerprint_key:
             raise ResumeRequestError(409, "续传请求体与原请求不一致。")
+        if buf.resume_expired():
+            await store.drop(buf.id, expected=buf, reason="客户端断开已超过续传窗口。", superseded=True)
+            raise ResumeRequestError(410, "客户端断开已超过续传窗口；重新生成请移除旧续传 ID 与游标。")
         if start > buf.next_seq:
             raise ResumeRequestError(409, f"续传起点 {start} 超过缓冲末尾 {buf.next_seq}。")
+        _track_buffer(buf, False, request)
         return buf, False, start, source
     idempotent = bool(request.headers.get("idempotency-key") or request.headers.get("x-idempotency-key"))
     buf, new = await store.get_or_create_request(
         request_key, model=model, kind=kind, fingerprint_key=fingerprint_key, idempotent=idempotent)
+    _track_buffer(buf, new, request)
     return buf, new, 0, source
+
+
+def _track_buffer(buf, new, request):
+    connection = getattr(request, "scope", {}).get("state", {}).get("client_connection")
+    if connection:
+        buf.attach_client(connection)
+    if trace := current_trace.get():
+        if new:
+            buf.trace_id = trace.id
+        trace.configure(generation_id=buf.id, detached=new, parent_id=None if new else buf.trace_id)
+        trace.event("buffer" if new else "resume", "后台缓冲已建立，前端断开后继续生成。" if new else
+                    f"续接已有生成 {buf.id}，不会重复请求上游。", phase="preparing" if new else "resuming")
 
 
 async def within_request_deadline(buf, operation):
@@ -109,6 +129,14 @@ def request_timeout_seconds() -> float:
         return max(0.01, value) if math.isfinite(value) else 1800.0
     except (ValueError, TypeError):
         return 1800.0
+
+
+def disconnect_grace_seconds() -> float:
+    try:
+        value = float(_setting("resumable_disconnect_grace_seconds"))
+        return max(0.0, min(7200.0, value)) if math.isfinite(value) else 10.0
+    except (ValueError, TypeError, OverflowError):
+        return 10.0
 
 
 def _byte_limit(key: str, default: int) -> int:
@@ -184,7 +212,13 @@ class ResumableBuffer:
         self.status_code: int = 200
         self.fully_delivered = False          # 是否已有读者完整读到终止帧
         self.readers = 0
+        self.clients = set()
+        self.last_disconnect_monotonic = None
+        self.last_disconnected_at = None
+        self.last_disconnect_grace_seconds = None
+        self.owner_trace = current_trace.get()
         self.request_key = ""
+        self.trace_id = None
         self.fingerprint_key = ""
         self.bytes_stored = 0
         self._account_bytes = None
@@ -242,6 +276,15 @@ class ResumableBuffer:
         async with self._cond:
             if self.done:
                 return
+            if self.owner_trace:
+                token = current_trace.set(self.owner_trace)
+                try:
+                    if error_type == "superseded":
+                        self.owner_trace.cancel(message)
+                    else:
+                        self.owner_trace.fail(message, code)
+                finally:
+                    current_trace.reset(token)
             payload = {"error": {"message": message[:1024], "type": error_type, "code": code}}
             if self.kind == "native":
                 detail = {400: "INVALID_ARGUMENT", 401: "UNAUTHENTICATED", 403: "PERMISSION_DENIED",
@@ -265,6 +308,37 @@ class ResumableBuffer:
             self._cond.notify_all()
 
     # ---------- 读取端（可以有多个、可以中途离开再回来） ----------
+
+    def attach_client(self, connection):
+        client = object()
+        self.clients.add(client)
+        self.last_disconnect_monotonic = None
+        self.last_disconnected_at = None
+        self.last_disconnect_grace_seconds = None
+
+        def update_meta():
+            if self.owner_trace:
+                with self.owner_trace._lock:
+                    self.owner_trace.data.update(
+                        resume_clients=len(self.clients), resume_grace_seconds=self.last_disconnect_grace_seconds,
+                        resume_expires_at=(self.last_disconnected_at + self.last_disconnect_grace_seconds
+                                           if self.last_disconnected_at is not None else None))
+
+        def closed(disconnected):
+            self.clients.discard(client)
+            if disconnected and not self.clients and not self.fully_delivered:
+                self.last_disconnect_monotonic = connection.disconnected_monotonic
+                self.last_disconnected_at = connection.disconnected_at
+                # Snapshot settings at the last reader's disconnect, just as
+                # each upstream attempt snapshots its first-reply deadline.
+                self.last_disconnect_grace_seconds = disconnect_grace_seconds()
+            update_meta()
+        update_meta()
+        connection.listen(closed)
+
+    def resume_expired(self):
+        return (not self.clients and not self.fully_delivered and self.last_disconnect_monotonic is not None
+                and time.monotonic() - self.last_disconnect_monotonic >= self.last_disconnect_grace_seconds)
 
     @property
     def next_seq(self) -> int:
@@ -328,6 +402,9 @@ class ResumableBuffer:
             "done": self.done,
             "fully_delivered": self.fully_delivered,
             "readers": self.readers,
+            "clients": len(self.clients),
+            "disconnected_at": self.last_disconnected_at,
+            "resume_expired": self.resume_expired(),
             "bytes": self.bytes_stored,
             "created_at": self.created_at,
             "finished_at": self.finished_at,
@@ -375,9 +452,14 @@ class ResumableStore:
     async def get_or_create_request(self, request_key: str, *, model: str, kind: str,
                                     fingerprint_key: str, idempotent: bool = False):
         """A request key selects a generation; completed generations keep unique IDs."""
+        cancelled = None
         async with self._lock:
             sid = self._requests.get(request_key, request_key)
             old = self._buffers.get(sid)
+            if old and old.kind == kind and old.resume_expired():
+                cancelled = self._pumps.get(old.id)
+                await self._discard_locked(old.id, "客户端断开已超过续传窗口，相同请求开始新一轮生成。", superseded=True)
+                old = None
             if old and old.kind == kind and (idempotent or not old.fully_delivered):
                 old.last_access = time.time()
                 return old, False
@@ -395,7 +477,18 @@ class ResumableStore:
             self._attach(buf)
             self._buffers[buf.id] = buf
             self._requests[request_key] = buf.id
-            return buf, True
+        # Do not hold the store lock while cancelled setup/stream cleanup runs.
+        # Followers can already follow the new placeholder; only its owner starts upstream.
+        if cancelled and not cancelled.done():
+            try:
+                done, _ = await asyncio.wait({cancelled}, timeout=5)
+                if not done:
+                    raise BufferCapacityError("旧请求仍在关闭连接，请稍后重试。")
+            except BaseException:
+                with anyio.CancelScope(shield=True):
+                    await self.drop(buf.id, expected=buf, reason="新请求在替换旧任务时中止。")
+                raise
+        return buf, True
 
     async def get(self, stream_id: str) -> Optional[ResumableBuffer]:
         async with self._lock:
@@ -436,13 +529,14 @@ class ResumableStore:
             await self._evict_locked(allow_running=True)
             return buf, True
 
-    async def drop(self, stream_id: str, *, expected: Optional[ResumableBuffer] = None) -> bool:
+    async def drop(self, stream_id: str, *, expected: Optional[ResumableBuffer] = None,
+                   reason="响应缓冲已删除。", superseded=False) -> bool:
         async with self._lock:
             if expected is not None and self._buffers.get(stream_id) is not expected:
                 return False
-            return await self._discard_locked(stream_id, "响应缓冲已删除。")
+            return await self._discard_locked(stream_id, reason, superseded=superseded)
 
-    async def _discard_locked(self, stream_id: str, reason: str) -> bool:
+    async def _discard_locked(self, stream_id: str, reason: str, *, superseded=False) -> bool:
         """移除缓冲时一并停止后台请求、唤醒仍在等结果的读者。"""
         task = self._pumps.pop(stream_id, None)
         if task and task is not asyncio.current_task() and not task.done() and not task.cancelling():
@@ -454,7 +548,13 @@ class ResumableStore:
             if self._requests.get(buf.request_key) == stream_id:
                 self._requests.pop(buf.request_key, None)
             if not buf.done:
-                await buf.fail(reason, error_type="buffer_evicted")
+                await buf.fail(reason, error_type="superseded" if superseded else "buffer_evicted")
+            elif superseded and buf.owner_trace:
+                token = current_trace.set(buf.owner_trace)
+                try:
+                    buf.owner_trace.cancel(reason)
+                finally:
+                    current_trace.reset(token)
         return buf is not None
 
     async def list_meta(self) -> List[dict]:
@@ -590,6 +690,8 @@ async def pump_stream(buf: ResumableBuffer, body_iterator: AsyncIterator[Any]) -
     """
     stream_error = None
     stream_error_code = 200
+    last_data_at = time.monotonic()
+    next_wait_log = last_data_at + 60
     try:
         if buf.done:
             return
@@ -601,7 +703,15 @@ async def pump_stream(buf: ResumableBuffer, body_iterator: AsyncIterator[Any]) -
                 continue
             if text.lstrip().startswith(":"):
                 # 注释帧（旧心跳等）不是事件：不进缓冲、不占序号，保持 id == 下标
+                now = time.monotonic()
+                if now >= next_wait_log:
+                    print(f"⏳ [上游等待] {buf.id}：已运行 {now - buf.started_monotonic:.0f} 秒，"
+                          f"距上次数据 {now - last_data_at:.0f} 秒，累计 {buf.next_seq} 个事件；"
+                          "心跳仅表示连接保活，仍在等待上游数据或错误响应。")
+                    next_wait_log = now + 60
                 continue
+            last_data_at = time.monotonic()
+            next_wait_log = last_data_at + 60
             # The upstream generators report failures as ordinary SSE error
             # frames followed by DONE. Completion of the iterator does not turn
             # such a reply into a successful poll/replay result.
@@ -627,7 +737,7 @@ async def pump_stream(buf: ResumableBuffer, body_iterator: AsyncIterator[Any]) -
             await buf.append(buf.event_frame(DONE_FRAME))
         await buf.finish("error" if stream_error else "done", error=stream_error,
                          status_code=stream_error_code)
-        print(f"📦 [续传缓冲] {buf.id} 上游已读完，共 {len(buf.events)} 个事件已完整落缓冲。")
+        print(f"📦 [续传缓冲] {buf.id} 上游读取结束，状态={buf.status}，共 {len(buf.events)} 个事件已落缓冲。")
     except asyncio.CancelledError:
         # The deadline/store owns cancellation status. Finishing here would
         # hide a 504 from the outer deadline and omit the terminal error frame.

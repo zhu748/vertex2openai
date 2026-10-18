@@ -4,7 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>agentplatform2api · 控制台</title>
-<script src="https://cdn.tailwindcss.com"></script>
+<script src="/static/request-monitor.js" defer></script>
+<link rel="stylesheet" href="/static/dashboard.css">
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -56,6 +57,27 @@
   .helpbox code { display:inline; white-space:normal; }
   .helpbox b { color:var(--fg); }
   .helpbox code { background:#e9e9ef; padding:1px 4px; border-radius:4px; font-size:11px; }
+  .request-table { width:100%; border-collapse:collapse; font-size:12px; text-align:left; white-space:nowrap; }
+  .request-table th { color:var(--muted); font-weight:500; background:#fafafa; }
+  .request-table th, .request-table td { padding:12px; border-bottom:1px solid var(--border); }
+  .request-table tr[data-request] { cursor:pointer; }
+  .request-table tr[data-request]:hover { background:#f5f4ff; }
+  .request-link { color:var(--accent); text-decoration:underline; cursor:pointer; }
+  .request-status { display:inline-block; border-radius:6px; padding:3px 7px; background:#f1f1f5; }
+  .request-status.running { color:#4338ca; background:#eeedff; }
+  .request-status.error { color:#be123c; background:#fff1f2; }
+  .request-status.succeeded { color:#047857; background:#ecfdf5; }
+  #request-dialog { width:min(920px,calc(100% - 28px)); max-height:88vh; padding:0; border:1px solid var(--border); border-radius:16px; color:var(--fg); box-shadow:0 24px 80px #0003; }
+  #request-dialog::backdrop { background:#18181b70; }
+  .request-detail-head { position:sticky; top:0; z-index:1; background:#fff; padding:18px 22px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center; gap:12px; }
+  .request-detail-body { padding:20px 22px; }
+  .request-metrics { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:14px; margin:16px 0; }
+  .request-metrics div { padding:12px; background:#f8f8fb; border-radius:9px; font-size:13px; overflow-wrap:anywhere; }
+  .request-metrics dt { color:var(--muted); font-size:11px; margin-bottom:6px; }
+  .request-metrics dd { margin:0; font-variant-numeric:tabular-nums; }
+  .request-timeline { list-style:none; padding:0; font-size:12px; }
+  .request-timeline li { padding:8px 0 8px 12px; border-left:2px solid #e0ddfa; overflow-wrap:anywhere; }
+  .request-detail-logs { white-space:pre-wrap; overflow-wrap:anywhere; max-height:260px; overflow:auto; background:#f8f8fb; border-radius:9px; padding:12px; font-size:11px; }
 </style>
 </head>
 <body class="min-h-screen">
@@ -89,11 +111,15 @@
     <div class="tab active" data-tab="overview" onclick="switchTab('overview')">数据概览</div>
     <div class="tab" data-tab="channel" onclick="switchTab('channel')">通道与凭证</div>
     <div class="tab" data-tab="params" onclick="switchTab('params')">模型参数</div>
+    <div class="tab" data-tab="requests" onclick="switchTab('requests')">请求监控 <span id="request-active-badge" class="pill pill-accent">0</span></div>
     <div class="tab" data-tab="logs" onclick="switchTab('logs')">运行日志</div>
   </nav>
 
   <!-- Overview -->
   <section id="view-overview">
+    <button class="card p-4 mb-4 text-sm w-full text-left" onclick="switchTab('requests')">
+      <span id="request-overview">正在加载请求状态…</span><span class="request-link" style="float:right">查看请求详情 →</span>
+    </button>
     <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
       <div class="card p-4"><div class="lbl">总请求</div><div id="s-total" class="val text-2xl font-bold mt-1">0</div></div>
       <div class="card p-4"><div class="lbl">成功响应</div><div id="s-success" class="val text-2xl font-bold mt-1 text-emerald-600">0</div></div>
@@ -290,6 +316,11 @@
           <select id="thinking_g3_level" class="inp"><option value="">自动（按模型默认）</option><option value="minimal">minimal</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option></select>
         </div>
         <p id="think-note" class="text-xs text-neutral-500 mt-2"></p>
+        <div class="mt-3">
+          <div class="lbl mb-1">模型首回复超时（秒，0=关闭）</div>
+          <input id="first_reply_timeout_seconds" type="number" min="0" max="7200" step="0.5" class="inp">
+          <p class="text-xs text-neutral-500 mt-2 leading-relaxed">默认 15 秒，每次上游尝试独立计时。思考、正文、工具调用、图片均算首回复；心跳、纯用量和签名不算。超时沿用下方重试预算。假流式和非流式需等待完整上游响应，可按模型调大或设为 0。</p>
+        </div>
         <div class="mt-3 pt-3 border-t border-neutral-100">
           <div class="lbl mb-1">原生思考控制（native_thinking_mode）</div>
           <select id="native_thinking_mode" class="inp">
@@ -488,9 +519,11 @@
         <div class="grid grid-cols-2 gap-3">
           <div><div class="lbl mb-1">整轮期限(秒)</div><input id="request_timeout_seconds" type="number" min="30" max="7200" class="inp"></div>
           <div><div class="lbl mb-1">上游最大并发</div><input id="upstream_max_concurrency" type="number" min="1" max="1000" class="inp"></div>
+          <div><div class="lbl mb-1">断连续传窗口（秒）</div><input id="resumable_disconnect_grace_seconds" type="number" min="0" max="7200" step="0.5" class="inp"></div>
           <div><div class="lbl mb-1">单次缓冲(MiB)</div><input id="resumable_max_buffer_mb" type="number" min="1" max="1024" class="inp"></div>
           <div><div class="lbl mb-1">总缓冲(MiB)</div><input id="resumable_max_total_mb" type="number" min="1" max="8192" class="inp"></div>
         </div>
+        <p class="text-xs text-neutral-500 mt-2">最后一个客户端断开后，窗口内相同请求续接；超过窗口再发时取消旧任务并重新生成。0=断开后不再复用。有其他客户端连接时继续共享。</p>
       </div>
 
       <!-- 开关 -->
@@ -501,7 +534,7 @@
           <div class="flex items-center justify-between"><span class="text-sm">假流式心跳间隔(秒)</span><input id="fake_streaming_interval" type="number" step="0.5" class="inp" style="width:90px"></div>
           <div>
             <div class="flex items-center justify-between"><span class="text-sm">弱网续传（服务端缓冲）<span class="helpq" onclick="hlp(this,'h_rsm')">?</span></span><label class="switch"><input type="checkbox" id="resumable_enabled"><span class="slider"></span></label></div>
-            <div id="h_rsm" class="helpbox">回复边接收边缓冲。断线后用返回的 <code>X-Resume-Id</code> 和最后事件 ID 续传，或轮询 <code>/v1/resumable/{id}</code>。每次逻辑请求建议使用独立 <code>Idempotency-Key</code>；重试沿用，重新生成则更换。缓冲受期限与容量限制，进程重启后失效。</div>
+            <div id="h_rsm" class="helpbox">回复边接收边缓冲。开启后，前端取消不会停止后台生成；相同请求再次发送会续接旧任务。酒馆用户若希望取消后重新生成，可关闭此项，或在 OpenAI 请求中加 <code>X-Resumable: false</code>（只影响新请求）。保留续传时，每次逻辑请求使用独立 <code>Idempotency-Key</code>，网络重试沿用，主动重新生成则更换；也可用返回的 <code>X-Resume-Id</code> 和最后事件 ID 续传，或轮询 <code>/v1/resumable/{id}</code>。缓冲受期限与容量限制，进程重启后失效。</div>
           </div>
           <div class="flex items-center justify-between"><span class="text-sm">续传缓冲保留时长(秒)</span><input id="resumable_ttl_seconds" type="number" step="60" class="inp" style="width:90px"></div>
           <div class="flex items-center justify-between"><span class="text-sm">续传缓冲数量上限</span><input id="resumable_max_streams" type="number" step="10" class="inp" style="width:90px"></div>
@@ -559,6 +592,26 @@
     </div>
   </section>
 
+  <!-- Request monitor -->
+  <section id="view-requests" class="hidden">
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+      <div class="card p-4"><div class="lbl">前端连接</div><div id="r-connections" class="val text-2xl font-bold mt-1">0</div></div>
+      <div class="card p-4"><div class="lbl">上游生成</div><div id="r-generations" class="val text-2xl font-bold mt-1">0</div></div>
+      <div class="card p-4"><div class="lbl">断开后后台运行</div><div id="r-background" class="val text-2xl font-bold mt-1">0</div></div>
+      <div class="card p-4"><div class="lbl">退避等待</div><div id="r-retry-wait" class="val text-2xl font-bold mt-1">0</div></div>
+    </div>
+    <div class="card overflow-hidden">
+      <div class="p-4 flex flex-wrap gap-3 items-center">
+        <input id="request-search" class="inp" style="max-width:300px" placeholder="搜索模型 / 请求 ID / 续传 ID" aria-label="搜索请求">
+        <select id="request-filter" class="inp" style="width:auto" aria-label="筛选请求状态"><option value="all">全部请求</option><option value="active">正在运行</option><option value="error">失败</option><option value="completed">已结束</option></select>
+        <span id="request-refresh-state" class="lbl" role="status">每 2 秒刷新 · 点击一行查看详情</span>
+      </div>
+      <div style="overflow-x:auto"><table class="request-table"><thead><tr><th>请求 / 模型</th><th>状态 / 阶段</th><th>开始时间</th><th>总耗时</th><th>首回复 / 正文</th><th>尝试 / 重试</th><th>输出 / 思考</th><th>连接</th></tr></thead><tbody id="request-rows"><tr><td colspan="8">暂无请求记录</td></tr></tbody></table></div>
+      <div class="p-4 flex justify-between items-center gap-3"><span id="request-page-info" class="lbl"></span><div class="flex gap-2"><button id="request-prev" class="btn-ghost px-3 py-1.5 text-sm">上一页</button><button id="request-next" class="btn-ghost px-3 py-1.5 text-sm">下一页</button></div></div>
+    </div>
+    <p class="lbl mt-3">活跃请求置顶；已结束记录最多保留 500 条、1 小时，诊断文本预算 16 MiB，容量满时提前回收旧记录。每条保留最近 160 个阶段事件与 200 条关联日志。数据属于当前进程，重启后清空。</p>
+  </section>
+
   <!-- Logs -->
   <section id="view-logs" class="hidden">
     <div class="card overflow-hidden">
@@ -571,12 +624,16 @@
   </section>
 </div>
 <div id="toast" class="toast"></div>
+<dialog id="request-dialog" aria-labelledby="request-detail-title">
+  <div class="request-detail-head"><div><div id="request-detail-title" class="text-sm font-semibold">请求详情</div><div id="request-detail-id" class="lbl mt-1"></div></div><button id="request-detail-close" class="btn-ghost px-3 py-1.5 text-sm">关闭</button></div>
+  <div class="request-detail-body"><div id="request-detail-state" role="status"></div><div id="request-detail-content"></div></div>
+</dialog>
 
 <script>
 const $ = id => document.getElementById(id);
 let CAPS = {}, chart = null, curAR = "";
 let GLOBAL_SETTINGS = {}, OVERRIDES = {};
-const PER_MODEL_KEYS = ['anti_truncation_mode','native_thinking_mode','thinking_g3_level','image_size','image_aspect_ratio','default_temperature','default_top_p','default_max_tokens','inject_system_instruction','inject_prefill','prefill_instruction','image_system_instruction','inject_prefill_for_image','sampling_policy','prefill_cot_guard'];
+const PER_MODEL_KEYS = ['first_reply_timeout_seconds','anti_truncation_mode','native_thinking_mode','thinking_g3_level','image_size','image_aspect_ratio','default_temperature','default_top_p','default_max_tokens','inject_system_instruction','inject_prefill','prefill_instruction','image_system_instruction','inject_prefill_for_image','sampling_policy','prefill_cot_guard'];
 const COMMON_ARS = ["1:1","3:2","2:3","3:4","4:3","4:5","5:4","9:16","16:9","21:9","1:4","4:1","1:8","8:1","9:21"];
 
 function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),1800); }
@@ -585,7 +642,8 @@ async function logout(){ try{ await fetch('/api/logout',{method:'POST'}); }catch
 
 function switchTab(t){
   document.querySelectorAll('.tab').forEach(e=>e.classList.toggle('active', e.dataset.tab===t));
-  ['overview','channel','params','logs'].forEach(v=>$('view-'+v).classList.toggle('hidden', v!==t));
+  ['overview','channel','params','requests','logs'].forEach(v=>$('view-'+v).classList.toggle('hidden', v!==t));
+  if(t==='requests') window.requestMonitor?.refresh();
 }
 
 /* ---------- Overview ---------- */
@@ -604,6 +662,7 @@ async function fetchStats(){
     $('t-prompt').textContent=fmt(d.prompt_tokens); $('t-comp').textContent=fmt(d.completion_tokens);
     $('t-total').textContent=fmt((d.prompt_tokens||0)+(d.completion_tokens||0));
     $('uptime').textContent='已运行 '+(d.uptime/3600).toFixed(1)+' h';
+    window.requestMonitor?.summary(d.requests);
     renderChart(d.success,d.error,d.retries);
   }catch(e){}
 }
@@ -861,7 +920,7 @@ async function loadParams(){
     const s=await (await fetch('/api/settings')).json();
     GLOBAL_SETTINGS=s;
     curAR = s.image_aspect_ratio || "";
-    ['native_thinking_mode','thinking_g3_level','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','retry_jitter_seconds','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','express_location','resumable_ttl_seconds','resumable_max_streams','request_timeout_seconds','upstream_max_concurrency','resumable_max_buffer_mb','resumable_max_total_mb'].forEach(k=>setV(k,s[k]));
+    ['first_reply_timeout_seconds','resumable_disconnect_grace_seconds','native_thinking_mode','thinking_g3_level','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','retry_jitter_seconds','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','express_location','resumable_ttl_seconds','resumable_max_streams','request_timeout_seconds','upstream_max_concurrency','resumable_max_buffer_mb','resumable_max_total_mb'].forEach(k=>setV(k,s[k]));
     ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction','inject_prefill_for_image','prefill_cot_guard','resumable_enabled'].forEach(k=>setV(k,s[k]));
     // 出站代理：回填输入框并刷新状态徽标
     setV('proxy-input', s.proxy_url || '');
@@ -912,6 +971,7 @@ function applyModelParamFields(model){
 async function saveModelOverride(){
   const m=$('model-sel').value; if(!m) return;
   const patch={
+    first_reply_timeout_seconds:numOr('first_reply_timeout_seconds',15),
     anti_truncation_mode:$('anti_truncation_mode').value,
     native_thinking_mode:$('native_thinking_mode').value,
     thinking_g3_level:$('thinking_g3_level').value,
@@ -1056,6 +1116,7 @@ async function saveSettings(){
     express_location:$('express_location').value,
     prefill_suppress_thinking:$('prefill_suppress_thinking').checked,
     resumable_enabled:$('resumable_enabled').checked,
+    resumable_disconnect_grace_seconds:numOr('resumable_disconnect_grace_seconds',10),
     resumable_ttl_seconds:numOr('resumable_ttl_seconds',1800),
     resumable_max_streams:numOr('resumable_max_streams',200),
     request_timeout_seconds:numOr('request_timeout_seconds',1800),
@@ -1063,14 +1124,8 @@ async function saveSettings(){
     resumable_max_buffer_mb:numOr('resumable_max_buffer_mb',64),
     resumable_max_total_mb:numOr('resumable_max_total_mb',256),
   };
-  // 7 个可覆盖参数：仅当所选模型“没有专属配置”时，才作为全局默认保存，
-  // 避免把某模型的专属值误存成全局（专属值请用“保存为该模型专属”）。
   const m=$('model-sel').value;
   const overriding = !!(OVERRIDES[m] && Object.keys(OVERRIDES[m]).length>0);
-  if(!overriding){
-    Object.assign(patch,{
-    });
-  }
   const scope = overriding
     ? '将保存全局的基础设施项（图压缩/重试/假流式/预填充/思考控制开关等）。\n当前所选模型有专属思考/生图/采样参数，不会被改动。'
     : '将保存为全局默认，影响所有【未设置专属参数】的模型。\n已设专属参数的模型不受影响。';
@@ -1091,7 +1146,8 @@ function logLine(t){
   else if(t.includes('⚠️')||t.includes('WARN')||t.includes('🔄')||t.includes('重试')){c='#b45309';bg='#fffbeb';bl='2px solid #f59e0b';}
   else if(t.includes('❌')||t.includes('ERROR')){c='#be123c';bg='#fef2f2';bl='2px solid #f43f5e';}
   else if(t.includes('💰')){c='#6d28d9';bg='#faf5ff';bl='2px solid #a855f7';}
-  let s=t.replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/(gemini-[a-zA-Z0-9.\-]+)/g,'<span style="color:#059669;font-weight:600">$1</span>');
+  let s=esc(t).replace(/(gemini-[a-zA-Z0-9.\-]+)/g,'<span style="color:#059669;font-weight:600">$1</span>')
+    .replace(/\b(trace-[a-f0-9]{16})\b/g,'<button class="request-link" data-request="$1">$1</button>');
   return `<div style="color:${c};background:${bg};border-left:${bl};padding:5px 9px;border-radius:4px;white-space:pre-wrap;word-break:break-word">${s}</div>`;
 }
 try{

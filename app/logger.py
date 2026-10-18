@@ -4,6 +4,7 @@ import asyncio
 import re
 import threading
 from typing import List, Optional
+from request_tracking import current_trace, redact
 
 original_print = builtins.print
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
@@ -31,6 +32,8 @@ class ProxyStats:
     def add_retry(self):
         with self.lock:
             self.retry_counts += 1
+        if trace := current_trace.get():
+            trace.add_retry()
 
     def add_success(self):
         """直接计一次成功请求（Cookie / Gemini 原生透传不走 SDK token 统计）。"""
@@ -164,7 +167,12 @@ def custom_print(*args, **kwargs):
                 pass
 
         try:
-            original_print(*args, **kwargs)
+            trace = current_trace.get()
+            if trace and raw_msg and trace.id not in raw_msg:
+                original_print(f"[{trace.id}] {redact(raw_msg)}", end=kwargs.get("end", "\n"),
+                               flush=kwargs.get("flush", False))
+            else:
+                original_print(*args, **kwargs)
         except Exception:
             pass
 
@@ -172,7 +180,12 @@ def custom_print(*args, **kwargs):
             return
 
         try:
-            rt_logger.push(ANSI_ESCAPE.sub('', raw_msg))
+            message = redact(ANSI_ESCAPE.sub('', raw_msg))
+            if trace := current_trace.get():
+                if trace.id not in message:
+                    message = f"[{trace.id}] {message}"
+                trace.log(message)
+            rt_logger.push(message)
         except Exception:
             pass
     finally:

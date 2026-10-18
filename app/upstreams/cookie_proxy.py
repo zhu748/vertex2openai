@@ -65,6 +65,8 @@ from upstreams.cookie_response import (
 )
 from upstreams.request_preparation import prepare_messages
 from usage import make_usage_chunk, map_usage, wants_usage
+from request_tracking import configure as track_configure, upstream_attempt, upstream_chunk
+from first_reply import FirstReplyGuard, FirstReplyTimeout, timed_call
 
 RETRYABLE_KEYWORDS = [
     "resource exhausted",
@@ -233,6 +235,7 @@ async def _execute_stream_request_generator_once(
     has_content = False
     got_finish = False
     try:
+        upstream_attempt()
         async with client.stream("POST", BATCH_GRAPHQL_URL, headers=headers, json=body) as response:
 
             # 1. 拦截 HTTP 状态码错误
@@ -260,6 +263,7 @@ async def _execute_stream_request_generator_once(
 
             # 2. 实时遍历并抛出流式 JSON 事件块
             async for obj in iter_json_objects(response):
+                upstream_chunk()
                 if sampler is not None:
                     sampler.add(obj)
                 for event_type, data in extract_events(obj):
@@ -305,7 +309,7 @@ async def _execute_stream_request_generator_once(
         yield "retryable_error" if is_retryable else "fatal_error", _StreamRequestError(err_msg, status_code=code)
 
 
-async def _execute_stream_request_generator(
+async def _execute_stream_request_generator_raw(
     client: Any,
     headers: dict,
     body: dict,
@@ -343,6 +347,36 @@ async def _execute_stream_request_generator(
         await events.aclose()
 
 
+async def _execute_stream_request_generator(client, headers, body, sampler=None, fallback_body=None, *, model=""):
+    source = _execute_stream_request_generator_raw(client, headers, body, sampler, fallback_body)
+    guard = FirstReplyGuard(model)
+    pending = []
+    pending_bytes = 0
+    try:
+        async for item in guard.iterate(source, lambda event: event[0] in ("text", "thought", "image", "function_call") and bool(event[1])):
+            status, data = item
+            if status in ("retryable_error", "fatal_error", "cookie_error", "blocked"):
+                pending.clear()
+                yield item
+                return
+            if not guard.ready:
+                pending_bytes += len(str(data).encode("utf-8"))
+                if pending_bytes > 2 * 1024 * 1024:
+                    raise IncompleteResponseError("首回复前的元数据缓冲超过 2 MiB。")
+                pending.append(item)
+                continue
+            for prefix in pending:
+                yield prefix
+            pending.clear()
+            yield item
+        for prefix in pending:
+            yield prefix
+    except FirstReplyTimeout as exc:
+        yield "retryable_error", _StreamRequestError(str(exc), status_code=504)
+    finally:
+        await source.aclose()
+
+
 async def _collect_full_response(project_id, base_model_name, request_obj, headers, client_kwargs,
                                  retry_max, backoff_sec, jitter_sec, fastapi_request) -> dict:
     """非流式地完整取回一次响应（供生图假流式复用）。返回 dict。"""
@@ -359,7 +393,9 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
         try:
             req_headers = build_headers(_get_cookie_string()) or headers
             async with open_upstream_client(client_kwargs) as client:
-                response = await client.post(BATCH_GRAPHQL_URL, headers=req_headers, json=body)
+                upstream_attempt()
+                response = await timed_call(base_model_name, client.post(BATCH_GRAPHQL_URL, headers=req_headers, json=body))
+                upstream_chunk()
 
             if is_retryable_status(response.status_code) and attempt < retry_max:
                 delay = retry_delay(getattr(response, "headers", {}).get("retry-after"), backoff_sec, attempt, jitter_sec)
@@ -438,6 +474,7 @@ class CookieProxyUpstream(BaseUpstream):
     """
 
     async def chat_completions(self, request_obj: OpenAIRequest, fastapi_request: Request):
+        track_configure(mode="stream" if request_obj.stream else "json", channel="cookie")
         try:
             validate_request_schemas(request_obj)
             if request_obj.response_format and request_obj.response_format.get("type") not in (None, "text"):
@@ -562,6 +599,8 @@ class CookieProxyUpstream(BaseUpstream):
         print(f"→ [Studio] {base_model_name} | {msg_count} 条消息 | {'流式' if is_stream else '非流式'}")
 
         is_image = _profile["is_image"]
+        track_configure(mode="fake_stream" if request_obj.stream and (buffer_text or is_image) else
+                        "stream" if request_obj.stream else "json", thinking_level=_tk.get("level"))
 
         # ========== 生图 + 流式：强制假流式 ==========
         # 生图输出是超大 base64，若按流式分块传输会卡死前端解析器；
@@ -684,7 +723,7 @@ class CookieProxyUpstream(BaseUpstream):
                         # 消费实时生成器（原始事件 → 此处格式化为 OpenAI chunk）
                         events = _execute_stream_request_generator(
                             client, req_headers, body, sampler=sampler,
-                            fallback_body=fallback_body,
+                            fallback_body=fallback_body, model=base_model_name,
                         )
                         if text_transport:
                             events = text_transport.decoder().cookie_stream(events)
@@ -943,9 +982,11 @@ class CookieProxyUpstream(BaseUpstream):
                                   f"{json.dumps(body['variables'].get('generationConfig', {}), ensure_ascii=False)}")
 
                         async with open_upstream_client(client_kwargs) as client:
-                            response = await client.post(
+                            upstream_attempt()
+                            response = await timed_call(base_model_name, client.post(
                                 BATCH_GRAPHQL_URL, headers=req_headers, json=body
-                            )
+                            ))
+                            upstream_chunk()
                             if fallback_body is not None and _native_tool_error_response(
                                     response.status_code, response.text):
                                 native_fallback_state["latched"] = True
@@ -953,9 +994,11 @@ class CookieProxyUpstream(BaseUpstream):
                                 if hasattr(resolved_fallback, "__await__"):
                                     resolved_fallback = await resolved_fallback
                                 print("⚠️ [Studio] 当前模型/协议拒绝原生函数 Schema；本次及后续重试固定降级为文本工具观测。")
-                                response = await client.post(
+                                upstream_attempt()
+                                response = await timed_call(base_model_name, client.post(
                                     BATCH_GRAPHQL_URL, headers=req_headers, json=resolved_fallback
-                                )
+                                ))
+                                upstream_chunk()
                                 fallback_body = None
 
                         if is_retryable_status(response.status_code):

@@ -14,6 +14,7 @@ import config as app_config
 from response_validation import AntiTruncationError, IncompleteResponseError
 from runtime_state import app_state
 from upstream_errors import error_status
+from request_tracking import retry_wait
 
 Number = TypeVar("Number", int, float)
 
@@ -55,6 +56,7 @@ def is_retryable_exception(e: Exception) -> bool:
     if isinstance(
         e,
         (
+            TimeoutError,
             httpx.TimeoutException,
             httpx.NetworkError,
             httpx.RemoteProtocolError,
@@ -85,7 +87,7 @@ def is_retryable_exception(e: Exception) -> bool:
     return False
 
 
-def retry_delay(retry_after: Optional[str], default: float, attempt: int = 0, jitter: float = 1.0) -> float:
+def _retry_delay_value(retry_after: Optional[str], default: float, attempt: int = 0, jitter: float = 1.0) -> float:
     """计算一次重试的等待秒数：**固定间隔 + 小幅抖动**，不随重试次数增长。
 
     - default：基础间隔秒数（控制台 retry_backoff_seconds，默认 5）；
@@ -122,9 +124,15 @@ def retry_delay(retry_after: Optional[str], default: float, attempt: int = 0, ji
     return min(delay, cap) if math.isfinite(delay) and delay >= 0 else fallback()
 
 
+def retry_delay(retry_after: Optional[str], default: float, attempt: int = 0, jitter: float = 1.0, *, error=None) -> float:
+    delay = _retry_delay_value(retry_after, default, attempt, jitter)
+    retry_wait(delay, error or "上游返回可重试错误或连接失败，详见关联日志。")
+    return delay
+
+
 def exception_retry_delay(error: Exception, default: float, attempt: int = 0, jitter: float = 1.0) -> float:
     headers = getattr(getattr(error, "response", None), "headers", None)
-    return retry_delay(headers.get("retry-after") if headers is not None else None, default, attempt, jitter)
+    return retry_delay(headers.get("retry-after") if headers is not None else None, default, attempt, jitter, error=error)
 
 
 async def wait_for_retry(request, delay: float) -> bool:
