@@ -470,7 +470,9 @@ class ConfigShapeTests(unittest.TestCase):
              mock.patch("config.VERTEX_BASE_URL", None), \
              mock.patch("http_options.build_sdk_channel_overrides", return_value={}):
             opts = get_http_options(proxy_url="direct")
-            self.assertIsNone(opts)           # 直连 + 无其他覆盖 → None（旧行为）
+            self.assertNotIn("proxy", opts.client_args)
+            self.assertEqual(opts.retry_options.attempts, 1)
+            self.assertIs(opts.async_client_args["trust_env"], False)
         opts_native = get_http_options(proxy_url="socks5://u:p@1.2.3.4:1080")
         self.assertEqual(opts_native.client_args["proxy"], "socks5://u:p@1.2.3.4:1080")
         self.assertEqual(opts_native.async_client_args["proxy"], "socks5://u:p@1.2.3.4:1080")

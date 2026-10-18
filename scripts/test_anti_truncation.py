@@ -40,6 +40,10 @@ def request(**kwargs):
     return OpenAIRequest(model=MODEL, messages=[{"role": "user", "content": "hello"}], **kwargs)
 
 
+def transport_request(mode="stream", **kwargs):
+    return request(**kwargs).model_copy(update={"model": MODEL + "-antitruncation-" + mode})
+
+
 def response(*parts, finish="STOP", usage=False):
     return types.GenerateContentResponse(
         candidates=[types.Candidate(content=types.Content(role="model", parts=list(parts)), finish_reason=finish)],
@@ -70,7 +74,7 @@ class PrepareTests(unittest.TestCase):
         self.addCleanup(patch.stop)
         return state
 
-    def test_default_transport_only_enabled_for_argon_and_38_flash(self):
+    def test_only_argon_and_38_flash_publish_aliases_and_plain_ids_never_enable(self):
         state = self.isolated_state()
         models = json.loads((Path(__file__).resolve().parents[1] / "vertexModels.json").read_text())["models"]
         enabled = {"gemini-4-argon", "gemini-3.8-flash"}
@@ -80,12 +84,9 @@ class PrepareTests(unittest.TestCase):
             settings = state.get_effective_settings(model)
             _, transport = at.prepare_transport(req, model, settings, native_stream=True)
             with self.subTest(model=model):
-                self.assertEqual(settings["anti_truncation_mode"], "stream" if model in enabled else "off")
-                if model in enabled:
-                    self.assertEqual(transport.mode, "stream")
-                    self.assertTrue(transport.native_stream)
-                else:
-                    self.assertIsNone(transport)
+                self.assertEqual(settings["anti_truncation_mode"], "both" if model in enabled else "off")
+                self.assertIsNone(transport)
+                self.assertEqual(len(at.listed_suffixes(model, settings)), 2 if model in enabled else 0)
         self.assertEqual(state.get_model_overrides(), state.get_settings()["model_overrides"])
 
     def test_model_defaults_survive_legacy_maps_and_partial_saved_parameters(self):
@@ -94,14 +95,14 @@ class PrepareTests(unittest.TestCase):
             MODEL: {"default_max_tokens": 500},
         }})
         for model in ("gemini-4-argon", "gemini-3.8-flash"):
-            self.assertEqual(state.get_effective_settings(model)["anti_truncation_mode"], "stream")
+            self.assertEqual(state.get_effective_settings(model)["anti_truncation_mode"], "both")
         self.assertEqual(state.get_effective_settings(MODEL)["anti_truncation_mode"], "off")
         saved = state.set_model_override("gemini-4-argon", {"thinking_g3_level": "medium"})
-        self.assertEqual(saved, {"thinking_g3_level": "medium", "anti_truncation_mode": "stream"})
+        self.assertEqual(saved, {"thinking_g3_level": "medium", "anti_truncation_mode": "both"})
         copy = state.get_model_overrides()
         copy["gemini-4-argon"]["anti_truncation_mode"] = "off"
-        self.assertEqual(state.get_effective_settings("gemini-4-argon")["anti_truncation_mode"], "stream")
-        self.assertEqual(config.DEFAULT_SETTINGS["model_overrides"]["gemini-4-argon"]["anti_truncation_mode"], "stream")
+        self.assertEqual(state.get_effective_settings("gemini-4-argon")["anti_truncation_mode"], "both")
+        self.assertEqual(config.DEFAULT_SETTINGS["model_overrides"]["gemini-4-argon"]["anti_truncation_mode"], "both")
 
     def test_defaults_can_be_disabled_and_restored_without_affecting_other_models(self):
         state = self.isolated_state()
@@ -109,7 +110,7 @@ class PrepareTests(unittest.TestCase):
             state.set_model_override(model, {"anti_truncation_mode": "off"})
             self.assertEqual(state.get_effective_settings(model)["anti_truncation_mode"], "off")
             state.clear_model_override(model)
-            self.assertEqual(state.get_effective_settings(model)["anti_truncation_mode"], "stream")
+            self.assertEqual(state.get_effective_settings(model)["anti_truncation_mode"], "both")
         state.set_model_override(MODEL, {"anti_truncation_mode": "stream"})
         state.clear_model_override(MODEL)
         self.assertEqual(state.get_effective_settings(MODEL)["anti_truncation_mode"], "off")
@@ -122,28 +123,45 @@ class PrepareTests(unittest.TestCase):
         with mock.patch.object(main, "app_state", state):
             result = asyncio.run(main.delete_model_override("gemini-4-argon", True))
         payload = json.loads(result.body)
-        self.assertEqual(payload["override"], {"anti_truncation_mode": "stream"})
+        self.assertEqual(payload["override"], {"anti_truncation_mode": "both"})
 
-    def test_aliases_and_settings_priority(self):
+    def test_enabled_suffix_selects_mode_and_legacy_parameter_cannot_override_it(self):
         for suffix, mode in at.SUFFIX_MODES.items():
             req = request().model_copy(update={"model": MODEL + suffix})
-            wrapped, transport = at.prepare_transport(req, MODEL, {"anti_truncation_mode": "off"})
-            self.assertEqual(transport.mode, mode)
             self.assertEqual(at.split_model_alias(req.model), (MODEL, mode))
-            self.assertEqual(wrapped.model, req.model)
-            off, transport = at.prepare_transport(req.model_copy(update={"anti_truncation_mode": "off"}),
-                                                  MODEL, {"anti_truncation_mode": "stream"})
-            self.assertIsNone(transport)
-            self.assertEqual(off.tools, None)
+            for legacy in (None, "off", "stream", "nonstream"):
+                wrapped, transport = at.prepare_transport(req.model_copy(update={"anti_truncation_mode": legacy}),
+                                                         MODEL, {"anti_truncation_mode": "both"})
+                self.assertEqual(transport.mode, mode)
+                self.assertEqual(wrapped.model, req.model)
+
+    def test_global_model_and_request_settings_cannot_activate_plain_id(self):
+        for selected in ("off", "stream", "nonstream", "both"):
+            state = self.isolated_state({"anti_truncation_mode": selected})
+            self.assertEqual(state.get_effective_settings(MODEL)["anti_truncation_mode"], "off")
+            state.set_model_override(MODEL, {"anti_truncation_mode": selected})
+            for legacy in (None, "off", "stream", "nonstream"):
+                req = request(anti_truncation_mode=legacy)
+                self.assertEqual(at.prepare_transport(req, MODEL, state.get_effective_settings(MODEL)), (req, None))
+
+    def test_disabled_or_unlisted_suffix_is_rejected(self):
+        for configured in ("off", "stream", "nonstream"):
+            for selected in ("stream", "nonstream"):
+                if configured == selected:
+                    continue
+                with self.subTest(configured=configured, selected=selected):
+                    with self.assertRaises(at.TransportSelectionError) as error:
+                        at.prepare_transport(transport_request(selected), MODEL, {"anti_truncation_mode": configured})
+                    self.assertEqual(error.exception.code, 400)
 
     def test_disabled_request_is_unchanged(self):
         req = request()
         self.assertEqual(at.prepare_transport(req, MODEL, {}), (req, None))
 
     def test_tools_history_and_source_are_preserved(self):
-        req = request(tools=[TOOL], anti_truncation_mode="stream", stream=True)
+        req = transport_request(tools=[TOOL], stream=True)
         before = req.model_dump_json()
-        wrapped, transport = at.prepare_transport(req, MODEL, {}, native_stream=True)
+        wrapped, transport = at.prepare_transport(req, MODEL, {"anti_truncation_mode": "both"}, native_stream=True)
         self.assertEqual(req.model_dump_json(), before)
         self.assertEqual(wrapped.tools[0], TOOL)
         self.assertEqual(wrapped.tool_choice, "required")
@@ -154,7 +172,7 @@ class PrepareTests(unittest.TestCase):
         from models import OpenAIMessage
         history = req.model_copy(update={"tools": None, "messages": [*req.messages,
             OpenAIMessage(role="tool", content="result", tool_call_id="abc")]})
-        _, transport = at.prepare_transport(history, MODEL, {}, native_stream=True)
+        _, transport = at.prepare_transport(history, MODEL, {"anti_truncation_mode": "both"}, native_stream=True)
         self.assertFalse(transport.native_stream)
 
     def test_incompatible_contracts_bypass(self):
@@ -166,9 +184,9 @@ class PrepareTests(unittest.TestCase):
                  {"functions": [{"name": "legacy"}]}]
         for case in cases:
             with self.subTest(case=case):
-                req = request(anti_truncation_mode="stream", **case)
-                self.assertIsNone(at.prepare_transport(req, MODEL, {})[1])
-        self.assertIsNone(at.prepare_transport(request(anti_truncation_mode="stream"), MODEL, {}, search=True)[1])
+                req = transport_request(**case)
+                self.assertIsNone(at.prepare_transport(req, MODEL, {"anti_truncation_mode": "both"})[1])
+        self.assertIsNone(at.prepare_transport(transport_request(), MODEL, {"anti_truncation_mode": "both"}, search=True)[1])
         for model in ("gemini-3.1-flash-image", "gemini-nano-banana-2.1", "text-embedding-005", "gemini-live"):
             self.assertFalse(at.supports_transport(model))
 
@@ -179,7 +197,7 @@ class PrepareTests(unittest.TestCase):
             self.assertFalse(at.supports_argument_stream(model))
 
     def test_settings_validation_inheritance_and_capabilities(self):
-        for mode in ("off", "stream", "nonstream"):
+        for mode in ("off", "stream", "nonstream", "both"):
             self.assertIsNone(main._validate_settings_patch({"anti_truncation_mode": mode}))
         for mode in (True, "yes", 1, None):
             self.assertIsNotNone(main._validate_settings_patch({"anti_truncation_mode": mode}))
@@ -192,6 +210,69 @@ class PrepareTests(unittest.TestCase):
             self.assertEqual(app_state.get_effective_settings(MODEL + suffix)["anti_truncation_mode"], "nonstream")
         self.assertTrue(mc.capabilities_summary(MODEL)["supports_anti_truncation"])
         self.assertFalse(mc.capabilities_summary("nano-banana-2.1")["supports_anti_truncation"])
+
+
+class CatalogHTTPTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.state = AppState()
+        # Reproduce an old persisted global value; it must not publish aliases.
+        self.state._state = {"settings": {"anti_truncation_mode": "stream"}}
+        self.raw = ["gemini-3.8-flash", "gemini-4-argon", MODEL, "gemini-3.1-pro-preview",
+                    "gemini-3.1-flash-image", "gemini-live", "text-embedding-005",
+                    MODEL + "-antitruncation-stream"]
+        for patch in (
+            mock.patch.object(self.state, "_save"),
+            mock.patch.object(main, "app_state", self.state),
+            mock.patch.object(models_api, "app_state", self.state),
+            mock.patch.object(models_api, "get_express_models", mock.AsyncMock(return_value=self.raw)),
+            mock.patch.object(main.app.state, "express_key_manager",
+                              SimpleNamespace(get_total_keys=lambda: 1)),
+            mock.patch.dict(main.app.dependency_overrides, {main.require_auth: lambda: True}),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app),
+                                        base_url="http://adapter.test",
+                                        headers={"Authorization": "Bearer " + config.API_KEY})
+        self.addAsyncCleanup(self.client.aclose)
+
+    async def ids(self):
+        result = await self.client.get("/v1/models")
+        self.assertEqual(result.status_code, 200)
+        return {model["id"] for model in result.json()["data"]}
+
+    async def test_default_catalog_and_model_setting_changes_take_effect_immediately(self):
+        defaults = {model + suffix for model in ("gemini-3.8-flash", "gemini-4-argon")
+                    for suffix in ("-antitruncation-stream", "-antitruncation-nonstream")}
+        self.assertEqual({name for name in await self.ids() if "antitruncation" in name}, defaults)
+        for selected, visible in (("both", {"stream", "nonstream"}), ("stream", {"stream"}),
+                                  ("nonstream", {"nonstream"}), ("off", set())):
+            result = await self.client.post("/api/model-overrides/" + MODEL,
+                                            json={"anti_truncation_mode": selected})
+            self.assertEqual(result.status_code, 200)
+            ids = await self.ids()
+            self.assertIn(MODEL, ids)
+            self.assertIn(MODEL + "-search", ids)
+            self.assertEqual({name for name in ids if "antitruncation" in name},
+                             defaults | {MODEL + "-antitruncation-" + mode for mode in visible})
+            self.assertEqual(at.prepare_transport(request(anti_truncation_mode="stream"), MODEL,
+                                                 self.state.get_effective_settings(MODEL))[1], None)
+        result = await self.client.post("/api/settings", json={"anti_truncation_mode": "both"})
+        self.assertEqual(result.status_code, 400)
+        self.assertEqual({name for name in await self.ids() if "antitruncation" in name}, defaults)
+
+    async def test_hiding_and_resetting_builtins_and_custom_aliases(self):
+        for model in ("gemini-3.8-flash", "gemini-4-argon", MODEL):
+            initial = "off" if model != MODEL else "both"
+            result = await self.client.post("/api/model-overrides/" + model,
+                                            json={"anti_truncation_mode": initial})
+            self.assertEqual(result.status_code, 200)
+            ids = await self.ids()
+            self.assertEqual(model + "-antitruncation-stream" in ids, initial == "both")
+            result = await self.client.delete("/api/model-overrides/" + model)
+            self.assertEqual(result.status_code, 200)
+            ids = await self.ids()
+            self.assertEqual(model + "-antitruncation-stream" in ids, model != MODEL)
 
 
 class DecoderTests(unittest.TestCase):
@@ -287,7 +368,7 @@ class DecoderTests(unittest.TestCase):
 
 class ChannelTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.settings = dict(config.DEFAULT_SETTINGS, anti_truncation_mode="off", retry_max=1,
+        self.settings = dict(config.DEFAULT_SETTINGS, anti_truncation_mode="both", retry_max=1,
                              retry_backoff_seconds=0, fake_streaming_interval=0,
                              express_location="", proxy_url="", resumable_enabled=False)
         for patch in (
@@ -345,6 +426,42 @@ class ChannelTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("stream_function_call_arguments", calls[0]["config"]["tool_config"]["function_calling_config"])
         self.assertEqual(req.model_dump_json(), before)
 
+    async def test_plain_express_id_never_injects_transport_into_actual_request(self):
+        calls = []
+        async def generate(**kwargs):
+            calls.append(kwargs)
+            self.assertFalse(kwargs["config"].get("tools"))
+            self.assertNotIn("stream_function_call_arguments", str(kwargs["config"]))
+            return response(types.Part(text="ordinary answer"))
+        for model in (MODEL, "gemini-3.8-flash", "gemini-4-argon"):
+            for legacy in (None, "stream", "nonstream"):
+                req = request(anti_truncation_mode=legacy).model_copy(update={"model": model})
+                result = await self.express(req, generate=generate)
+                self.assertEqual(result.status_code, 200)
+                self.assertEqual(json.loads(result.body)["choices"][0]["message"]["content"], "ordinary answer")
+                self.assertEqual(calls[-1]["model"], model)
+
+    async def test_plain_cookie_id_never_injects_transport_into_actual_request(self):
+        seen = []
+        @asynccontextmanager
+        async def open_client(*args, **kwargs):
+            async def post(url, headers, json):
+                seen.append(json)
+                self.assertFalse(json["variables"].get("tools"))
+                return httpx.Response(200, json={"results": [{"data": {"candidates": [{
+                    "content": {"parts": [{"text": "ordinary answer"}]}, "finishReason": "STOP"}]}}]})
+            yield SimpleNamespace(post=post)
+        with mock.patch.object(cookie_proxy, "_get_cookie_string", return_value="SAPISID=test"), \
+             mock.patch.object(cookie_proxy, "_get_project_id", return_value="test-project"), \
+             mock.patch.object(cookie_proxy, "open_upstream_client", open_client):
+            for model in (MODEL, "gemini-3.8-flash", "gemini-4-argon"):
+                for legacy in (None, "stream", "nonstream"):
+                    req = request(anti_truncation_mode=legacy).model_copy(update={"model": model})
+                    result = await cookie_proxy.CookieProxyUpstream().chat_completions(req, self.http_request)
+                    self.assertEqual(result.status_code, 200)
+                    self.assertEqual(json.loads(result.body)["choices"][0]["message"]["content"], "ordinary answer")
+                    self.assertEqual(seen[-1]["variables"]["model"].rsplit("/", 1)[-1], model)
+
     async def test_express_native_delivers_before_upstream_finishes(self):
         allow_finish = asyncio.Event()
         async def stream(**kwargs):
@@ -356,7 +473,7 @@ class ChannelTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(allow_finish.wait(), timeout=2)
                 yield response(function(None, partial_args=[types.PartialArg(json_path="$.content", string_value="last")]), usage=True)
             return iterate()
-        req = request(stream=True, anti_truncation_mode="stream", stream_options={"include_usage": True})
+        req = transport_request(stream=True, stream_options={"include_usage": True})
         result = await self.express(req, stream=stream)
         body = ""
         async for frame in result.body_iterator:
@@ -408,7 +525,7 @@ class ChannelTests(unittest.IsolatedAsyncioTestCase):
             name = kwargs["config"]["tools"][0]["function_declarations"][-1]["name"]
             self.assertNotIn("stream_function_call_arguments", kwargs["config"]["tool_config"]["function_calling_config"])
             return response(function(name, {"content": "prefix of answer: rest"}), usage=True)
-        result = await self.express(request(stream=True, anti_truncation_mode="nonstream",
+        result = await self.express(transport_request(mode="nonstream", stream=True,
             stream_options={"include_usage": True}), generate=generate)
         body = await self.body(result)
         self.assertEqual(content(body), "prefix of answer: rest")
@@ -428,7 +545,7 @@ class ChannelTests(unittest.IsolatedAsyncioTestCase):
                 async def iterate():
                     yield response(function(name, {"content": "retried"}))
                 return iterate()
-            result = await self.express(request(stream=True, anti_truncation_mode="stream"), stream=stream)
+            result = await self.express(transport_request(stream=True), stream=stream)
             body = await self.body(result)
             self.assertEqual(len(calls), 2)
             self.assertEqual(content(body), "retried")
@@ -440,7 +557,7 @@ class ChannelTests(unittest.IsolatedAsyncioTestCase):
                 async def iterate():
                     yield response(function(name, {"content": 123 if invalid else "partial"}), finish=None)
                 return iterate()
-            result = await self.express(request(stream=True, anti_truncation_mode="stream"), stream=stream)
+            result = await self.express(transport_request(stream=True), stream=stream)
             body = await self.body(result)
             self.assertIn('"error"', body)
             self.assertNotIn('"finish_reason": "stop"', body)
@@ -455,7 +572,7 @@ class ChannelTests(unittest.IsolatedAsyncioTestCase):
                 yield response(function(name, {"content": "partial"}), finish=None)
             return iterate()
         with mock.patch.object(api_helpers, "stats", stats):
-            result = await self.express(request(stream=True, anti_truncation_mode="stream"), stream=stream)
+            result = await self.express(transport_request(stream=True), stream=stream)
             buf = resumable.ResumableBuffer("anti-error", MODEL)
             await resumable.pump_stream(buf, result.body_iterator)
         self.assertEqual(buf.status, "error")
@@ -520,17 +637,17 @@ class ChannelTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cookie_preserves_real_calls_and_retries_429(self):
         for stream in (False, True):
-            _, body, _ = await self.cookie(request(stream=stream, tools=[TOOL], anti_truncation_mode="stream"), real_tool=True)
+            _, body, _ = await self.cookie(transport_request(stream=stream, tools=[TOOL]), real_tool=True)
             self.assertIn("read_database", body)
             self.assertIn("cmVhbC1zaWduYXR1cmU=", body)
             self.assertNotIn("v2o_emit_", body)
-        _, body, seen = await self.cookie(request(stream=True, anti_truncation_mode="stream"), retry=True)
+        _, body, seen = await self.cookie(transport_request(stream=True), retry=True)
         self.assertEqual(len(seen), 2)
         self.assertEqual(content(body), "cookie answer")
 
     async def test_cookie_interrupted_response_is_error(self):
         for stream in (False, True):
-            result, body, _ = await self.cookie(request(stream=stream, anti_truncation_mode="stream"), interrupted=True)
+            result, body, _ = await self.cookie(transport_request(stream=stream), interrupted=True)
             self.assertIn('"error"', body)
             self.assertNotIn('"finish_reason": "stop"', body)
             self.assertEqual(result.status_code, 200 if stream else 502)
@@ -538,7 +655,7 @@ class ChannelTests(unittest.IsolatedAsyncioTestCase):
     async def test_cookie_fatal_schema_and_exhausted_retries_are_errors(self):
         self.settings["retry_max"] = 0
         for status in ("fatal_error", "retryable_error", "cookie_error"):
-            _, body, seen = await self.cookie(request(stream=True, tools=[TOOL], anti_truncation_mode="stream"),
+            _, body, seen = await self.cookie(transport_request(stream=True, tools=[TOOL]),
                                                terminal_status=status)
             self.assertEqual(len(seen), 1)
             self.assertIn('"error"', body)

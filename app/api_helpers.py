@@ -2,6 +2,7 @@ import json
 import time
 import math
 import asyncio
+import inspect
 from contextlib import suppress
 import httpx
 from curl_cffi.requests.exceptions import ConnectionError as CurlConnectionError, Timeout as CurlTimeout
@@ -79,7 +80,7 @@ def extract_upstream_error(e: Exception) -> tuple[int, str]:
     避免笼统的 500 Internal Server Error。
     """
     code = error_status(e)
-    if code is None and isinstance(e, (httpx.TimeoutException, CurlTimeout)):
+    if code is None and isinstance(e, (TimeoutError, httpx.TimeoutException, CurlTimeout)):
         code = 504
     elif code is None and isinstance(e, (httpx.NetworkError, httpx.RemoteProtocolError, CurlConnectionError)):
         code = 502
@@ -538,14 +539,17 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
             delta_payload["content"] = ""
 
         google_extra = {}
-        if indexer:
+        if indexer and openai_finish_reason:
             metadata_to_emit, order_to_emit = indexer.topology(output_index)
+        elif indexer:
+            # A final snapshot preserves ordinary Parts/signatures for clients
+            # which replace extension objects. Per-token cumulative snapshots
+            # turn an otherwise linear stream (and its replay buffer) quadratic.
+            metadata_to_emit, order_to_emit = [], []
         else:
             metadata_to_emit, order_to_emit = ordinary_metadata, part_order
 
-        # Emit cumulative topology on every later chunk (including the final STOP)
-        # so standard OpenAI SSE aggregation—which replaces extension objects—keeps
-        # the complete cross-chunk Part order and every ordinary signature.
+        # Emit the complete topology only on the final candidate chunk.
         cumulative_signature = None
         cumulative_signature_kind = None
         for item in reversed(metadata_to_emit):
@@ -767,6 +771,8 @@ async def gemini_fake_stream_generator(
             if retry_pending:
                 if retry_target_factory:
                     target = retry_target_factory()
+                    if inspect.isawaitable(target):
+                        target = await target
                     if target is None:
                         raise last_error or RuntimeError("没有可用的 Express API Key。")
                     gemini_client_instance, model_for_api_call, fallback_model = _resolve_retry_target(
@@ -811,7 +817,7 @@ async def gemini_fake_stream_generator(
                     print(f"↩️ [上游端点] 假流式钉定失败，退回裸模型名 {fallback_model} 重试。")
                     continue
                 if is_retryable_exception(e_call) and attempt < max_retries:
-                    wait_time = exception_retry_delay(e_call, backoff_sec)
+                    wait_time = exception_retry_delay(e_call, backoff_sec, attempt)
                     print(f"⚠️ [自动重试] 假流式上游繁忙（{e_call.__class__.__name__}），"
                           f"第 {attempt + 1} 次退避重试，等待 {wait_time} 秒。")
                     waited = 0.0
@@ -928,11 +934,13 @@ async def execute_gemini_call(
         # 工厂本身走池化；不能缓存上一次 Key 的客户端供换 Key 后兜底使用。
         return fallback_client_factory()
 
-    def _select_retry_target() -> bool:
+    async def _select_retry_target() -> bool:
         nonlocal current_client, model_to_call, fallback_model
         if retry_target_factory is None:
             return True
         target = retry_target_factory()
+        if inspect.isawaitable(target):
+            target = await target
         if target is None:
             return False
         current_client, model_to_call, fallback_model = _resolve_retry_target(
@@ -995,7 +1003,7 @@ async def execute_gemini_call(
                     target_unavailable = False
                     try:
                         if retry_pending:
-                            if not _select_retry_target():
+                            if not await _select_retry_target():
                                 target_unavailable = True
                                 raise last_error or RuntimeError("没有可用的 Express API Key。")
                             stats.add_retry()
@@ -1124,7 +1132,7 @@ async def execute_gemini_call(
                         if is_retryable and not has_yielded and not target_unavailable and attempt < max_retries:
                             # F-5：退避时长改读控制台的 retry_backoff_seconds，
                             # 原先硬编码 2**(attempt%4)，控制台设置对真流式完全没作用。
-                            wait_time = exception_retry_delay(e_stream_call, backoff_sec)
+                            wait_time = exception_retry_delay(e_stream_call, backoff_sec, attempt)
                             print(f"⚠️ [自动重试] Agent Platform Express Mode 流式请求返回 429/503 或配额繁忙。第 {attempt + 1} 次退避重试，等待 {wait_time} 秒。")
                             if await _client_gone():
                                 print(f"ℹ️ [客户端断开] 重试前检测到客户端已断开，停止调用模型 {model_to_call}。")
@@ -1181,7 +1189,7 @@ async def execute_gemini_call(
             target_unavailable = False
             try:
                 if retry_pending:
-                    if not _select_retry_target():
+                    if not await _select_retry_target():
                         target_unavailable = True
                         raise last_error or RuntimeError("没有可用的 Express API Key。")
                     stats.add_retry()
@@ -1208,7 +1216,7 @@ async def execute_gemini_call(
                     print("ℹ️ [流量等级] 回退默认路由已使用普通请求。")
                     continue
                 if is_retryable_exception(e_call) and not target_unavailable and attempt < max_retries:
-                    wait_time = exception_retry_delay(e_call, backoff_sec)
+                    wait_time = exception_retry_delay(e_call, backoff_sec, attempt)
                     print(f"⚠️ [自动重试] 上游繁忙或触发配额限制（{e_call.__class__.__name__}）。第 {attempt + 1} 次退避重试，等待 {wait_time} 秒。")
                     if not await wait_for_retry(fastapi_request, wait_time):
                         return JSONResponse(status_code=499, content=create_openai_error_response(

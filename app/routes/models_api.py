@@ -4,7 +4,7 @@ from typing import List, Dict, Any, Set
 from auth import get_api_key
 from model_loader import get_express_models
 from runtime_state import app_state
-from anti_truncation import split_model_alias, supports_transport
+from anti_truncation import split_model_alias, listed_suffixes
 
 router = APIRouter()
 
@@ -25,12 +25,15 @@ async def list_models(fastapi_request: Request, api_key: str = Depends(get_api_k
     def add_model(base_id: str):
         suffixes = [""]
         plain_id, mode = split_model_alias(base_id)
+        available = listed_suffixes(plain_id, app_state.get_effective_settings(plain_id))
+        if mode is not None and f"-antitruncation-{mode}" not in available:
+            return
         if mode is None and not base_id.endswith("-search") and "gemini" in base_id.lower() and "image" not in base_id.lower():
             suffixes.append("-search")
         # Native Gemini listings remain a transparent upstream catalog. These
         # transport variants belong only to the OpenAI-compatible endpoint.
-        if mode is None and not plain_id.endswith("-search") and supports_transport(plain_id):
-            suffixes.extend(["-antitruncation-nonstream", "-antitruncation-stream"])
+        if mode is None:
+            suffixes.extend(available)
 
         for suffix in suffixes:
             final_id = f"{base_id}{suffix}"

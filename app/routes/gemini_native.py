@@ -11,8 +11,8 @@ Gemini 直连的客户端）说的是另一套协议：
 
 本模块把这些端点**原样透传**到 Gemini Express（api_key）端点，不做任何
 字段转换——tools / function calling / thinkingConfig / safetySettings /
-cachedContent / responseSchema 等全部字段天然 100% 兼容，因为请求体
-一个字节都没动，只是换了认证（客户端的本服务 Key → Express Key）。
+cachedContent / responseSchema 等字段保持原请求体，兼容性取决于上游模型与端点；
+认证从本服务 Key 替换为 Express Key。
 
 实现要点：
 - 认证兼容三种原生写法：Authorization: Bearer、x-goog-api-key、?key=
@@ -36,6 +36,8 @@ cachedContent / responseSchema 等全部字段天然 100% 兼容，因为请求�
 """
 
 import json
+import asyncio
+import time
 from typing import Any, Optional
 from urllib.parse import parse_qs, quote
 
@@ -44,7 +46,9 @@ import httpx
 from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from api_helpers import get_retry_settings, is_retryable_exception
+from api_helpers import get_retry_settings, is_retryable_exception, extract_upstream_error
+from response_validation import IncompleteResponseError, has_finish_reason
+from admission import limit_generation, GenerationCapacityError
 from retry_policy import retry_delay as _retry_delay, wait_for_retry as _wait_for_retry
 from auth import constant_time_equal
 from config import API_KEY
@@ -56,6 +60,10 @@ from model_loader import get_express_models
 from express_fingerprint import build_direct_headers
 from client_pool import passthrough_client_pool
 from proxy_resolver import ProxyResolveError, resolve_proxy_uri, resolve_proxy_uri_async
+from streaming import sse_frames, with_heartbeats, HEARTBEAT, HEARTBEAT_FRAME
+from resumable import (resumable_store, resolve_buffer, ResumeRequestError, BufferCapacityError,
+                       DetachedRequest, sse_from_buffer, within_request_deadline,
+                       request_timeout_seconds, is_enabled as resumable_enabled)
 
 router = APIRouter()
 
@@ -242,6 +250,7 @@ async def _close_upstream(upstream: httpx.Response) -> None:
         await upstream.aclose()
 
 
+@limit_generation
 async def _passthrough_request(fastapi_request: Request, model: str, action: str,
                                query: str, payload: bytes):
     """选 Key → 透传 → 429/5xx 换 Key 重试 → 钉定失败兜底。返回 Response。
@@ -260,6 +269,8 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
       与 SDK 通道（api_helpers.execute_gemini_call 的 fallback_model）对齐，
       避免「OpenAI 接口能自动兜底、原生透传却把 404 原样抛给客户端」。
     """
+    started_at = time.monotonic()
+    deadline = started_at + request_timeout_seconds()
     manager = fastapi_request.app.state.express_key_manager
     if manager.get_total_keys() == 0:
         return _native_error(
@@ -280,7 +291,7 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
         调用前池签名已对同一 URI resolve 过一次（命中缓存），
         这里的 resolve 必然拿到同一结果，不会二次启动 sing-box。
         """
-        client_kwargs: dict[str, Any] = {"timeout": _UPSTREAM_TIMEOUT, "follow_redirects": False}
+        client_kwargs: dict[str, Any] = {"timeout": _UPSTREAM_TIMEOUT, "follow_redirects": False, "trust_env": False}
         proxy_url = resolve_proxy_uri(proxy_raw)
         if proxy_url:
             client_kwargs["proxy"] = proxy_url
@@ -324,7 +335,7 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
                 print(f"❌ [Gemini 透传] 出站代理不可用：{e}")
                 if key_attempts >= retry_max:
                     return _native_error(502, f"出站代理不可用：{e}", "UNAVAILABLE")
-                if not await _wait_for_retry(fastapi_request, backoff_seconds):
+                if not await _wait_for_retry(fastapi_request, _retry_delay(None, backoff_seconds, key_attempts)):
                     return Response(status_code=499)
                 key_attempts += 1
                 record = None
@@ -352,7 +363,7 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
                 break
             print(f"⚠️ [Gemini 透传] 上游连接异常（{type(e).__name__}），"
                   f"{backoff_seconds:.1f}s 后重试（{key_attempts + 1}/{retry_max}）。")
-            if not await _wait_for_retry(fastapi_request, backoff_seconds):
+            if not await _wait_for_retry(fastapi_request, _retry_delay(None, backoff_seconds, key_attempts)):
                 return Response(status_code=499)
             key_attempts += 1
             record = None
@@ -389,7 +400,7 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
                     upstream.status_code, "上游错误响应未完整传输。").body
             finally:
                 await _close_upstream(upstream)
-            wait = _retry_delay(upstream.headers.get("retry-after"), backoff_seconds)
+            wait = _retry_delay(upstream.headers.get("retry-after"), backoff_seconds, key_attempts)
             print(f"⚠️ [Gemini 透传] 上游 HTTP {upstream.status_code}，"
                   f"{wait:.1f}s 后重试（{key_attempts + 1}/{retry_max}，单 Key 同样适用）。")
             if not await _wait_for_retry(fastapi_request, wait):
@@ -400,7 +411,9 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
 
         # 成功 / 不可重试错误 / Key 轮换预算耗尽 → 透传
         if is_stream and upstream.status_code < 400:
-            return await _relay_stream(upstream)
+            return await _relay_stream(
+                upstream, keepalive="sse" in parse_qs(query).get("alt", []),
+                deadline=deadline)
 
         # 错误（或非流式响应）：缓冲 body 再透传，顺带供钉定失败判定
         status = upstream.status_code
@@ -445,7 +458,54 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
     )
 
 
-async def _relay_stream(upstream: httpx.Response) -> StreamingResponse:
+class NativeStreamError(RuntimeError):
+    def __init__(self, payload):
+        self.payload = json.dumps(payload, ensure_ascii=False).encode()
+        error = payload.get("error")
+        code = error.get("code") if isinstance(error, dict) else None
+        self.code = code if isinstance(code, int) and 400 <= code <= 599 else 502
+        super().__init__(str(error))
+
+
+async def _native_sse_frames(upstream):
+    seen, finished = set(), set()
+    received = False
+    frames = sse_frames(upstream.aiter_bytes())
+    try:
+        async for frame in frames:
+            data = b"\n".join(line[5:].lstrip() for line in frame.splitlines() if line.startswith(b"data:"))
+            if data and data != b"[DONE]":
+                try:
+                    payload = json.loads(data)
+                except (ValueError, UnicodeError):
+                    raise IncompleteResponseError("上游 SSE 包含无效 JSON 事件。") from None
+                objects = payload if isinstance(payload, list) else [payload]
+                for obj in objects:
+                    if not isinstance(obj, dict):
+                        raise IncompleteResponseError("上游 SSE 事件不是 Gemini 响应对象。")
+                    received = True
+                    if obj.get("error"):
+                        raise NativeStreamError(obj)
+                    if not isinstance(obj.get("candidates", []), list):
+                        raise IncompleteResponseError("上游 SSE candidates 格式错误。")
+                    for index, candidate in enumerate(obj.get("candidates") or []):
+                        if not isinstance(candidate, dict) or not isinstance(candidate.get("content", {}), dict):
+                            raise IncompleteResponseError("上游 SSE 候选格式错误。")
+                        index = candidate.get("index", index)
+                        if (candidate.get("content") or {}).get("parts"):
+                            seen.add(index)
+                        if has_finish_reason(candidate.get("finishReason")):
+                            finished.add(index)
+            yield frame
+        if not received:
+            raise IncompleteResponseError("上游 SSE 已结束，但未收到响应数据。")
+        if seen - finished:
+            raise IncompleteResponseError("上游连接已结束，但候选回复缺少结束标记。")
+    finally:
+        await frames.aclose()
+
+
+async def _relay_stream(upstream: httpx.Response, *, keepalive=False, deadline=None) -> StreamingResponse:
     """把上游 SSE（或 JSON array 流）以解压后的字节转发给客户端。
 
     用 aiter_bytes()（透明解压）：上游可能按我们的 accept-encoding
@@ -466,13 +526,36 @@ async def _relay_stream(upstream: httpx.Response) -> StreamingResponse:
         started = True
         total = 0
         completed = False
+        events = None
         try:
-            async for chunk in upstream.aiter_bytes():
-                if chunk:
-                    total += len(chunk)
-                    yield chunk
+            remaining = (deadline or time.monotonic() + request_timeout_seconds()) - time.monotonic()
+            async with asyncio.timeout(max(0.001, remaining)):
+                if keepalive:
+                    events = with_heartbeats(_native_sse_frames(upstream))
+                    yield HEARTBEAT_FRAME.encode()
+                    async for item in events:
+                        if item is HEARTBEAT:
+                            yield HEARTBEAT_FRAME.encode()
+                        else:
+                            total += len(item)
+                            yield item
+                else:
+                    async for chunk in upstream.aiter_bytes():
+                        if chunk:
+                            total += len(chunk)
+                            yield chunk
             completed = True
+        except Exception as exc:
+            if not keepalive:
+                raise
+            code, _ = extract_upstream_error(exc)
+            body = (exc.payload if isinstance(exc, NativeStreamError) else
+                    _native_error(code, "上游流未完整传输，请重新生成或检查网络。").body)
+            yield b"data: " + body + b"\n\n"
         finally:
+            if events:
+                with anyio.CancelScope(shield=True):
+                    await events.aclose()
             # 先打日志再关连接：客户端断开（任务被取消）时 finally 里的
             # await 也可能被再取消，保证中止日志一定落盘。
             if completed:
@@ -486,6 +569,13 @@ async def _relay_stream(upstream: httpx.Response) -> StreamingResponse:
             await _close_upstream(upstream)
 
     class NativeStreamingResponse(StreamingResponse):
+        async def aclose(self):
+            with anyio.CancelScope(shield=True):
+                try:
+                    await self.body_iterator.aclose()
+                finally:
+                    await _close_upstream(upstream)
+
         async def __call__(self, scope, receive, send):
             try:
                 await super().__call__(scope, receive, send)
@@ -503,6 +593,8 @@ async def _relay_stream(upstream: httpx.Response) -> StreamingResponse:
     media_type = upstream.headers.get("content-type", "text/event-stream")
     passthrough = {k: v for k, v in upstream.headers.items()
                    if k.lower() == "retry-after"}
+    if keepalive:
+        passthrough.update({"Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no"})
     return NativeStreamingResponse(_relay(), status_code=upstream.status_code,
                                    media_type=media_type, headers=passthrough or None)
 
@@ -510,6 +602,86 @@ async def _relay_stream(upstream: httpx.Response) -> StreamingResponse:
 # ============================================================
 # 端点：generateContent / streamGenerateContent / countTokens / embedContent
 # ============================================================
+async def _resumable_native(request, api_key, model, action, query, payload, parsed):
+    fingerprint = "native:" + json.dumps(
+        [model, action, sorted(parse_qs(query).items()), parsed], sort_keys=True,
+        ensure_ascii=False, separators=(",", ":"))
+    try:
+        buf, new, start, _source = await resolve_buffer(
+            resumable_store, request, api_key, fingerprint, model=model, kind="native")
+    except (ResumeRequestError, BufferCapacityError) as exc:
+        return _native_error(exc.code, str(exc))
+
+    async def close_response(response):
+        close = getattr(response, "aclose", response.body_iterator.aclose)
+        with anyio.CancelScope(shield=True):
+            await close()
+
+    async def pump(response):
+        failed = False
+        try:
+            async for frame in response.body_iterator:
+                text = frame.decode("utf-8") if isinstance(frame, bytes) else frame
+                if text.lstrip().startswith(":"):
+                    continue
+                for line in text.splitlines():
+                    if line.startswith("data:"):
+                        try:
+                            obj = json.loads(line[5:])
+                        except ValueError:
+                            continue
+                        if isinstance(obj, dict) and obj.get("error"):
+                            error = obj["error"]
+                            await buf.append(buf.event_frame(text))
+                            code = error.get("code") if isinstance(error, dict) else None
+                            await buf.finish("error", error=str(error), status_code=(
+                                code if isinstance(code, int) and 400 <= code <= 599 else 502))
+                            failed = True
+                            return
+                if await buf.append(buf.event_frame(text)) is None:
+                    return
+            if not failed:
+                await buf.finish()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await buf.fail(str(exc), getattr(exc, "code", 502))
+        finally:
+            with anyio.CancelScope(shield=True):
+                await response.body_iterator.aclose()
+
+    if new:
+        async def setup():
+            try:
+                response = await _passthrough_request(
+                    DetachedRequest(request), model, action, query, payload)
+                if not isinstance(response, StreamingResponse):
+                    message = response.body.decode("utf-8", "replace")[:1024]
+                    await buf.fail(message, response.status_code)
+                    return response
+                if buf.done:
+                    await close_response(response)
+                    return _native_error(buf.status_code, buf.error or "响应缓冲已释放。")
+                task = asyncio.create_task(within_request_deadline(buf, lambda: pump(response)))
+                task.add_done_callback(lambda _task: resumable_store.schedule_cleanup(lambda: close_response(response)))
+                resumable_store.register_pump(buf.id, task, buffer=buf)
+                return response
+            except Exception as exc:
+                await buf.fail(str(exc), getattr(exc, "code", 502))
+                raise
+        task = asyncio.create_task(within_request_deadline(buf, setup))
+        resumable_store.register_pump(buf.id, task, buffer=buf)
+        done, _ = await asyncio.wait({task}, timeout=0.05)
+        if done:
+            response = task.result()
+            if not isinstance(response, StreamingResponse):
+                return response
+    return StreamingResponse(
+        sse_from_buffer(buf, start), media_type="text/event-stream",
+        headers={"X-Resume-Id": buf.id, "Cache-Control": "no-store, no-transform",
+                 "X-Accel-Buffering": "no", **({"X-Resumable-Replay": "1"} if not new else {})})
+
+
 def _passthrough_endpoint():
     """为 /v1beta 与 /v1 两个前缀注册同一个透传处理。
 
@@ -548,13 +720,30 @@ def _passthrough_endpoint():
         # 透传 query（alt=sse 等），但剔除本服务鉴权用的 key 参数。
         # query_params 取出的是已解码值，重新下发前必须再编码，否则值里
         # 带 & / = / 空格会把 URL 拼坏（alt=sse 之外的参数被截断）。
-        qp = [(k, v) for k, v in request.query_params.multi_items() if k != "key"]
+        qp = [(k, v) for k, v in request.query_params.multi_items() if k not in ("key", "resume_from")]
         query = "&".join(f"{quote(k, safe='')}={quote(v, safe='')}" for k, v in qp)
 
         is_stream = action == "streamGenerateContent"
         print(f"🔁 [Gemini 透传] {model}:{action} | {'流式' if is_stream else '非流式'}"
               f" | 原生协议透传（Express 通道）")
-        return await _passthrough_request(request, model, action, query, raw_body)
+        try:
+            sse = is_stream and "sse" in parse_qs(query).get("alt", [])
+            resume = (request.headers.get("x-resumable", "").lower() in ("1", "true", "yes")
+                      or request.headers.get("x-resume-id")
+                      or ":" in request.headers.get("last-event-id", ""))
+            if resume and not sse:
+                return _native_error(400, "原生续传需要 streamGenerateContent?alt=sse。")
+            if sse and resume and resumable_enabled():
+                return await _resumable_native(request, _auth, model, action, query, raw_body, parsed)
+            async with asyncio.timeout(request_timeout_seconds()):
+                return await _passthrough_request(request, model, action, query, raw_body)
+        except TimeoutError:
+            return _native_error(504, "本轮请求超过总执行期限。")
+        except GenerationCapacityError as exc:
+            return _native_error(503, str(exc))
+        except Exception as exc:
+            code, message = extract_upstream_error(exc)
+            return _native_error(code, message[:1024])
 
     return endpoint
 

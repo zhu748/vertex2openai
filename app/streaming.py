@@ -1,11 +1,45 @@
 """Keep quiet SSE connections alive without cancelling or restarting reads."""
 import asyncio
+import re
 from contextlib import suppress
 
 
 HEARTBEAT = object()
 HEARTBEAT_INTERVAL = 10.0
 HEARTBEAT_FRAME = ": keep-alive\n\n"
+
+
+async def sse_frames(source, max_frame_bytes=64 * 1024 * 1024):
+    """Frame raw SSE before inserting comments or assigning resume IDs.
+
+    Network chunks can split JSON, UTF-8 or CRLF. Heartbeats must never be
+    inserted inside such a chunk's unfinished data line.
+    """
+    from response_validation import IncompleteResponseError
+    buffer = bytearray()
+    scan = 0
+    try:
+        async for chunk in source:
+            buffer.extend(chunk)
+            while True:
+                match = re.search(rb"\r\n\r\n|\n\n|\r\r", buffer[scan:])
+                if match is None:
+                    if len(buffer) > max_frame_bytes:
+                        raise IncompleteResponseError("上游 SSE 事件超过字节上限。")
+                    scan = max(0, len(buffer) - 3)
+                    break
+                end = scan + match.end()
+                if end > max_frame_bytes:
+                    raise IncompleteResponseError("上游 SSE 事件超过字节上限。")
+                yield bytes(buffer[:end])
+                del buffer[:end]
+                scan = 0
+        if buffer.strip():
+            raise IncompleteResponseError("上游 SSE 在事件完整结束前断开。")
+    finally:
+        close = getattr(source, "aclose", None)
+        if close:
+            await close()
 
 
 async def _disconnected(request):

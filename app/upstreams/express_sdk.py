@@ -334,12 +334,9 @@ class ExpressSDKUpstream(BaseUpstream):
                              "response_modalities", "image_config")}
             print(f"🔎 [出站调试] Express 通道 生成参数={_dbg}")
 
-        def retry_target_factory():
-            # 同步上下文（api_helpers 的异步生成器里直接调用）：换 Key 后若
-            # 新 Key 的 sing-box 代理尚未预热，这里会同步启动（典型 ~100ms）。
-            # 重试路径本就有退避等待，这点开销可接受；主调用路径已在上面
-            # 用 resolve_proxy_uri_async 预热过，不落到这里。
-            nonlocal express_api_key
+        async def retry_target_factory():
+            # A newly selected proxy must be warmed asynchronously as well.
+            nonlocal express_api_key, key_proxy_uri
             record = express_key_manager_instance.get_express_record(exclude_key=express_api_key)
             if record is None:
                 return None
@@ -347,6 +344,8 @@ class ExpressSDKUpstream(BaseUpstream):
             model_path = resolve_express_model_path(
                 base_model_name, _inj_settings, key_project_id=record.get("project_id", ""))
             retry_proxy_uri = get_effective_proxy_uri_for_key(record)
+            await resolve_proxy_uri_async(retry_proxy_uri)
+            key_proxy_uri = retry_proxy_uri
             return (get_pooled_express_client(express_api_key, retry_proxy_uri), model_path,
                     base_model_name if model_path != base_model_name else None)
 

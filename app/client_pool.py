@@ -36,7 +36,7 @@ from http_options import get_http_options
 # SDK Client 池上限：Key 池轮换时最多同时保留这么多个（LRU 淘汰最久未用）
 _SDK_POOL_MAX = 6
 # 旧客户端延迟关闭的宽限期（秒）：覆盖最长流式 + 重试窗口
-_GRACE_CLOSE_SECONDS = 900.0
+_GRACE_CLOSE_SECONDS = 7230.0  # longest supported request (7200s), including hot setting changes
 
 
 def _resolve_proxy_for_signature(key_proxy: Optional[str]) -> str:
@@ -79,43 +79,66 @@ def _direct_signature(proxy_uri: Optional[str] = None) -> tuple:
     return ("v2", _resolve_proxy_for_signature(proxy_uri), app_config.SSL_CERT_FILE or "")
 
 
-class _GracefulCloser:
-    """延迟关闭被淘汰的客户端：先等宽限期（护住飞行中的请求）再关。"""
+class PoolCapacityError(RuntimeError):
+    code = 503
 
-    def __init__(self):
+
+class _GracefulCloser:
+    """Retain retired clients for reuse; never force-close an active client."""
+
+    def __init__(self, max_pending: int = 256):
         self._tasks: set = set()
         self._pending: dict = {}
+        self._retired: dict = {}
+        self._max_pending = max_pending
 
-    def schedule(self, close: Callable[[], Any]) -> None:
+    def ensure_capacity(self, count=1):
+        if len(self._pending) + count > self._max_pending:
+            raise PoolCapacityError("客户端配置切换过于频繁，连接正在回收，请稍后重试。")
+
+    def reclaim(self, key):
+        task = self._retired.pop(key, None)
+        entry = self._pending.pop(task, None)
+        if entry is None:
+            return None
+        task.cancel()
+        return entry[2]
+
+    def schedule(self, close: Callable[[], Any], *, key=None, resource=None) -> None:
+        self.ensure_capacity()
         async def _close_later():
-            await asyncio.sleep(_GRACE_CLOSE_SECONDS)
-            self._pending.pop(asyncio.current_task(), None)
+            from resumable import request_timeout_seconds
+            await asyncio.sleep(max(_GRACE_CLOSE_SECONDS, request_timeout_seconds() + 30))
+            entry = self._pending.pop(asyncio.current_task(), None)
+            if entry is None:
+                return
+            if key is not None and self._retired.get(key) is asyncio.current_task():
+                self._retired.pop(key, None)
             try:
                 result = close()
                 if inspect.isawaitable(result):
                     await result
             except Exception:
-                pass  # 关闭失败只能交给 GC（与历史行为一致）
+                pass
 
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return  # 不在事件循环里（理论不可达，仅防御）：交给 GC
+        loop = asyncio.get_running_loop()
         task = loop.create_task(_close_later())
         self._tasks.add(task)
-        self._pending[task] = close
+        self._pending[task] = (close, key, resource)
+        if key is not None:
+            self._retired[key] = task
         task.add_done_callback(self._tasks.discard)
 
     async def aclose(self) -> None:
-        """停机时立即关闭仍在宽限期内的客户端，并等待已开始的关闭任务。"""
         pending = list(self._pending.items())
         self._pending.clear()
+        self._retired.clear()
         tasks = list(self._tasks)
         for task, _ in pending:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        for _, close in pending:
+        for _, (close, _key, _resource) in pending:
             try:
                 result = close()
                 if inspect.isawaitable(result):
@@ -156,27 +179,29 @@ class SdkClientPool:
                 self._clients[api_key] = entry
                 return entry[1]
 
-        client = genai.Client(
-            vertexai=True,
-            api_key=api_key,
-            http_options=get_http_options(
-                proxy_url=(key_proxy if key_proxy is not None else None)),
-        )
+        retired_key = ("sdk", id(self), api_key, sig)
+        client = _closer.reclaim(retired_key)
+        _closer.ensure_capacity(int(entry is not None or len(self._clients) >= self._maxsize))
+        if client is None:
+            client = genai.Client(
+                vertexai=True, api_key=api_key,
+                http_options=get_http_options(proxy_url=key_proxy))
 
         stale: list = []
         with self._lock:
             entry = self._clients.get(api_key)
             if entry is not None:            # 同 Key 旧签名（或竞态里先建好的）
-                stale.append(entry[1])
+                stale.append((("sdk", id(self), api_key, entry[0]), entry[1]))
             self._clients[api_key] = (sig, client)
             while len(self._clients) > self._maxsize:
                 oldest = next(iter(self._clients))
                 if oldest == api_key:
                     break
-                stale.append(self._clients.pop(oldest)[1])
+                old_sig, old_client = self._clients.pop(oldest)
+                stale.append((("sdk", id(self), oldest, old_sig), old_client))
 
-        for c in stale:
-            _closer.schedule(_make_sdk_closer(c))
+        for retired_key, c in stale:
+            _closer.schedule(_make_sdk_closer(c), key=retired_key, resource=c)
         return client
 
     def size(self) -> int:
@@ -240,14 +265,17 @@ class HttpxClientPool:
                 self._entries[sig] = hit
                 return hit
 
-        client = factory()
+        client = _closer.reclaim(("httpx", id(self), sig))
+        _closer.ensure_capacity(int(len(self._entries) >= self._maxsize))
+        if client is None:
+            client = factory()
         stale: list = []
         with self._lock:
             hit = self._entries.get(sig)
             if hit is not None:
                 # 竞态窗口：别的协程刚建好同签名客户端，用它；
                 # 我们手里这个没人用过，直接进宽限关闭。
-                stale.append(client)
+                stale.append((None, client))
                 client = hit
             else:
                 self._entries[sig] = client
@@ -255,10 +283,10 @@ class HttpxClientPool:
                     oldest = next(iter(self._entries))
                     if oldest == sig:
                         break
-                    stale.append(self._entries.pop(oldest))
+                    stale.append((("httpx", id(self), oldest), self._entries.pop(oldest)))
 
-        for c in stale:
-            _closer.schedule(_make_httpx_closer(c))
+        for retired_key, c in stale:
+            _closer.schedule(_make_httpx_closer(c), key=retired_key, resource=c)
         return client
 
     async def aclose(self) -> None:
@@ -279,9 +307,9 @@ def _make_httpx_closer(client: Any) -> Callable[[], Any]:
     return _aclose
 
 
-def schedule_graceful_close(close: Callable[[], Any]) -> None:
+def schedule_graceful_close(close: Callable[[], Any], *, key=None, resource=None) -> None:
     """公开的延迟关闭调度（供 impersonate.py 的 Cookie 通道客户端池复用）。"""
-    _closer.schedule(close)
+    _closer.schedule(close, key=key, resource=resource)
 
 
 # ---------- 模块级单例（全进程共享） ----------

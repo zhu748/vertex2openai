@@ -6,6 +6,7 @@ from auth import get_api_key
 
 import asyncio
 import json
+import time
 
 # 引入运行状态管理器与多通道分发策略
 from runtime_state import app_state
@@ -14,19 +15,24 @@ from upstreams.cookie_proxy import CookieProxyUpstream
 from api_helpers import extract_upstream_error, create_openai_error_response
 from logger import stats
 from streaming import keepalive_sse
+from admission import limit_generation, ManagedStreamingResponse
+from response_validation import IncompleteResponseError
 
 # 第二轮：弱网可靠传输 —— 服务端响应缓冲 + 序列号事件 + 断线重放 / 分片轮询。
-# 上游的读取由后台泵任务驱动，与前端连接解绑；Google 的回复总能完整落缓冲，
-# 前端凭 Last-Event-ID / ?resume_from= 续传，或轮询 /v1/resumable/{id} 拉分片。
-# SSE 空闲时发送注释保活；断线后的完整性交由缓冲和续传保证。
+# 上游读取由后台泵驱动，与前端连接解绑；已收到的事件保存在有界缓冲。
+# 前端凭生成 ID / Last-Event-ID 续传，或轮询 /v1/resumable/{id} 拉分片。
+# SSE 空闲时注释保活；上游中断或超出期限时发送明确错误。
 from resumable import (
     resumable_store,
-    compute_stream_id,
     is_enabled as resumable_enabled,
     DetachedRequest,
     pump_stream,
     sse_from_buffer,
-    frame_with_id,
+    resolve_buffer,
+    resume_cursor,
+    within_request_deadline,
+    request_timeout_seconds,
+    ResumeRequestError,
     DONE_FRAME,
 )
 
@@ -37,20 +43,66 @@ express_upstream = ExpressSDKUpstream()
 cookie_upstream = CookieProxyUpstream()
 
 
+@limit_generation
 async def _call_upstream(request_obj: OpenAIRequest, fastapi_request: Request):
     """按控制台开关分流到两条上游通道（与原来完全一致）。"""
-    if app_state.is_web_proxy_enabled():
-        response = await cookie_upstream.chat_completions(request_obj, fastapi_request)
+    deadline = time.monotonic() + request_timeout_seconds()
+    async def prepare():
+        async with asyncio.timeout(max(0.001, deadline - time.monotonic())):
+            if app_state.is_web_proxy_enabled():
+                return await cookie_upstream.chat_completions(request_obj, fastapi_request)
+            return await express_upstream.chat_completions(request_obj, fastapi_request)
+
+    if request_obj.stream:
+        # Start SSE promptly even if proxy startup or image preprocessing is
+        # slow. Fast validation errors can still keep their HTTP status.
+        setup = asyncio.create_task(prepare())
+
+        async def close_setup():
+            if not setup.done() and not setup.cancelling():
+                setup.cancel()
+            result = (await asyncio.gather(setup, return_exceptions=True))[0]
+            if isinstance(result, StreamingResponse):
+                close = getattr(result, "aclose", result.body_iterator.aclose)
+                await close()
+
+        try:
+            done, _ = await asyncio.wait({setup}, timeout=0.05)
+        except BaseException:
+            await close_setup()
+            raise
+        if done:
+            response = setup.result()
+        else:
+            async def prepared_frames():
+                result = await setup
+                if isinstance(result, StreamingResponse):
+                    async for frame in result.body_iterator:
+                        yield frame
+                else:
+                    stats.add_error()
+                    try:
+                        payload = json.loads(result.body)
+                    except (ValueError, TypeError, AttributeError):
+                        payload = None
+                    if not isinstance(payload, dict) or not payload.get("error"):
+                        payload = create_openai_error_response(
+                            result.status_code if result.status_code >= 400 else 502,
+                            "上游未返回流式响应。", "upstream_error")
+                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                    yield DONE_FRAME
+            response = ManagedStreamingResponse(prepared_frames(), media_type="text/event-stream", cleanup=close_setup)
     else:
-        response = await express_upstream.chat_completions(request_obj, fastapi_request)
+        response = await prepare()
     if isinstance(response, StreamingResponse):
         original = response.body_iterator
 
         async def relay():
             stream = keepalive_sse(original, fastapi_request)
             try:
-                async for frame in stream:
-                    yield frame
+                async with asyncio.timeout(max(0.001, deadline - time.monotonic())):
+                    async for frame in stream:
+                        yield frame
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -62,7 +114,12 @@ async def _call_upstream(request_obj: OpenAIRequest, fastapi_request: Request):
                 yield DONE_FRAME
             finally:
                 await stream.aclose()
-        response.body_iterator = relay()
+        headers = dict(response.headers)
+        headers.pop("content-length", None)
+        headers.update({"Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no"})
+        return ManagedStreamingResponse(
+            relay(), status_code=response.status_code, headers=headers, background=response.background,
+            cleanup=getattr(response, "aclose", original.aclose))
     return response
 
 
@@ -77,24 +134,11 @@ def _request_fingerprint(request_obj: OpenAIRequest) -> str:
 
 def _resume_start_seq(fastapi_request: Request) -> int:
     """续传起点：优先 Last-Event-ID 请求头，其次 ?resume_from= 查询参数，缺省 0。"""
-    try:
-        leid = (fastapi_request.headers.get("last-event-id") or "").strip()
-        if leid:
-            # Last-Event-ID 是客户端已收到的最后一帧；查询参数仍是起点游标。
-            return max(0, int(leid) + 1)
-    except (TypeError, ValueError):
-        pass
-    try:
-        q = fastapi_request.query_params.get("resume_from")
-        if q is not None:
-            return max(0, int(str(q).strip()))
-    except (TypeError, ValueError):
-        pass
-    return 0
+    return resume_cursor(fastapi_request)[1]
 
 
 def _resume_headers(stream_id: str, replay: bool = False) -> dict:
-    headers = {"X-Resume-Id": stream_id, "Cache-Control": "no-store"}
+    headers = {"X-Resume-Id": stream_id, "Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no"}
     if replay:
         headers["X-Resumable-Replay"] = "1"
     return headers
@@ -105,44 +149,24 @@ async def _abort_placeholder(buf, stream_id: str, message: str, code: int = 500)
 
     撤掉占位是为了不让一个「空壳」缓冲挡住后续重试（跟读者手里还拿着缓冲对象，读得完）。
     """
-    err = {"error": {"message": message[:1024], "type": "upstream_error", "code": code}}
-    await buf.append(frame_with_id(buf.next_seq, f"data: {json.dumps(err, ensure_ascii=False)}\n\n"))
-    await buf.append(frame_with_id(buf.next_seq, DONE_FRAME))
-    await buf.finish("error", error=message, status_code=code)
+    await buf.fail(message, code)
     await resumable_store.drop(stream_id, expected=buf)
 
 
 async def _resumable_stream(fastapi_request: Request, request_obj: OpenAIRequest, api_key: str):
     """流式：缓冲命中则重放/续传；否则建缓冲、后台泵抽帧，当前连接只做缓冲的读者。
 
-    建缓冲走 `create_if_absent` 原子占位：并发的同一请求只有第一个去打上游，
+    建缓冲走原子占位：并发的同一请求只有第一个去打上游，
     其余直接跟读同一份缓冲（不重复烧配额，也不会把先建的缓冲/泵任务覆盖掉）。
     """
-    stream_id, id_src = compute_stream_id(
-        fastapi_request.headers, api_key or "", _request_fingerprint(request_obj))
-
-    start = _resume_start_seq(fastapi_request)
-    has_cursor = bool((fastapi_request.headers.get("last-event-id") or "").strip()) or (
-        fastapi_request.query_params.get("resume_from") is not None)
-    if has_cursor:
-        # 显式续传始终读取旧副本；不能生成另一轮再跳过前 start 帧。
-        buf = await resumable_store.get(stream_id)
-        if buf is None or buf.kind != "stream":
-            return JSONResponse(
-                status_code=404,
-                content=create_openai_error_response(
-                    404, "续传缓冲不存在或已过期；如需重新生成，请移除续传游标。", "not_found"),
-                headers=_resume_headers(stream_id))
-        if start > buf.next_seq:
-            return JSONResponse(
-                status_code=409,
-                content=create_openai_error_response(
-                    409, f"续传起点 {start} 超过缓冲末尾 {buf.next_seq}。", "invalid_resume_cursor"),
-                headers=_resume_headers(stream_id))
-        is_new = False
-    else:
-        buf, is_new = await resumable_store.create_if_absent(
-            stream_id, model=request_obj.model, kind="stream", replace_delivered=True)
+    try:
+        buf, is_new, start, id_src = await resolve_buffer(
+            resumable_store, fastapi_request, api_key or "", _request_fingerprint(request_obj),
+            model=request_obj.model, kind="stream")
+    except ResumeRequestError as exc:
+        return JSONResponse(status_code=exc.code, content=create_openai_error_response(
+            exc.code, str(exc), "invalid_resume_request"))
+    stream_id = buf.id
     if not is_new:
         # 命中在用的缓冲：重放已缓冲的部分并继续跟随上游直到本轮结束，不再请求上游。
         print(f"↩️ [续传命中] {stream_id}（{id_src}）：直接重放/续传，不再请求上游。")
@@ -160,7 +184,6 @@ async def _resumable_stream(fastapi_request: Request, request_obj: OpenAIRequest
         try:
             resp = await _call_upstream(request_obj, detached)
         except asyncio.CancelledError:
-            await _abort_placeholder(buf, stream_id, "上游准备任务已取消。", 503)
             raise
         except Exception as exc:
             code, message = extract_upstream_error(exc)
@@ -177,16 +200,21 @@ async def _resumable_stream(fastapi_request: Request, request_obj: OpenAIRequest
                 await close()
             return JSONResponse(status_code=buf.status_code, content=buf.payload or
                                 create_openai_error_response(503, "响应缓冲已释放。", "buffer_evicted"))
-        pump_task = asyncio.create_task(pump_stream(buf, resp.body_iterator))
+        pump_task = asyncio.create_task(within_request_deadline(buf, lambda: pump_stream(buf, resp.body_iterator)))
+        pump_task.add_done_callback(lambda _task: resumable_store.schedule_cleanup(resp.body_iterator.aclose))
         resumable_store.register_pump(stream_id, pump_task, buffer=buf)
         print(f"📦 [续传缓冲] {stream_id}（{id_src}）：后台泵已启动，上游读取与前端连接解绑。")
         return resp
 
-    setup_task = asyncio.create_task(start_stream())
+    setup_task = asyncio.create_task(within_request_deadline(buf, start_stream))
     resumable_store.register_pump(stream_id, setup_task, buffer=buf)
-    resp = await asyncio.shield(setup_task)
-    if not isinstance(resp, StreamingResponse):
-        return resp
+    # Fast setup errors keep their HTTP status. Slow preparation gets an SSE
+    # reader immediately, so image downloads/proxy setup cannot leave it idle.
+    done, _ = await asyncio.wait({setup_task}, timeout=0.05)
+    if done:
+        resp = setup_task.result()
+        if not isinstance(resp, StreamingResponse):
+            return resp
 
     return StreamingResponse(
         sse_from_buffer(buf, 0),
@@ -198,19 +226,18 @@ async def _resumable_stream(fastapi_request: Request, request_obj: OpenAIRequest
 async def _resumable_json(fastapi_request: Request, request_obj: OpenAIRequest, api_key: str):
     """非流式：完整回复落缓冲；原样重发命中未交付缓冲则直接重放。
 
-    同样走 `create_if_absent` 原子占位：并发的同一请求只打一次上游，
+    同样走原子占位：并发的同一请求只打一次上游，
     后来的请求等同一个后台泵的结果。
     """
-    stream_id, id_src = compute_stream_id(
-        fastapi_request.headers, api_key or "", _request_fingerprint(request_obj))
-
-    buf, is_new = await resumable_store.create_if_absent(
-        stream_id, model=request_obj.model, kind="json", replace_delivered=True)
+    buf, is_new, _start, id_src = await resolve_buffer(
+        resumable_store, fastapi_request, api_key or "", _request_fingerprint(request_obj),
+        model=request_obj.model, kind="json")
+    stream_id = buf.id
     if not is_new:
         # 命中在用的缓冲：已出结果的直接重放；上游还在算的，等同一个后台泵的结果。
         print(f"↩️ [重放命中] {stream_id}（{id_src}）：直接返回已缓冲的完整回复，不再请求上游。")
         if buf.payload is None:
-            await buf.wait_for(2 ** 62, 600.0)
+            await buf.wait_for(2 ** 62, max(0.001, buf.deadline_monotonic - time.monotonic()))
         if buf.payload is None:
             return JSONResponse(
                 status_code=504,
@@ -227,10 +254,6 @@ async def _resumable_json(fastapi_request: Request, request_obj: OpenAIRequest, 
         try:
             resp = await _call_upstream(request_obj, detached)
         except asyncio.CancelledError:
-            if not buf.done:
-                await buf.finish("error", error="上游调用已取消。",
-                                 payload=create_openai_error_response(503, "上游调用已取消。", "upstream_error"),
-                                 status_code=503)
             raise
         except Exception as e:
             code, msg = extract_upstream_error(e)
@@ -243,17 +266,19 @@ async def _resumable_json(fastapi_request: Request, request_obj: OpenAIRequest, 
         status = getattr(resp, "status_code", 200)
         try:
             payload = json.loads(body.decode("utf-8")) if body else {}
-        except Exception:
-            payload = {"_raw": body.decode("utf-8", "replace")[:4000]}
+        except (ValueError, UnicodeError):
+            raise IncompleteResponseError("上游返回无效或不完整的 JSON 响应。") from None
+        if not isinstance(payload, dict):
+            raise IncompleteResponseError("上游返回的 JSON 不是响应对象。")
         await buf.finish("done" if 200 <= status < 300 else "error",
                          payload=payload, status_code=status)
 
-    pump_task = asyncio.create_task(_pump_json())
+    pump_task = asyncio.create_task(within_request_deadline(buf, _pump_json))
     resumable_store.register_pump(stream_id, pump_task, buffer=buf)
 
     # 当前连接等待缓冲完成（等同于原来的直通等待；断线不影响后台泵）。
     # wait_for(seq=极大值) 等价于“等到 done 或超时”。
-    await buf.wait_for(2 ** 62, 600.0)
+    await buf.wait_for(2 ** 62, max(0.001, buf.deadline_monotonic - time.monotonic()))
     if buf.payload is None:
         return JSONResponse(
             status_code=504,
@@ -271,7 +296,7 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
     """
     /v1/chat/completions 动态分流路由器
     根据大盘设置的全局开关，决定将 OpenAI 请求路由至：
-    - True  -> CookieProxyUpstream (Cookie 直连反代通道，规避 429 限流)
+    - True  -> CookieProxyUpstream (Cookie 网页通道)
     - False -> ExpressSDKUpstream (官方 API Key 标准通道)
 
     弱网可靠传输（resumable_enabled 开启时，默认开）：
@@ -307,7 +332,7 @@ async def resumable_poll(stream_id: str, fastapi_request: Request,
     客户端按 seq 去重、按 done 判定本轮完整结束。wait>0 时为长轮询（最多等 25 秒）。
     响应头 X-Resume-Id 即为这里的 {id}。
     """
-    buf = await resumable_store.get(stream_id)
+    buf = await resumable_store.get_exact(stream_id)
     if buf is None:
         return JSONResponse(
             status_code=404,
@@ -317,6 +342,9 @@ async def resumable_poll(stream_id: str, fastapi_request: Request,
     if wait > 0 and not buf.done:
         await buf.wait_for(max(0, from_), min(wait, 25.0))
     start = max(0, from_)
+    if start > buf.next_seq:
+        return JSONResponse(status_code=409, content=create_openai_error_response(
+            409, "轮询游标超过缓冲末尾。", "invalid_resume_cursor"))
     events = buf.snapshot(start, limit)
     end = start + len(events)
     done = buf.done and end >= buf.next_seq

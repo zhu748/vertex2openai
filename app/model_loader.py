@@ -63,20 +63,20 @@ def _load_local_models_config() -> Dict[str, List[str]]:
 async def fetch_and_parse_models_config() -> Optional[Dict[str, List[str]]]:
     primary_url = app_config.MODELS_CONFIG_URL or DEFAULT_MODELS_CONFIG_URL
     urls_to_try = [primary_url]
-    for fallback_url in FALLBACK_MODELS_CONFIG_URLS:
+    for fallback_url in (FALLBACK_MODELS_CONFIG_URLS if primary_url == DEFAULT_MODELS_CONFIG_URL else []):
         if fallback_url not in urls_to_try:
             urls_to_try.append(fallback_url)
 
-    client_args = {"timeout": 20.0}
+    client_args = {"timeout": 20.0, "trust_env": False}
     # vless/vmess 等分享链接 → 本地 socks5（sing-box 转换）。模型列表刷新是
-    # 附属功能：转换失败按无代理直连重试（主调用通道各自对代理失败明确报错），
-    # 不让它拖垮本地兜底列表的加载。
+    # 附属功能：转换失败保留本地缓存，不意外直连或替换用户指定的模型来源。
     try:
         from proxy_resolver import resolve_proxy_uri_async
         # 异步版：sing-box 首次启动放线程池，不卡事件循环
         proxy_url = await resolve_proxy_uri_async(get_effective_proxy_url())
-    except Exception:
-        proxy_url = ""
+    except Exception as exc:
+        print(f"⚠️ [模型配置] 出站代理不可用，保留本地模型缓存：{type(exc).__name__}")
+        return None
     if proxy_url:
         client_args["proxy"] = proxy_url
     if app_config.SSL_CERT_FILE:

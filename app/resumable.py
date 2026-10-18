@@ -1,41 +1,22 @@
-"""弱网可靠传输：服务端响应缓冲 + 序列号事件 + 断线重放 / 分片轮询拉取。
+"""Process-local bounded reply storage and reconnect delivery.
 
-问题背景
---------
-反代 → Google 的链路是好的，Google 的回复能完整到达反代；坏的是**前端 → 反代**这一段
-（延迟抖动、丢包、连接中断）。原实现把上游的读取与前端连接绑死：
-  - 前端连接一断，`fastapi_request.is_disconnected()` 变真，上游调用/重试被主动放弃；
-  - 已经产出的增量只存在于那条 TCP 连接里，断了就永远找不回来，前端只能整轮重发
-    （重新烧一次上游配额，且长回复在弱网下几乎不可能一次跑完）。
+Each generation has an immutable random ID. A canonical request fingerprint
+selects the latest generation for legacy retries; Idempotency-Key explicitly
+identifies one logical operation. SSE event IDs contain generation + sequence,
+and X-Resume-Id directly addresses the retained generation, bound to its body.
 
-方案（缓冲与续传保证完整性，SSE 注释保活减少空闲断连）
---------------------------------------
-1. **响应落缓冲**：每个请求在服务端建一个缓冲区，上游产出的每个 SSE 帧按到达顺序
-   追加进去并分配**单调递增的序列号 seq**。上游的读取由一个**后台任务**驱动，
-   与前端连接完全解耦——前端断开不会取消它，Google 的回复总能被完整收下来。
-2. **稳定请求 ID**：缓冲区的 id 优先取客户端请求头（X-Request-Id / Idempotency-Key），
-   否则由「API Key + 请求体」哈希而来，因此**同一请求重发即命中同一缓冲区**。
-3. **断线续传**：
-   - SSE 路径：每帧前带 `id: <seq>`，重连时用 `Last-Event-ID` 或 `?resume_from=` 续取；
-   - 轮询路径：`GET /v1/resumable/{stream_id}?from=<seq>&limit=&wait=` 拿一段分片（短连接，天生抗抖动），
-     响应里带 `next` 游标与 `done` 标志，客户端按 seq 去重、按 done 判完成。
-4. **幂等重放**：普通前端（酒馆等）在网络失败后会原样重发同一请求。此时若缓冲区里
-   那次回复**还没被完整交付过**，就直接从 seq=0 重放已缓冲内容并继续跟随上游，
-   **不再打一次 Google**；已经完整交付过的，才当成一次新生成。
-5. **生命周期与容量**：缓冲区在完成后保留 `resumable_ttl_seconds`，总数超过
-   `resumable_max_streams` 时淘汰最旧的已完成缓冲；所有状态变更在锁/条件变量下进行。
-
-为什么这能满足「Google 的回复到了反代，前端就一定能拿到完整一致的回复」
------------------------------------------------------------------------
-回复的权威副本在服务端缓冲区里，且是**带序号的有序事件流**；前端连接只是这份副本的
-一个游标读者。抖动 → 读者慢一点，数据仍在缓冲里等它；断线 → 换一条连接从 `next`
-继续读，语义上等价于文件断点续传；前端整轮重发 → 命中同一缓冲区，得到同一份内容而
-不是新的一次生成。因此最终交付的内容与服务端收到的内容逐字节一致。
+Frontend disconnects do not cancel admitted generation. TTL, byte budgets and a
+total execution deadline bound retention. Upstream loss cannot reconstruct an
+unreceived tail; it is reported as an error. ASGI send completion acknowledges
+server delivery only, not application-level receipt. Buffers are not shared
+between workers/replicas and do not survive a process restart.
 """
 
 import asyncio
 import hashlib
 import json
+import math
+import secrets
 import time
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
@@ -45,6 +26,92 @@ from streaming import with_heartbeats, HEARTBEAT, HEARTBEAT_FRAME
 
 # 终止帧：与 OpenAI 流一致，客户端见到它即可判定「本轮完整结束」
 DONE_FRAME = "data: [DONE]\n\n"
+
+
+class BufferCapacityError(RuntimeError):
+    code = 503
+
+
+class ResumeRequestError(ValueError):
+    def __init__(self, code: int, message: str):
+        self.code = code
+        super().__init__(message)
+
+
+def resume_cursor(request) -> tuple[Optional[str], int, bool]:
+    generation = (request.headers.get("x-resume-id") or "").strip() or None
+    raw = (request.headers.get("last-event-id") or "").strip()
+    query = getattr(request, "query_params", {}).get("resume_from")
+    if not raw and query is None:
+        return generation, 0, generation is not None
+    if raw and ":" in raw:
+        event_generation, _, raw = raw.rpartition(":")
+        if generation and generation != event_generation:
+            raise ResumeRequestError(409, "续传 ID 与事件游标属于不同生成。")
+        generation = event_generation
+    try:
+        seq = int(raw) if raw else int(str(query))
+        if seq < 0:
+            raise ValueError
+        if raw:
+            seq += 1
+    except (ValueError, TypeError):
+        raise ResumeRequestError(400, "续传游标必须是非负整数或服务端返回的事件 ID。") from None
+    return generation, seq, True
+
+
+async def resolve_buffer(store, request, api_key: str, fingerprint: str, *, model: str, kind: str):
+    """Resolve an immutable generation, or atomically admit a new request."""
+    request_key, source = compute_stream_id(request.headers, api_key, fingerprint)
+    fingerprint_key, _ = compute_stream_id({}, api_key, fingerprint)
+    generation, start, reconnect = resume_cursor(request)
+    if reconnect:
+        buf = await (store.get_exact(generation) if generation else store.get(request_key))
+        if buf is None or buf.kind != kind:
+            raise ResumeRequestError(404, "续传缓冲不存在或已过期；重新生成请移除续传 ID 与游标。")
+        if buf.fingerprint_key and buf.fingerprint_key != fingerprint_key:
+            raise ResumeRequestError(409, "续传请求体与原请求不一致。")
+        if start > buf.next_seq:
+            raise ResumeRequestError(409, f"续传起点 {start} 超过缓冲末尾 {buf.next_seq}。")
+        return buf, False, start, source
+    idempotent = bool(request.headers.get("idempotency-key") or request.headers.get("x-idempotency-key"))
+    buf, new = await store.get_or_create_request(
+        request_key, model=model, kind=kind, fingerprint_key=fingerprint_key, idempotent=idempotent)
+    return buf, new, 0, source
+
+
+async def within_request_deadline(buf, operation):
+    """One deadline covers preparation, retries and all subsequent reads."""
+    remaining = buf.deadline_monotonic - time.monotonic()
+    try:
+        async with asyncio.timeout(max(0.001, remaining)):
+            return await (operation() if callable(operation) else operation)
+    except TimeoutError:
+        await buf.fail("本轮请求超过总执行期限。", 504, "timeout")
+        raise
+    except asyncio.CancelledError:
+        await buf.fail("上游任务已取消。", 503)
+        raise
+    except Exception as exc:
+        from api_helpers import extract_upstream_error
+        code, message = extract_upstream_error(exc)
+        await buf.fail(message, code)
+        raise
+
+
+def request_timeout_seconds() -> float:
+    try:
+        value = float(_setting("request_timeout_seconds"))
+        return max(0.01, value) if math.isfinite(value) else 1800.0
+    except (ValueError, TypeError):
+        return 1800.0
+
+
+def _byte_limit(key: str, default: int) -> int:
+    try:
+        return max(1, int(float(_setting(key)) * 1024 * 1024))
+    except (ValueError, TypeError, OverflowError):
+        return default * 1024 * 1024
 
 
 def _setting(key: str) -> Any:
@@ -78,7 +145,8 @@ def compute_stream_id(headers: Any, api_key: str, fingerprint: str) -> Tuple[str
     优先用客户端显式给的幂等键——聪明的客户端可以自己控制"哪两次请求算同一次"；
     没有就用「API Key + 请求体」哈希，让**原样重发**天然命中同一缓冲区。
     """
-    for h in ("x-resume-id", "x-request-id", "x-idempotency-key", "idempotency-key"):
+    # X-Resume-Id identifies an existing generation, not a new idempotency key.
+    for h in ("idempotency-key", "x-idempotency-key", "x-request-id"):
         try:
             v = (headers.get(h) or "").strip()
         except Exception:
@@ -101,6 +169,8 @@ class ResumableBuffer:
         self.model = model
         self.kind = kind                      # stream | json
         self.created_at = time.time()
+        self.started_monotonic = time.monotonic()
+        self.deadline_monotonic = self.started_monotonic + request_timeout_seconds()
         self.finished_at: Optional[float] = None
         self.last_access = self.created_at
         self.status = "running"               # running | done | error
@@ -110,6 +180,10 @@ class ResumableBuffer:
         self.status_code: int = 200
         self.fully_delivered = False          # 是否已有读者完整读到终止帧
         self.readers = 0
+        self.request_key = ""
+        self.fingerprint_key = ""
+        self.bytes_stored = 0
+        self._account_bytes = None
         self._cond = asyncio.Condition()
 
     # ---------- 写入端（后台泵任务持有） ----------
@@ -119,6 +193,12 @@ class ResumableBuffer:
             # 淘汰/完成后的副本必须保持不变；部分上游会在取消后仍交出最后一块。
             if self.done:
                 return None
+            size = len(frame.encode("utf-8"))
+            if self.bytes_stored + size > _byte_limit("resumable_max_buffer_mb", 64):
+                raise BufferCapacityError("单次响应超过续传缓冲字节上限。")
+            if self._account_bytes and not self._account_bytes(size, False):
+                raise BufferCapacityError("响应缓冲总字节预算已满，请稍后重试。")
+            self.bytes_stored += size
             self.events.append(frame)
             self._cond.notify_all()
             return len(self.events) - 1
@@ -131,9 +211,52 @@ class ResumableBuffer:
             self.status = status
             self.error = error
             if payload is not None:
+                size = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+                fits = self.bytes_stored + size <= _byte_limit("resumable_max_buffer_mb", 64)
+                if fits and self._account_bytes:
+                    fits = self._account_bytes(size, False)
+                if not fits:
+                    self.status = "error"
+                    self.error = "响应超过续传缓冲字节预算。"
+                    status_code = 503
+                    payload = {"error": {"message": self.error, "type": "buffer_capacity", "code": 503}}
+                    size = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+                    if self._account_bytes:
+                        self._account_bytes(size, True)
+                self.bytes_stored += size
                 self.payload = payload
             if status_code is not None:
                 self.status_code = status_code
+            self.finished_at = time.time()
+            self._cond.notify_all()
+
+    def event_frame(self, frame: str) -> str:
+        return frame_with_id(self.next_seq, frame, self.id if self.id.startswith("rid-") else None)
+
+    async def fail(self, message: str, code: int = 503, error_type: str = "upstream_error") -> None:
+        """Reserve a small terminal error even when the data budget is exhausted."""
+        async with self._cond:
+            if self.done:
+                return
+            payload = {"error": {"message": message[:1024], "type": error_type, "code": code}}
+            if self.kind == "native":
+                detail = {400: "INVALID_ARGUMENT", 401: "UNAUTHENTICATED", 403: "PERMISSION_DENIED",
+                          404: "NOT_FOUND", 429: "RESOURCE_EXHAUSTED", 504: "DEADLINE_EXCEEDED"}.get(code, "UNAVAILABLE")
+                payload = {"error": {"message": message[:1024], "status": detail, "code": code}}
+            frames = ([self.event_frame(f"data: {json.dumps(payload, ensure_ascii=False)}\n\n")]
+                      if self.kind != "json" else [])
+            if self.kind != "json":
+                # Allocate the next sequence after the error, not the same ID.
+                self.events.extend(frames)
+                if self.kind != "native":
+                    frames.append(self.event_frame(DONE_FRAME))
+                    self.events.append(frames[-1])
+            self.payload = payload
+            size = sum(len(f.encode("utf-8")) for f in frames) + len(json.dumps(payload).encode())
+            if self._account_bytes:
+                self._account_bytes(size, True)
+            self.bytes_stored += size
+            self.status, self.error, self.status_code = "error", message[:1024], code
             self.finished_at = time.time()
             self._cond.notify_all()
 
@@ -201,6 +324,7 @@ class ResumableBuffer:
             "done": self.done,
             "fully_delivered": self.fully_delivered,
             "readers": self.readers,
+            "bytes": self.bytes_stored,
             "created_at": self.created_at,
             "finished_at": self.finished_at,
             "age_seconds": round(time.time() - self.created_at, 1),
@@ -214,10 +338,64 @@ class ResumableStore:
         self._buffers: Dict[str, ResumableBuffer] = {}
         self._lock = asyncio.Lock()
         self._pumps: Dict[str, asyncio.Task] = {}
+        self._all_pumps: set[asyncio.Task] = set()
+        self._requests: Dict[str, str] = {}
+        self._bytes_used = 0
+        self._cleanup_tasks: set[asyncio.Task] = set()
+
+    def schedule_cleanup(self, close):
+        async def cleanup():
+            try:
+                await close()
+            except Exception:
+                pass
+        task = asyncio.create_task(cleanup())
+        self._cleanup_tasks.add(task)
+        task.add_done_callback(self._cleanup_tasks.discard)
+
+    def _attach(self, buf: ResumableBuffer) -> None:
+        def account(size, force):
+            if not force and self._bytes_used + size > _byte_limit("resumable_max_total_mb", 256):
+                return False
+            self._bytes_used += size
+            return True
+        buf._account_bytes = account
+
+    async def get_exact(self, stream_id: str) -> Optional[ResumableBuffer]:
+        async with self._lock:
+            buf = self._buffers.get(stream_id)
+            if buf:
+                buf.last_access = time.time()
+            return buf
+
+    async def get_or_create_request(self, request_key: str, *, model: str, kind: str,
+                                    fingerprint_key: str, idempotent: bool = False):
+        """A request key selects a generation; completed generations keep unique IDs."""
+        async with self._lock:
+            sid = self._requests.get(request_key, request_key)
+            old = self._buffers.get(sid)
+            if old and old.kind == kind and (idempotent or not old.fully_delivered):
+                old.last_access = time.time()
+                return old, False
+            # Admission must not cancel an unrelated in-flight request.
+            if len(self._buffers) >= max_streams() or self._bytes_used >= _byte_limit("resumable_max_total_mb", 256):
+                for candidate in sorted(self._buffers.values(), key=lambda b: b.created_at):
+                    if candidate.done and candidate.readers == 0:
+                        await self._discard_locked(candidate.id, "响应缓冲容量已满。")
+                        if len(self._buffers) < max_streams() and self._bytes_used < _byte_limit("resumable_max_total_mb", 256):
+                            break
+                else:
+                    raise BufferCapacityError("响应缓冲容量已满，请稍后重试。")
+            buf = ResumableBuffer("rid-" + secrets.token_hex(16), model=model, kind=kind)
+            buf.request_key, buf.fingerprint_key = request_key, fingerprint_key
+            self._attach(buf)
+            self._buffers[buf.id] = buf
+            self._requests[request_key] = buf.id
+            return buf, True
 
     async def get(self, stream_id: str) -> Optional[ResumableBuffer]:
         async with self._lock:
-            buf = self._buffers.get(stream_id)
+            buf = self._buffers.get(stream_id) or self._buffers.get(self._requests.get(stream_id, ""))
             if buf:
                 buf.last_access = time.time()
             return buf
@@ -226,8 +404,9 @@ class ResumableStore:
         async with self._lock:
             await self._discard_locked(stream_id, "已开始新一轮生成。")
             buf = ResumableBuffer(stream_id, model=model, kind=kind)
+            self._attach(buf)
             self._buffers[stream_id] = buf
-            await self._evict_locked()
+            await self._evict_locked(allow_running=True)
             return buf
 
     async def create_if_absent(self, stream_id: str, model: str = "",
@@ -248,8 +427,9 @@ class ResumableStore:
                 buf.last_access = time.time()
                 return buf, False
             buf = ResumableBuffer(stream_id, model=model, kind=kind)
+            self._attach(buf)
             self._buffers[stream_id] = buf
-            await self._evict_locked()
+            await self._evict_locked(allow_running=True)
             return buf, True
 
     async def drop(self, stream_id: str, *, expected: Optional[ResumableBuffer] = None) -> bool:
@@ -261,15 +441,16 @@ class ResumableStore:
     async def _discard_locked(self, stream_id: str, reason: str) -> bool:
         """移除缓冲时一并停止后台请求、唤醒仍在等结果的读者。"""
         task = self._pumps.pop(stream_id, None)
-        if task and task is not asyncio.current_task() and not task.done():
+        if task and task is not asyncio.current_task() and not task.done() and not task.cancelling():
             task.cancel()
         buf = self._buffers.pop(stream_id, None)
-        if buf is not None and not buf.done:
-            error = {"error": {"message": reason, "type": "buffer_evicted", "code": 503}}
-            if buf.kind == "stream":
-                await buf.append(frame_with_id(buf.next_seq, f"data: {json.dumps(error, ensure_ascii=False)}\n\n"))
-                await buf.append(frame_with_id(buf.next_seq, DONE_FRAME))
-            await buf.finish("error", error=reason, payload=error, status_code=503)
+        if buf is not None:
+            self._bytes_used = max(0, self._bytes_used - buf.bytes_stored)
+            buf._account_bytes = None
+            if self._requests.get(buf.request_key) == stream_id:
+                self._requests.pop(buf.request_key, None)
+            if not buf.done:
+                await buf.fail(reason, error_type="buffer_evicted")
         return buf is not None
 
     async def list_meta(self) -> List[dict]:
@@ -279,6 +460,8 @@ class ResumableStore:
 
     def register_pump(self, stream_id: str, task: asyncio.Task,
                       *, buffer: Optional[ResumableBuffer] = None) -> None:
+        self._all_pumps.add(task)
+        task.add_done_callback(self._all_pumps.discard)
         if buffer is not None and self._buffers.get(stream_id) is not buffer:
             task.cancel()
             return
@@ -288,25 +471,30 @@ class ResumableStore:
             # 旧泵的取消回调不能把同 ID 后来注册的新泵移除。
             if self._pumps.get(stream_id) is completed:
                 self._pumps.pop(stream_id, None)
+            # Background setup can outlive its initiating frontend connection.
+            if not completed.cancelled():
+                completed.exception()
         task.add_done_callback(finished)
 
     def cancel_all_pumps(self) -> None:
         """取消所有后台泵任务（服务停机时调用）。"""
-        for task in list(self._pumps.values()):
-            if not task.done():
+        for task in list(self._all_pumps):
+            if not task.done() and not task.cancelling():
                 task.cancel()
         self._pumps.clear()
 
     async def aclose(self) -> None:
-        tasks = list(self._pumps.values())
+        tasks = list(self._all_pumps)
         async with self._lock:
             for sid in list(self._buffers):
                 await self._discard_locked(sid, "服务正在关闭。")
         self.cancel_all_pumps()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        if self._cleanup_tasks:
+            await asyncio.gather(*list(self._cleanup_tasks), return_exceptions=True)
 
-    async def _evict_locked(self) -> None:
+    async def _evict_locked(self, *, allow_running=False) -> None:
         """容量上限：优先淘汰最旧的「已完成」缓冲；实在没有就淘汰最旧的。"""
         limit = max_streams()
         if len(self._buffers) <= limit:
@@ -317,7 +505,7 @@ class ResumableStore:
             if len(self._buffers) <= limit:
                 return
             await self._discard_locked(buf.id, "响应缓冲容量已满。")
-        while len(self._buffers) > limit:
+        while allow_running and len(self._buffers) > limit:
             oldest = min(self._buffers.values(), key=lambda x: x.created_at)
             await self._discard_locked(oldest.id, "响应缓冲容量已满。")
 
@@ -328,13 +516,11 @@ class ResumableStore:
         removed = 0
         async with self._lock:
             for sid, buf in list(self._buffers.items()):
-                if buf.readers > 0:
-                    continue
                 ref = buf.finished_at or buf.last_access
-                if buf.done and (now - ref) > ttl:
+                if buf.done and buf.readers == 0 and (now - ref) > ttl:
                     await self._discard_locked(sid, "响应缓冲已过期。")
                     removed += 1
-                elif not buf.done and (now - buf.created_at) > max(ttl * 4, 1800):
+                elif not buf.done and time.monotonic() >= buf.deadline_monotonic:
                     # 极端兜底：上游永不结束的僵尸缓冲
                     await self._discard_locked(sid, "上游响应等待超时。")
                     removed += 1
@@ -381,13 +567,14 @@ def _as_text(chunk: Any) -> str:
     return str(chunk)
 
 
-def frame_with_id(seq: int, frame: str) -> str:
+def frame_with_id(seq: int, frame: str, stream_id: Optional[str] = None) -> str:
     """给 SSE 数据帧加上事件 ID，供 Last-Event-ID 续传。
 
     注释帧（以 `:` 开头）不带 id —— 它不是事件，带 id 会污染客户端游标。
     """
     if frame.startswith("data:"):
-        return f"id: {seq}\n{frame}"
+        event_id = f"{stream_id}:{seq}" if stream_id else str(seq)
+        return f"id: {event_id}\n{frame}"
     return frame
 
 
@@ -398,6 +585,7 @@ async def pump_stream(buf: ResumableBuffer, body_iterator: AsyncIterator[Any]) -
     前端凭 Last-Event-ID / resume_from 续传时与这里的序号对齐。
     """
     stream_error = None
+    stream_error_code = 200
     try:
         if buf.done:
             return
@@ -425,25 +613,25 @@ async def pump_stream(buf: ResumableBuffer, body_iterator: AsyncIterator[Any]) -
                     if error:
                         stream_error = str(error.get("message", "上游返回错误。")
                                            if isinstance(error, dict) else error)[:1024]
-            if await buf.append(frame_with_id(buf.next_seq, text)) is None:
+                        code = error.get("code") if isinstance(error, dict) else None
+                        stream_error_code = code if isinstance(code, int) and 400 <= code <= 599 else 502
+            if await buf.append(buf.event_frame(text)) is None:
                 return
         if buf.done:
             return
         if not buf.events or not buf.events[-1].strip().endswith("[DONE]"):
-            await buf.append(frame_with_id(buf.next_seq, DONE_FRAME))
-        await buf.finish("error" if stream_error else "done", error=stream_error)
+            await buf.append(buf.event_frame(DONE_FRAME))
+        await buf.finish("error" if stream_error else "done", error=stream_error,
+                         status_code=stream_error_code)
         print(f"📦 [续传缓冲] {buf.id} 上游已读完，共 {len(buf.events)} 个事件已完整落缓冲。")
     except asyncio.CancelledError:
-        if not buf.done:
-            await buf.finish("error", error="上游读取任务被取消。")
+        # The deadline/store owns cancellation status. Finishing here would
+        # hide a 504 from the outer deadline and omit the terminal error frame.
         raise
     except Exception as e:
         msg = f"{type(e).__name__} - {e}"
         print(f"❌ [续传缓冲] {buf.id} 上游读取失败：{msg}")
-        err = {"error": {"message": str(e)[:1024], "type": "upstream_error", "code": 500}}
-        await buf.append(frame_with_id(buf.next_seq, f"data: {json.dumps(err, ensure_ascii=False)}\n\n"))
-        await buf.append(frame_with_id(buf.next_seq, DONE_FRAME))
-        await buf.finish("error", error=msg)
+        await buf.fail(str(e), getattr(e, "code", 500))
     finally:
         aclose = getattr(body_iterator, "aclose", None)
         if aclose:
@@ -474,5 +662,5 @@ async def sse_from_buffer(buf: ResumableBuffer, start_seq: int = 0) -> AsyncIter
                 delivered_done = True
     finally:
         await events.aclose()
-    if delivered_done:
+    if delivered_done or (buf.kind == "native" and buf.done and start_seq <= buf.next_seq):
         buf.mark_delivered()

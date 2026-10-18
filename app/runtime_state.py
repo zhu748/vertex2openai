@@ -12,6 +12,10 @@ STATE_DIR = os.environ.get("STATE_DIR", ".")
 STATE_FILE = os.path.join(STATE_DIR, "web_state.json")
 
 
+class StatePersistenceError(RuntimeError):
+    """A management update could not be durably committed."""
+
+
 class AppState:
     """运行态管理器（内存优先 + 写时落盘）。
 
@@ -29,6 +33,7 @@ class AppState:
         self._lock = threading.RLock()
         self._state = {"use_web_proxy": False}
         self._load_from_disk()
+        self._committed = copy.deepcopy(self._state)
 
     # ---------- 持久化 ----------
 
@@ -65,13 +70,26 @@ class AppState:
                 os.chmod(STATE_FILE, 0o600)   # 里面有完整 Google Cookie
             except OSError:
                 pass
+            self._committed = copy.deepcopy(self._state)
         except Exception as e:
             print(f"⚠️ [状态管理器] 无法保存状态到磁盘: {e}")
+            self._state = copy.deepcopy(self._committed)
+            raise StatePersistenceError("配置保存失败，请检查状态目录权限和磁盘空间；本次更新已回滚。") from e
 
     def reload(self) -> None:
         """显式从磁盘重载（外部改了文件时用）。"""
         with self._lock:
             self._load_from_disk()
+            self._committed = copy.deepcopy(self._state)
+
+    def set_cookie_credentials(self, cookie: str = "", project_id: str = "") -> None:
+        """Commit both credential fields together, so partial updates cannot leak."""
+        with self._lock:
+            if cookie:
+                self._state["google_cookie"] = cookie
+            if project_id:
+                self._state["google_project_id"] = project_id
+            self._save()
 
     # ---------- 通道开关与凭证 ----------
 
@@ -169,7 +187,8 @@ class AppState:
             print(f"🔑 [状态管理器] 已保存 {len(clean)} 个 Express API Key（明文存于 web_state.json，权限 0600）。")
         return clean
 
-    def update_express_key_project(self, key: str, project_id: str, source: str = "auto") -> bool:
+    def update_express_key_project(self, key: str, project_id: str, source: str = "auto", *,
+                                   expected: dict | None = None) -> bool:
         """写回某个 Key 的 Project ID（自动探测或人工覆盖）。"""
         key = (key or "").strip()
         if not key:
@@ -185,6 +204,8 @@ class AppState:
                 if not rec:
                     continue
                 if rec["key"] == key:
+                    if expected is not None and rec != expected:
+                        return False
                     rec["project_id"] = (project_id or "").strip()
                     rec["project_source"] = source if source in ("auto", "manual") else ""
                     rec["detected_at"] = time.time()
@@ -342,6 +363,9 @@ class AppState:
         的基础名。
         """
         base = self.get_settings()
+        # Legacy global transport defaults must not publish every model's
+        # aliases. Only an explicit per-model choice (including built-ins) does.
+        base["anti_truncation_mode"] = "off"
         overrides = base.get("model_overrides") or {}
         key = (model_name or "").strip()
         ov = overrides.get(key)

@@ -27,6 +27,10 @@ class AntiTruncationError(ValueError):
     code = 502
 
 
+class TransportSelectionError(ValueError):
+    code = 400
+
+
 def split_model_alias(model: str) -> tuple[str, str | None]:
     """Strip only our suffix; keep the upstream model's original spelling."""
     name = model.strip()
@@ -41,6 +45,16 @@ def supports_transport(model: str) -> bool:
     name, _ = split_model_alias(model)
     return (not get_profile(name)["is_image"]
             and not re.search(r"audio|tts|live|embed|video|robotics", name, re.I))
+
+
+def listed_suffixes(model: str, settings: dict) -> tuple[str, ...]:
+    """Only per-model settings publish aliases; a plain ID never opts in."""
+    name, _ = split_model_alias(model)
+    if name.lower().endswith("-search") or not supports_transport(name):
+        return ()
+    selected = settings.get("anti_truncation_mode", "off")
+    return tuple(suffix for suffix, mode in SUFFIX_MODES.items()
+                 if suffix != "-antitruncation" and selected in (mode, "both"))
 
 
 def supports_argument_stream(model: str) -> bool:
@@ -68,16 +82,17 @@ def prepare_transport(request, base_model: str, settings: dict, *,
                       prefill: bool = False):
     """Called AFTER console injection/prefill so synthetic tools cannot disable them.
 
-    Request > alias > model override > global. Genuine tools keep their schemas
-    and signatures. Forced choices and incompatible output contracts bypass this
-    optional text transport instead of silently changing their semantics.
+    Only an enabled model suffix opts in. Neither console defaults nor the
+    legacy request parameter may activate a plain model or override its suffix.
+    Genuine tools keep their schemas/signatures; incompatible contracts bypass
+    this optional transport instead of silently changing their semantics.
     """
     _, alias_mode = split_model_alias(request.model)
-    mode = request.anti_truncation_mode
-    if mode is None:
-        mode = alias_mode or settings.get("anti_truncation_mode", "off")
-    if mode not in ("stream", "nonstream"):
+    if alias_mode is None:
         return request, None
+    mode = alias_mode
+    if f"-antitruncation-{mode}" not in listed_suffixes(base_model, settings):
+        raise TransportSelectionError("该模型的抗截断后缀未开启，请先在设置中为此模型开启对应后缀。")
     reason = None
     extra = request.model_extra or {}
     if not supports_transport(base_model):

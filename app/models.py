@@ -45,6 +45,8 @@ class OpenAIMessage(BaseModel):
 class OpenAIRequest(BaseModel):
     model: str
     messages: list[OpenAIMessage]
+    # Legacy field accepted for compatibility; only an enabled model suffix
+    # selects anti-truncation. This parameter no longer overrides that choice.
     anti_truncation_mode: Literal["off", "nonstream", "stream"] | None = None
     # 默认 None = 客户端未显式传入（便于区分“省略”与“显式 1.0”，从而应用控制台默认值/按模型剥离）
     temperature: float | None = None

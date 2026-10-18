@@ -31,7 +31,7 @@ Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风
   - **模型参数面板**：按所选模型显示其支持能力，并在线调整思考强度、生图分辨率与比例、采样默认值、输入图压缩、重试、假流式/轮询/安全分显示、预填充兼容模式（详见下文）。
   - **实时监控**：运行日志推流、健康度图表（成功/错误/拥堵重试）、Express 通道 Token 消耗统计（包含思考 Token；Cookie 私有接口通常不返回可靠用量）。成功计数不依赖上游是否返回 Token 用量。
 - **Gemini 能力与适配**
-  - **按模型选择抗截断传输**：文本模型列表自动提供流式/非流式抗截断别名，控制台也可保存模型专属默认值；Express 支持原生增量函数参数流，Cookie 通道支持完整函数参数还原，详见下文。
+  - **按后缀选择抗截断传输**：默认仅 3.8 Flash / 4a 提供抗截断后缀，其它模型可在设置中逐个开启；普通名称始终不启用。Express 支持原生增量函数参数流，Cookie 通道支持完整函数参数还原，详见下文。
   - 文本对话、流式（SSE）与非流式。
   - OpenAI tools / function calling ↔ Gemini function calling 适配（含 Gemini 3.x 多轮所需的 thought signature 编解码）；Express 与 Cookie 直连通道均支持自定义函数声明、调用与结果回传。
   - **安全分类对齐**：两条通道下发同一套安全设置（`HARM_CATEGORY_HATE_SPEECH`、`DANGEROUS_CONTENT`、`SEXUALLY_EXPLICIT`、`HARASSMENT`、`JAILBREAK`），阈值最宽松，避免通道间行为不一致。
@@ -51,7 +51,7 @@ Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风
     流式预填充和空的用量块不会提前阻断重试；收到正文、思考或工具调用后不再重发，
     后续异常会明确返回错误事件，避免将半截答案当成成功。
   - **预填充智能兼容**：自动处理"以 model 轮次结尾"被新模型拒绝（400）的问题（详见下文）。
-  - **断连即停**：客户端断开后立即停止上游调用与重试。
+  - **断连策略**：关闭续传时断连即停；开启续传时，后台在执行期限与容量预算内继续收集回复。
 - **中文运行日志**：密钥轮询、上游调用、重试退避、权限报错、Token 统计等均为中文实时说明。
 
 ## 快速开始（本地 Docker）
@@ -121,7 +121,7 @@ GET 返回（代理地址自动脱敏，凭据不外泄）：
 
 除了 OpenAI 兼容接口，本服务还提供 **Gemini 原生 REST 端点**——请求体一个字节不改地透传到
 Express 端点，因此 tools / function calling / `thinkingConfig` / `safetySettings` / `responseSchema` /
-`cachedContent` 等全部原生字段天然 100% 兼容：
+`cachedContent` 等原生字段保持原样，由目标模型和上游 API 决定支持情况：
 
 ```bash
 # 非流式
@@ -175,80 +175,26 @@ curl -s https://你的域名/v1beta/models -H "x-goog-api-key: 你的API_KEY"
 - **客户端接入示例**（google-genai / Cherry Studio / LobeChat 等）：API Base 填
   `https://你的域名/`，API Key 填本服务 `API_KEY`，选 "Gemini / Google" 供应商类型即可。
 
-## Cookie 通道指纹伪装（curl_cffi）
+## Cookie 通道浏览器档案（curl_cffi）
 
-Cookie 直连通道模拟的是 Cloud Console 前端的 batchGraphql 请求，但普通 Python HTTP 库的
-TLS 指纹（JA3/JA4）与真浏览器完全不同，且请求头里连 User-Agent 都没有——"用浏览器接口
-却没有浏览器外壳"的请求很容易被风控识别。本服务用 curl_cffi（依赖内置）做两层伪装：
+默认使用 `chrome`；也可选择 `edge`、`firefox`、`safari`、`safari_ios` 或 `off`。
+启用时，TLS 档案、User-Agent 和 client hints 都由同一个 curl 档案提供，
+不再把固定旧版本的 UA 覆盖到更新的 TLS 档案上。接口请求的 fetch metadata 单独设置，
+并明确移除 `Sec-Fetch-User` / `Upgrade-Insecure-Requests` 等导航头。
+Cookie / SAPISIDHASH / Origin 等业务认证字段保持原有逻辑。
 
-1. **TLS 指纹**：impersonate 成真实 Chrome / Edge / Safari / Firefox 的握手特征；
-2. **浏览器请求头**：User-Agent、sec-ch-ua、sec-fetch-*、accept-language，与所选档案配套
-   （Authorization / Cookie 等 Google 专用头不受影响），并按 **Chrome 真实 XHR 线序**
-   发送（client hints → content-type → authorization → … → cookie 殿后），
-   避开「authorization 第一、cookie 第二」这种脚本 dict 插入序特征。
+这些设置用于保持协议形态一致，不代表完整浏览器环境，也不保证避免 Google 的限制。
+私有 batchGraphql 接口、查询签名、账号权限和配额仍可能变化。依赖版本已固定；
+升级 curl_cffi 时应运行本地实际 HTTP 收包回归。
 
-控制台「通道与凭证」页新增**「Cookie 通道指纹伪装」**卡片，可热切换档案
-（默认 chrome；选 off 完全回退旧版 httpx 行为），保存即生效、无需重启。
-Express 通道不需要浏览器伪装（官方 API 端点收浏览器头反而可疑），但它的
-**请求头指纹**可以接管，见下一节。
+## Express 通道请求头标签
 
-## Express 通道请求头指纹（User-Agent / x-goog-api-client）
+默认 `sdk` 由官方 Python SDK 管理。`node`、`gcloud`、`custom` 作为已有集成的兼容选项保留，
+仅改变 HTTP 标签，不改变实际 TLS/HTTP2 栈，不保证降低风控风险。`node` 只作用于裸 REST 出站点，
+SDK 主通道仍保留自身 Python 标签。自定义值支持 `{sdk}`、`{python}`、`{node}` 占位符。
 
-Express API Key 通道走官方 google-genai SDK，TLS 栈无法更换（SDK 强依赖 httpx），
-但风控日志里每条请求的客户端标识来自 `User-Agent` 与 `x-goog-api-client` 两个头——
-这两个头可以完整接管。此外修复了若干裸 httpx 出站点（Gemini 原生透传 / Key 探测 /
-模型配置拉取 / 代理连通测试）原本暴露 `python-httpx/<ver>`（透传通道甚至自曝
-`vertex2openai-passthrough`）的问题。
-
-控制台「通道与凭证」页**「Express 通道请求头指纹」**卡片可热切换档案：
-
-| 档案 | 形态 | 适用场景 |
-|---|---|---|
-| `sdk`（默认） | `google-genai-sdk/<ver> gl-python/<ver>`（SDK 自动管理，零改动） | 无特殊需求 |
-| `node` | 裸出站点：`google-genai-sdk/<ver> gl-node/22.14.0`（纯官方 Node.js SDK 形态）；**SDK 主通道：保持纯 python 形态**（见下） | JS 生态调用量最大、风控难一刀切；`VERTEX_BASE_URL` 指向的中转站封 python UA 时 |
-| `gcloud` | 追加 `gcloud/<ver> command/gcloud.ai-platform gccl/<ver>`（gcloud CLI 运维流量形态） | 伪装成 GCP 官方运维调用 |
-| `custom` | 自定义串，占位符 `{sdk}` `{python}` `{node}` 自动展开为当前精确标签 | 自由定制 |
-
-**node 档案为什么不动 SDK 主通道**（第十一轮实测修正）：SDK 的
-`append_library_version_headers` 会给任何含 gl-node 的 UA 强制追加
-gl-python，拼出 `gl-node + gl-python` 混合标签——而 Node SDK 从不带
-gl-python，真实世界没有任何客户端会发出这种组合，等于给风控留下一个
-**固定的异常特征**。因此 node 档案下 SDK 主通道保持官方纯 python 形态，
-只有裸 httpx 出站点（Gemini 透传 / Key 探测 / 模型配置）发纯 node 形态：
-同一 Key 上 python / node 两种**纯**形态并存，就像一个团队同时跑两种
-语言的应用一样平常。
-
-实现细节（为什么不会出现双重标签）：google-genai SDK 会强制给注入的
-`user-agent` / `x-goog-api-client` 追加自己的 `google-genai-sdk/<ver>` 与
-`gl-python/<ver>` 标签，除非注入值已包含**当前精确的**这两个标签。本服务
-运行时读取 SDK 与 Python 真实版本号构造精确标签，让 SDK 原样放行（已用
-mock 上游抓包验证）。Key 探测同步把 API Key 从 URL query 挪到
-`x-goog-api-key` 头（官方 SDK 的真实形态）。
-
-**逐字节对齐**（第十轮）：用 `httpx.MockTransport` 注入官方 SDK 抓字节级
-基准并逐项对照，裸 httpx 出站点（Gemini 透传 / Key 探测）修复了四类偏差后
-与官方 SDK **完全一致（顺序+大小写+值）**：
-
-- 头线序/大小写与 SDK 同款同序（`Content-Type → x-goog-api-key → user-agent →
-  x-goog-api-client`，含 GET 也带 Content-Type 的 SDK 特性）；
-- 压缩协商回归 httpx 默认 `gzip, deflate`（旧版钉 `identity` 是全网 SDK
-  用户里不存在的异类形态），流式中继 `aiter_bytes` 透明解压；
-- 透传通道转发客户端请求体**原始字节**（不解析重组——httpx `json=` 的紧凑
-  分隔符与真实 SDK 的 `json.dumps` 默认分隔符不一致，重组即自曝）；
-- Cookie 通道浏览器头按 Chrome 线序重排（见上节）。
-
-**四档案线序实证 + 混合标签修复**（第十一轮）：补测了上轮的盲区——SDK
-主通道注入 node/gcloud/custom 档案后的真实线序（探针
-`scripts/probe_sdk_channel_profiles.py`），实测四档案线序/大小写均与官方
-默认一致；但发现 node 档案会被 SDK 强制追加 gl-python 形成真实客户端
-造不出来的混合标签（已按上节策略修复），custom 档案缺占位符时的标签
-拼接顺序也与真实 SDK 变换不同（真实 SDK 把 sdk+python 两标签**整体
-前置**，旧实现把 gl-python 放尾部）——已把 `_ensure_sdk_labels` 改为
-与 SDK 逐字符同款变换，保证 custom 无论怎么填，产出都是「真实 SDK 对
-同样输入的输出」。
-
-对照/回归验证：`scripts/probe_fingerprint_diff.py`（SDK 基准抓包对比）与
-`scripts/test_gemini_native_fix.py`（含 [10] 指纹保真 / [11] gzip 解压断言）。
+`scripts/probe_sdk_channel_profiles.py` 比较 SDK 构造的 HTTP 请求；MockTransport 不经过真实 TLS，
+因此结果不能用于证明真实浏览器一致性或 Google 风控结论。`429` 应先结合上游错误正文、容量及配额排查。
 
 ## 性能：上游连接池化与大响应解析
 
@@ -256,7 +202,9 @@ mock 上游抓包验证）。Key 探测同步把 API Key 从 URL query 挪到
 请求之间、重试之间共享连接池（HTTP keep-alive），不再每请求/每重试重新
 TCP+TLS 握手（每次约省 100~300ms 与相应 CPU）；429 重试场景收益最大
 （默认 10 次重试从 11 次握手降到 1 次）。控制台热改代理或指纹档案后，
-新请求自动换新形态客户端，旧客户端延迟 15 分钟回收，不打断飞行中的流。
+新请求自动使用新配置；宽限期内再次用到相同客户端时直接复用，避免 Key 数超过热池容量后反复重建。
+待回收客户端上限为 256；配置频繁变化导致预算满时返回明确的 503。
+回收宽限期覆盖最长允许请求及配置热更新期间的旧请求，停机时立即统一关闭。
 
 配套优化：Cookie 通道重试不再重复构建请求体（含重复下载/压缩同一批输入
 图片）；batchGraphql 大响应解析改用 C 实现的 `raw_decode` 增量解析（1MB
@@ -587,32 +535,32 @@ curl http://localhost:8050/v1/chat/completions \
 
 ## 抗截断模型选项
 
-刷新客户端的 `/v1/models` 列表后，每个兼容的文本模型都会提供以下入口。无需额外运行 Node.js/Go 网关，也无需在客户端配置正则：
+默认仅 **`gemini-3.8-flash` 和 `gemini-4-argon`（Gemini 4a / Argon）** 在 `/v1/models` 中显示流式与非流式抗截断后缀。其它模型默认仅提供普通名称和原有搜索别名，不添加抗截断后缀。
 
-普通模型入口的内置默认：**`gemini-4-argon`（Gemini 4a / Argon）和 `gemini-3.8-flash` 开启流式抗截断，其它模型关闭**。不需要选择后缀别名，这两个模型的原始名称即会启用。已有手动保存的该模型 `anti_truncation_mode` 仍优先于内置值；旧配置里只有采样等其它专属参数时，不会覆盖掉新的抗截断默认值。
+**普通无后缀名称始终不启用抗截断，包括 3.8 Flash 和 4a。** 只有选择已开启的抗截断后缀才会使用该传输方式，无需额外运行 Node.js/Go 网关或配置客户端正则。
 
 | 模型名称示例 | 行为 |
 |---|---|
-| `gemini-3.6-flash` | 普通入口，默认关闭抗截断；可使用控制台设置的默认模式 |
-| `gemini-3.6-flash-antitruncation-nonstream` | 上游完整返回后还原正文；客户端开启 `stream` 时仍以 SSE 交付 |
-| `gemini-3.6-flash-antitruncation-stream` | 上游支持时增量还原正文；客户端关闭 `stream` 时返回普通 JSON |
+| `gemini-3.8-flash` / `gemini-4-argon` | 普通入口，不启用抗截断 |
+| `gemini-3.8-flash-antitruncation-nonstream` | 上游完整返回后还原正文；客户端开启 `stream` 时仍以 SSE 交付 |
+| `gemini-3.8-flash-antitruncation-stream` | 上游支持时增量还原正文；客户端关闭 `stream` 时返回普通 JSON |
+| `gemini-3.6-flash` | 普通入口，不启用抗截断；在设置中开启后才添加其抗截断别名 |
 
-手动填写 `-antitruncation` 短后缀也可使用流式模式。别名只在本地解析，上游收到的仍是原始模型 ID。
+在控制台「模型参数」中先选择具体模型，将「模型列表中的抗截断后缀」设为“不显示”“显示两种”“仅非流式”或“仅流式”，点「保存为该模型专属」，再刷新客户端模型列表。设置只控制该模型的后缀，不会改变普通入口，也不支持全局开启。
 
-在控制台「模型参数」中选择模型，将「抗截断传输」设为关闭、非流式或流式，再点「保存为该模型专属」，即可让普通模型名也使用该模式；也可选择全局默认作用域保存。单次请求可传：
+例如，先为 `gemini-3.6-flash` 开启流式后缀，再发送：
 
 ```json
 {
-  "model": "gemini-3.6-flash",
-  "anti_truncation_mode": "stream",
+  "model": "gemini-3.6-flash-antitruncation-stream",
   "stream": true,
   "messages": [{"role": "user", "content": "请完整解释这个算法"}]
 }
 ```
 
-优先级为 **请求 `anti_truncation_mode` > 模型别名 > 模型专属设置 > 全局默认**。传 `"off"` 可明确关闭本轮包装。
+配置字段 `anti_truncation_mode` 现在仅控制各模型发布的后缀：`off` 不发布，`stream` / `nonstream` 仅发布对应后缀，`both` 发布两种。已保存的模型专属值继续有效；旧全局值不再应用。请求体中的同名旧参数保留接收兼容，但不能开启抗截断或覆盖所选后缀；需要普通回复请使用无后缀名称。
 
-要持久关闭默认启用的两个模型，请在对应模型下选择“关闭”并保存专属设置。清除模型专属设置会恢复该模型的内置默认（这两个模型恢复为流式，其它模型回退全局）。
+手动填写 `-antitruncation` 短后缀仍对应流式模式，但同样要求该模型已开启流式后缀；未开启的后缀返回 400。别名只在本地解析，上游收到原始模型 ID。清除模型专属设置后，3.8 Flash / 4a 恢复显示两种后缀，其它模型恢复不显示。
 
 ### 实现与兼容范围
 
@@ -637,9 +585,73 @@ Google 的增量函数参数流有模型限制，详情见[官方说明](https:/
 
 OpenAI 对话 SSE 在上游安静等待、长思考或完整函数参数尚未返回时，每约 10 秒发送一次注释保活。Cookie 的非流式抗截断和全局假流式也会先建立 SSE，再等待上游完成。保活不会取消或重发上游调用，不占续传事件 ID，也不会保存进响应缓冲；关闭直通连接会取消等待中的生成，开启续传时仍由后台任务继续收集回复。
 
-开启续传后，准备阶段前端断开也会保留同一次上游调用。使用相同请求体与原幂等请求头，附 `Last-Event-ID`（已收到的最后一个事件 ID）或 `?resume_from=`（下一帧序号）重连，会继续读取原缓冲；已发送过的回复同样可以显式续传。缓冲已过期返回 404，游标超过当前缓冲末尾返回 409；要重新生成，请移除续传游标。JSON 对象字段顺序不影响同请求识别，消息与数组顺序仍参与匹配。
+### Cloudflare 橙云下的长等待
 
-`GET /v1/resumable/{id}` 对流式缓冲返回事件分片；对非流式缓冲在 `done=true` 时返回 `payload`（完整正文）和 `status_code`（上游状态码，轮询请求本身仍返回 200）。JSON 响应和轮询均在 ASGI 完成发送后标记交付，发送抛错时可重放原回复；这一标记不等同于客户端的应用层收件确认。缓冲完成或被淘汰后内容固定，迟到的上游结果不会覆盖终态。
+Cloudflare 当前文档列出的默认源站读取超时为 **125 秒**，上传写入超时为 **30 秒**（参见[连接限制](https://developers.cloudflare.com/fundamentals/reference/connection-limits/)与[524 说明](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-5xx-errors/error-524/)）。
+假流式应同时在客户端使用 `stream:true`：本服务在准备超过约 50ms 时先建立 SSE，随后发送心跳，
+覆盖图片预处理、代理启动、上游生成和退避等待；即使将假流式专用心跳间隔设为 0，外层仍有约 10 秒的注释保活。
+响应带 `Cache-Control: no-store, no-transform` 与 `X-Accel-Buffering: no`，降低缓存、转换和缓冲造成的延迟。
+
+如果前面还有 Nginx，应让它转发每次输出，例如：
+
+```nginx
+location /v1/ {
+    proxy_pass http://127.0.0.1:7860;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_buffering off;
+    proxy_cache off;
+    gzip off;
+    proxy_read_timeout 180s;
+}
+```
+
+同样给 `/v1beta/` 的原生 SSE 路由配置；Cloudflare 的自定义 Cache Rules / Worker 也应对 API 跳过缓存，
+流式转发响应，避免先完整读取响应再返回。客户端自身的读取/首条内容超时也需要足够长。
+本地 TCP 回归验证了持续输出，未通过真实 Cloudflare 域名验证；心跳不能保证规避平台的其它限制。
+
+真正的 `stream:false` JSON 在完成前没有可发送的正文，不能用 SSE 注释保活。超长任务应改用流式、
+已取得续传 ID 后的分片轮询，或使用可承载长请求的入口。提高本服务的总期限不会改变 Cloudflare 的限制，
+响应心跳也无法解决上传或建连阶段的超时。
+
+### 断连缓冲与轮询
+
+开启续传后，准备阶段前端断开也会保留同一次上游调用。新请求在准备超过约 50ms 后先建立 SSE 并保活；
+此后发生的准备错误通过 SSE 错误事件交付，快速准备失败仍保留原 HTTP 错误码。
+
+每次生成拥有独立的 `X-Resume-Id`。事件 ID 为 `<生成ID>:<序号>`；重连传回完整的 `Last-Event-ID`，
+或者传 `X-Resume-Id` 加 `?resume_from=<下一帧序号>`。ID 直接查找原生成，且校验原请求体；
+不存在/过期返回 404，请求体或游标冲突返回 409，无效游标返回 400。旧生成不会被新一轮覆盖。
+兼容仅传数字的旧游标，但它必须结合原请求与幂等头；新客户端应使用完整事件 ID。
+
+每次逻辑请求建议提供独立 `Idempotency-Key`，网络重试沿用该键，主动重新生成则更换。
+同键同体在 TTL 内始终重放同一次生成，包括已交付的回复。未提供幂等键时保留请求体指纹兼容行为：
+正在生成或未交付时复用，已交付后视为新生成。共享 API Key 的独立请求应使用不同幂等键，避免相同请求被合并。
+
+`GET /v1/resumable/{id}?from=<seq>&limit=200&wait=10` 返回事件分片；非流式缓冲在 `done=true` 时提供
+`payload` 和上游 `status_code`。响应头已对跨域浏览器暴露。JSON、轮询和 SSE 交付标记均在实际 ASGI
+发送成功后更新；这不是客户端应用层收件确认。
+
+Gemini 原生 `streamGenerateContent?alt=sse` 默认增加安全的事件间注释保活，并检查事件和候选结束标记。
+原始 JSON data 内容保持不变。需要后台缓冲/续传时加 `X-Resumable: true`；之后同样使用
+`X-Resume-Id` / 完整事件 ID 或轮询恢复。原生 SSE 不添加 OpenAI 的 `[DONE]`。非 SSE 原生响应仍按原协议透传。
+上游半途断流时返回错误，不把缓存中的半截内容当成完整成功，也不自动拼接另一轮生成。
+
+默认预算（控制台“请求与缓冲预算”可调整）：
+
+| 设置 | 默认值 | 含义 |
+|---|---|---|
+| `request_timeout_seconds` | 1800 秒 | 准备、退避、生成及读取的整轮期限 |
+| `upstream_max_concurrency` | 32 | 包括断开前端后仍在运行的后台生成；满时返回 503 |
+| `resumable_max_buffer_mb` | 64 MiB | 单次回复编码字节预算 |
+| `resumable_max_total_mb` | 256 MiB | 已登记副本总编码字节预算 |
+| `resumable_max_streams` | 200 | 缓冲数量上限 |
+| `resumable_ttl_seconds` | 1800 秒 | 完成后的保留时间 |
+
+字节预算按编码数据计数，不等同于 Python 进程 RSS；终止错误保留少量额外空间。
+容量不足优先清理可回收的完成副本；没有空位时拒绝新生成，不取消其它正在运行的请求。
+会话和回复副本目前位于进程内，请使用单 worker/单实例；服务重启、实例丢失或超出保留期后无法继续旧回复。
+代理和客户端应关闭 SSE 缓冲，并让超时覆盖预期生成时间。心跳不能保证物理网络不断线，恢复需要客户端配合。
 
 控制台更新的 Cookie / Project ID 优先于环境变量；环境变量只在尚未保存对应配置时作为初始值。按模型更新部分参数时会保留其它已保存字段，避免调整思考档位时把该模型明确关闭的抗截断重新打开。生图 system 指令开关在两条通道都按模型专属设置生效。
 
@@ -660,7 +672,9 @@ OpenAI 对话 SSE 在上游安静等待、长思考或完整函数参数尚未�
 ## 关于 429 报错与并发控制
 
 429（Resource Exhausted）常因上游限额不足或请求频率过高。项目已内置退避重试，另建议：
-- 控制客户端并发频率。
+- 服务端默认将上游并发限制为 32，后台生成也计入；可在控制台调整。
+- 退避使用有上限的指数增长与随机抖动，有效 `Retry-After` 优先，最多等待 120 秒。
+- 控制客户端并发频率，重试沿用同一个幂等键。
 - 适当减小最大输出 Token。
 - 配置多个有效 Express Key 并开启轮询。
 - 及时更新失效或权限受限的 Google Cookie。
@@ -685,7 +699,7 @@ OpenAI 对话 SSE 在上游安静等待、长思考或完整函数参数尚未�
 # 安装运行和开发检查依赖
 pip install -r requirements-dev.txt
 
-# 完整离线检查：语法、静态分析、工作流、四组回归及 SDK 档案兼容
+# 完整检查：语法、静态分析、工作流、所有回归及 SDK 档案兼容
 python scripts/check_project.py
 
 # 本地启动

@@ -48,12 +48,41 @@ import subprocess
 import threading
 import time
 import atexit
+from contextvars import ContextVar
 from typing import Any, Optional
 from urllib.parse import unquote, parse_qs, urlsplit, urlunsplit
 
 
 class ProxyResolveError(Exception):
     """代理解析/转换失败。消息面向最终用户，须给出可操作的指引。"""
+
+
+current_proxy_usage = ContextVar("current_proxy_usage", default=None)
+
+
+class ProxyUsage:
+    """Keep every proxy touched by a generation alive until its stream closes."""
+    def __init__(self):
+        self._entries = set()
+        self._closed = False
+        self._lock = threading.Lock()
+
+    def include(self, manager, uri):
+        with self._lock:
+            entry = (manager, uri)
+            if self._closed or entry in self._entries:
+                return
+            manager.retain(uri)
+            self._entries.add(entry)
+
+    def close(self):
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            for manager, uri in self._entries:
+                manager.release(uri)
+            self._entries.clear()
 
 
 # ============================================================
@@ -652,7 +681,23 @@ class SingboxManager:
         self._lock = threading.Lock()          # 只保护下面两个 dict 的存取
         self._instances: dict[str, _SingboxInstance] = {}
         self._uri_locks: dict[str, threading.Lock] = {}
+        self._active_uses: dict[str, int] = {}
         self._closed = False
+
+    def retain(self, uri):
+        with self._lock:
+            self._active_uses[uri] = self._active_uses.get(uri, 0) + 1
+
+    def release(self, uri):
+        with self._lock:
+            count = self._active_uses.get(uri, 0) - 1
+            if count <= 0:
+                self._active_uses.pop(uri, None)
+            else:
+                self._active_uses[uri] = count
+            instance = self._instances.get(uri)
+            if instance is not None:
+                instance.last_used = time.time()
 
     # ---------- 对外 ----------
 
@@ -666,6 +711,9 @@ class SingboxManager:
         uri = str(uri or "").strip()
         if not uri:
             raise ProxyResolveError("get_local_socks5 收到空 URI。")
+        usage = current_proxy_usage.get()
+        if usage is not None:
+            usage.include(self, uri)
         inst = self._instances.get(uri)     # CPython dict.get 原子，快路径免锁
         if inst is not None and inst.alive():
             inst.last_used = time.time()
@@ -737,7 +785,7 @@ class SingboxManager:
         now = time.time()
         with self._lock:
             stale = [k for k, v in self._instances.items()
-                     if now - v.last_used > idle_seconds]
+                     if not self._active_uses.get(k) and now - v.last_used > idle_seconds]
             victims = [self._instances.pop(k) for k in stale]
         for inst in victims:
             self._terminate(inst)           # 锁外终止，不阻塞正在取用的请求

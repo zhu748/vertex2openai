@@ -6,6 +6,17 @@ from express_fingerprint import build_sdk_channel_overrides
 from proxy_resolver import resolve_proxy_uri
 
 
+def _request_timeout(request):
+    # The SDK passes timeout=None per request unless HttpOptions.timeout is set,
+    # which would override a client's phase timeout. Apply phase limits after
+    # that merge; this uses httpx's supported request event hook.
+    request.extensions["timeout"] = {"connect": 30.0, "read": 600.0, "write": 60.0, "pool": 10.0}
+
+
+async def _async_request_timeout(request):
+    _request_timeout(request)
+
+
 def get_http_options(
     base_url: Optional[str] = None,
     proxy_url: Optional[str] = None,
@@ -37,13 +48,18 @@ def get_http_options(
     if app_config.SSL_CERT_FILE:
         client_args["verify"] = app_config.SSL_CERT_FILE
 
-    options = {}
+    # Explicit network phase limits; the outer request deadline also bounds
+    # repeated calls and streams which continually produce small chunks.
+    import httpx
+    client_args["timeout"] = httpx.Timeout(connect=30, read=600, write=60, pool=10)
+    client_args["trust_env"] = False
+    options = {"retry_options": types.HttpRetryOptions(attempts=1)}
     base_url = base_url or (app_config.VERTEX_BASE_URL or None)
     if base_url:
         options["base_url"] = base_url
     if client_args:
-        options["client_args"] = client_args
-        options["async_client_args"] = client_args
+        options["client_args"] = dict(client_args, event_hooks={"request": [_request_timeout]})
+        options["async_client_args"] = dict(client_args, event_hooks={"request": [_async_request_timeout]})
 
     headers_override = build_sdk_channel_overrides()
     if headers_override:

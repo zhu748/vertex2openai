@@ -66,8 +66,8 @@ VERTEX_REASONING_TAG = REASONING_TAG
 # 环境变量仅作为“初始值”。
 # ============================================================
 DEFAULT_SETTINGS = {
-    # 全局默认关闭；下方 model_overrides 为 4 Argon / 3.8 Flash 单独开启。
-    "anti_truncation_mode": "off",        # off | nonstream | stream
+    # 仅模型专属有效：控制发布哪些抗截断后缀；普通名称始终不启用。
+    "anti_truncation_mode": "off",        # off | nonstream | stream | both
     # 思考
     "thinking_g3_level": "",              # 空=按模型各自默认(3.6-flash=medium/pro=high/flash-lite=minimal)；也可强制 minimal|low|medium|high
     # 生图
@@ -191,11 +191,15 @@ DEFAULT_SETTINGS = {
     "resumable_enabled": True,            # 总开关；关掉则回到原有直通行为
     "resumable_ttl_seconds": 1800,        # 已完成的缓冲保留时长（秒），超时清掉
     "resumable_max_streams": 200,         # 缓冲总数上限，超限淘汰最旧的已完成缓冲
+    "resumable_max_buffer_mb": 64,       # 单次回复的编码字节上限
+    "resumable_max_total_mb": 256,       # 全部已登记副本的编码字节预算
+    "request_timeout_seconds": 1800,    # 一轮准备、重试及读取的总期限
+    "upstream_max_concurrency": 32,     # 后台任务也占用生成名额；满时明确返回 503
     # 按模型单独保存的参数覆盖：{ "模型ID": { 键: 值, ... } }
     # 仅覆盖“与模型相关”的参数（见 PER_MODEL_KEYS）；优先级 请求 > 模型专属 > 全局 > 内置。
     "model_overrides": {
-        "gemini-4-argon": {"anti_truncation_mode": "stream"},
-        "gemini-3.8-flash": {"anti_truncation_mode": "stream"},
+        "gemini-4-argon": {"anti_truncation_mode": "both"},
+        "gemini-3.8-flash": {"anti_truncation_mode": "both"},
     },
 }
 

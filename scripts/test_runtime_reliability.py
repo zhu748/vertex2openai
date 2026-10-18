@@ -109,11 +109,11 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         raw.acontent.assert_not_awaited()
 
     async def test_curl_aread_is_idempotent(self):
-        raw = self.curl_response([])
+        raw = self.curl_response([b"payload"])
         response = impersonate._CurlRespShim(raw, True)
         self.assertEqual(await response.aread(), b"payload")
         self.assertEqual(await response.aread(), b"payload")
-        raw.acontent.assert_awaited_once()
+        raw.acontent.assert_not_awaited()
 
     async def test_delayed_clients_are_closed_on_shutdown_once(self):
         closer = client_pool._GracefulCloser()
@@ -214,7 +214,7 @@ class ResumableTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_expired_running_buffer_cancels_its_task(self):
         buf, _ = await self.store.create_if_absent("stale")
-        buf.created_at -= 100000
+        buf.deadline_monotonic -= 100000
         task = asyncio.create_task(asyncio.Event().wait())
         self.store.register_pump("stale", task, buffer=buf)
         self.assertEqual(await self.store.sweep(), 1)
@@ -398,6 +398,7 @@ class ImageFetchTests(unittest.TestCase):
             200, headers={"content-type": "image/png"}, stream=ImageStream())))
         with mock.patch.object(message_processing.httpx, "Client", return_value=client), \
              mock.patch.object(message_processing, "_is_blocked_host", return_value=False), \
+             mock.patch.object(message_processing, "_public_image_addresses", return_value=["93.184.216.34"]), \
              mock.patch.object(message_processing, "get_effective_proxy_url", return_value=""), \
              mock.patch.object(message_processing, "MAX_REMOTE_IMAGE_BYTES", 64 * 1024):
             self.assertIsNone(message_processing.fetch_remote_image("https://example.test/image"))

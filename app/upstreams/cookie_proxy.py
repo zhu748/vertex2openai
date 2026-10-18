@@ -717,6 +717,16 @@ def _build_batch_graphql_body(
             if mv is not None:
                 gen_config["maxOutputTokens"] = mv
 
+        # These are accepted by the shared OpenAI contract. Unsupported private
+        # protocol fields must fail explicitly rather than silently change it.
+        if request.response_format and request.response_format.get("type") not in (None, "text"):
+            raise SchemaValidationError("Cookie 通道尚未验证结构化输出支持，请改用 Express 通道。")
+        for source, target in (("top_k", "topK"), ("seed", "seed"), ("n", "candidateCount")):
+            capability = "candidate_count" if source == "n" else source
+            value = getattr(request, source, None)
+            if value is not None and capability in allowed:
+                gen_config[target] = value
+
         thinking_config = _build_thinking_config(model_name, request, prefill_active=prefill_active)
         if thinking_config:
             gen_config["thinkingConfig"] = thinking_config
@@ -1257,7 +1267,7 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
 
             if _retryable_status(response.status_code) and attempt < retry_max:
                 print(f"⚠️ [Studio] HTTP {response.status_code}（生图，尝试 {attempt+1}），{backoff_sec}s 后重试...")
-                delay = retry_delay(getattr(response, "headers", {}).get("retry-after"), backoff_sec)
+                delay = retry_delay(getattr(response, "headers", {}).get("retry-after"), backoff_sec, attempt)
                 if not await wait_for_retry(fastapi_request, delay):
                     return {"kind": "error", "message": "客户端已断开连接。"}
                 continue
@@ -1298,7 +1308,7 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
 
             if api_error and _retryable_status(api_error_status) and attempt < retry_max:
                 print(f"⚠️ [Studio] 生图 429/限流（尝试 {attempt+1}），{backoff_sec}s 后重试...")
-                if not await wait_for_retry(fastapi_request, backoff_sec):
+                if not await wait_for_retry(fastapi_request, retry_delay(None, backoff_sec, attempt)):
                     return {"kind": "error", "message": "客户端已断开连接。"}
                 continue
             if api_error:
@@ -1319,7 +1329,7 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
             em = str(e)
             if is_retryable_exception(e) and attempt < retry_max:
                 print(f"⚠️ [Studio] 生图异常（尝试 {attempt+1}）：{em[:80]}，{backoff_sec}s 后重试...")
-                if not await wait_for_retry(fastapi_request, backoff_sec):
+                if not await wait_for_retry(fastapi_request, retry_delay(None, backoff_sec, attempt)):
                     return {"kind": "error", "message": "客户端已断开连接。"}
                 continue
             code, _ = extract_upstream_error(e)
@@ -1338,6 +1348,8 @@ class CookieProxyUpstream(BaseUpstream):
     async def chat_completions(self, request_obj: OpenAIRequest, fastapi_request: Request):
         try:
             validate_request_schemas(request_obj)
+            if request_obj.response_format and request_obj.response_format.get("type") not in (None, "text"):
+                raise SchemaValidationError("Cookie 通道尚未验证结构化输出支持，请改用 Express 通道。")
         except SchemaValidationError as exc:
             return JSONResponse(status_code=400, content={
                 "error": {"message": str(exc), "type": "invalid_request_error", "code": 400}
@@ -1446,8 +1458,11 @@ class CookieProxyUpstream(BaseUpstream):
         # curl_cffi / httpx 均可直接消费）。
         client_kwargs = {
             "timeout": httpx.Timeout(connect=30.0, read=180.0, write=30.0, pool=10.0),
-            "follow_redirects": True,
+            "follow_redirects": False,
+            "trust_env": False,
         }
+        if app_config.SSL_CERT_FILE:
+            client_kwargs["verify"] = app_config.SSL_CERT_FILE
         _proxy_raw = get_effective_proxy_url()
         if _proxy_raw:
             try:
@@ -1718,7 +1733,7 @@ class CookieProxyUpstream(BaseUpstream):
                             if await fastapi_request.is_disconnected():
                                 print("ℹ️ [Studio] 客户端已断开连接，取消后续重试。")
                                 return
-                            wait_sec = retry_delay(getattr(error_to_raise, "retry_after", None), backoff_sec)
+                            wait_sec = retry_delay(getattr(error_to_raise, "retry_after", None), backoff_sec, attempt)
                             print(f"⚠️ [Studio] 遇到可重试拥堵/限流: {error_to_raise[:80]}... {wait_sec}s 后进行第 {attempt+2} 次退避重试")
                             # 退避等待期间持续吐心跳，保活前端连接（issue4：3.1-pro 频繁 429 长等待易被前端断开）
                             async for _hb in _sleep_with_heartbeat(wait_sec, request=fastapi_request):
@@ -1850,7 +1865,7 @@ class CookieProxyUpstream(BaseUpstream):
                             if attempt < retry_max:
                                 wait_sec = backoff_sec
                                 print(f"⚠️ [Studio] HTTP {response.status_code} (尝试 {attempt+1}), {wait_sec}s 后重试...")
-                                delay = retry_delay(getattr(response, "headers", {}).get("retry-after"), wait_sec)
+                                delay = retry_delay(getattr(response, "headers", {}).get("retry-after"), wait_sec, attempt)
                                 if not await wait_for_retry(fastapi_request, delay):
                                     return JSONResponse(status_code=499, content={"error": {"message": "客户端已断开连接。"}})
                                 continue
@@ -1929,7 +1944,7 @@ class CookieProxyUpstream(BaseUpstream):
                         if api_error and _retryable_status(api_error_status) and attempt < retry_max:
                             wait_sec = backoff_sec
                             print(f"⚠️ [Studio] 429/限流 (尝试 {attempt+1}): {api_error[:100]}, {wait_sec}s 后重试...")
-                            if not await wait_for_retry(fastapi_request, wait_sec):
+                            if not await wait_for_retry(fastapi_request, retry_delay(None, wait_sec, attempt)):
                                 return JSONResponse(status_code=499, content={"error": {"message": "客户端已断开连接。"}})
                             continue
                         if api_error:
@@ -2004,7 +2019,7 @@ class CookieProxyUpstream(BaseUpstream):
                         if is_retryable and attempt < retry_max:
                             wait_sec = backoff_sec
                             print(f"⚠️ [Studio] 异常 (尝试 {attempt+1}): {err_msg[:100]}, {wait_sec}s 后重试...")
-                            if not await wait_for_retry(fastapi_request, wait_sec):
+                            if not await wait_for_retry(fastapi_request, retry_delay(None, wait_sec, attempt)):
                                 return JSONResponse(status_code=499, content={"error": {"message": "客户端已断开连接。"}})
                             continue
 

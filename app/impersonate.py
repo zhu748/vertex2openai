@@ -1,19 +1,9 @@
-"""TLS / 浏览器指纹伪装模块（Cookie 通道专用，可热开关）。
+"""Cookie transport: use one curl preset for TLS and browser identity headers.
 
-背景：Cookie 直连通道模拟的是 Cloud Console 前端的 batchGraphql 请求，
-但旧实现用 httpx 发包 —— TLS 指纹是 Python/OpenSSL 特征（JA3/JA4 一眼假），
-请求头里连 User-Agent 都没有，Google 风控极易把这类“没有浏览器外壳的
-前端接口调用”识别为脚本流量。
-
-本模块用 curl_cffi（依赖里早已引入但从未用上）做两件事：
-  1. TLS 指纹伪装：impersonate 成真实 Chrome/Edge/Safari 的 TLS 栈；
-  2. 浏览器头补齐：User-Agent、sec-ch-ua、sec-fetch-*、accept-language 等
-     与所选浏览器档案对齐（authorization/cookie 等 Google 专用头不受影响）。
-
-设置项 cookie_impersonate（控制台「通道与凭证」页可热改）：
-  off    = 关闭伪装，退回原 httpx 行为（完全旧兼容）
-  chrome = Chrome 最新版指纹（默认）
-  edge / safari / firefox / safari_ios = 其它档案
+Application/authentication headers describe an API fetch, while curl supplies
+its own matching User-Agent and client hints. Navigation-only defaults are
+explicitly suppressed. This is protocol consistency, not a guarantee against
+upstream account restrictions or private API changes.
 """
 
 from contextlib import asynccontextmanager
@@ -24,7 +14,7 @@ from typing import Any, AsyncIterator, Callable
 import httpx
 
 from runtime_state import app_state
-from client_pool import schedule_graceful_close
+from client_pool import schedule_graceful_close, _closer
 
 # 控制台可选的伪装档案（curl_cffi 泛别名会跟随其内置的最新浏览器版本）
 SUPPORTED_PROFILES = ("off", "chrome", "edge", "safari", "firefox", "safari_ios")
@@ -32,6 +22,7 @@ SUPPORTED_PROFILES = ("off", "chrome", "edge", "safari", "firefox", "safari_ios"
 # 超时总上限：curl 的 timeout 是“整个请求”的硬超时（不像 httpx 的 read 是
 # “两块数据之间的间隔”），长思考流可能持续数分钟，这里放宽到 30 分钟。
 _CURL_TOTAL_TIMEOUT_SECONDS = 1800.0
+_CURL_BUFFER_LIMIT_BYTES = 64 * 1024 * 1024
 
 
 def get_impersonate_profile() -> str:
@@ -47,104 +38,22 @@ def impersonation_active() -> bool:
     return get_impersonate_profile() != "off"
 
 
-# ============================================================
-# 浏览器请求头模板（与 curl_cffi 各档案的 TLS 指纹配套）
-# 只补“浏览器外观”，绝不碰 authorization / cookie / origin / referer
-# 这些由 cookie_auth.build_headers 负责的 Google 专用头。
-# ============================================================
-_BROWSER_HEADERS: dict[str, dict[str, str]] = {
-    "chrome": {
-        "user-agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"),
-        "accept": "*/*",
-        "accept-language": "en-US,en;q=0.9",
-        "sec-ch-ua": '"Chromium";v="142", "Google Chrome";v="142", "Not:A-Brand";v="24"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-site",
-    },
-    "edge": {
-        "user-agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0"),
-        "accept": "*/*",
-        "accept-language": "en-US,en;q=0.9",
-        "sec-ch-ua": '"Chromium";v="142", "Microsoft Edge";v="142", "Not:A-Brand";v="24"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-site",
-    },
-    "safari": {
-        "user-agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
-                       "(KHTML, like Gecko) Version/18.4 Safari/605.1.15"),
-        "accept": "*/*",
-        "accept-language": "en-US,en;q=0.9",
-        "sec-ch-ua-platform": '"macOS"',
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-site",
-    },
-    "safari_ios": {
-        "user-agent": ("Mozilla/5.0 (iPhone; CPU iPhone OS 18_4 like Mac OS X) "
-                       "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Mobile/15E148 Safari/604.1"),
-        "accept": "*/*",
-        "accept-language": "en-US,en;q=0.9",
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-site",
-    },
-    "firefox": {
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0",
-        "accept": "*/*",
-        "accept-language": "en-US,en;q=0.9",
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-site",
-    },
-}
-
-
-# Chrome 对 XHR/fetch 请求的稳定头发送序（HTTP/2 下 HPACK 按序编码，
-# 服务端可见）。真实 Cloud Console 前端的 batchGraphql 请求就是这套序：
-#   client hints (sec-ch-ua*) → content-type → authorization →
-#   Google 专用头 → user-agent → accept → origin/referer →
-#   sec-fetch-* → accept-language → cookie 殿后
-# 浏览器外壳头的**顺序**本身是指纹：Python dict 按插入序发送，
-# 「authorization 第一、cookie 第二」一眼就是脚本拼的 dict。
-_CHROME_HEADER_ORDER = (
-    "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
-    "content-type", "authorization", "x-goog-authuser", "x-same-domain",
-    "user-agent", "accept", "origin", "referer",
-    "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site",
-    "accept-language", "cookie",
-)
-
-
 def apply_browser_headers(headers: dict | None) -> dict:
-    """按当前伪装档案补齐浏览器头并**按 Chrome 线序重排**。
-
-    - 不覆盖已有键（Google 专用头 authorization/cookie/content-type/
-      x-goog-* / origin / referer 永远以调用方传入的为准）；
-    - 合并后按 _CHROME_HEADER_ORDER 重排（在基准序列里的头按 Chrome
-      真实顺序发送，不在序列里的保持原相对序殿后）——伪装关闭时
-      原样返回拷贝，完全旧兼容。
-    - firefox 档案没有 sec-ch-ua*，重排后仍是浏览器合理形态
-      （user-agent/accept 在前、cookie 殿后），不构成异常信号。
-    """
+    """Let curl generate identity headers from the same preset as its TLS stack."""
     merged = dict(headers or {})
     if not impersonation_active():
         return merged
-    profile = get_impersonate_profile()
-    for k, v in _BROWSER_HEADERS.get(profile, _BROWSER_HEADERS["chrome"]).items():
-        merged.setdefault(k, v)
-    ordered = {k: merged[k] for k in _CHROME_HEADER_ORDER if k in merged}
-    for k, v in merged.items():
-        if k not in ordered:
-            ordered[k] = v
-    return ordered
+    merged.update({
+        "accept": "*/*",
+        "accept-language": "en-US,en;q=0.9",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-site",
+        # None is curl_cffi's explicit suppression marker, not an empty header.
+        "sec-fetch-user": None,
+        "upgrade-insecure-requests": None,
+    })
+    return merged
 
 
 # ============================================================
@@ -188,10 +97,14 @@ class _CurlRespShim:
             return bytes(self._buffered)
         if not self._from_stream:     # 非流式响应：curl 已缓冲完整 body
             return self._r.content or b""
-        # 未消费过的流：直接读全部（带硬超时兜底，防 curl 死等）
+        # Consume incrementally, so an oversized error body cannot bypass the
+        # bounded stream buffer by using curl's all-at-once acontent().
         import asyncio as _asyncio
-        content = await _asyncio.wait_for(self._r.acontent(), timeout=60.0)
-        self._buffered.extend(content or b"")
+        async with _asyncio.timeout(60.0):
+            async for chunk in self._r.aiter_content():
+                if len(self._buffered) + len(chunk) > _CURL_BUFFER_LIMIT_BYTES:
+                    raise ValueError("上游响应超过 64MiB 读取上限。")
+                self._buffered.extend(chunk)
         self._consumed = True
         return bytes(self._buffered)
 
@@ -209,6 +122,8 @@ class _CurlRespShim:
             async for chunk in self._r.aiter_content():
                 if not chunk:
                     continue
+                if len(self._buffered) + len(chunk) > _CURL_BUFFER_LIMIT_BYTES:
+                    raise ValueError("上游响应超过 64MiB 读取上限。")
                 self._buffered.extend(chunk)
                 text = decoder.decode(chunk)
                 if text:
@@ -299,6 +214,10 @@ def _create_upstream_client(client_kwargs: dict):
     session_kwargs: dict[str, Any] = {
         "impersonate": profile,
         "timeout": total_timeout,
+        "allow_redirects": bool(client_kwargs.get("follow_redirects", False)),
+        "verify": client_kwargs.get("verify", True),
+        "trust_env": False,
+        "default_headers": True,
     }
     if proxy:
         session_kwargs["proxy"] = proxy
@@ -344,13 +263,16 @@ class _UpstreamClientPool:
                 self._entries[sig] = hit
                 return hit
 
-        client = factory(client_kwargs)
+        client = _closer.reclaim(("cookie", id(self), sig))
+        _closer.ensure_capacity(int(len(self._entries) >= _UPSTREAM_POOL_MAX))
+        if client is None:
+            client = factory(client_kwargs)
         stale: list = []
         with self._lock:
             hit = self._entries.get(sig)
             if hit is not None:
                 # 竞态窗口：别的协程先建好同签名客户端，用它
-                stale.append(client)
+                stale.append((None, client))
                 client = hit
             else:
                 self._entries[sig] = client
@@ -358,10 +280,10 @@ class _UpstreamClientPool:
                     oldest = next(iter(self._entries))
                     if oldest == sig:
                         break
-                    stale.append(self._entries.pop(oldest))
+                    stale.append((("cookie", id(self), oldest), self._entries.pop(oldest)))
 
-        for c in stale:
-            schedule_graceful_close(_make_upstream_closer(c))
+        for retired_key, c in stale:
+            schedule_graceful_close(_make_upstream_closer(c), key=retired_key, resource=c)
         return client
 
     async def aclose(self) -> None:

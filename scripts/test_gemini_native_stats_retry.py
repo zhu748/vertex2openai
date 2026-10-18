@@ -211,7 +211,12 @@ class NativeStatsRetryTests(unittest.TestCase):
                 self.responder = responder
                 with mock.patch.object(gemini_native, "_wait_for_retry", return_value=True) as wait:
                     self.assertEqual(self.post().status_code, 200)
-                    self.assertEqual(wait.await_args.args[1], expected)
+                    delay = wait.await_args.args[1]
+                    if expected == 7:
+                        self.assertGreaterEqual(delay, 3.5)
+                        self.assertLessEqual(delay, 7)
+                    else:
+                        self.assertEqual(delay, expected)
         self.assert_stats(total=7, success=7, retries=7)
 
     def test_server_errors_use_same_retry_budget(self):

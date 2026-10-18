@@ -79,8 +79,8 @@ def build_headers(cookie_str: str) -> Optional[Dict[str, str]]:
     每次调用都重新计算 SAPISIDHASH（因为包含实时时间戳）。
     浏览器外观头（User-Agent / sec-ch-ua / sec-fetch-* 等）由
     impersonate.apply_browser_headers 按当前伪装档案补齐——真实
-    Cloud Console 前端就是带这一整套头发请求的，缺了很容易被风控
-    识别为脚本流量；伪装关闭（cookie_impersonate=off）时保持原样。
+    身份头由 curl 的浏览器档案配套生成；这不保证私有接口可用或避免限制。
+    伪装关闭（cookie_impersonate=off）时保持普通 HTTP 行为。
     """
     from impersonate import apply_browser_headers
 

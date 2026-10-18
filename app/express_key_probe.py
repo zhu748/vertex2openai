@@ -126,7 +126,13 @@ async def probe_and_store(key: str, *, force: bool = False) -> dict:
 
     project_id, message = await probe_project_id(key)
     if project_id:
-        app_state.update_express_key_project(key, project_id, source="auto")
+        updated = await asyncio.to_thread(app_state.update_express_key_project,
+                                          key, project_id, source="auto", expected=rec)
+        if not updated:
+            current = next((r for r in app_state.get_express_keys() if r["key"] == key), {})
+            return {"key": key, "ok": bool(current.get("project_id")),
+                    "project_id": current.get("project_id", ""),
+                    "message": "探测期间配置已更新，保留当前配置。"}
         print(f"🔎 [密钥探测] Key {mask_key(key)} 归属项目：{project_id}")
         return {"key": key, "ok": True, "project_id": project_id, "message": message}
     print(f"⚠️ [密钥探测] Key {mask_key(key)} 未能自动探测到 Project ID：{message}")

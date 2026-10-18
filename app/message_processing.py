@@ -904,73 +904,53 @@ _IMAGE_FETCH_HEADERS = {
 }
 
 
-def _is_blocked_host(host: str) -> bool:
-    """目标是否指向内网/环回/链路本地等不该被代理访问的地址。
-
-    云元数据服务（169.254.169.254）属于链路本地段，已被 is_link_local 覆盖。
-    主机名先解析再判断，避免用 DNS 指向内网的域名绕过。
-    """
+def _public_image_addresses(host: str) -> list[str]:
+    """Resolve and validate every address; callers connect to a validated IP."""
     import ipaddress
     import socket
-
     if not host:
-        return True
+        raise ValueError("图片地址缺少主机名")
     host = host.strip("[]")
-    candidates = []
     try:
-        candidates.append(ipaddress.ip_address(host))
+        addresses = [ipaddress.ip_address(host)]
     except ValueError:
-        try:
-            infos = socket.getaddrinfo(host, None)
-        except Exception:
-            return True   # 解析不了就不放行
-        for info in infos:
-            try:
-                candidates.append(ipaddress.ip_address(info[4][0]))
-            except ValueError:
-                continue
-    if not candidates:
+        addresses = [ipaddress.ip_address(info[4][0]) for info in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)]
+    if not addresses or any(not address.is_global or address.is_multicast for address in addresses):
+        raise ValueError("目标地址指向内网/环回/链路本地，已拒绝")
+    return list(dict.fromkeys(str(address) for address in addresses))
+
+
+def _is_blocked_host(host: str) -> bool:
+    try:
+        _public_image_addresses(host)
+        return False
+    except (OSError, ValueError):
         return True
-    for ip in candidates:
-        if (ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
-            return True
-    return False
 
 
 def fetch_remote_image(url: str, timeout: float = 10.0) -> Optional[Tuple[bytes, str]]:
-    """同步抓取远程图片，返回 (bytes, mime)。失败返回 None。
+    """Download a bounded public image using a pinned, validated destination.
 
-    调用方须保证不在事件循环线程里直接调用（Express/Cookie 两条通道都用
-    asyncio.to_thread 包住整个消息转换）。
-
-    F-3 防护：只允许 http/https、拒绝内网与链路本地地址（重定向后逐跳复查）、
-    限制响应体积、校验 content-type。配置了出站代理时（含经 sing-box
-    转换的 vless 等，代理侧已把控出口）本就到不了内网，此时跳过地址检查。
+    Runs in a worker thread. Every redirect is validated, including when using
+    a proxy; proxy conversion failure never causes an unexpected direct fetch.
     """
     from urllib.parse import urlparse
     from proxy_resolver import resolve_proxy_uri
 
     raw_proxy = get_effective_proxy_url()
-    # vless/vmess 等分享链接 → 本地 socks5；解析失败按无代理处理
-    # （图片抓取是附属功能，不能因代理问题拖垮整个请求；
-    #   上游主调用仍会在各自通道里对代理失败明确报错）。
     try:
         proxy_url = resolve_proxy_uri(raw_proxy)
-    except Exception:
-        proxy_url = ""
-    # F-3 内网检查按**实际出口**判断：配置了代理但转换失败（如缺 sing-box）
-    # 时此刻是直连出口，必须照常做内网检查——不能因为「配置过代理」就放行，
-    # 否则等于给了 SSRF 一条旁路。
-    check_host = not proxy_url
+    except Exception as exc:
+        print(f"⚠️ [图片处理] 出站代理不可用，未抓取远程图片：{type(exc).__name__}")
+        return None
     try:
         parsed = urlparse(url)
         if parsed.scheme not in ("http", "https"):
             raise ValueError(f"不支持的 URL 协议：{parsed.scheme or '(空)'}")
-        if check_host and _is_blocked_host(parsed.hostname or ""):
+        if _is_blocked_host(parsed.hostname or ""):
             raise ValueError("目标地址指向内网/环回/链路本地，已拒绝")
 
-        client_args = {"timeout": timeout, "follow_redirects": False}
+        client_args = {"timeout": timeout, "follow_redirects": False, "trust_env": False}
         if proxy_url:
             client_args["proxy"] = proxy_url
         if getattr(app_config, "SSL_CERT_FILE", None):
@@ -979,14 +959,25 @@ def fetch_remote_image(url: str, timeout: float = 10.0) -> Optional[Tuple[bytes,
         with httpx.Client(**client_args) as client:
             current = url
             for _ in range(MAX_REMOTE_IMAGE_REDIRECTS + 1):
-                with client.stream("GET", current, headers=_IMAGE_FETCH_HEADERS) as resp:
+                original_url = httpx.URL(current)
+                if original_url.username or original_url.password:
+                    raise ValueError("图片 URL 不允许包含认证凭据")
+                # Pin the checked address for direct and proxy connections,
+                # preserving Host and TLS SNI. DNS cannot change between the
+                # safety check and the actual connection (DNS rebinding).
+                address = _public_image_addresses(original_url.host)[0]
+                pinned_url = original_url.copy_with(host=address)
+                image_headers = dict(_IMAGE_FETCH_HEADERS, Host=original_url.netloc.decode("ascii"))
+                with client.stream("GET", pinned_url, headers=image_headers,
+                                   extensions={"sni_hostname": original_url.raw_host.decode("ascii")}) as resp:
                     if resp.is_redirect:
                         # 每跳复查，且重定向响应体无需下载。
-                        current = str(resp.next_request.url) if resp.next_request else ""
+                        location = resp.headers.get("location", "")
+                        current = str(original_url.join(location)) if location else ""
                         nxt = urlparse(current)
                         if nxt.scheme not in ("http", "https"):
                             raise ValueError(f"重定向到不支持的协议：{nxt.scheme or '(空)'}")
-                        if check_host and _is_blocked_host(nxt.hostname or ""):
+                        if _is_blocked_host(nxt.hostname or ""):
                             raise ValueError("重定向指向内网/环回/链路本地，已拒绝")
                         continue
 

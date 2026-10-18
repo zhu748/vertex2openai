@@ -212,7 +212,7 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(saved["anti_truncation_mode"], "off")
         self.assertEqual(state.get_effective_settings("gemini-4-argon")["anti_truncation_mode"], "off")
         state.clear_model_override("gemini-4-argon")
-        self.assertEqual(state.get_effective_settings("gemini-4-argon")["anti_truncation_mode"], "stream")
+        self.assertEqual(state.get_effective_settings("gemini-4-argon")["anti_truncation_mode"], "both")
 
     def test_keep_turn_can_be_saved_from_dashboard(self):
         main.app.dependency_overrides[main.require_auth] = lambda: True
@@ -237,20 +237,22 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual("systemInstruction" in cookie["variables"], enabled)
 
     def test_prepared_decoder_rejects_undeclared_tools(self):
-        obj = req(anti_truncation_mode="stream")
-        _, transport = at.prepare_transport(obj, MODEL, {})
+        obj = req().model_copy(update={"model": MODEL + "-antitruncation-stream"})
+        _, transport = at.prepare_transport(obj, MODEL, {"anti_truncation_mode": "stream"})
         with self.assertRaises(at.AntiTruncationError):
             transport.decoder().call("hallucinated_tool", {})
         tool = {"type": "function", "function": {"name": "declared", "parameters": {"type": "object"}}}
-        _, transport = at.prepare_transport(obj.model_copy(update={"tools": [tool]}), MODEL, {})
+        _, transport = at.prepare_transport(obj.model_copy(update={"tools": [tool]}), MODEL,
+                                            {"anti_truncation_mode": "stream"})
         self.assertIsNone(transport.decoder().call("declared", {}))
 
     def test_random_tool_name_collision_has_a_bound(self):
         name = "v2o_emit_" + "a" * 24
-        obj = req(anti_truncation_mode="stream", tools=[{"type": "function", "function": {"name": name}}])
+        obj = req(tools=[{"type": "function", "function": {"name": name}}]).model_copy(
+            update={"model": MODEL + "-antitruncation-stream"})
         with mock.patch.object(at.secrets, "token_hex", return_value="a" * 24) as random:
             with self.assertRaises(at.AntiTruncationError):
-                at.prepare_transport(obj, MODEL, {})
+                at.prepare_transport(obj, MODEL, {"anti_truncation_mode": "stream"})
         self.assertEqual(random.call_count, 8)
 
 
@@ -298,6 +300,8 @@ class CookieStreamTests(unittest.IsolatedAsyncioTestCase):
             upstream = mock.AsyncMock(side_effect=post)
             self.pool(SimpleNamespace(post=upstream))
             obj = req(stream=True)
+            if mode != "off":
+                obj = obj.model_copy(update={"model": MODEL + "-antitruncation-" + mode})
             before = obj.model_dump_json()
             result = await cookie_proxy.CookieProxyUpstream().chat_completions(obj, self.request)
             self.assertFalse(started.is_set())
@@ -321,7 +325,8 @@ class CookieStreamTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 closed.set()
         self.pool(SimpleNamespace(post=post))
-        result = await cookie_proxy.CookieProxyUpstream().chat_completions(req(stream=True), self.request)
+        obj = req(stream=True).model_copy(update={"model": MODEL + "-antitruncation-nonstream"})
+        result = await cookie_proxy.CookieProxyUpstream().chat_completions(obj, self.request)
         with mock.patch.object(streaming, "HEARTBEAT_INTERVAL", 0.002):
             frames = result.body_iterator
             await anext(frames)
@@ -333,7 +338,8 @@ class CookieStreamTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_buffered_failure_is_one_sse_error(self):
         self.pool(SimpleNamespace(post=mock.AsyncMock(return_value=httpx.Response(429, text="busy"))))
-        result = await cookie_proxy.CookieProxyUpstream().chat_completions(req(stream=True), self.request)
+        obj = req(stream=True).model_copy(update={"model": MODEL + "-antitruncation-nonstream"})
+        result = await cookie_proxy.CookieProxyUpstream().chat_completions(obj, self.request)
         body = "".join([frame async for frame in result.body_iterator])
         self.assertIn('"code": 429', body)
         self.assertNotIn('"finish_reason": "stop"', body)

@@ -16,8 +16,9 @@ from routes import models_api, chat_api
 from routes import gemini_native
 
 from logger import rt_logger, stats
+from middleware import StatsMiddleware
 import config
-from runtime_state import app_state
+from runtime_state import app_state, StatePersistenceError
 from runtime_state import get_effective_proxy_url, mask_proxy_url
 import model_capabilities as mc
 from model_loader import get_express_models
@@ -164,28 +165,18 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Resume-Id", "X-Resumable-Replay", "Retry-After"],
 )
 
 app.state.express_key_manager = express_key_manager
 
 
-@app.middleware("http")
-async def stats_tracker_middleware(request: Request, call_next):
-    is_native_request = (
-        request.method == "POST"
-        and request.url.path.startswith(("/v1beta/models/", "/v1/models/"))
-    )
-    if "chat/completions" in request.url.path or is_native_request:
-        stats.increment_total()
-        try:
-            response = await call_next(request)
-            if response.status_code >= 400:
-                stats.add_error()
-            return response
-        except Exception as e:
-            stats.add_error()
-            raise e
-    return await call_next(request)
+@app.exception_handler(StatePersistenceError)
+async def state_persistence_error(request, exc):
+    return JSONResponse(status_code=503, content={"error": str(exc), "type": "state_persistence_error"})
+
+
+app.add_middleware(StatsMiddleware, stats=lambda: stats)
 
 
 # ====== 仅密码登录（Cookie 会话，免输账号）======
@@ -562,7 +553,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="flex items-center justify-between flex-wrap gap-2 mb-3">
         <div>
           <div class="text-sm font-semibold">Cookie 通道指纹伪装<span class="helpq" onclick="hlp(this,'h_fp')">?</span></div>
-          <div class="text-xs text-neutral-500 mt-0.5">curl_cffi 模拟真实浏览器 TLS 指纹 + 补齐浏览器请求头，降低 Google 风控识别。仅作用于 Cookie 直连通道</div>
+          <div class="text-xs text-neutral-500 mt-0.5">curl_cffi 为 TLS 与浏览器身份头使用配套档案。仅作用于 Cookie 通道，不保证私有接口可用。</div>
         </div>
         <div class="flex items-center gap-2">
           <span id="fp-status" class="pill" style="text-transform:none">—</span>
@@ -570,7 +561,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
       </div>
       <div id="h_fp" class="helpbox">
-        <b>为什么需要</b>：Cookie 通道模拟的是 Cloud Console 前端的 batchGraphql 请求，但普通 Python HTTP 库的 TLS 指纹（JA3/JA4）与真浏览器完全不同，且旧版请求头里连 User-Agent 都没有——“用浏览器接口却没有浏览器外壳”的请求很容易被风控盯上。<br>
+        <b>作用</b>：Cookie 通道使用 Cloud Console 私有接口；TLS 与浏览器身份头由同一 curl 档案提供，避免版本不一致。上游限制和私有接口变化仍可能导致失败。<br>
         <b>伪装内容</b>：① TLS 指纹（ClientHello / cipher suite / 扩展顺序等，impersonate 成所选浏览器的真实握手）；② 浏览器请求头（User-Agent、sec-ch-ua、sec-fetch-*、accept-language，与所选档案配套）。Authorization / Cookie 等 Google 专用头不受影响。<br>
         <b>档案选择</b>：Chrome / Edge 同内核（Windows UA），Safari 是 macOS/iOS，Firefox 独立内核。没有特殊理由就选 Chrome。<br>
         <b>热生效</b>：保存即写入 <code>web_state.json</code>，下一个请求立刻走伪装通道，无需重启。选 <b>off</b> 完全回到旧版 httpx 行为。<br>
@@ -600,9 +591,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
       </div>
       <div id="h_fp2" class="helpbox">
-        <b>管什么</b>：Express API Key（官方 SDK）通道发出的 <code>User-Agent</code> 与 <code>x-goog-api-client</code> 两个头——Google 后端日志里每条请求的客户端标识就靠它们；同时修复 Gemini 原生透传 / Key 探测 / 代理测试这些裸 httpx 出站点原本暴露的 <code>python-httpx</code>（甚至自曝代理名）的 UA。<br>
-        <b>为什么不伪装 TLS</b>：SDK 强依赖 httpx，TLS 栈换不了；但官方 API 端点本就接受各种语言的官方客户端，请求头才是风控看的重点。Cookie 通道的 TLS 伪装在上一张卡片。<br>
-        <b>档案说明</b>：<b>官方 Python SDK</b>＝默认零改动；<b>Node.js SDK</b>＝JS 生态形态（调用量最大、风控难一刀切），<b>仅对 Gemini 透传等裸出站点完全生效</b>——SDK 主通道无法伪装成 node（SDK 会强制追加 gl-python，拼出真实客户端不可能出现的 gl-node+gl-python 混合标签），因此 SDK 主通道在此档案下保持官方纯 python 形态：同一 Key 上 python / node 两种纯形态并存，就像一个团队同时跑两种语言的应用一样平常；<b>gcloud CLI</b>＝GCP 运维流量形态；<b>自定义</b>＝自由填写，占位符 <code>{sdk}</code> <code>{python}</code> <code>{node}</code> 自动展开为当前精确标签（缺标签按真实 SDK 同款变换自动补齐，不会出现 SDK 造不出来的形态）。<br>
+        <b>作用</b>：调整 HTTP 客户端标签；默认由官方 Python SDK 管理。<br>
+        <b>兼容档案</b>：Node / gcloud / 自定义仅用于已有集成兼容，不改变实际 TLS 栈，不保证降低风控风险。Node 标签仅作用于裸 REST 请求。<br>
         <b>热生效</b>：保存即写入 <code>web_state.json</code>，下一个请求立刻生效。<br>
         <b>VERTEX_BASE_URL 指向第三方中转时</b>：中转站（尤其 Cloudflare）常按 UA 放行，选非 sdk 档案可绕开对 python UA 的封锁。
       </div>
@@ -709,20 +699,21 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <!-- 合成函数正文传输（可按模型覆盖） -->
       <div class="card p-5">
         <div class="flex items-center justify-between gap-3">
-          <span class="text-sm font-semibold">抗截断传输<span class="helpq" onclick="hlp(this,'h_at')">?</span></span>
+          <span class="text-sm font-semibold">模型列表中的抗截断后缀<span class="helpq" onclick="hlp(this,'h_at')">?</span></span>
           <select id="anti_truncation_mode" class="inp" style="max-width:190px">
-            <option value="off">关闭</option>
-            <option value="nonstream">非流式抗截断</option>
-            <option value="stream">流式抗截断</option>
+            <option value="off">不显示抗截断后缀</option>
+            <option value="both">显示两种抗截断后缀</option>
+            <option value="nonstream">仅显示非流式后缀</option>
+            <option value="stream">仅显示流式后缀</option>
           </select>
         </div>
-        <p id="anti-truncation-note" class="text-xs text-neutral-500 mt-2">4 Argon / 3.8 Flash 默认开启流式抗截断，其它模型默认关闭；可按模型修改。</p>
+        <p id="anti-truncation-note" class="text-xs text-neutral-500 mt-2">默认仅 4 Argon / 3.8 Flash 提供抗截断后缀；普通无后缀名称始终不启用。</p>
         <div id="h_at" class="helpbox">将正文放入临时函数的 <code>content</code> 参数，网关还原为普通回复，不执行任何函数。<br>
           <b>非流式</b>：等上游完整返回再交付；客户端仍可开启 SSE。<br>
           <b>流式</b>：Express 对支持的 Gemini 3+ 模型使用增量函数参数流（3.1 Flash-Lite 除外）；Cookie 通道、旧模型和混合真实工具请求在函数参数完整后还原。全局“假流式”开启时也会等待完整结果。<br>
           生图、搜索、结构化输出、多候选以及明确指定 <code>tool_choice</code> 的请求自动跳过。普通自定义函数及其历史记录保留。<br>
-          优先级：请求的 <code>anti_truncation_mode</code> ＞ 抗截断模型别名 ＞ 模型专属 ＞ 全局。仅作用于 OpenAI 对话端点。<br>
-          <b>内置默认</b>：Gemini 4 Argon 和 Gemini 3.8 Flash 开启流式抗截断，其它模型关闭。需要关闭这两个模型时，请选择“关闭”并保存为该模型专属；清除专属设置会恢复内置默认。<br>
+          <b>启用条件</b>：只在客户端选择已开启的 <code>-antitruncation-stream</code> 或 <code>-antitruncation-nonstream</code> 模型时使用；普通模型名称始终不启用，旧请求参数也不会开启或覆盖后缀。仅作用于 OpenAI 对话端点。<br>
+          <b>后缀设置</b>：先选择具体模型，设置显示的后缀并“保存为该模型专属”，再刷新客户端模型列表。不提供全局开启。默认仅 Gemini 4 Argon 和 Gemini 3.8 Flash 显示两种后缀，清除专属设置会恢复各自内置默认。<br>
           该方式不能保证消除截断或拒绝；输出 Token 上限、网络中断及上游限制仍然适用，也会增加少量提示词与函数格式开销。</div>
       </div>
 
@@ -837,7 +828,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div class="text-sm font-semibold mb-3">重试与退避</div>
         <div class="grid grid-cols-2 gap-3">
           <div><div class="lbl mb-1">最大重试次数</div><input id="retry_max" type="number" class="inp"></div>
-          <div><div class="lbl mb-1">退避间隔(秒)</div><input id="retry_backoff_seconds" type="number" step="0.5" class="inp"></div>
+          <div><div class="lbl mb-1">退避基数(秒，含随机抖动)</div><input id="retry_backoff_seconds" type="number" step="0.5" class="inp"></div>
+        </div>
+      </div>
+
+      <div class="card p-5">
+        <div class="text-sm font-semibold mb-3">请求与缓冲预算</div>
+        <div class="grid grid-cols-2 gap-3">
+          <div><div class="lbl mb-1">整轮期限(秒)</div><input id="request_timeout_seconds" type="number" min="30" max="7200" class="inp"></div>
+          <div><div class="lbl mb-1">上游最大并发</div><input id="upstream_max_concurrency" type="number" min="1" max="1000" class="inp"></div>
+          <div><div class="lbl mb-1">单次缓冲(MiB)</div><input id="resumable_max_buffer_mb" type="number" min="1" max="1024" class="inp"></div>
+          <div><div class="lbl mb-1">总缓冲(MiB)</div><input id="resumable_max_total_mb" type="number" min="1" max="8192" class="inp"></div>
         </div>
       </div>
 
@@ -849,7 +850,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div class="flex items-center justify-between"><span class="text-sm">假流式心跳间隔(秒)</span><input id="fake_streaming_interval" type="number" step="0.5" class="inp" style="width:90px"></div>
           <div>
             <div class="flex items-center justify-between"><span class="text-sm">弱网续传（服务端缓冲）<span class="helpq" onclick="hlp(this,'h_rsm')">?</span></span><label class="switch"><input type="checkbox" id="resumable_enabled"><span class="slider"></span></label></div>
-            <div id="h_rsm" class="helpbox">反代收到 Google 的完整回复后先放进服务端缓冲区再吐给前端；前端断线可凭 <code>Last-Event-ID</code> 或 <code>?resume_from=</code> 续传，也可轮询 <code>/v1/resumable/{id}</code> 拉分片。关掉则回到原有直通行为。</div>
+            <div id="h_rsm" class="helpbox">回复边接收边缓冲。断线后用返回的 <code>X-Resume-Id</code> 和最后事件 ID 续传，或轮询 <code>/v1/resumable/{id}</code>。每次逻辑请求建议使用独立 <code>Idempotency-Key</code>；重试沿用，重新生成则更换。缓冲受期限与容量限制，进程重启后失效。</div>
           </div>
           <div class="flex items-center justify-between"><span class="text-sm">续传缓冲保留时长(秒)</span><input id="resumable_ttl_seconds" type="number" step="60" class="inp" style="width:90px"></div>
           <div class="flex items-center justify-between"><span class="text-sm">续传缓冲数量上限</span><input id="resumable_max_streams" type="number" step="10" class="inp" style="width:90px"></div>
@@ -1209,7 +1210,7 @@ async function loadParams(){
     const s=await (await fetch('/api/settings')).json();
     GLOBAL_SETTINGS=s;
     curAR = s.image_aspect_ratio || "";
-    ['native_thinking_mode','thinking_g3_level','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','express_location','resumable_ttl_seconds','resumable_max_streams'].forEach(k=>setV(k,s[k]));
+    ['native_thinking_mode','thinking_g3_level','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','express_location','resumable_ttl_seconds','resumable_max_streams','request_timeout_seconds','upstream_max_concurrency','resumable_max_buffer_mb','resumable_max_total_mb'].forEach(k=>setV(k,s[k]));
     ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction','inject_prefill_for_image','prefill_cot_guard','resumable_enabled'].forEach(k=>setV(k,s[k]));
     // 出站代理：回填输入框并刷新状态徽标
     setV('proxy-input', s.proxy_url || '');
@@ -1242,7 +1243,7 @@ function applyModelParamFields(model){
   // __global__ = 全局默认作用域：只显示全局值，不掺任何模型专属值
   const ov = (model==='__global__') ? {} : (OVERRIDES[model] || {});
   PER_MODEL_KEYS.forEach(k=>{
-    const v = (k in ov) ? ov[k] : GLOBAL_SETTINGS[k];
+    const v = (k in ov) ? ov[k] : (k==='anti_truncation_mode' ? 'off' : GLOBAL_SETTINGS[k]);
     if(k==='image_aspect_ratio'){ curAR = v || ""; }
     else setV(k, v);
   });
@@ -1277,6 +1278,7 @@ async function saveModelOverride(){
     prefill_cot_guard:$('prefill_cot_guard').checked,
   };
   if(m==='__global__'){
+    delete patch.anti_truncation_mode;
     // 全局默认作用域：写进全局设置，而不是任何模型的专属值
     try{
       const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});
@@ -1322,8 +1324,8 @@ function renderCaps(){
   const m=$('model-sel').value;
   if(m==='__global__'){
     applyModelParamFields(m);
-    $('anti_truncation_mode').disabled=false;
-    $('anti-truncation-note').textContent='全局默认关闭；4 Argon / 3.8 Flash 有内置的流式抗截断专属默认值，可切到模型修改。';
+    $('anti_truncation_mode').disabled=true;
+    $('anti-truncation-note').textContent='请先选择具体模型再设置其后缀；普通无后缀名称始终不启用抗截断。';
     $('caps-summary').innerHTML='<span class="text-xs text-neutral-500">全局默认作用域：下面的值对所有未设 ★ 专属的模型生效。切到具体模型可查看该模型的能力与专属值。</span>';
     ['thinking_g3_level','image_size','image_aspect_ratio'].forEach(id=>{const el=$(id); if(el) el.disabled=false;});
     $('wrap-g3level').style.opacity='1';
@@ -1336,7 +1338,7 @@ function renderCaps(){
   applyModelParamFields(m);   // 按模型填入专属/全局参数值（含 curAR）
   $('anti_truncation_mode').disabled=!cap.supports_anti_truncation;
   $('anti-truncation-note').textContent=cap.supports_anti_truncation
-    ? '可按模型保存；刷新客户端模型列表也可直接选择 -antitruncation-stream / -antitruncation-nonstream。'
+    ? '保存为该模型专属后刷新客户端列表；仅选择已开启的抗截断后缀才使用抗截断，普通名称不启用。'
     : '该模型不支持文本函数传输，不提供抗截断版本。';
   const th=cap.thinking||{};
   let sum=[chip('家族 '+cap.family, true)];
@@ -1404,6 +1406,10 @@ async function saveSettings(){
     resumable_enabled:$('resumable_enabled').checked,
     resumable_ttl_seconds:numOr('resumable_ttl_seconds',1800),
     resumable_max_streams:numOr('resumable_max_streams',200),
+    request_timeout_seconds:numOr('request_timeout_seconds',1800),
+    upstream_max_concurrency:numOr('upstream_max_concurrency',32),
+    resumable_max_buffer_mb:numOr('resumable_max_buffer_mb',64),
+    resumable_max_total_mb:numOr('resumable_max_total_mb',256),
   };
   // 7 个可覆盖参数：仅当所选模型“没有专属配置”时，才作为全局默认保存，
   // 避免把某模型的专属值误存成全局（专属值请用“保存为该模型专属”）。
@@ -1529,7 +1535,7 @@ PROXY_TEST_TIMEOUT_SECONDS = 8.0
 # 后所有假流式请求全挂）。这里在入口就拦下，并给出字段级错误提示。
 # ============================================================
 _SETTING_ENUMS = {
-    "anti_truncation_mode": ("off", "nonstream", "stream"),
+    "anti_truncation_mode": ("off", "nonstream", "stream", "both"),
     "prefill_mode": ("smart", "keep_turn", "minimal", "off"),
     "native_thinking_mode": ("request", "off", "console"),
     "sampling_policy": ("auto", "deprecated", "allowed"),
@@ -1547,6 +1553,10 @@ _SETTING_NUMERIC_RANGE = {
     "img_compress_quality": (10, 100),
     "resumable_ttl_seconds": (60, 604800),
     "resumable_max_streams": (1, 10000),
+    "resumable_max_buffer_mb": (1, 1024),
+    "resumable_max_total_mb": (1, 8192),
+    "request_timeout_seconds": (30, 7200),
+    "upstream_max_concurrency": (1, 1000),
 }
 # 已有专项校验的键（代理格式 / 指纹档案白名单），通用层跳过避免重复
 _SETTING_SPECIAL_KEYS = {"proxy_url", "express_ua_profile", "express_ua_custom", "model_overrides"}
@@ -1759,7 +1769,7 @@ async def get_runtime_settings(_auth: bool = Depends(require_auth)):
 
 @app.post("/api/settings/mode")
 async def set_settings_mode(setting: ModeSetting, _auth: bool = Depends(require_auth)):
-    app_state.enable_web_proxy(setting.mode == "web_proxy")
+    await asyncio.to_thread(app_state.enable_web_proxy, setting.mode == "web_proxy")
     return JSONResponse(content={"status": "success"})
 
 
@@ -1776,6 +1786,9 @@ async def update_settings_api(request: Request, _auth: bool = Depends(require_au
         return JSONResponse(status_code=400, content={"error": "请求体必须是合法 JSON 对象。"})
     if not isinstance(patch, dict):
         return JSONResponse(status_code=400, content={"error": "请求体必须是 JSON 对象。"})
+    if "anti_truncation_mode" in patch and patch["anti_truncation_mode"] != "off":
+        return JSONResponse(status_code=400, content={
+            "error": "抗截断后缀只能按模型开启，请使用模型专属设置。", "field": "anti_truncation_mode"})
     # 出站代理单独校验格式：畸形代理一旦存入，所有上游请求会统一失败
     if "proxy_url" in patch:
         if not isinstance(patch["proxy_url"], str):
@@ -1812,7 +1825,7 @@ async def update_settings_api(request: Request, _auth: bool = Depends(require_au
     verr = _validate_settings_patch(patch)
     if verr:
         return JSONResponse(status_code=400, content={"error": verr["error"], "field": verr["field"]})
-    updated = app_state.update_settings(patch)
+    updated = await asyncio.to_thread(app_state.update_settings, patch)
     return JSONResponse(content=updated)
 
 
@@ -1849,13 +1862,13 @@ async def save_model_override(model_name: str, request: Request, _auth: bool = D
     verr = _validate_settings_patch(patch, keys_scope=set(config.PER_MODEL_KEYS))
     if verr:
         return JSONResponse(status_code=400, content={"error": verr["error"], "field": verr["field"]})
-    saved = app_state.set_model_override(model_name, patch)
+    saved = await asyncio.to_thread(app_state.set_model_override, model_name, patch)
     return JSONResponse(content={"status": "success", "model": model_name, "override": saved})
 
 
 @app.delete("/api/model-overrides/{model_name}")
 async def delete_model_override(model_name: str, _auth: bool = Depends(require_auth)):
-    ok = app_state.clear_model_override(model_name)
+    ok = await asyncio.to_thread(app_state.clear_model_override, model_name)
     return JSONResponse(content={"status": "success" if ok else "not_found", "model": model_name,
                                  "override": app_state.get_model_overrides().get(model_name, {})})
 
@@ -1922,7 +1935,7 @@ async def save_express_keys(body: ExpressKeysBody, _auth: bool = Depends(require
             return JSONResponse(status_code=400, content={
                 "error": f"第 {idx + 1} 个 Key（{masked}）的专属代理格式不合法：{err}",
             })
-    saved = app_state.set_express_keys(body.keys)
+    saved = await asyncio.to_thread(app_state.set_express_keys, body.keys)
     express_key_manager.refresh_keys()
     # 新加进来、还没有 Project ID 的 Key 立刻在后台探一次
     pending = [r["key"] for r in saved if not r.get("project_id")]
@@ -1951,7 +1964,7 @@ async def probe_express_keys(body: ProbeBody, _auth: bool = Depends(require_auth
 @app.post("/api/express-keys/project")
 async def set_express_key_project(body: KeyProjectBody, _auth: bool = Depends(require_auth)):
     """人工覆盖某个 Key 的 Project ID（来源标记为 manual，自动探测不会再覆盖它）。"""
-    ok = app_state.update_express_key_project(
+    ok = await asyncio.to_thread(app_state.update_express_key_project,
         body.key, body.project_id, source=("manual" if body.project_id.strip() else ""))
     if not ok:
         return JSONResponse(status_code=404, content={"error": "该 Key 不在列表中。"})
@@ -1979,7 +1992,6 @@ async def set_google_cookie(setting: CookieSetting, _auth: bool = Depends(requir
         validation = validate_cookie(new_cookie)
         if not validation["valid"]:
             return JSONResponse(status_code=400, content={"error": validation["message"]})
-        app_state.set_google_cookie(new_cookie)
         message = validation["message"]
     else:
         if not app_state.get_google_cookie():
@@ -1987,8 +1999,7 @@ async def set_google_cookie(setting: CookieSetting, _auth: bool = Depends(requir
                 "error": "尚未配置 Cookie，请粘贴完整的 Google Cookie。"})
         message = "✅ 已保留原有 Cookie，仅更新 Project ID。"
 
-    if project_id:
-        app_state.set_project_id(project_id)
+    await asyncio.to_thread(app_state.set_cookie_credentials, new_cookie, project_id)
     return JSONResponse(content={"status": "success", "message": message})
 
 
