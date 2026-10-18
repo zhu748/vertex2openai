@@ -331,13 +331,22 @@ class PersistenceTests(unittest.TestCase):
 
 
 class RetryAndContractTests(unittest.IsolatedAsyncioTestCase):
-    def test_backoff_is_capped_exponential_with_jitter_and_honors_retry_after(self):
-        with mock.patch.object(retry_policy.random, "uniform", side_effect=lambda low, high: (low + high) / 2) as random:
-            self.assertEqual([retry_policy.retry_delay(None, 5, n) for n in range(3)], [3.75, 7.5, 15])
-            self.assertEqual(retry_policy.retry_delay(None, 5, 20), 90)
-            random.reset_mock()
-            self.assertEqual(retry_policy.retry_delay("2.5", 5, 10), 2.5)
-            random.assert_not_called()
+    def test_backoff_is_fixed_with_jitter_and_honors_retry_after(self):
+        with mock.patch.object(retry_policy.random, "uniform", side_effect=lambda low, high: (low + high) / 2):
+            # 固定间隔 + 抖动：默认 5s ± 0.5s，不随 attempt 指数增长
+            self.assertEqual([retry_policy.retry_delay(None, 5, n) for n in range(3)], [5.0, 5.0, 5.0])
+            self.assertEqual(retry_policy.retry_delay(None, 5, 20), 5.0)
+            # 抖动幅度可配置：0 → 精确 5s；2 → uniform(4, 6) 中点 5s
+            self.assertEqual(retry_policy.retry_delay(None, 5, 0, 0), 5.0)
+            self.assertEqual(retry_policy.retry_delay(None, 5, 0, 2), 5.0)
+            # 更短的上游提示被采纳；更长的提示钳位到窗口上限，且不触发随机
+            with mock.patch.object(retry_policy.random, "uniform") as uniform:
+                self.assertEqual(retry_policy.retry_delay("2.5", 5, 10), 2.5)
+                self.assertEqual(retry_policy.retry_delay("60", 5), 5.5)
+                uniform.assert_not_called()
+            # backoff=0 → 立即重试，不叠加抖动
+            self.assertEqual(retry_policy.retry_delay(None, 0, 3), 0.0)
+            self.assertEqual(retry_policy.retry_delay("2", 0), 0.0)
 
     async def test_cookie_rejects_unverified_structured_output_before_network_call(self):
         for response_format in ({"type": "json_object"}, {"type": "json_schema", "json_schema": {"schema": {"type": "object"}}}):

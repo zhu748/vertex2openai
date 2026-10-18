@@ -128,6 +128,8 @@ class StreamRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.stats.retry_counts, 0)
 
     async def test_failed_stream_is_closed_before_backoff(self):
+        # backoff=5（窗口 4.5~5.5s）：上游提示 0.25s 比窗口短，照常采纳
+        self.settings["retry_backoff_seconds"] = 5
         closed = []
         calls = []
 
@@ -168,6 +170,8 @@ class StreamRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.stats.retry_counts, 0)
 
     async def test_nonstream_uses_retry_after_header(self):
+        # backoff=5（窗口 4.5~5.5s）：上游提示 2.5s 比窗口短，照常采纳
+        self.settings["retry_backoff_seconds"] = 5
         generate = mock.AsyncMock(side_effect=[api_error(429, headers={"retry-after": "2.5"}), text_response()])
         client = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(generate_content=generate)))
         obj = api_helpers.OpenAIRequest(model="gemini-3.6-flash", messages=[])
@@ -328,11 +332,13 @@ class CookieRetryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_image_collection_reports_exhausted_api_error(self):
         obj = api_helpers.OpenAIRequest(model="gemini-3.1-flash-image", messages=[])
-        result = await cookie_proxy._collect_full_response("p", obj.model, obj, {}, {}, 0, 0, self.request)
+        result = await cookie_proxy._collect_full_response("p", obj.model, obj, {}, {}, 0, 0, 0, self.request)
         self.assertEqual(result["kind"], "error")
         self.assertEqual(result["code"], 429)
 
     async def test_http_502_504_retry_and_honor_retry_after(self):
+        # backoff=5（窗口 4.5~5.5s）：上游提示 2.5s 比窗口短，照常采纳
+        self.settings["retry_backoff_seconds"] = 5
         obj = api_helpers.OpenAIRequest(model="gemini-3.6-flash", messages=[])
         self.client.post.side_effect = [httpx.Response(502, headers={"retry-after": "2.5"}), httpx.Response(504), httpx.Response(200, json={})]
         with mock.patch.object(cookie_proxy, "wait_for_retry", return_value=True) as wait, \
@@ -535,8 +541,12 @@ class RetryPolicyTests(unittest.TestCase):
 
     def test_retry_after_supports_http_dates_and_past_dates(self):
         with mock.patch("retry_policy.time.time", return_value=1000):
-            self.assertEqual(retry_delay("Thu, 01 Jan 1970 00:17:00 GMT", 5), 20)
+            # HTTP 日期（未来 20s）解析成功，但被钳位到固定窗口上限：5 + 1/2
+            self.assertEqual(retry_delay("Thu, 01 Jan 1970 00:17:00 GMT", 5), 5.5)
+            # 过去日期 → 立即重试
             self.assertEqual(retry_delay("Thu, 01 Jan 1970 00:10:00 GMT", 5), 0)
+            # 短于窗口的秒数提示原样生效
+            self.assertEqual(retry_delay("2", 5), 2)
 
     def test_permanent_local_errors_are_not_retryable(self):
         self.assertFalse(api_helpers.is_retryable_exception(ValueError("bad quota model-429")))

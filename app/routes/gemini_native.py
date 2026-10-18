@@ -267,8 +267,9 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
 
     两类重试互相独立、不共用预算：
     - Key 重选重试（429/5xx/网络异常）：读取控制台 retry_max，每次按策略
-      重新选择 Express Key，单 Key 或一轮用完后也继续重试，受 retry-after /
-      retry_backoff_seconds 控制；
+      重新选择 Express Key，单 Key 或一轮用完后也继续重试；重试间隔为
+      固定值 + 抖动（retry_backoff_seconds / retry_jitter_seconds，不随
+      次数放大），更短的上游 retry-after 会被采纳；
     - 钉定失败兜底（403/404 且报错像项目/区域问题，见 _looks_like_pin_failure）：
       不换 Key、不占上面的预算，仅把模型路径退回裸模型名再试一次——
       与 SDK 通道（api_helpers.execute_gemini_call 的 fallback_model）对齐，
@@ -305,7 +306,7 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
         return httpx.AsyncClient(**client_kwargs)
 
     is_stream = action == "streamGenerateContent"
-    retry_max, backoff_seconds = get_retry_settings()
+    retry_max, backoff_seconds, jitter_seconds = get_retry_settings()
     record = None
     previous_key = None
     key_attempts = 0           # 上游错误已重试次数（不含首次）
@@ -340,7 +341,7 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
                 print(f"❌ [Gemini 透传] 出站代理不可用：{e}")
                 if key_attempts >= retry_max:
                     return _native_error(502, f"出站代理不可用：{e}", "UNAVAILABLE")
-                if not await _wait_for_retry(fastapi_request, _retry_delay(None, backoff_seconds, key_attempts)):
+                if not await _wait_for_retry(fastapi_request, _retry_delay(None, backoff_seconds, key_attempts, jitter_seconds)):
                     return Response(status_code=499)
                 key_attempts += 1
                 record = None
@@ -366,9 +367,10 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
                 last_error_body = _native_error(502, f"Upstream connection failed ({type(e).__name__})", "UNAVAILABLE").body
             if key_attempts >= retry_max or not is_retryable_exception(e):
                 break
+            wait = _retry_delay(None, backoff_seconds, key_attempts, jitter_seconds)
             print(f"⚠️ [Gemini 透传] 上游连接异常（{type(e).__name__}），"
-                  f"{backoff_seconds:.1f}s 后重试（{key_attempts + 1}/{retry_max}）。")
-            if not await _wait_for_retry(fastapi_request, _retry_delay(None, backoff_seconds, key_attempts)):
+                  f"{wait:.1f}s 后重试（{key_attempts + 1}/{retry_max}）。")
+            if not await _wait_for_retry(fastapi_request, wait):
                 return Response(status_code=499)
             key_attempts += 1
             record = None
@@ -405,7 +407,7 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
                     upstream.status_code, "上游错误响应未完整传输。").body
             finally:
                 await _close_upstream(upstream)
-            wait = _retry_delay(upstream.headers.get("retry-after"), backoff_seconds, key_attempts)
+            wait = _retry_delay(upstream.headers.get("retry-after"), backoff_seconds, key_attempts, jitter_seconds)
             print(f"⚠️ [Gemini 透传] 上游 HTTP {upstream.status_code}，"
                   f"{wait:.1f}s 后重试（{key_attempts + 1}/{retry_max}，单 Key 同样适用）。")
             if not await _wait_for_retry(fastapi_request, wait):

@@ -375,10 +375,12 @@ class SdkTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(api_helpers.is_retryable_exception(ValueError("invalid argument")))
 
     async def test_nonfinite_persisted_retry_settings_use_defaults(self):
-        self.settings.update(retry_max=float("inf"), retry_backoff_seconds=float("nan"))
-        count, delay = api_helpers.get_retry_settings()
+        self.settings.update(retry_max=float("inf"), retry_backoff_seconds=float("nan"),
+                             retry_jitter_seconds=float("nan"))
+        count, delay, jitter = api_helpers.get_retry_settings()
         self.assertEqual(count, 10)
         self.assertEqual(delay, 5)
+        self.assertEqual(jitter, 1)
 
 
 class ImageFetchTests(unittest.TestCase):

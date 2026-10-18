@@ -411,7 +411,7 @@ class CookieStreamTests(unittest.IsolatedAsyncioTestCase):
                 200, json={"results": [{"data": {"candidates": [{"content": {"parts": [{"text": "partial"}]}}]}}]}))) as client:
             self.pool(client)
             result = await cookie_proxy._collect_full_response(
-                "project", "gemini-3.1-flash-image", req(), {}, {}, 0, 0, self.request)
+                "project", "gemini-3.1-flash-image", req(), {}, {}, 0, 0, 0, self.request)
         self.assertEqual(result["kind"], "error")
         self.assertEqual(result["code"], 502)
 

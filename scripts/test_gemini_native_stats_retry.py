@@ -197,8 +197,10 @@ class NativeStatsRetryTests(unittest.TestCase):
 
     def test_configured_backoff_and_retry_after(self):
         self.settings["retry_backoff_seconds"] = 7
+        self.settings["retry_jitter_seconds"] = 1  # 固定 7s ± 0.5s 抖动，不随次数增长
+        # 长提示（300s）钳位到窗口上限 7.5；短提示（0.25s）原样采纳
         for header, expected in ((None, 7), ("0.25", 0.25), ("invalid", 7),
-                                 ("-1", 7), ("NaN", 7), ("Infinity", 7), ("300", 120)):
+                                 ("-1", 7), ("NaN", 7), ("Infinity", 7), ("300", 7.5)):
             with self.subTest(retry_after=header):
                 self.requests.clear()
 
@@ -213,8 +215,9 @@ class NativeStatsRetryTests(unittest.TestCase):
                     self.assertEqual(self.post().status_code, 200)
                     delay = wait.await_args.args[1]
                     if expected == 7:
-                        self.assertGreaterEqual(delay, 3.5)
-                        self.assertLessEqual(delay, 7)
+                        # 固定间隔 7s ± 0.5s 抖动窗口
+                        self.assertGreaterEqual(delay, 6.5)
+                        self.assertLessEqual(delay, 7.5)
                     else:
                         self.assertEqual(delay, expected)
         self.assert_stats(total=7, success=7, retries=7)
@@ -405,7 +408,7 @@ class NativeResponseLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     app=types.SimpleNamespace(state=types.SimpleNamespace(express_key_manager=manager)),
                     is_disconnected=mock.AsyncMock(return_value=False))
                 async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: upstream)) as client:
-                    with mock.patch.object(gemini_native, "get_retry_settings", return_value=(retries, 0)), \
+                    with mock.patch.object(gemini_native, "get_retry_settings", return_value=(retries, 0, 0)), \
                          mock.patch.object(gemini_native, "_resolve_upstream_model_path", return_value="gemini-test"), \
                          mock.patch.object(gemini_native, "get_effective_proxy_uri_for_key", return_value=""), \
                          mock.patch.object(gemini_native, "passthrough_client_pool", types.SimpleNamespace(get=lambda *args: client)):

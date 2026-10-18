@@ -1273,7 +1273,7 @@ async def _execute_stream_request_generator(
 
 
 async def _collect_full_response(project_id, base_model_name, request_obj, headers, client_kwargs,
-                                 retry_max, backoff_sec, fastapi_request) -> dict:
+                                 retry_max, backoff_sec, jitter_sec, fastapi_request) -> dict:
     """非流式地完整取回一次响应（供生图假流式复用）。返回 dict。"""
     # 请求体只构建一次：构建内部含远程图片下载 + PIL 压缩，旧实现每次
     # 重试都重建一遍 = 反复下载同一批图片。重试发同一个 body 本就是重试语义。
@@ -1291,8 +1291,8 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
                 response = await client.post(BATCH_GRAPHQL_URL, headers=req_headers, json=body)
 
             if _retryable_status(response.status_code) and attempt < retry_max:
-                print(f"⚠️ [Studio] HTTP {response.status_code}（生图，尝试 {attempt+1}），{backoff_sec}s 后重试...")
-                delay = retry_delay(getattr(response, "headers", {}).get("retry-after"), backoff_sec, attempt)
+                delay = retry_delay(getattr(response, "headers", {}).get("retry-after"), backoff_sec, attempt, jitter_sec)
+                print(f"⚠️ [Studio] HTTP {response.status_code}（生图，尝试 {attempt+1}），{delay:.1f}s 后重试...")
                 if not await wait_for_retry(fastapi_request, delay):
                     return {"kind": "error", "message": "客户端已断开连接。"}
                 continue
@@ -1328,8 +1328,9 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
                         break
 
             if api_error and _retryable_status(api_error_status) and attempt < retry_max:
-                print(f"⚠️ [Studio] 生图 429/限流（尝试 {attempt+1}），{backoff_sec}s 后重试...")
-                if not await wait_for_retry(fastapi_request, retry_delay(None, backoff_sec, attempt)):
+                delay = retry_delay(None, backoff_sec, attempt, jitter_sec)
+                print(f"⚠️ [Studio] 生图 429/限流（尝试 {attempt+1}），{delay:.1f}s 后重试...")
+                if not await wait_for_retry(fastapi_request, delay):
                     return {"kind": "error", "message": "客户端已断开连接。"}
                 continue
             if api_error:
@@ -1349,8 +1350,9 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
         except Exception as e:
             em = str(e)
             if is_retryable_exception(e) and attempt < retry_max:
-                print(f"⚠️ [Studio] 生图异常（尝试 {attempt+1}）：{em[:80]}，{backoff_sec}s 后重试...")
-                if not await wait_for_retry(fastapi_request, retry_delay(None, backoff_sec, attempt)):
+                delay = retry_delay(None, backoff_sec, attempt, jitter_sec)
+                print(f"⚠️ [Studio] 生图异常（尝试 {attempt+1}）：{em[:80]}，{delay:.1f}s 后重试...")
+                if not await wait_for_retry(fastapi_request, delay):
                     return {"kind": "error", "message": "客户端已断开连接。"}
                 continue
             code, _ = extract_upstream_error(e)
@@ -1503,7 +1505,8 @@ class CookieProxyUpstream(BaseUpstream):
                 client_kwargs["proxy"] = _proxy_url
 
         # 重试配置（控制台可调）；语义与 Express 通道统一：总尝试次数 = retry_max + 1
-        retry_max, backoff_sec = get_retry_settings()
+        # 间隔为固定值 + 抖动（backoff ± jitter/2，不随次数放大）
+        retry_max, backoff_sec, jitter_sec = get_retry_settings()
 
         buffer_text = not _profile["is_image"] and (
             (text_transport and text_transport.mode == "nonstream")
@@ -1537,7 +1540,7 @@ class CookieProxyUpstream(BaseUpstream):
                 if await fastapi_request.is_disconnected():
                     return
                 print(f"🖼️ [生图保护] 图片模型 {base_model_name} 已自动切换为假流式输出（Cookie 通道），避免分块 base64 卡死前端。")
-                # 收集期间持续吐心跳：生图（含退避等待，最长 120s×N）可能持续
+                # 收集期间持续吐心跳：生图（含重试等待，固定间隔+抖动）可能持续
                 # 数十秒到数分钟；旧实现首个字节在收集完成之后才发，SSE 连接
                 # 在整个生成期间零字节，前端/中间层会按空闲超时掐断（与
                 # README 声明的心跳覆盖范围不符，也与 stream_generator /
@@ -1545,7 +1548,7 @@ class CookieProxyUpstream(BaseUpstream):
                 yield _sse_heartbeat()
                 collect_task = asyncio.create_task(_collect_full_response(
                     project_id, base_model_name, request_obj, headers, client_kwargs,
-                    retry_max, backoff_sec, fastapi_request,
+                    retry_max, backoff_sec, jitter_sec, fastapi_request,
                 ))
                 while True:
                     done, _pending = await asyncio.wait({collect_task}, timeout=10.0)
@@ -1776,7 +1779,7 @@ class CookieProxyUpstream(BaseUpstream):
                             if await fastapi_request.is_disconnected():
                                 print("ℹ️ [Studio] 客户端已断开连接，取消后续重试。")
                                 return
-                            wait_sec = retry_delay(getattr(error_to_raise, "retry_after", None), backoff_sec, attempt)
+                            wait_sec = retry_delay(getattr(error_to_raise, "retry_after", None), backoff_sec, attempt, jitter_sec)
                             print(f"⚠️ [Studio] 遇到可重试拥堵/限流: {error_to_raise[:80]}... {wait_sec}s 后进行第 {attempt+2} 次退避重试")
                             # 退避等待期间持续吐心跳，保活前端连接（issue4：3.1-pro 频繁 429 长等待易被前端断开）
                             async for _hb in _sleep_with_heartbeat(wait_sec, request=fastapi_request):
@@ -1926,9 +1929,8 @@ class CookieProxyUpstream(BaseUpstream):
 
                         if _retryable_status(response.status_code):
                             if attempt < retry_max:
-                                wait_sec = backoff_sec
-                                print(f"⚠️ [Studio] HTTP {response.status_code} (尝试 {attempt+1}), {wait_sec}s 后重试...")
-                                delay = retry_delay(getattr(response, "headers", {}).get("retry-after"), wait_sec, attempt)
+                                delay = retry_delay(getattr(response, "headers", {}).get("retry-after"), backoff_sec, attempt, jitter_sec)
+                                print(f"⚠️ [Studio] HTTP {response.status_code} (尝试 {attempt+1}), {delay:.1f}s 后重试...")
                                 if not await wait_for_retry(fastapi_request, delay):
                                     return JSONResponse(status_code=499, content={"error": {"message": "客户端已断开连接。"}})
                                 continue
@@ -1999,9 +2001,9 @@ class CookieProxyUpstream(BaseUpstream):
                                     break
 
                         if api_error and _retryable_status(api_error_status) and attempt < retry_max:
-                            wait_sec = backoff_sec
-                            print(f"⚠️ [Studio] 429/限流 (尝试 {attempt+1}): {api_error[:100]}, {wait_sec}s 后重试...")
-                            if not await wait_for_retry(fastapi_request, retry_delay(None, wait_sec, attempt)):
+                            wait_sec = retry_delay(None, backoff_sec, attempt, jitter_sec)
+                            print(f"⚠️ [Studio] 429/限流 (尝试 {attempt+1}): {api_error[:100]}, {wait_sec:.1f}s 后重试...")
+                            if not await wait_for_retry(fastapi_request, wait_sec):
                                 return JSONResponse(status_code=499, content={"error": {"message": "客户端已断开连接。"}})
                             continue
                         if api_error:
@@ -2074,9 +2076,9 @@ class CookieProxyUpstream(BaseUpstream):
                         is_retryable = is_retryable_exception(e)
 
                         if is_retryable and attempt < retry_max:
-                            wait_sec = backoff_sec
-                            print(f"⚠️ [Studio] 异常 (尝试 {attempt+1}): {err_msg[:100]}, {wait_sec}s 后重试...")
-                            if not await wait_for_retry(fastapi_request, retry_delay(None, wait_sec, attempt)):
+                            wait_sec = retry_delay(None, backoff_sec, attempt, jitter_sec)
+                            print(f"⚠️ [Studio] 异常 (尝试 {attempt+1}): {err_msg[:100]}, {wait_sec:.1f}s 后重试...")
+                            if not await wait_for_retry(fastapi_request, wait_sec):
                                 return JSONResponse(status_code=499, content={"error": {"message": "客户端已断开连接。"}})
                             continue
 

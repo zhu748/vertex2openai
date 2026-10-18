@@ -826,10 +826,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <!-- 重试 -->
       <div class="card p-5">
         <div class="text-sm font-semibold mb-3">重试与退避</div>
-        <div class="grid grid-cols-2 gap-3">
+        <div class="grid grid-cols-3 gap-3">
           <div><div class="lbl mb-1">最大重试次数</div><input id="retry_max" type="number" class="inp"></div>
-          <div><div class="lbl mb-1">退避基数(秒，含随机抖动)</div><input id="retry_backoff_seconds" type="number" step="0.5" class="inp"></div>
+          <div><div class="lbl mb-1">重试间隔(秒)</div><input id="retry_backoff_seconds" type="number" step="0.5" class="inp"></div>
+          <div><div class="lbl mb-1">抖动幅度(秒)</div><input id="retry_jitter_seconds" type="number" step="0.5" min="0" class="inp"></div>
         </div>
+        <div class="text-xs opacity-60 mt-2">实际等待 = 重试间隔 ± 抖动幅度/2（固定不变，不随重试次数增长；上游 Retry-After 更短时采纳其提示）</div>
       </div>
 
       <div class="card p-5">
@@ -1210,7 +1212,7 @@ async function loadParams(){
     const s=await (await fetch('/api/settings')).json();
     GLOBAL_SETTINGS=s;
     curAR = s.image_aspect_ratio || "";
-    ['native_thinking_mode','thinking_g3_level','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','express_location','resumable_ttl_seconds','resumable_max_streams','request_timeout_seconds','upstream_max_concurrency','resumable_max_buffer_mb','resumable_max_total_mb'].forEach(k=>setV(k,s[k]));
+    ['native_thinking_mode','thinking_g3_level','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','retry_jitter_seconds','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','express_location','resumable_ttl_seconds','resumable_max_streams','request_timeout_seconds','upstream_max_concurrency','resumable_max_buffer_mb','resumable_max_total_mb'].forEach(k=>setV(k,s[k]));
     ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction','inject_prefill_for_image','prefill_cot_guard','resumable_enabled'].forEach(k=>setV(k,s[k]));
     // 出站代理：回填输入框并刷新状态徽标
     setV('proxy-input', s.proxy_url || '');
@@ -1394,6 +1396,7 @@ async function saveSettings(){
     img_compress_quality:numOr('img_compress_quality',85),
     retry_max:numOr('retry_max',10),
     retry_backoff_seconds:numOr('retry_backoff_seconds',5),
+    retry_jitter_seconds:numOr('retry_jitter_seconds',1),
     fake_streaming:$('fake_streaming').checked,
     fake_streaming_interval:numOr('fake_streaming_interval',1),
     roundrobin:$('roundrobin').checked,
@@ -1547,6 +1550,7 @@ _SETTING_ENUMS = {
 _SETTING_NUMERIC_RANGE = {
     "retry_max": (0, 50),
     "retry_backoff_seconds": (0.0, 120.0),
+    "retry_jitter_seconds": (0.0, 60.0),
     "fake_streaming_interval": (0.0, 30.0),
     "img_compress_max_dim": (64, 8192),
     "img_compress_max_mb": (0.05, 32.0),

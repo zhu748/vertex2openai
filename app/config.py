@@ -84,9 +84,14 @@ DEFAULT_SETTINGS = {
     "img_compress_quality": 85,
     # 重试
     # 语义：retry_max = 失败后的**重试**次数，总请求次数 = retry_max + 1。
-    # 两条通道统一走 api_helpers.get_retry_settings() 读取（会钳位到 0–50）。
+    # 两条通道统一走 api_helpers.get_retry_settings() 读取（retry_max 钳位 0–50）。
+    # 重试间隔为**固定值 + 抖动**（不再随次数指数放大）：实际等待在
+    # [retry_backoff_seconds - retry_jitter_seconds/2,
+    #  retry_backoff_seconds + retry_jitter_seconds/2] 内均匀采样；
+    # 上游 Retry-After 更短时采纳其提示，更长时钳位到该窗口上限。
     "retry_max": 10,
     "retry_backoff_seconds": 5,
+    "retry_jitter_seconds": 1,
     # 开关（初始值取环境变量）
     "fake_streaming": FAKE_STREAMING_ENABLED,
     "fake_streaming_interval": FAKE_STREAMING_INTERVAL_SECONDS,

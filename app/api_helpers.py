@@ -58,12 +58,16 @@ class SafetyBlockedError(ValueError):
 
 
 
-def get_retry_settings() -> tuple[int, float]:
+def get_retry_settings() -> tuple[int, float, float]:
     """读取重试配置。
 
     **语义（全项目统一）**：`retry_max` 是「失败后的重试次数」，
     总请求次数 = retry_max + 1。所以循环一律写 `range(retry_max + 1)`。
     旧实现在 Express 通道写成 `range(retry_max)`，retry_max=0 时一次请求都不发（P0-2）。
+
+    重试间隔为**固定值 + 抖动**，不随次数指数放大：实际等待在
+    [backoff - jitter/2, backoff + jitter/2] 内均匀采样（见 retry_policy.retry_delay）。
+    返回 (retry_max, backoff, jitter) 三元组。
     """
     try:
         retry_max = int(app_state.get_setting("retry_max", app_config.DEFAULT_SETTINGS["retry_max"]))
@@ -76,7 +80,15 @@ def get_retry_settings() -> tuple[int, float]:
         backoff = float(app_config.DEFAULT_SETTINGS["retry_backoff_seconds"])
     if not math.isfinite(backoff):
         backoff = float(app_config.DEFAULT_SETTINGS["retry_backoff_seconds"])
-    return max(0, min(50, retry_max)), max(0.0, min(120.0, backoff))
+    try:
+        jitter = float(app_state.get_setting(
+            "retry_jitter_seconds", app_config.DEFAULT_SETTINGS["retry_jitter_seconds"]))
+    except (TypeError, ValueError):
+        jitter = float(app_config.DEFAULT_SETTINGS["retry_jitter_seconds"])
+    if not math.isfinite(jitter):
+        jitter = float(app_config.DEFAULT_SETTINGS["retry_jitter_seconds"])
+    return (max(0, min(50, retry_max)), max(0.0, min(120.0, backoff)),
+            max(0.0, min(60.0, jitter)))
 
 
 def create_openai_error_response(status_code: int, message: str, error_type: str) -> Dict[str, Any]:
@@ -780,8 +792,9 @@ async def gemini_fake_stream_generator(
     print(f"🌊 [假流式] 已开始调用 Gemini 模型 {model_for_api_call}，客户端请求模型名为 {request_obj.model}。")
 
     # P1-6：不再使用 tenacity 的硬编码 20 次，改为与真流式/非流式一致的手写退避，
-    # 读取控制台的 retry_max / retry_backoff_seconds，并在等待期间检测客户端断开。
-    max_retries, backoff_sec = get_retry_settings()
+    # 读取控制台的 retry_max / retry_backoff_seconds / retry_jitter_seconds
+    # （固定间隔 + 抖动，不随次数放大），并在等待期间检测客户端断开。
+    max_retries, backoff_sec, jitter_sec = get_retry_settings()
 
     async def _client_gone() -> bool:
         if fastapi_request is None:
@@ -856,7 +869,7 @@ async def gemini_fake_stream_generator(
                     print(f"↩️ [上游端点] 假流式钉定失败，退回裸模型名 {fallback_model} 重试。")
                     continue
                 if is_retryable_exception(e_call) and attempt < max_retries:
-                    wait_time = exception_retry_delay(e_call, backoff_sec, attempt)
+                    wait_time = exception_retry_delay(e_call, backoff_sec, attempt, jitter_sec)
                     print(f"⚠️ [自动重试] 假流式上游繁忙（{e_call.__class__.__name__}），"
                           f"第 {attempt + 1} 次退避重试，等待 {wait_time} 秒。")
                     waited = 0.0
@@ -1025,7 +1038,7 @@ async def execute_gemini_call(
             async def _gemini_real_stream_generator_inner():
                 # 钉定失败要在这里改写模型名与客户端，必须声明 nonlocal。
                 nonlocal model_to_call, current_client, fallback_model
-                max_retries, backoff_sec = get_retry_settings()
+                max_retries, backoff_sec, jitter_sec = get_retry_settings()
                 has_yielded = False  # 是否已向客户端输出过内容
                 # 立即吐一个 SSE 心跳，尽快建立连接（429 重试期间也保活，防前端超时中断）
                 yield ": keep-alive\n\n"
@@ -1171,7 +1184,7 @@ async def execute_gemini_call(
                         if is_retryable and not has_yielded and not target_unavailable and attempt < max_retries:
                             # F-5：退避时长改读控制台的 retry_backoff_seconds，
                             # 原先硬编码 2**(attempt%4)，控制台设置对真流式完全没作用。
-                            wait_time = exception_retry_delay(e_stream_call, backoff_sec, attempt)
+                            wait_time = exception_retry_delay(e_stream_call, backoff_sec, attempt, jitter_sec)
                             print(f"⚠️ [自动重试] Agent Platform Express Mode 流式请求返回 429/503 或配额繁忙。第 {attempt + 1} 次退避重试，等待 {wait_time} 秒。")
                             if await _client_gone():
                                 print(f"ℹ️ [客户端断开] 重试前检测到客户端已断开，停止调用模型 {model_to_call}。")
@@ -1212,7 +1225,7 @@ async def execute_gemini_call(
             return StreamingResponse(_gemini_real_stream_generator_inner(), media_type="text/event-stream")
     else: # Non-streaming
         # 手动退避重试循环（替代 tenacity），以便在每次重试前检测客户端断开
-        max_retries, backoff_sec = get_retry_settings()
+        max_retries, backoff_sec, jitter_sec = get_retry_settings()
         response_obj_call = None
         # 总尝试次数 = retry_max + 1，retry_max=0 时仍会请求一次
         attempt = 0
@@ -1255,7 +1268,7 @@ async def execute_gemini_call(
                     print("ℹ️ [流量等级] 回退默认路由已使用普通请求。")
                     continue
                 if is_retryable_exception(e_call) and not target_unavailable and attempt < max_retries:
-                    wait_time = exception_retry_delay(e_call, backoff_sec, attempt)
+                    wait_time = exception_retry_delay(e_call, backoff_sec, attempt, jitter_sec)
                     print(f"⚠️ [自动重试] 上游繁忙或触发配额限制（{e_call.__class__.__name__}）。第 {attempt + 1} 次退避重试，等待 {wait_time} 秒。")
                     if not await wait_for_retry(fastapi_request, wait_time):
                         return JSONResponse(status_code=499, content=create_openai_error_response(
