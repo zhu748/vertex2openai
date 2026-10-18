@@ -41,9 +41,9 @@ def parse_cookie_value(cookie_str: str, name: str) -> str:
     return match.group(1).strip() if match else ""
 
 
-def _compute_hash(sapisid_value: str, origin: str) -> str:
-    """计算单个 SAPISIDHASH"""
-    timestamp = int(time.time())
+def _compute_hash(sapisid_value: str, origin: str, timestamp: int) -> str:
+    """计算单个 SAPISIDHASH（timestamp 由调用方传入：三段必须用同一秒，
+    跨秒边界时各段不一致虽仍能通过校验，但与浏览器实现的三段同 ts 不符）。"""
     hash_input = f"{timestamp} {sapisid_value} {origin}"
     hash_value = hashlib.sha1(hash_input.encode()).hexdigest()
     return f"{timestamp}_{hash_value}"
@@ -64,10 +64,11 @@ def build_authorization_header(cookie_str: str) -> Optional[str]:
     if not primary:
         return None
     
-    # 计算 hash（它们通常值相同，hash 也相同）
-    h_main = _compute_hash(sapisid or primary, SAPISIDHASH_ORIGIN)
-    h_1p = _compute_hash(sapisid_1p or primary, SAPISIDHASH_ORIGIN)
-    h_3p = _compute_hash(sapisid_3p or primary, SAPISIDHASH_ORIGIN)
+    # 计算 hash（它们通常值相同，hash 也相同）；三段共用同一个时间戳
+    timestamp = int(time.time())
+    h_main = _compute_hash(sapisid or primary, SAPISIDHASH_ORIGIN, timestamp)
+    h_1p = _compute_hash(sapisid_1p or primary, SAPISIDHASH_ORIGIN, timestamp)
+    h_3p = _compute_hash(sapisid_3p or primary, SAPISIDHASH_ORIGIN, timestamp)
     
     return f"SAPISIDHASH {h_main} SAPISID1PHASH {h_1p} SAPISID3PHASH {h_3p}"
 

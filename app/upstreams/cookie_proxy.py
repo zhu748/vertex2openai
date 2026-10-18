@@ -98,7 +98,10 @@ PROJECT_ERROR_KEYWORDS = [
     "has not been used in project",
     "is not found and cannot be used",
     "project not found",
-    "invalid argument",
+    # 注：不含 "invalid argument"——那是通用 400 文案（字段非法 / 原生函数
+    # Schema 被拒都常带它），归进来会把可降级的协议拒绝误报成“项目/计费
+    # 问题”，阻断降级重试并给出误导性提示。项目级误判由下方 projects/
+    # 资源路径 + denied 的组合判断兜底。
 ]
 
 PROJECT_ERROR_HINT = (
@@ -890,32 +893,52 @@ def _summ_obj(obj: dict, width: int = 700) -> str:
     return s[:width] + ("…" if len(s) > width else "")
 
 
+class _AiterTextSource:
+    """把已取回的完整文本包成异步文本迭代器（非流式路径复用流式解析器用）。
+
+    旧实现在重试循环体内每次重建 _F / _FakeResponse 两个一次性类（解释器
+    每次重新编译类体），提升为模块级单一实现。
+    """
+
+    def __init__(self, text):
+        self._text = text
+
+    async def aiter_text(self):
+        yield self._text
+
+
 class _RawSampler:
-    """收集原始响应对象的首尾样本，供“无正文/空响应”时输出诊断日志。"""
+    """收集原始响应对象的首尾样本，供“无正文/空响应”时输出诊断日志。
+
+    只存原始对象引用（上界 keep 个）；_summ_obj 的完整 json.dumps + 截断
+    推迟到 dump() 才做。旧实现在 add() 里对**每个**对象都先序列化一遍、
+    随即丢弃（生图响应单个对象可达数 MB，等于在事件循环上做无谓的
+    全量序列化再扔掉）。
+    """
 
     def __init__(self, keep: int = 2):
         self.keep = keep
-        self.head: list = []
-        self.tail: list = []
+        self._head: list = []
+        self._tail: list = []
         self.count = 0
 
     def add(self, obj: dict):
         self.count += 1
-        if len(self.head) < self.keep:
-            self.head.append(_summ_obj(obj))
+        if len(self._head) < self.keep:
+            self._head.append(obj)
         else:
-            self.tail.append(_summ_obj(obj))
-            if len(self.tail) > self.keep:
-                self.tail.pop(0)
+            self._tail.append(obj)
+            if len(self._tail) > self.keep:
+                self._tail.pop(0)
 
     def dump(self) -> str:
         if self.count == 0:
             return "（上游未返回任何可解析的 JSON 对象）"
         lines = [f"共 {self.count} 个对象；首尾样本："]
-        lines += [f"  ▸ {s}" for s in self.head]
-        if self.tail:
+        lines += [f"  ▸ {_summ_obj(o)}" for o in self._head]
+        if self._tail:
             lines.append(f"  …")
-            lines += [f"  ▸ {s}" for s in self.tail]
+            lines += [f"  ▸ {_summ_obj(o)}" for o in self._tail]
         return "\n".join(lines)
 
 
@@ -1146,14 +1169,17 @@ async def _execute_stream_request_generator_once(
                 error_text = await response.aread()
                 error_msg = error_text.decode('utf-8', errors='replace')[:1000]
 
+                # 原生函数 Schema 被拒优先于 Cookie/项目分类（与事件流分支
+                # 的判定顺序一致；旧实现反序，且 "invalid argument" 被归进
+                # 项目关键词，导致可降级的协议拒绝永远走不到降级重试）。
+                if _native_tool_error(error_msg):
+                    yield "native_tool_unsupported", _StreamRequestError(error_msg, status_code=response.status_code)
+                    return
+
                 if response.status_code in (401, 403) or _is_cookie_expired_error(error_msg) \
                         or _is_project_error(error_msg):
                     hint = PROJECT_ERROR_HINT if _is_project_error(error_msg) else COOKIE_REFRESH_HINT
                     yield "cookie_error", _StreamRequestError(error_msg + hint, status_code=response.status_code)
-                    return
-
-                if _native_tool_error(error_msg):
-                    yield "native_tool_unsupported", _StreamRequestError(error_msg, status_code=response.status_code)
                     return
                 is_retryable = _retryable_status(response.status_code)
                 error = _StreamRequestError(error_msg, getattr(response, "headers", {}).get("retry-after"),
@@ -1214,7 +1240,6 @@ async def _execute_stream_request_generator(
     body: dict,
     sampler: "_RawSampler | None" = None,
     fallback_body: Any = None,
-    fallback_state: Optional[dict] = None,
 ) -> AsyncGenerator[tuple[str, Any], None]:
     """Execute native tools, lazily degrading after one clear protocol rejection."""
     events = _execute_stream_request_generator_once(client, headers, body, sampler)
@@ -1233,8 +1258,8 @@ async def _execute_stream_request_generator(
         await events.aclose()
 
     # 先归还被拒请求的连接，再构造/启动替代请求。
-    if fallback_state is not None:
-        fallback_state["latched"] = True
+    # （降级锁定由 fallback_body 闭包内的 native_fallback_state["latched"]=True
+    # 完成；旧签名的 fallback_state 参数无任何调用方传入，已移除。）
     resolved_fallback = fallback_body() if callable(fallback_body) else fallback_body
     if hasattr(resolved_fallback, "__await__"):
         resolved_fallback = await resolved_fallback
@@ -1281,11 +1306,7 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
             safety_html = ""
             sampler = _RawSampler()
 
-            class _F:
-                def __init__(self, t): self._t = t
-                async def aiter_text(self): yield self._t
-
-            async for obj in _iter_json_objects(_F(response.text)):
+            async for obj in _iter_json_objects(_AiterTextSource(response.text)):
                 sampler.add(obj)
                 for et, data in _extract_from_results(obj):
                     if et == "text":
@@ -1443,7 +1464,9 @@ class CookieProxyUpstream(BaseUpstream):
                 print("ℹ️ [预填充兼容] 未检测到预填充（请求最后一条不是 assistant 消息）。"
                       "预设里的思维链指令属于 system/user 条目，不是预填充；"
                       "若要用预设思维链顶掉原生思考，需在预设末尾放一条 assistant 条目（通常是思考块的开标签）。")
-            if prefill_active and app_state.get_setting("prefill_suppress_thinking", True):
+            if prefill_active and app_state.get_setting(
+                    "prefill_suppress_thinking",
+                    app_config.DEFAULT_SETTINGS.get("prefill_suppress_thinking", True)):
                 print("🧠 [预填充兼容] 已按模型压制原生思考（可在控制台关闭），让预设思维链接管。")
 
         request_obj, text_transport = prepare_transport(
@@ -1514,10 +1537,32 @@ class CookieProxyUpstream(BaseUpstream):
                 if await fastapi_request.is_disconnected():
                     return
                 print(f"🖼️ [生图保护] 图片模型 {base_model_name} 已自动切换为假流式输出（Cookie 通道），避免分块 base64 卡死前端。")
-                res = await _collect_full_response(
+                # 收集期间持续吐心跳：生图（含退避等待，最长 120s×N）可能持续
+                # 数十秒到数分钟；旧实现首个字节在收集完成之后才发，SSE 连接
+                # 在整个生成期间零字节，前端/中间层会按空闲超时掐断（与
+                # README 声明的心跳覆盖范围不符，也与 stream_generator /
+                # buffered_stream 的首心跳行为不一致）。
+                yield _sse_heartbeat()
+                collect_task = asyncio.create_task(_collect_full_response(
                     project_id, base_model_name, request_obj, headers, client_kwargs,
                     retry_max, backoff_sec, fastapi_request,
-                )
+                ))
+                while True:
+                    done, _pending = await asyncio.wait({collect_task}, timeout=10.0)
+                    if done:
+                        break
+                    if await fastapi_request.is_disconnected():
+                        collect_task.cancel()
+                        print("ℹ️ [Studio] 客户端已断开连接，取消生图收集。")
+                        return
+                    yield _sse_heartbeat()
+                try:
+                    res = collect_task.result()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    res = {"kind": "error", "code": 502,
+                           "message": f"batchGraphql proxy error: {type(e).__name__}: {e}"}
                 yield _make_openai_chunk(response_id, model_display, role="assistant")
                 if res.get("kind") != "ok":
                     stats.add_error()
@@ -1545,11 +1590,9 @@ class CookieProxyUpstream(BaseUpstream):
 
         # ========== 流式处理（彻底解决 60s 超时的真·流式机制） ==========
         if is_stream:
-            async def stream_generator():
+            async def _stream_core():
                 nonlocal start_time
 
-                # 立即吐一个心跳，尽快建立连接（避免首个上游调用较慢/429 时前端久等无字节）
-                yield _sse_heartbeat()
                 native_fallback_state = {"latched": False}
 
                 # 请求体按「原生 / 降级」两形态各自只构建一次：构建内部含
@@ -1803,6 +1846,26 @@ class CookieProxyUpstream(BaseUpstream):
                             print(f"✅ [Studio] {base_model_name} | 流式传输顺利完毕 | 耗时 {elapsed:.1f}s")
                         return
 
+            async def stream_generator():
+                # 立即吐一个心跳，尽快建立连接（避免首个上游调用较慢/429 时前端久等无字节）
+                yield _sse_heartbeat()
+                try:
+                    async for frame in _stream_core():
+                        yield frame
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    # 准备阶段（请求体构建 / 客户端池获取）的异常旧实现直接抛出
+                    # 生成器：SSE 已 200 建流后连接被拦腰掐断，客户端拿不到任何
+                    # 错误帧只能干等到超时。这里统一以错误帧 + [DONE] 收尾，
+                    # 与「半截答案不当成功、异常必须显式返回」的设计原则一致。
+                    stats.add_error()
+                    code, message = extract_upstream_error(e)
+                    print(f"❌ [Studio] {base_model_name} | 流式响应意外中断 | HTTP {code} | {str(e)[:150]}")
+                    error = create_openai_error_response(code, message[:1024], "upstream_error")
+                    yield "data: " + json.dumps(error, ensure_ascii=False) + "\n\n"
+                    yield "data: [DONE]\n\n"
+
             return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
         # ========== 非流式处理 ==========
@@ -1891,13 +1954,7 @@ class CookieProxyUpstream(BaseUpstream):
                         blocked_msg = None
                         sampler = _RawSampler()
 
-                        class _FakeResponse:
-                            def __init__(self, text):
-                                self._text = text
-                            async def aiter_text(self):
-                                yield self._text
-
-                        fake_resp = _FakeResponse(response.text)
+                        fake_resp = _AiterTextSource(response.text)
                         text_decoder = text_transport.decoder() if text_transport else None
                         async for obj in _iter_json_objects(fake_resp):
                             sampler.add(obj)
