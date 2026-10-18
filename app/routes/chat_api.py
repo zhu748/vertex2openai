@@ -264,8 +264,12 @@ async def _resumable_json(fastapi_request: Request, request_obj: OpenAIRequest, 
             return
         body = getattr(resp, "body", b"") or b""
         status = getattr(resp, "status_code", 200)
+        # 空 body 的 2xx 不再包装成成功空对象（旧实现 payload={} 直接落缓冲，
+        # 客户端拿到 200 空 JSON）；上游正常回复必有 JSON 体，空体即不完整。
+        if not body:
+            raise IncompleteResponseError("上游返回空响应体。") from None
         try:
-            payload = json.loads(body.decode("utf-8")) if body else {}
+            payload = json.loads(body.decode("utf-8"))
         except (ValueError, UnicodeError):
             raise IncompleteResponseError("上游返回无效或不完整的 JSON 响应。") from None
         if not isinstance(payload, dict):

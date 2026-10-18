@@ -42,6 +42,10 @@ def resume_cursor(request) -> tuple[Optional[str], int, bool]:
     generation = (request.headers.get("x-resume-id") or "").strip() or None
     raw = (request.headers.get("last-event-id") or "").strip()
     query = getattr(request, "query_params", {}).get("resume_from")
+    if query is not None and not str(query).strip():
+        # `?resume_from=`（存在但值为空）视同缺省：从 seq 0 开始。
+        # 旧实现会落到 int("") 报 400「游标非法」，把无害写法当成错误。
+        query = None
     if not raw and query is None:
         return generation, 0, generation is not None
     if raw and ":" in raw:

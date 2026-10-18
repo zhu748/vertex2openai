@@ -83,6 +83,11 @@ EXPRESS_API_VERSION = "v1beta1"
 # 支持透传的 :action 后缀
 _SUPPORTED_ACTIONS = {"generateContent", "streamGenerateContent", "countTokens", "embedContent"}
 
+# 透传请求体体积上限：原始 bytes 在解析、指纹、重试全程被持有，不设限
+# 等于允许认证后的内存放大。32MiB 远大于任何正常请求（含数张 4K 图的
+# base64）；先查 Content-Length 头再复查实际长度（防谎报头的绕过）。
+MAX_NATIVE_BODY_BYTES = 32 * 1024 * 1024
+
 # 上游透传客户端超时：流式长思考可能持续数分钟，read 放宽。
 _UPSTREAM_TIMEOUT = httpx.Timeout(connect=30.0, read=600.0, write=60.0, pool=10.0)
 
@@ -709,7 +714,14 @@ def _passthrough_endpoint():
         # 成什么样（分隔符、键序、空白），上游收到的就是什么样，与
         # “客户端直连 Google”的形态完全一致（反代最忌讳的就是重组后的
         # body 与自称的 SDK 形态对不上号）。
+        # 体积上限：解析、指纹、重试全程持有原始 bytes，不设限等于允许
+        # 认证后的内存放大（32MiB 远大于任何正常请求，含数张 4K 图）。
+        declared_length = request.headers.get("content-length", "")
+        if declared_length.isdigit() and int(declared_length) > MAX_NATIVE_BODY_BYTES:
+            return _native_error(413, f"请求体超过 {MAX_NATIVE_BODY_BYTES // (1024 * 1024)}MiB 上限。")
         raw_body = await request.body()
+        if len(raw_body) > MAX_NATIVE_BODY_BYTES:
+            return _native_error(413, f"请求体超过 {MAX_NATIVE_BODY_BYTES // (1024 * 1024)}MiB 上限。")
         try:
             parsed = json.loads(raw_body)
         except Exception:
@@ -786,12 +798,16 @@ async def native_list_models(fastapi_request: Request,
 
 
 @router.get("/v1beta/models/{model_action}")
-async def native_get_model(model_action: str,
+async def native_get_model(model_action: str, fastapi_request: Request,
                            _auth: str = Depends(get_gemini_auth)):
+    # 与 native_list_models 一致：未配置任何通道时不返回模型详情
+    # （旧实现缺这个检查，无 Key 也照常返回目录条目，与列表行为矛盾）。
+    manager = fastapi_request.app.state.express_key_manager
+    has_any = manager.get_total_keys() > 0 or app_state.is_web_proxy_enabled()
     model, action = _split_model_action(model_action)
     if action:
         return _native_error(400, f"GET 不支持 :{action}，请用 POST。")
-    raw = await get_express_models()
+    raw = await get_express_models() if has_any else []
     if model and model in raw:
         return {
             "name": f"models/{model}",

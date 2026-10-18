@@ -110,5 +110,6 @@ def limit_generation(function):
             response.body_iterator = iterator
             return response
         return ManagedStreamingResponse(iterator, status_code=response.status_code,
-                                        headers=dict(response.headers), background=response.background)
+                                        headers=dict(response.headers), background=response.background,
+                                        media_type=getattr(response, "media_type", None))
     return guarded

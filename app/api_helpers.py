@@ -18,7 +18,14 @@ from message_processing import (
     _create_safety_ratings_html,
     strip_prefill_overlap,
     PrefillDeduper,
+    parse_gemini_response_for_reasoning_and_content,
+    build_tool_call_id,
+    thought_signature_extra,
+    ordinary_part_metadata,
+    _convert_image_to_markdown,
+    _signature_bytes,
 )
+from signature_store import SignatureState
 import config as app_config
 
 import model_capabilities as mc
@@ -37,6 +44,17 @@ def _safety_score_enabled() -> bool:
         return bool(app_state.get_setting("safety_score", app_config.SAFETY_SCORE))
     except Exception:
         return bool(app_config.SAFETY_SCORE)
+
+
+class SafetyBlockedError(ValueError):
+    """上游安全策略拦截了请求内容（promptFeedback.blockReason）。
+
+    携带 code=400：被拦截是**请求内容**问题而非服务器故障，旧实现抛裸
+    ValueError 会被 extract_upstream_error 兜底成 500（内容审查当内部错误）。
+    error_status() 会探测 .code 属性，流式/非流式两条路径自动拿到 400。
+    """
+
+    code = 400
 
 
 
@@ -421,17 +439,16 @@ class ToolCallIndexer:
         return candidate_index in self._seen_tool_calls
 
 
-def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candidate_index: int = 0,
-                            indexer: Optional[ToolCallIndexer] = None) -> str:
-    from message_processing import (
-        parse_gemini_response_for_reasoning_and_content,
-        build_tool_call_id,
-        thought_signature_extra,
-        ordinary_part_metadata,
-        _convert_image_to_markdown,
-        _signature_bytes,
-    )
-    from signature_store import SignatureState
+def _build_chunk_payload(chunk: Any, model_name: str, response_id: str, candidate_index: int = 0,
+                        indexer: Optional[ToolCallIndexer] = None) -> dict:
+    """构造单条 OpenAI chunk 的 payload dict（不序列化）。
+
+    热路径优化：真流式循环里每个 chunk 要做判空、预填充去重再输出，
+    旧实现“dict→json.dumps→str→json.loads→dict→改→json.dumps→str”
+    往返两次序列化；拆出本函数后判空/去重直接操作 dict，只在最终
+    yield 时序列化一次（convert_chunk_to_openai 保留字符串返回，
+    外部调用方与测试脚本行为不变）。
+    """
     delta_payload = {}
     openai_finish_reason = None
     output_index = candidate_index
@@ -577,7 +594,13 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
         "id": response_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model_name,
         "choices": [{"index": output_index, "delta": delta_payload, "finish_reason": openai_finish_reason}]
     }
-    return f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
+    return chunk_data
+
+
+def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candidate_index: int = 0,
+                            indexer: Optional[ToolCallIndexer] = None) -> str:
+    """单条 Gemini chunk → OpenAI SSE 帧（对外保持字符串返回，兼容既有调用方）。"""
+    return f"data: {json.dumps(_build_chunk_payload(chunk, model_name, response_id, candidate_index, indexer), ensure_ascii=False)}\n\n"
 
 def create_final_chunk(model: str, response_id: str, candidate_count: int = 1) -> str:
     choices = [{"index": i, "delta": {}, "finish_reason": "stop"} for i in range(candidate_count)]
@@ -595,7 +618,7 @@ async def _chunk_openai_response_dict_for_sse(
     
     choices = openai_response_dict.get("choices", [])
     if not choices: 
-        yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model_name, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'error'}]})}\n\n"
+        yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model_name, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'error'}]}, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
         return
 
@@ -607,7 +630,7 @@ async def _chunk_openai_response_dict_for_sse(
             payload = {"id": resp_id, "object": "chat.completion.chunk", "created": created_time,
                        "model": model_name, "choices": [{"index": choice_idx, "delta": delta,
                                                            "finish_reason": None}]}
-            return f"data: {json.dumps(payload)}\n\n"
+            return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
         # A response may legitimately mix thoughts, visible text, tool calls and
         # message-level signature metadata in the same assistant turn. Emit each
@@ -682,14 +705,30 @@ def _dedup_sse_chunk_content(sse_line: str, deduper: PrefillDeduper, force_flush
       判定完成后原样透传，零额外延迟。
     - force_flush=True 或 chunk 带 finish_reason 时，把攒着的文本一并放出，
       避免正文落在 finish 之后（部分客户端在 finish 后停止读取）。
+
+    保留字符串接口供既有调用方；热路径请用 _dedup_chunk_payload（凭 dict
+    直改，免去一次序列化/反序列化往返）。
     """
     if deduper.done and not force_flush:
         return sse_line
     try:
         payload = json.loads(sse_line[len("data: "):].strip())
+        out = _dedup_chunk_payload(payload, deduper, force_flush)
+        if out is None:
+            return None
+        return f"data: {json.dumps(out, ensure_ascii=False)}\n\n"
+    except Exception:
+        return sse_line
+
+
+def _dedup_chunk_payload(payload: dict, deduper: PrefillDeduper, force_flush: bool = False) -> Optional[dict]:
+    """_dedup_sse_chunk_content 的 dict 版：直接改写 payload，返回 None 表示整条跳过。"""
+    if deduper.done and not force_flush:
+        return payload
+    try:
         choices = payload.get("choices") or []
         if not choices:
-            return sse_line
+            return payload
         choice = choices[0]
         delta = choice.get("delta") or {}
         content = delta.get("content")
@@ -702,17 +741,17 @@ def _dedup_sse_chunk_content(sse_line: str, deduper: PrefillDeduper, force_flush
         if out:
             delta["content"] = out
             choice["delta"] = delta
-            return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            return payload
 
         # 没有可放出的正文：若 chunk 还有其他信息（角色/思考/finish 等）则去掉 content 保留其余
         if content is not None:
             delta.pop("content", None)
         if delta or has_finish:
             choice["delta"] = delta
-            return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            return payload
         return None  # 纯 content 且被暂存 → 整条跳过
     except Exception:
-        return sse_line
+        return payload
 
 
 def _resolve_retry_target(current_client, current_model, current_fallback, target):
@@ -1033,7 +1072,7 @@ async def execute_gemini_call(
                             # 支持 n>1：按候选序号逐个输出
                             feedback = getattr(chunk_item_call, "prompt_feedback", None)
                             if getattr(feedback, "block_reason", None):
-                                raise ValueError(f"请求被上游安全策略拦截：{feedback.block_reason}")
+                                raise SafetyBlockedError(f"请求被上游安全策略拦截：{feedback.block_reason}")
                             for ci, candidate in enumerate(chunk_item_call.candidates or []):
                                 index = candidate.index if candidate.index is not None else ci
                                 seen_candidates.add(index)
@@ -1043,23 +1082,23 @@ async def execute_gemini_call(
                                 chunk_item_call = text_decoder.restore_sdk(chunk_item_call)
                             num_candidates = len(getattr(chunk_item_call, "candidates", None) or [])
                             for ci in range(num_candidates):
-                                sse_chunk = convert_chunk_to_openai(
+                                chunk_payload = _build_chunk_payload(
                                     chunk_item_call, request_obj.model, response_id_for_stream, ci,
                                     indexer=tool_indexer)
                                 if deduper is not None:
-                                    sse_chunk = _dedup_sse_chunk_content(sse_chunk, deduper)
-                                    if sse_chunk is None:
+                                    chunk_payload = _dedup_chunk_payload(chunk_payload, deduper)
+                                    if chunk_payload is None:
                                         continue  # 正文暂存于去重器，跳过空 chunk
-                                choice = json.loads(sse_chunk[6:])["choices"][0]
-                                delta = choice.get("delta", {})
-                                signature = delta.get("extra_content", {}).get("google", {}).get("thought_signature")
+                                choice = (chunk_payload.get("choices") or [{}])[0]
+                                delta = choice.get("delta") or {}
+                                signature = ((delta.get("extra_content") or {}).get("google") or {}).get("thought_signature")
                                 if not (delta.get("content") or delta.get("reasoning_content")
                                         or delta.get("tool_calls") or signature or choice.get("finish_reason")):
                                     continue
                                 if prefill_text and not has_yielded:
-                                    yield f"data: {json.dumps(_pf)}\n\n"
+                                    yield f"data: {json.dumps(_pf, ensure_ascii=False)}\n\n"
                                 has_yielded = True
-                                yield sse_chunk
+                                yield f"data: {json.dumps(chunk_payload, ensure_ascii=False)}\n\n"
 
                         if text_decoder:
                             text_decoder.validate_end()
@@ -1242,7 +1281,7 @@ async def execute_gemini_call(
             if hasattr(response_obj_call.prompt_feedback,"block_reason_message") and \
                response_obj_call.prompt_feedback.block_reason_message:
                 block_msg+=f"（{response_obj_call.prompt_feedback.block_reason_message}）"
-            raise ValueError(block_msg)
+            raise SafetyBlockedError(block_msg)
 
         require_complete_response(response_obj_call)
         if text_transport:
