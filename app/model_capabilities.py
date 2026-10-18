@@ -134,9 +134,34 @@ def _temp_deprecated(name: str) -> bool:
 
 
 def get_profile(model_name: str) -> Dict[str, Any]:
-    """返回给定模型的能力档案。"""
+    """返回给定模型的能力档案（带缓存）。
+
+    单次请求链路会重复调用 5+ 次（后缀剥离、采样裁剪、思考档位、生图校验…），
+    每次都重新做后缀剥离 + 两轮正则 + 集合运算；这里按归一化后的名字缓存
+    计算结果。安全性：apply_sampling_policy 已经返回浅拷贝不修改入参，
+    其余调用方均只读——缓存直接共享同一 dict 是安全的。
+    缓存条目数封顶（模型名来自客户端请求，不设限会被任意名字撑爆内存）；
+    满了整体清空重算，成本仅是单次档案计算。dict 读写依赖 GIL 原子性，
+    最坏竞态也只是重复计算一次，无需加锁。
+    """
     raw = (model_name or "").lower()
-    name = _strip_known_suffixes(raw)
+    cached = _profile_cache.get(raw)
+    if cached is not None:
+        return cached
+    profile = _compute_profile(raw)
+    if len(_profile_cache) >= _PROFILE_CACHE_LIMIT:
+        _profile_cache.clear()
+    _profile_cache[raw] = profile
+    return profile
+
+
+_PROFILE_CACHE_LIMIT = 512
+_profile_cache: Dict[str, Dict[str, Any]] = {}
+
+
+def _compute_profile(name: str) -> Dict[str, Any]:
+    """能力档案的实际计算（入参已 lower，由 get_profile 缓存后调用）。"""
+    name = _strip_known_suffixes(name)
 
     # ---- 生图模型 ----
     # 识别规则："image" in name 覆盖 3.x 生图；"nano-banana" in name 覆盖 Nano Banana 家族

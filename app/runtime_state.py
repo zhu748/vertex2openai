@@ -4,6 +4,7 @@ import os
 import tempfile
 import threading
 import time
+from typing import Optional
 
 import config as app_config
 
@@ -271,10 +272,18 @@ class AppState:
         with self._lock:
             stored = self._state.get("settings")
             if isinstance(stored, dict) and key in stored:
-                return copy.deepcopy(stored[key])
-            if key in app_config.DEFAULT_SETTINGS:
-                return copy.deepcopy(app_config.DEFAULT_SETTINGS[key])
-            return default
+                value = stored[key]
+            elif key in app_config.DEFAULT_SETTINGS:
+                value = app_config.DEFAULT_SETTINGS[key]
+            else:
+                return default
+            # 不可变标量直接返回（深拷贝无意义）；容器值仍深拷贝，防外部
+            # 改动污染状态树。旧实现无差别深拷贝：热路径上每个 SSE 帧的
+            # 限额读取、每个 chunk 的开关查询都在锁内做递归拷贝。
+            # 注：bool 是 int 子类，isinstance 一并覆盖；float 含 nan 也安全。
+            if value is None or isinstance(value, (str, int, float, bool)):
+                return value
+            return copy.deepcopy(value)
 
     def get_raw_stored_setting(self, key: str, default=None):
         """只取**用户在控制台持久化保存过**的原始值，不做任何回退。
@@ -350,8 +359,13 @@ class AppState:
             print(f"🔧 [状态管理器] 已清除模型 {model_name} 的专属参数。")
             return True
 
-    def get_effective_settings(self, model_name: str) -> dict:
+    def get_effective_settings(self, model_name: str, base: Optional[dict] = None) -> dict:
         """该模型生效的设置：全局默认叠加该模型专属覆盖（仅 PER_MODEL_KEYS）。
+
+        base 参数（可选）：传入 get_settings() 的结果可免掉每次全量深拷贝——
+        /v1/models、/api/capabilities 这类逐模型循环调用的场景里，旧实现
+        每个模型都 deepcopy 一次完整设置树（含全部 model_overrides）。
+        本方法只做**顶层标量**赋值，浅拷贝入参即安全，不会改到调用方的基础。
 
         覆盖键查找做后缀归一：控制台按基础名（如 gemini-3.6-flash）保存的
         专属参数，在 -search 等别名后缀的请求下也要生效——旧实现拿原始
@@ -362,7 +376,10 @@ class AppState:
         再退回剥掉已知别名后缀（-search / -1k/-2k/-4k/-512 / -think-*）
         的基础名。
         """
-        base = self.get_settings()
+        if base is None:
+            base = self.get_settings()
+        else:
+            base = dict(base)
         # Legacy global transport defaults must not publish every model's
         # aliases. Only an explicit per-model choice (including built-ins) does.
         base["anti_truncation_mode"] = "off"

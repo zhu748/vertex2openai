@@ -1836,7 +1836,9 @@ async def get_capabilities_api(_auth: bool = Depends(require_auth)):
     except Exception:
         models = []
     # 能力摘要要反映该模型生效的采样策略，否则控制台提示与实际下发不一致
-    caps = {m: mc.capabilities_summary(m, app_state.get_effective_settings(m)) for m in models}
+    # （设置基底只取一次：旧实现每个模型都全量 deepcopy 整个设置树）
+    settings_base = app_state.get_settings()
+    caps = {m: mc.capabilities_summary(m, app_state.get_effective_settings(m, base=settings_base)) for m in models}
     # 附带各模型是否已有专属参数覆盖，供前端标示
     overrides = app_state.get_model_overrides()
     return JSONResponse(content={"models": models, "capabilities": caps, "overrides": overrides})

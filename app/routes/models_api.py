@@ -18,6 +18,10 @@ async def list_models(fastapi_request: Request, api_key: str = Depends(get_api_k
     
     raw_models = await get_express_models() if (has_express_key or has_web_proxy) else []
 
+    # 设置基底只取一次（旧实现每个模型都 get_effective_settings → 全量
+    # deepcopy 整个设置树，N 个模型 = N 次深拷贝；现在每模型只剩浅拷贝）。
+    settings_base = app_state.get_settings()
+
     final_model_list: List[Dict[str, Any]] = []
     processed_ids: Set[str] = set()
     current_time = int(time.time())
@@ -25,7 +29,7 @@ async def list_models(fastapi_request: Request, api_key: str = Depends(get_api_k
     def add_model(base_id: str):
         suffixes = [""]
         plain_id, mode = split_model_alias(base_id)
-        available = listed_suffixes(plain_id, app_state.get_effective_settings(plain_id))
+        available = listed_suffixes(plain_id, app_state.get_effective_settings(plain_id, base=settings_base))
         if mode is not None and f"-antitruncation-{mode}" not in available:
             return
         if mode is None and not base_id.endswith("-search") and "gemini" in base_id.lower() and "image" not in base_id.lower():
