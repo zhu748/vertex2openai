@@ -103,7 +103,7 @@ class SocketRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     get_express_record=lambda **kwargs: {"key": "offline", "project_id": ""})
                 patches = [
                     mock.patch.object(app_state, "is_web_proxy_enabled", return_value=web),
-                    mock.patch.object(app_state, "get_effective_settings", side_effect=lambda m: dict(settings)),
+                    mock.patch.object(app_state, "get_effective_settings", side_effect=lambda m, base=None: (dict(settings) if base is None else dict(base))),
                     mock.patch.object(app_state, "get_setting", side_effect=lambda k, d=None: settings.get(k, d)),
                     mock.patch.object(main.app.state, "express_key_manager", key_manager),
                     mock.patch.object(streaming, "HEARTBEAT_INTERVAL", 0.01),

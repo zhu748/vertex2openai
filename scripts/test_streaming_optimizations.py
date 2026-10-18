@@ -264,7 +264,7 @@ class CookieStreamTests(unittest.IsolatedAsyncioTestCase):
         self.stats = ProxyStats()
         for patch in (
             mock.patch.object(app_state, "get_setting", side_effect=lambda k, d=None: self.settings.get(k, d)),
-            mock.patch.object(app_state, "get_effective_settings", side_effect=lambda m: self.settings.copy()),
+            mock.patch.object(app_state, "get_effective_settings", side_effect=lambda m, base=None: (self.settings.copy() if base is None else dict(base))),
             mock.patch.object(cookie_proxy, "_get_cookie_string", return_value="SAPISID=test"),
             mock.patch.object(cookie_proxy, "_get_project_id", return_value="project"),
             mock.patch.object(cookie_proxy, "build_headers", return_value={"authorization": "test"}),

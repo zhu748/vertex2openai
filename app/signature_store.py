@@ -55,7 +55,7 @@ class SignatureStore:
     def put_record(self, call_id: str, record: SignatureRecord) -> None:
         if not call_id:
             return
-        now = time.time()
+        now = time.monotonic()
         with self._lock:
             self._data[call_id] = (now, record)
             self._data.move_to_end(call_id)
@@ -70,7 +70,7 @@ class SignatureStore:
     def get_record(self, call_id: str) -> Optional[SignatureRecord]:
         if not call_id:
             return None
-        now = time.time()
+        now = time.monotonic()
         with self._lock:
             item = self._data.get(call_id)
             if item is None:

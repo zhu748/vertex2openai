@@ -438,7 +438,9 @@ class KeyRotationTests(unittest.IsolatedAsyncioTestCase):
     async def test_random_selection_excludes_failed_key_if_alternative_exists(self):
         self.settings["roundrobin"] = False
         manager = ExpressKeyManager()
-        with mock.patch("express_key_manager.random.shuffle", side_effect=lambda records: None):
+        # Key 选择已换 SystemRandom（见 express_key_manager._sysrand），
+        # mock 目标从模块级 random.shuffle 同步迁移。
+        with mock.patch("express_key_manager._sysrand.shuffle", side_effect=lambda records: None):
             self.assertEqual(manager.get_express_record()["key"], "key-1")
             self.assertEqual(manager.get_express_record(exclude_key="key-1")["key"], "key-2")
 

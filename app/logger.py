@@ -147,17 +147,21 @@ def custom_print(*args, **kwargs):
 
     _in_hook.active = True
     try:
-        import io
-        buf = io.StringIO()
-        kwargs_for_buffer = dict(kwargs)
-        kwargs_for_buffer["file"] = buf
-
         raw_msg = ""
-        try:
-            original_print(*args, **kwargs_for_buffer)
-            raw_msg = buf.getvalue().strip()
-        except Exception:
-            pass
+        if kwargs.get("file") is None:
+            # 仅当调用方未显式指定 file 时才捕获进控制台日志流。旧实现
+            # 无条件覆盖 file= ——开发者只想写 stderr 的内容被广播进 web
+            # 控制台，而实际输出仍走原 file，行为分裂且有泄漏面。
+            import io
+            buf = io.StringIO()
+            kwargs_for_buffer = dict(kwargs)
+            kwargs_for_buffer["file"] = buf
+
+            try:
+                original_print(*args, **kwargs_for_buffer)
+                raw_msg = buf.getvalue().strip()
+            except Exception:
+                pass
 
         try:
             original_print(*args, **kwargs)

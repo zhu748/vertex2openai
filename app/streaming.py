@@ -8,6 +8,11 @@ HEARTBEAT = object()
 HEARTBEAT_INTERVAL = 10.0
 HEARTBEAT_FRAME = ": keep-alive\n\n"
 
+# 事件分隔符预编译（re.search 的模块级缓存对直接传 pattern 串也有，但这里
+# 主要收益是配合 Pattern.search(buffer, pos) 免去 buffer[scan:] 的切片拷贝：
+# 单个网络块含大量小事件时，旧实现每匹配一次就复制一次剩余字节）。
+_FRAME_SEP_RE = re.compile(rb"\r\n\r\n|\n\n|\r\r")
+
 
 async def sse_frames(source, max_frame_bytes=64 * 1024 * 1024):
     """Frame raw SSE before inserting comments or assigning resume IDs.
@@ -22,13 +27,13 @@ async def sse_frames(source, max_frame_bytes=64 * 1024 * 1024):
         async for chunk in source:
             buffer.extend(chunk)
             while True:
-                match = re.search(rb"\r\n\r\n|\n\n|\r\r", buffer[scan:])
+                match = _FRAME_SEP_RE.search(buffer, scan)
                 if match is None:
                     if len(buffer) > max_frame_bytes:
                         raise IncompleteResponseError("上游 SSE 事件超过字节上限。")
                     scan = max(0, len(buffer) - 3)
                     break
-                end = scan + match.end()
+                end = match.end()
                 if end > max_frame_bytes:
                     raise IncompleteResponseError("上游 SSE 事件超过字节上限。")
                 yield bytes(buffer[:end])

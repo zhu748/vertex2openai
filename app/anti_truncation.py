@@ -31,6 +31,15 @@ class TransportSelectionError(ValueError):
     code = 400
 
 
+# 上游结束原因白名单（TextDecoder.finish 两处判定共用；旧实现是两份近似
+# 但各自维护的字面量列表，改动极易漂移）：
+#   _FINISH_TRUNCATING = 视为“可提前收尾”的截断/内容过滤类原因
+#   _FINISH_KNOWN      = 全部已知合法原因（超集）
+_FINISH_TRUNCATING = ("MAX_TOKENS", "SAFETY", "PROHIBITED_CONTENT", "RECITATION",
+                      "BLOCKLIST", "SPII", "IMAGE_SAFETY")
+_FINISH_KNOWN = ("STOP",) + _FINISH_TRUNCATING + ("FUNCTION_CALL", "TOOL_CODE")
+
+
 def split_model_alias(model: str) -> tuple[str, str | None]:
     """Strip only our suffix; keep the upstream model's original spelling."""
     name = model.strip()
@@ -236,11 +245,13 @@ class TextDecoder:
         if self.finish_reason:
             raise AntiTruncationError("抗截断：上游重复发送结束标记。")
         self.finish_reason = reason
-        if self.seen and not self.closed and reason not in (
-                "MAX_TOKENS", "SAFETY", "PROHIBITED_CONTENT", "RECITATION", "BLOCKLIST", "SPII", "IMAGE_SAFETY"):
+        # 结束原因白名单（两处共用一份常量；旧实现两份近似列表各自维护，
+        # 改一处漏一处的风险高）：
+        #   _FINISH_TRUNCATING = 视为“可提前收尾”的截断/过滤类原因
+        #   _FINISH_KNOWN      = 全部已知合法原因
+        if self.seen and not self.closed and reason not in _FINISH_TRUNCATING:
             raise AntiTruncationError("抗截断：正文函数未结束，上游提前关闭了回复。")
-        if reason not in ("STOP", "MAX_TOKENS", "SAFETY", "PROHIBITED_CONTENT", "RECITATION",
-                          "BLOCKLIST", "SPII", "IMAGE_SAFETY", "FUNCTION_CALL", "TOOL_CODE"):
+        if reason not in _FINISH_KNOWN:
             raise AntiTruncationError(f"抗截断：上游回复异常结束（{reason}）。")
         pending = self.pending_text if not self.seen else []
         self.pending_text = []

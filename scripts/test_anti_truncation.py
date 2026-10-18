@@ -373,7 +373,7 @@ class ChannelTests(unittest.IsolatedAsyncioTestCase):
                              express_location="", proxy_url="", resumable_enabled=False)
         for patch in (
             mock.patch.object(app_state, "get_settings", side_effect=lambda: dict(self.settings)),
-            mock.patch.object(app_state, "get_effective_settings", side_effect=lambda model: dict(self.settings)),
+            mock.patch.object(app_state, "get_effective_settings", side_effect=lambda model, base=None: (dict(self.settings) if base is None else dict(base))),
             mock.patch.object(app_state, "get_setting", side_effect=lambda key, default=None: self.settings.get(key, default)),
         ):
             patch.start()

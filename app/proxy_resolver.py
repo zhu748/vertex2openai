@@ -778,18 +778,27 @@ class SingboxManager:
             self._closed = False
 
     def reap_idle(self) -> int:
-        """回收空闲实例（超过 SINGBOX_IDLE_MINUTES 未使用）。返回回收数量。"""
+        """回收空闲实例（超过 SINGBOX_IDLE_MINUTES 未使用）。返回回收数量。
+
+        已崩溃的死实例即使空闲回收被关闭（SINGBOX_IDLE_MINUTES=0）也必须
+        清理：旧实现直接 return，崩溃子进程的条目永远无人处理（僵尸进程
+        要等下一次有人调它的 alive()/poll() 才被收尸，不再被访问就常驻）。
+        """
         idle_seconds = _idle_minutes() * 60.0
-        if idle_seconds <= 0:
-            return 0
         now = time.time()
         with self._lock:
-            stale = [k for k, v in self._instances.items()
-                     if not self._active_uses.get(k) and now - v.last_used > idle_seconds]
-            victims = [self._instances.pop(k) for k in stale]
+            dead = {k for k, v in self._instances.items()
+                    if not self._active_uses.get(k) and not v.alive()}
+            stale = []
+            if idle_seconds > 0:
+                stale = [k for k, v in self._instances.items()
+                         if k not in dead and not self._active_uses.get(k)
+                         and now - v.last_used > idle_seconds]
+            keys = sorted(dead) + [k for k in stale if k not in dead]
+            victims = [self._instances.pop(k) for k in keys]
         for inst in victims:
             self._terminate(inst)           # 锁外终止，不阻塞正在取用的请求
-        return len(stale)
+        return len(keys)
 
     def stats(self) -> dict:
         """运行概览（供日志 / 控制台展示）。"""
@@ -824,7 +833,10 @@ class SingboxManager:
         outbound["tag"] = "proxy"
 
         directory = _state_dir()
-        os.makedirs(directory, exist_ok=True)
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except OSError as e:
+            raise ProxyResolveError(f"无法创建 sing-box 状态目录（{directory}）：{e}")
         digest = hashlib.sha1(uri.encode("utf-8")).hexdigest()[:16]
         # 清掉同 URI 的旧实例残留（崩溃重启/端口变化后避免配置与日志文件无限积累）
         try:
@@ -845,12 +857,30 @@ class SingboxManager:
             "route": {"final": "proxy"},
         }
         try:
-            with open(config_path, "w", encoding="utf-8") as f:
+            # 0600：配置含节点凭据（uuid/密码），默认 umask 的 0644 会让
+            # 同机其他本地账号读到完整代理凭证。os.open 的 mode 仅在创建时
+            # 生效，文件已存在（残留清理失败等）则靠 chmod 兑底。
+            fd = os.open(config_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(config, f, ensure_ascii=False, indent=2)
+            try:
+                os.chmod(config_path, 0o600)
+            except OSError:
+                pass
         except OSError as e:
             raise ProxyResolveError(f"无法写入 sing-box 配置文件（{config_path}）：{e}")
 
-        log_file = open(log_path, "ab", buffering=0)
+        # 日志同样收紧权限（可能带节点信息）；打开失败按既定错误契约抛
+        # ProxyResolveError（旧实现裸抛 OSError，调用链只捕本类型会变未分类 500）。
+        try:
+            log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            log_file = os.fdopen(log_fd, "ab", buffering=0)
+            try:
+                os.chmod(log_path, 0o600)
+            except OSError:
+                pass
+        except OSError as e:
+            raise ProxyResolveError(f"无法打开 sing-box 日志文件（{log_path}）：{e}")
         try:
             process = subprocess.Popen(
                 [binary, "run", "-c", config_path, "-D", directory],
@@ -905,9 +935,11 @@ def _reaper_loop() -> None:
         try:
             n = singbox_manager.reap_idle()
             if n:
-                print(f"♻️ [代理转换] 已回收 {n} 个空闲 sing-box 实例。")
-        except Exception:
-            pass
+                print(f"♻️ [代理转换] 已回收 {n} 个空闲/已退出的 sing-box 实例。")
+        except Exception as e:
+            # 回收线程必须永不退出，但异常也不能无声无息（旧实现裸 pass，
+            # 出问题只能靠猜）。
+            print(f"⚠️ [代理转换] sing-box 空闲回收线程异常（已忽略）：{type(e).__name__} - {e}")
 
 
 _reaper_started = False

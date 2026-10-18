@@ -25,9 +25,31 @@ _GCLOUD_LABEL = "gcloud/520.0.0"
 _GCLOUD_COMMAND = "command/gcloud.ai-platform"
 
 
+_GENAI_VERSION: Any = None
+
+
+def _genai_version() -> str:
+    """当前运行时 google-genai 的版本号（懒加载并缓存）。
+
+    包属性缺失时退回 importlib.metadata，再缺失才用与 requirements 锁定的
+    版本号兜底（旧实现直接硬编码，装了不同版本时 UA 标签失真）。
+    """
+    global _GENAI_VERSION
+    if _GENAI_VERSION is None:
+        v = getattr(_genai_pkg, "__version__", None)
+        if not v:
+            try:
+                from importlib.metadata import version as _pkg_version
+                v = _pkg_version("google-genai")
+            except Exception:
+                v = None
+        _GENAI_VERSION = v or "2.31.0"
+    return str(_GENAI_VERSION)
+
+
 def sdk_label() -> str:
     """当前运行时 google-genai 的精确标签：google-genai-sdk/<ver>。"""
-    return f"google-genai-sdk/{getattr(_genai_pkg, '__version__', '') or '2.31.0'}"
+    return f"google-genai-sdk/{_genai_version()}"
 
 
 def python_label() -> str:

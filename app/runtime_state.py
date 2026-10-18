@@ -46,6 +46,12 @@ class AppState:
                 data = json.load(f)
             if isinstance(data, dict):
                 self._state.update(data)
+            # 旧版本创建的文件可能是 0644（里面有完整 Google Cookie），
+            # 加载后立即收紧；否则要等到下一次 _save 才被 chmod 修复。
+            try:
+                os.chmod(STATE_FILE, 0o600)
+            except OSError:
+                pass
         except Exception as e:
             print(f"⚠️ [状态管理器] 无法读取持久化配置文件，已自动降级为内存模式: {e}")
 

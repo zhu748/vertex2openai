@@ -3,6 +3,11 @@ from typing import List, Optional, Tuple
 import config as app_config
 from runtime_state import app_state
 
+# Key 选择使用加密安全随机（random.shuffle 的 Mersenne Twister 可预测性
+# 与 Key 内容安全无关，但合规场景下“选中哪把 Key”不应可预测，换 SystemRandom
+# 无行为差异、成本可忽略）。
+_sysrand = random.SystemRandom()
+
 
 class ExpressKeyManager:
     """管理 Agent Platform (原 Vertex AI) Express Mode API Key，支持随机或轮询选择。
@@ -35,7 +40,7 @@ class ExpressKeyManager:
         # 有其他 Key 时避开刚失败的那把；单 Key 仍可使用完整重试预算。
         alternatives = [(i, r) for i, r in indexed if r["key"] != exclude_key]
         indexed = alternatives or indexed
-        random.shuffle(indexed)
+        _sysrand.shuffle(indexed)
         original_idx, rec = indexed[0]
         print(f"🔑 [密钥选择] 已随机选择第 {original_idx + 1} 个 Express API Key"
               f"（项目：{rec.get('project_id') or '未探测'}）。")
