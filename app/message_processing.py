@@ -270,24 +270,26 @@ def _extract_markdown_images_to_parts(text: str) -> Tuple[List[types.Part], str]
     matches = list(re.finditer(pattern, text))
     
     if matches:
+        extracted = 0
         for match in reversed(matches):
             mime_type = match.group(1)
             b64_data = match.group(2)
-            if not mime_type.startswith("image/"):
-                continue
             try:
-                raw_bytes = base64.b64decode(b64_data)
+                raw_bytes = _decode_data_url_image(b64_data)
                 opt_bytes, opt_mime = optimize_image_bytes(raw_bytes, mime_type)
                 parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
                 start, end = match.span()
                 remaining_text = remaining_text[:start] + remaining_text[end:]
+                extracted += 1
             except Exception as e:
                 print(f"⚠️ [图片处理] 提取 Markdown 图片失败，已跳过该图片：{e}")
         parts.reverse()
         # 仅在**确实抽走了图片**时才压平空白：抠掉 data URL 会留下成片空格。
         # 旧实现无条件执行，导致所有纯文本消息的缩进/多空格（代码块、ASCII 图、
-        # 酒馆预设的排版）都被悄悄改写。文本保真优先。
-        remaining_text = re.sub(r"[ \t]+", " ", remaining_text).strip()
+        # 酒馆预设的排版）都被悄悄改写；全部提取失败时同样不该改写文本。
+        # 文本保真优先。
+        if extracted:
+            remaining_text = re.sub(r"[ \t]+", " ", remaining_text).strip()
 
     return parts, remaining_text
 
@@ -649,14 +651,26 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
         parts = []
         current_gemini_role = "" 
 
-        if role == "tool":
+        if role in ("tool", "function"):
+            # 旧版 OpenAI 协议的 role="function"（name=函数名，content=结果字符串）
+            # 与 role="tool" 语义相同；旧实现会把它当成 Gemini 的 role 直发（
+            # Gemini 仅接受 user/model，直接 400），这里并入 tool 分支统一转
+            # functionResponse。
             tool_call_id_str = message.tool_call_id or ""
             real_tool_id = tool_call_id_str.partition(LEGACY_THOUGHT_SEP)[0]
             function_name = message.name or tool_name_by_id.get(tool_call_id_str) or tool_name_by_id.get(real_tool_id)
 
             if not function_name:
                 # 既没有显式 name，也无法从前面的 assistant.tool_calls 关联时才降级。
-                mock_text = f"[System Observation - Tool Result]:\n{message.content}"
+                # content 可能是 str / 分段 list / dict：统一归一成文本，避免
+                # list 直接被 f-string 嵌成 Python repr。
+                fallback_text = _message_text(message.content)
+                if not fallback_text and message.content is not None and not isinstance(message.content, str):
+                    try:
+                        fallback_text = json.dumps(message.content, ensure_ascii=False)
+                    except Exception:
+                        fallback_text = str(message.content)
+                mock_text = f"[System Observation - Tool Result]:\n{fallback_text}"
                 parts.append(types.Part.from_text(text=mock_text))
                 current_gemini_role = "user"
             else:
@@ -689,7 +703,9 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
 
                 try:
                     parsed_arguments = json.loads(arguments_str) if isinstance(arguments_str, str) else (arguments_str or {})
-                except json.JSONDecodeError:
+                except json.JSONDecodeError as e:
+                    print(f"⚠️ [工具调用] 历史 tool_call 的 arguments 不是合法 JSON（{e}），"
+                          f"已按空参数下发：{str(arguments_str)[:120]}")
                     parsed_arguments = {}
 
                 explicit_sig, _ = signature_from_extra(tool_call)
@@ -723,8 +739,11 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
                 reasoning = getattr(message, "reasoning_content", None)
                 if reasoning:
                     ordinary_parts.append(types.Part(text=reasoning, thought=True))
-                if isinstance(message.content, str) and message.content:
-                    image_parts, clean_text = _extract_markdown_images_to_parts(message.content)
+                # content 为分段 list 时旧实现会静默丢弃全部文本（只处理 str），
+                # 与 Cookie 通道行为不一致；这里先归一成文本再走同一条抽取链。
+                content_text = _message_text(message.content) if isinstance(message.content, list) else message.content
+                if isinstance(content_text, str) and content_text:
+                    image_parts, clean_text = _extract_markdown_images_to_parts(content_text)
                     if clean_text:
                         ordinary_parts.append(types.Part.from_text(text=clean_text))
                     ordinary_parts.extend(image_parts)
@@ -740,7 +759,9 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
                     if target is None and signature_kind != "signature_only":
                         target = ordinary_parts[-1] if ordinary_parts else None
                     if target is not None:
-                        ordinary_parts[ordinary_parts.index(target)] = target.model_copy(
+                        # list.index 按 == 匹配：等值重复 part 时会命中第一个，而
+                        # target 是从后往前选出的那个——签名必须落在被选中的对象上。
+                        ordinary_parts[_rindex_by_identity(ordinary_parts, target)] = target.model_copy(
                             update={"thought_signature": message_sig})
                     else:
                         ordinary_parts.append(types.Part(text="", thought_signature=message_sig))
@@ -816,12 +837,19 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
                             image_url = getattr(img_url_data, "url", "") or ""
 
                         if image_url.startswith("data:"):
-                            mime_match = re.match(r"data:([^;]+);base64,(.+)", image_url)
+                            # re.DOTALL：RFC 2045 允许 base64 折行，含换行的
+                            # data URL 也必须能解出（与 Cookie 通道实现对齐；
+                            # 旧实现缺 DOTALL 会静默丢图）。解码失败不再炸整
+                            # 个请求（与 Cookie 通道一致：跳过该图并留日志）。
+                            mime_match = re.match(r"data:([^;]+);base64,(.+)", image_url, re.DOTALL)
                             if mime_match:
                                 mime_type, b64_data = mime_match.groups()
-                                raw_bytes = base64.b64decode(b64_data)
-                                opt_bytes, opt_mime = optimize_image_bytes(raw_bytes, mime_type)
-                                parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
+                                try:
+                                    raw_bytes = _decode_data_url_image(b64_data)
+                                    opt_bytes, opt_mime = optimize_image_bytes(raw_bytes, mime_type)
+                                    parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
+                                except Exception as e:
+                                    print(f"⚠️ [图片处理] 解析内联图片失败，已跳过：{e}")
                         elif image_url.startswith(("http://", "https://")):
                             # 统一走加固后的 fetch_remote_image（SSRF 与体积防护都在那里，见 F-3）。
                             fetched = fetch_remote_image(image_url)
@@ -842,7 +870,8 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
                 if target is None:
                     parts.append(types.Part(text="", thought_signature=message_sig))
                 else:
-                    parts[parts.index(target)] = target.model_copy(update={"thought_signature": message_sig})
+                    # 同上：按对象身份从后往前定位，避免等值重复 part 挂错签名。
+                    parts[_rindex_by_identity(parts, target)] = target.model_copy(update={"thought_signature": message_sig})
 
         if not parts: continue
         raw_gemini_messages.append(types.Content(role=current_gemini_role, parts=parts))
@@ -892,6 +921,38 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
 # 不加限制等于把代理变成一个任意内网 GET 的跳板（SSRF）。
 MAX_REMOTE_IMAGE_BYTES = 20 * 1024 * 1024   # 单张图上限，防止超大响应打爆内存
 MAX_REMOTE_IMAGE_REDIRECTS = 3
+
+# 内联 data URL / Markdown 内联图片的体积防线：与远程抓图共用 20MiB 上限。
+# 旧实现在这条路径上**没有任何限制**（远程图有 20MiB，内联图没有），
+# 单条请求可塞任意多张超大 base64 图把内存打爆。base64 字符长度按 4:3
+# 预折算成字节数，先在解码前拦截，避免“解码本身就耗尽内存”。
+MAX_DATA_URL_IMAGE_B64_CHARS = (MAX_REMOTE_IMAGE_BYTES // 3) * 4 + 4
+
+
+def _decode_data_url_image(b64_data: str) -> bytes:
+    """解码内联 base64 图片字节，超出体积上限时抛 ValueError（调用方跳图）。"""
+    if len(b64_data) > MAX_DATA_URL_IMAGE_B64_CHARS:
+        raise ValueError(
+            f"内联图片 base64 超过 {MAX_REMOTE_IMAGE_BYTES // (1024 * 1024)}MiB 上限（收到 "
+            f"{len(b64_data) // (1024 * 1024)}MiB 级字符）")
+    raw = base64.b64decode(b64_data)
+    if len(raw) > MAX_REMOTE_IMAGE_BYTES:
+        raise ValueError(f"内联图片解码后超过 {MAX_REMOTE_IMAGE_BYTES // (1024 * 1024)}MiB 上限")
+    return raw
+
+
+def _rindex_by_identity(seq: list, item: Any) -> int:
+    """从后往前按**对象身份**查找下标。
+
+    list.index 按 == 匹配：parts 里存在等值重复 part 时会命中第一个，
+    而思考签名的 target 是从后往前（reversed）选出的——用 index 反查
+    会把签名挂到错误的 part 上，破坏 Gemini 3 “签名必须在正确 part”
+    的校验。找不到时抛 ValueError（防御性，正常路径不可能发生）。
+    """
+    for i in range(len(seq) - 1, -1, -1):
+        if seq[i] is item:
+            return i
+    raise ValueError("签名目标 part 不在列表中（不应发生）")
 
 # 图片抓取的出站外观：普通浏览器 UA + 图片 Accept。
 # 这条出站路径打的是任意图床/CDN（用户给的 URL），不是 Google API——
@@ -1062,7 +1123,7 @@ def openai_content_to_wire_parts(content: Any) -> List[Dict[str, Any]]:
                     if m:
                         mime_type, b64_data = m.groups()
                         try:
-                            parts.append(_wire_image_part(base64.b64decode(b64_data), mime_type))
+                            parts.append(_wire_image_part(_decode_data_url_image(b64_data), mime_type))
                         except Exception as e:
                             print(f"⚠️ [图片处理] 解析内联图片失败，已跳过：{e}")
                 elif url.startswith("http"):
@@ -1182,7 +1243,7 @@ def parse_gemini_response_for_reasoning_and_content(gemini_response_candidate: A
 def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_model_str: str) -> Dict[str, Any]:
     choices = []
     response_timestamp = int(time.time())
-    base_id = f"chatcmpl-{response_timestamp}-{random.randint(1000,9999)}"
+    base_id = f"chatcmpl-{response_timestamp}-{uuid.uuid4().hex[:12]}"
 
     if hasattr(gemini_response_obj, "candidates") and gemini_response_obj.candidates:
         for i, candidate in enumerate(gemini_response_obj.candidates):
