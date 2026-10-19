@@ -347,7 +347,7 @@ TCP+TLS 握手（每次约省 100~300ms 与相应 CPU）；429 重试场景收�
 | 裸模型名（旧行为）→ express 端点 `https://aiplatform.googleapis.com/v1beta1/publishers/google/models/{model}:generateContent` | **404** `projects/…/locations/asia-southeast1/…was not found` | 区域由后端路由，落到没有该模型的区域 |
 | `projects/{project}/locations/global/publishers/google/models/{model}` | **200 正常出文** | 区域由我们钉定 ✅ |
 
-**默认已经是 `global`**（多数 Gemini 模型只在 global 提供）。控制台「模型参数 → ② 全局设置 → 标准模式 location」下拉里除 `global` 外还列出了 Agent Platform 提供 Gemini 的各区域（美国 / 欧洲 / 亚太 / 其它，共 30 项）可按需切换；选「默认（后端自选）」＝回到旧行为。
+**默认已经是 `global`**（多数 Gemini 模型只在 global 提供）。控制台「模型参数 → 全局运行设置 → 上游区域」下拉里除 `global` 外还列出了 Agent Platform 提供 Gemini 的各区域（美国 / 欧洲 / 亚太 / 其它，共 30 项）可按需切换；选「默认（后端自选）」＝回到旧行为。
 
 **项目 ID 不需要单独配**：自动用「通道与凭证」页填的那个（或环境变量 `GOOGLE_PROJECT_ID`）——一个人通常只有一个 Express 项目。两者都没有时自动退回裸模型名（不会拼出半截路径）。
 
@@ -644,8 +644,29 @@ location /v1/ {
 管理接口 `GET /api/requests?status=active&q=gemini&offset=0&limit=50` 与
 `GET /api/requests/{trace-id}` 使用控制台登录会话鉴权；响应不缓存。
 
-控制台布局样式随应用提供，Tailwind CDN 不可达也能切换页面和查看请求。新增工具样式后，可在开发环境运行
-`sh scripts/build_dashboard_css.sh` 重新生成已提交的 `app/static/dashboard.css`；部署与 Docker 运行不需要 Node。
+登录和控制台均只使用本地静态资源，不依赖外部字体、Tailwind CDN 或图表脚本。概览成功率按成功与错误计数计算，
+重试单独统计；Token 条按实际输入 / 输出占比显示。桌面采用宽屏布局，手机上的请求表格转为卡片，详情保留关键时序，
+交付与上游诊断可展开查看。日志支持内容搜索、错误 / 警告筛选、自动滚动开关与连接状态提示。
+
+模型参数与全局运行设置分别保存，模型保存栏随对应分区滚动；思维链守卫位于模型行为区，可按模型覆盖。
+加载失败时可重新加载配置，未成功加载的配置禁止保存；项目探测会保留尚未保存的 Key、Project ID 与代理编辑。
+切换模型会保留当前页面内各模型与全局默认的独立草稿，并标记“未保存”；刷新页面后草稿清空。保存或探测期间，
+对应分区暂时禁止编辑，避免回包覆盖新输入；不同分区可分别保存，返回的数据只合并对应字段。参数错误会标记并定位到具体输入框，
+采样说明同步反映当前选择。分区链接支持直接打开与刷新定位；手动关闭日志自动滚动后，滚动到底部不会自动重启该开关。
+新增 Tailwind 工具样式后，可在开发环境运行 `sh scripts/build_dashboard_css.sh` 重新生成已提交的
+`app/static/dashboard.css`；手写组件样式维护在 `app/static/console.css`。部署与 Docker 运行不需要 Node。
+
+前端交互可另用 Playwright 检查（需先安装 `requirements-dev.txt`）：
+
+```bash
+npm install --no-save --prefix /tmp/vertex-console-ui playwright
+NODE_PATH=/tmp/vertex-console-ui/node_modules /tmp/vertex-console-ui/node_modules/.bin/playwright install chromium
+NODE_PATH=/tmp/vertex-console-ui/node_modules node scripts/verify_console_ui.cjs
+```
+
+此检查启动临时状态目录中的本地服务，使用虚构凭证与请求数据，不访问 Google 上游；覆盖登录、模型 / 全局保存、
+凭证草稿、请求详情、日志筛选、错误恢复及 320–1440px 响应式布局。可通过 `PLAYWRIGHT_CHROMIUM_EXECUTABLE`
+指定已有 Chromium，并通过 `UI_SCREENSHOT_DIR` 保存检查截图。该浏览器检查独立于默认 Python 离线检查。
 
 诊断只驻留当前进程，不写入凭据文件，不保存请求正文或完整生成正文；日志按原有诊断内容脱敏、截断。
 已结束记录最多 500 条、1 小时，诊断文本按 16 MiB 预算优先淘汰旧的完成记录；活跃任务不会因此取消。

@@ -477,6 +477,7 @@ def capabilities_summary(model_name: str, settings: Optional[Dict[str, Any]] = N
     """
     from anti_truncation import supports_transport
     prof = get_profile(model_name)
+    default_sampling_advice = prof.get("sampling_advice")
     if settings:
         prof = apply_sampling_policy(prof, settings)
     thinking: Dict[str, Any] = {"kind": prof["thinking_kind"]}
@@ -490,6 +491,7 @@ def capabilities_summary(model_name: str, settings: Optional[Dict[str, Any]] = N
         "thinking": thinking,
         "sampling": sorted(prof["allowed_sampling"]),
         "sampling_advice": prof.get("sampling_advice"),
+        "default_sampling_advice": default_sampling_advice,
         "image_aspect_ratios": sorted(prof.get("image_aspect_ratios", set())),
         "image_sizes": sorted(prof.get("image_sizes", set())),
         "supports_search": prof["supports_search"],

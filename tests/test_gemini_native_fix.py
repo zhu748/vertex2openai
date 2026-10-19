@@ -292,8 +292,12 @@ def test_pinned_stream_200():
           got_url == f"{PINNED_URL}:streamGenerateContent?alt=sse", got_url)
     check("状态码 200", resp.status_code == 200, str(resp.status_code))
     check("SSE 字节透传", b"data:" in body, repr(body[:60]))
-    check("accept-encoding 为 httpx 默认 gzip, deflate（与 SDK 一致，不再钉 identity）",
-          rec and rec[0]["accept_encoding"] == "gzip, deflate",
+    # Optional Brotli/Zstandard decoders expand httpx's advertised encodings.
+    # Compare the running client's defaults, without making a network request.
+    with httpx.Client(trust_env=False) as default_client:
+        expected_encoding = default_client.headers["accept-encoding"]
+    check("accept-encoding 保持当前 httpx 默认值（与 SDK 一致，不再钉 identity）",
+          rec and rec[0]["accept_encoding"] == expected_encoding,
           rec[0]["accept_encoding"] if rec else "无请求")
     check("x-goog-api-key 已转发", rec and rec[0]["api_key"] == "AIza-test-key-1")
 

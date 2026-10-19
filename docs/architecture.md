@@ -17,6 +17,8 @@ Express SDK 或 Cookie 上游；Gemini 原生请求通过 Express REST 透传。
 | `app/routes/credentials_api.py` | Express Key、项目探测和 Cookie 凭证 |
 | `app/routes/system_api.py` | 健康检查和代理连通性测试 |
 | `app/templates/` | 登录和控制台 HTML；页面按文件路径加载并缓存，无需前端构建 |
+| `app/static/dashboard.js`、`app/static/login.js` | 概览、配置、凭证与日志交互，以及登录表单反馈；全部使用本地资源 |
+| `app/static/console.css`、`app/static/dashboard.css` | 手写组件与响应式样式，以及预编译的 Tailwind 工具样式 |
 | `app/auth.py`、`app/console_auth.py` | 分别处理 API Key 鉴权、控制台会话与登录限速 |
 | `app/settings_validation.py` | 管理入口的类型、范围和专项设置校验 |
 | `app/runtime_state.py`、`app/config.py` | 可持久化运行状态、环境变量和内置默认值 |
@@ -102,3 +104,7 @@ Cookie 执行器只编排认证、重试、协议降级与交付，不再承担�
 单组测试可以直接运行，例如 `python tests/test_console_routes.py`。
 `verify_round17.py` 和 `verify_singbox_e2e.py` 属于手动网络诊断，不属于离线回归。
 新增离线回归请放在 `tests/test_*.py`，由统一入口自动发现。
+
+前端浏览器回归为 `node scripts/verify_console_ui.cjs`，需另装 Playwright 和 Chromium，配置见 README。
+它在临时状态中启动真实管理接口，并为上游探测提供固定结果；不需要 Google 凭证，也不触发模型调用。
+修改模板、前端脚本或 CSS 后，重点检查模型保存作用域、未保存凭证编辑、自动刷新焦点及移动端溢出。

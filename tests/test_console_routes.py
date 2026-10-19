@@ -1,6 +1,7 @@
 """控制台跨路由会话、模板加载与凭证热更新的离线集成回归。"""
 
 import os
+from html.parser import HTMLParser
 from pathlib import Path
 import sys
 import tempfile
@@ -67,7 +68,7 @@ class ConsoleRoutesTests(unittest.TestCase):
     def test_login_session_is_shared_and_revoked_across_routers(self):
         self.assertIn("请输入访问密码", self.client.get("/").text)
         token = self.login()
-        self.assertIn("chart.js", self.client.get("/").text)
+        self.assertIn("/static/dashboard.js", self.client.get("/").text)
         for path in ("/api/settings", "/api/express-keys", "/api/stats"):
             self.assertEqual(self.client.get(path).status_code, 200)
         self.assertEqual(self.client.post("/api/logout").status_code, 200)
@@ -86,10 +87,36 @@ class ConsoleRoutesTests(unittest.TestCase):
             self.login()
             response = self.client.get("/")
             self.assertIn("text/html", response.headers["content-type"])
-            self.assertIn("chart.js", response.text)
+            self.assertIn("/static/dashboard.js", response.text)
         finally:
             os.chdir(previous)
             console._load_template.cache_clear()
+
+    def test_login_and_dashboard_serve_all_assets_locally(self):
+        class Assets(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.urls = []
+
+            def handle_starttag(self, tag, attrs):
+                values = dict(attrs)
+                if tag == 'script' and values.get('src'):
+                    self.urls.append(values['src'])
+                if tag == 'link' and values.get('rel') == 'stylesheet':
+                    self.urls.append(values['href'])
+
+        for authenticated in (False, True):
+            if authenticated:
+                self.login()
+            assets = Assets()
+            assets.feed(self.client.get('/').text)
+            self.assertGreaterEqual(len(assets.urls), 3)
+            for url in assets.urls:
+                with self.subTest(authenticated=authenticated, asset=url):
+                    self.assertTrue(url.startswith('/static/'), url)
+                    response = self.client.get(url)
+                    self.assertEqual(response.status_code, 200)
+                    self.assertGreater(len(response.content), 0)
 
     def test_key_save_refreshes_the_registered_manager(self):
         self.login()
@@ -142,6 +169,16 @@ class ConsoleRoutesTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertNotIn('resumable_disconnect_grace_seconds', response.json()['override'])
         self.assertEqual(self.state.get_setting('resumable_disconnect_grace_seconds'), 3.5)
+
+    def test_capabilities_keep_builtin_sampling_advice_when_overridden(self):
+        self.login()
+        model = 'gemini-4-argon'
+        self.state.set_model_override(model, {'sampling_policy': 'allowed'})
+        with mock.patch.object(settings_api, 'get_express_models',
+                               new=mock.AsyncMock(return_value=[model])):
+            cap = self.client.get('/api/capabilities').json()['capabilities'][model]
+        self.assertEqual(cap['sampling_advice'], 'recommend_default')
+        self.assertEqual(cap['default_sampling_advice'], 'deprecated')
 
 
 if __name__ == "__main__":

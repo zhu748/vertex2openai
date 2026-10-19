@@ -1,0 +1,742 @@
+const $ = id => document.getElementById(id);
+let CAPS = {}, curAR = "";
+let GLOBAL_SETTINGS = {}, OVERRIDES = {};
+let settingsLoaded=false, capabilitiesLoaded=false, keysLoaded=false, runtimeLoaded=false;
+const PER_MODEL_KEYS = ['first_reply_timeout_seconds','anti_truncation_mode','native_thinking_mode','thinking_g3_level','image_size','image_aspect_ratio','default_temperature','default_top_p','default_max_tokens','inject_system_instruction','inject_prefill','prefill_instruction','image_system_instruction','inject_prefill_for_image','sampling_policy','prefill_cot_guard'];
+const COMMON_ARS = ["1:1","3:2","2:3","3:4","4:3","4:5","5:4","9:16","16:9","21:9","1:4","4:1","1:8","8:1","9:21"];
+const MODEL_DRAFTS = new Map();
+let renderedModel=null, modelSnapshot=null;
+
+let toastTimer;
+function toast(m){ const t=$('toast'); clearTimeout(toastTimer); t.textContent=m; t.classList.add('show'); toastTimer=setTimeout(()=>t.classList.remove('show'),4000); }
+function fmt(n){ return (n||0).toLocaleString('en-US'); }
+async function logout(){
+  try{
+    const response=await fetch('/api/logout',{signal:AbortSignal.timeout(10000),method:'POST'});
+    if(!response.ok) throw new Error(await responseError(response,'退出失败'));
+    location.href='/';
+  }catch(error){toast(error.name==='TimeoutError'?'退出请求超时，请重试':error.message);}
+}
+async function readJSON(url){
+  const response=await fetch(url,{cache:'no-store',signal:AbortSignal.timeout(15000)});
+  if(!response.ok) throw new Error(response.status===401?'登录已过期，请重新登录':'加载失败（HTTP '+response.status+'）');
+  return response.json();
+}
+function loadNotice(section,message){
+  const box=$(section+'-load-error');
+  box.classList.toggle('hidden',!message);
+  box.querySelector('span').textContent=message;
+}
+async function responseError(response,fallback='保存失败',result=null){
+  if(response.status===401) return '登录已过期，请重新登录';
+  const data=result || await response.json().catch(()=>({}));
+  const aliases={proxy_url:'proxy-input',express_ua_custom:'express-ua-custom',express_ua_profile:'express-ua-profile',cookie_impersonate:'cookie-impersonate'};
+  const field=$(aliases[data.field]||data.field);
+  if(field){
+    field.setAttribute('aria-invalid','true');
+    requestAnimationFrame(()=>{if(field.getClientRects().length && !field.matches(':disabled')) field.focus();});
+  }
+  if(typeof data.error==='string') return data.error;
+  if(Array.isArray(data.detail)) return data.detail.map(item=>item.msg).join('；');
+  return typeof data.detail==='string'?data.detail:fallback+'（HTTP '+response.status+'）';
+}
+
+function switchTab(t, updateHash=true){
+  if(!['overview','channel','params','requests','logs'].includes(t)) return;
+  const changed=document.querySelector('.tab.active')?.dataset.tab!==t;
+  document.querySelectorAll('.tab').forEach(e=>{
+    const active=e.dataset.tab===t;
+    e.classList.toggle('active', active);
+    e.setAttribute('aria-selected', String(active));
+    e.tabIndex=active?0:-1;
+  });
+  ['overview','channel','params','requests','logs'].forEach(v=>$('view-'+v).classList.toggle('hidden', v!==t));
+  if(updateHash) history.replaceState(null,'','#'+t);
+  if(changed) window.scrollTo({top:0,behavior:'instant'});
+  $('tab-'+t).scrollIntoView({block:'nearest',inline:'nearest'});
+  if(t==='requests') window.requestMonitor?.refresh();
+  if(t==='logs' && autoscroll) logwin.scrollTop=logwin.scrollHeight;
+}
+
+document.querySelector('.tab-bar').addEventListener('keydown',event=>{
+  if(!['ArrowLeft','ArrowRight','Home','End'].includes(event.key)) return;
+  const tabs=[...document.querySelectorAll('.tab')];
+  const index=tabs.indexOf(document.activeElement);
+  if(index<0) return;
+  event.preventDefault();
+  const next=event.key==='Home'?0:event.key==='End'?tabs.length-1:(index+(event.key==='ArrowRight'?1:-1)+tabs.length)%tabs.length;
+  tabs[next].focus();switchTab(tabs[next].dataset.tab);
+});
+function navigateHash(){
+  const target=location.hash.slice(1);
+  if(['model-scope','global-settings'].includes(target)){
+    switchTab('params',false);
+    requestAnimationFrame(()=>$(target).scrollIntoView({block:'start'}));
+  }else switchTab(['overview','channel','params','requests','logs'].includes(target)?target:'overview',false);
+}
+window.addEventListener('hashchange',navigateHash);
+
+/* ---------- Overview ---------- */
+function renderHealth(success,error){
+  const completed=success+error;
+  const percent=completed?success/completed*100:0;
+  const rate=completed?percent.toFixed(1)+'%':'—';
+  $('health-ring').style.setProperty('--rate',percent+'%');
+  $('health-ring').style.setProperty('--ring-color',completed?'var(--danger)':'#e8ebf3');
+  $('health-ring').setAttribute('aria-label',completed?`成功率 ${rate}，成功 ${success}，错误 ${error}`:'暂无请求数据');
+  $('health-rate').textContent=rate;
+  $('health-success').textContent=fmt(success);
+  $('health-error').textContent=fmt(error);
+  $('health-note').textContent=completed?`共 ${fmt(completed)} 次成功 / 错误记录`:'有请求完成后显示成功率';
+}
+let statsLoading=false;
+async function fetchStats(){
+  if(statsLoading) return;
+  statsLoading=true;
+  try{
+    const response=await fetch('/api/stats',{cache:'no-store',signal:AbortSignal.timeout(10000)});
+    if(!response.ok) throw new Error(response.status===401?'登录已过期，请重新登录':'统计暂不可用，将自动重试');
+    const d=await response.json();
+    $('s-total').textContent=fmt(d.total); $('s-success').textContent=fmt(d.success);
+    $('s-error').textContent=fmt(d.error); $('s-retries').textContent=fmt(d.retries);
+    $('t-prompt').textContent=fmt(d.prompt_tokens); $('t-comp').textContent=fmt(d.completion_tokens);
+    const tokens=(d.prompt_tokens||0)+(d.completion_tokens||0);
+    $('t-total').textContent=fmt(tokens);
+    $('prompt-bar').style.width=(tokens?d.prompt_tokens/tokens*100:0)+'%';
+    $('completion-bar').style.width=(tokens?d.completion_tokens/tokens*100:0)+'%';
+    $('uptime').textContent='已运行 '+(d.uptime<3600?Math.floor(d.uptime/60)+' 分钟':(d.uptime/3600).toFixed(1)+' 小时');
+    window.requestMonitor?.summary(d.requests);
+    renderHealth(d.success||0,d.error||0);
+    $('stats-sync').textContent='每 3 秒更新 · '+new Date().toLocaleTimeString('zh-CN',{hour12:false});
+    $('stats-sync').classList.remove('error');
+    $('uptime').parentElement.classList.remove('service-offline');
+  }catch(e){
+    $('stats-sync').textContent=e.name==='TimeoutError'?'统计连接超时，将自动重试':e.message;
+    $('stats-sync').classList.add('error');
+    $('uptime').textContent=e.message.includes('登录已过期')?'登录已过期':'暂时无法连接';
+    $('uptime').parentElement.classList.add('service-offline');
+  }finally{statsLoading=false;}
+}
+
+/* ---------- 通用转义（XSS 防护）：所有拼进 innerHTML 的服务端数据必须先过这里 ---------- */
+function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+
+/* ---------- Channel ---------- */
+let currentMode='api_key';
+async function updateMode(m){
+  if(!runtimeLoaded){document.querySelectorAll('input[name=mode]').forEach(r=>r.checked=false);toast('通道状态尚未加载，请先重新加载配置');return;}
+  const pill=$('mode-pill'), prev=pill.textContent, previousMode=currentMode;
+  const radios=document.querySelectorAll('input[name=mode]');
+  radios.forEach(r=>r.disabled=true);
+  // 先乐观切显示，请求失败则弹提示并回滚（旧版无错误处理，后端 500 时 UI 与实际状态脱节）
+  $('cookie-box').classList.toggle('hidden', m!=='web_proxy');
+  pill.textContent = m==='web_proxy' ? '通道 Cookie 直连' : '通道 Express API';
+  try{
+    const r=await fetch('/api/settings/mode',{signal:AbortSignal.timeout(30000),method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:m})});
+    if(!r.ok){ throw new Error('HTTP '+r.status); }
+    currentMode=m;
+  }catch(e){
+    pill.textContent=prev;
+    document.querySelector(`input[name=mode][value=${previousMode}]`).checked=true;
+    $('cookie-box').classList.toggle('hidden', previousMode!=='web_proxy');
+    toast('❌ 通道切换失败，已回滚：'+e.message);
+  }finally{radios.forEach(r=>r.disabled=false);}
+}
+function parseCookies(str){
+  str=(str||'').trim();
+  if(str.startsWith('[')&&str.endsWith(']')){ try{ const a=JSON.parse(str); if(Array.isArray(a)) return a.map(c=>{const n=c.name||c.key,v=c.value; return (n&&v)?`${n}=${v}`:'';}).filter(Boolean).join('; ');}catch(e){} }
+  return str;
+}
+async function saveCookie(){
+  let ck=parseCookies($('cookie-input').value); let pid=$('project-input').value.trim();
+  const m=pid.match(/[?&]project=([^&]+)/)||pid.match(/\/projects\/([^\/]+)/); if(m) pid=m[1];
+  $('cookie-input').value=ck; $('project-input').value=pid;
+  if(!pid){ toast('请填写 Project ID'); return; }
+  try{
+    const r=await fetch('/api/cookie',{signal:AbortSignal.timeout(30000),method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cookie:ck,project_id:pid})});
+    const d=await r.json(); toast(r.ok?(d.message||'Cookie 已保存'):('❌ '+(d.error||'保存失败')));
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+async function loadRuntime(){
+  try{
+    const s=await readJSON('/api/settings/runtime');
+    const m=s.use_web_proxy?'web_proxy':'api_key';
+    currentMode=m;
+    runtimeLoaded=true;
+    document.querySelector(`input[name=mode][value=${m}]`).checked=true;
+    $('mode-pill').textContent = m==='web_proxy' ? '通道 Cookie 直连' : '通道 Express API';
+    $('cookie-box').classList.toggle('hidden', m!=='web_proxy');
+    /* S-1：后端只返回掩码，绝不回填到输入框（否则保存时会把真实 Cookie 覆盖成掩码）。
+       输入框留空 = 保持现有 Cookie；填了才更新。 */
+    const ci=$('cookie-input');
+    if(ci){
+      ci.value='';
+      ci.placeholder = s.google_cookie_configured
+        ? ('已配置：'+s.google_cookie+'　（留空则保持不变，需更新时粘贴新 Cookie）')
+        : '粘贴完整 Cookie 头或 Cookie-Editor 导出内容';
+    }
+    if(s.google_project_id) $('project-input').value=s.google_project_id;
+  }catch(e){loadNotice('channel','通道状态'+e.message+'。可重新加载配置。');}
+}
+
+/* ---------- Express Key 列表（多账号，热编辑） ---------- */
+let KEYS = [], SAVED_KEYS = [];
+function keySrcPill(rec){
+  if(rec.project_source==='auto') return '<span class="pill" style="text-transform:none">来源 auto</span>';
+  if(rec.project_source==='manual') return '<span class="pill" style="text-transform:none">来源 manual</span>';
+  return '<span class="pill" style="text-transform:none;color:#b45309">未探测</span>';
+}
+function keyProxyPill(rec){
+  const v=(rec.proxy||'').trim().toLowerCase();
+  if(!v) return '';
+  if(v==='direct'||v==='none'||v==='直连') return '<span class="pill" style="text-transform:none;background:#f5f5f5;color:#737373">强制直连</span>';
+  const proto=(rec.proxy||'').split(':')[0]||'proxy';
+  const native=['http','https','socks5','socks5h'].includes(proto)?'#047857':'#1d4ed8';
+  return `<span class="pill" style="text-transform:none;color:${native}">专属代理 ${esc(proto+'://')}</span>`;
+}
+function renderKeys(){
+  const box=$('keys-list');
+  box.innerHTML=KEYS.map((rec,i)=>`
+    <div class="key-card" data-i="${i}">
+      <div class="key-head">
+        <div class="key-title"><span class="pill pill-accent">Key ${i+1}</span>${keySrcPill(rec)}${keyProxyPill(rec)}</div>
+        <div class="key-actions">
+          <label><input type="checkbox" class="k-enabled" ${rec.enabled===false?'':'checked'} aria-label="启用 Key ${i+1}">启用</label>
+          <button type="button" onclick="runAction(this,()=>probeOneKey(${i}))">探测项目</button>
+          <button type="button" class="danger" onclick="removeKeyRow(${i})" aria-label="删除 Key ${i+1}">删除</button>
+        </div>
+      </div>
+      <div class="key-fields">
+        <div><label for="key-${i}">Express API Key</label><input id="key-${i}" class="inp log k-key" placeholder="粘贴 Express API Key" spellcheck="false" autocomplete="off" value="${esc(rec.key)}"></div>
+        <div><label for="project-${i}">Project ID</label><input id="project-${i}" class="inp log k-project" placeholder="留空 = 等待自动探测" spellcheck="false" value="${esc(rec.project_id)}"></div>
+        <div><label for="proxy-${i}">专属代理</label><input id="proxy-${i}" class="inp log k-proxy" placeholder="留空跟随全局；direct 强制直连" spellcheck="false" value="${esc(rec.proxy)}"></div>
+      </div>
+      ${rec.detected_at?`<div class="key-meta">上次探测：${esc(new Date(rec.detected_at*1000).toLocaleString('zh-CN',{hour12:false}))}</div>`:''}
+      ${rec._msg?`<div class="key-meta ${rec._msg_ok===false?'error-message':''}" role="status">${esc(rec._msg)}</div>`:''}
+    </div>`).join('');
+  $('keys-count').textContent=KEYS.length+' 个';
+  $('keys-empty').classList.toggle('hidden',KEYS.length>0);
+}
+function collectKeys(){
+  // 以输入框的当前内容为准（用户可能改了还没保存）
+  [...document.querySelectorAll('#keys-list [data-i]')].forEach(row=>{
+    const i=Number(row.dataset.i);
+    if(!KEYS[i]) return;
+    KEYS[i].key = row.querySelector('.k-key').value.trim();
+    const pid = row.querySelector('.k-project').value.trim();
+    if(pid !== (KEYS[i].project_id||'')){ KEYS[i].project_id = pid; KEYS[i].project_source = pid?'manual':''; }
+    const kProxy = row.querySelector('.k-proxy');
+    if(kProxy) KEYS[i].proxy = kProxy.value.trim();
+    KEYS[i].enabled = row.querySelector('.k-enabled').checked;
+  });
+  return KEYS.filter(r=>r.key);
+}
+function addKeyRow(){ if(!keysLoaded){toast('凭证列表尚未加载，请先重新加载配置');return;} collectKeys(); KEYS.push({key:'',project_id:'',project_source:'',proxy:'',enabled:true}); renderKeys(); $('key-'+(KEYS.length-1)).focus(); }
+function removeKeyRow(i){ collectKeys(); KEYS.splice(i,1); renderKeys(); }
+async function loadExpressKeys(){
+  try{
+    const d=await readJSON('/api/express-keys');
+    KEYS=(d.keys||[]).map(r=>Object.assign({},r));
+    SAVED_KEYS=KEYS.map(r=>({...r}));
+    keysLoaded=true;
+    renderKeys();
+  }catch(e){loadNotice('channel','凭证列表'+e.message+'。重新加载成功后再保存 Key。');}
+}
+async function saveExpressKeys(){
+  if(!keysLoaded){toast('凭证尚未加载，请先重新加载配置');return;}
+  const payload=collectKeys();
+  if(payload.length===0 && !confirm('将保存为“空 Key 列表”。\n保存后即使环境变量 VERTEX_EXPRESS_API_KEY 有值，重启也不会再导入。\n确定吗？')) { renderKeys(); return; }
+  try{
+    const r=await fetch('/api/express-keys',{signal:AbortSignal.timeout(30000),method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keys:payload})});
+    const d=await r.json();
+    if(r.ok){ KEYS=(d.keys||[]).map(x=>Object.assign({},x)); SAVED_KEYS=KEYS.map(r=>({...r})); renderKeys(); toast('已保存 '+KEYS.length+' 个 Key（已热生效）'); }
+    else toast('❌ '+(d.error||'保存失败'));
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+async function probeOneKey(i){
+  collectKeys();
+  const rec=KEYS[i]; if(!rec||!rec.key){ toast('请先填入 Key'); return; }
+  if(!SAVED_KEYS.some(x=>x.key===rec.key)){toast('请先保存新增或修改后的 Key，再探测项目');return;}
+  toast('正在探测…');
+  try{
+    const r=await fetch('/api/express-keys/probe',{signal:AbortSignal.timeout(30000),method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:rec.key,force:true})});
+    const d=await r.json();
+    if(!r.ok){ toast('❌ '+(d.error||'探测失败')); return; }
+    const res=(d.results||[])[0]||{};
+    mergeProbeResults([res.key?res:{...res,key:rec.key}],d.keys||[]);
+    toast(res.ok?('项目：'+(res.project_id||'—')):('❌ '+(res.message||'探测失败')));
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+async function probeAllKeys(){
+  if(!keysLoaded){toast('凭证列表尚未加载，请先重新加载配置');return;}
+  collectKeys();
+  toast('正在探测全部 Key…');
+  try{
+    const r=await fetch('/api/express-keys/probe',{signal:AbortSignal.timeout(30000),method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({all:true,force:true})});
+    const d=await r.json();
+    if(!r.ok){ toast('❌ '+(d.error||'探测失败')); return; }
+    const results=d.results||[];
+    mergeProbeResults(results,d.keys||[]);
+    toast('探测完成：成功 '+results.filter(x=>x.ok).length+' / '+results.length);
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+
+// Probe responses only update diagnostics/project metadata; preserve unsaved rows and edits.
+function mergeProbeResults(results,saved){
+  collectKeys();
+  results.forEach(res=>{
+    KEYS.filter(x=>x.key===res.key).forEach(hit=>{
+      const server=saved.find(x=>x.key===res.key);
+      const previous=SAVED_KEYS.find(x=>x.key===res.key);
+      const edited=previous && (hit.project_id!==previous.project_id || hit.project_source!==previous.project_source);
+      if(!edited && (server?.project_id || res.project_id)){
+        hit.project_id=server?.project_id || res.project_id;
+        hit.project_source=server?.project_source || 'auto';
+        hit.detected_at=server?.detected_at || Date.now()/1000;
+      }
+      hit._msg=res.message||'';hit._msg_ok=!!res.ok;
+    });
+  });
+  SAVED_KEYS=saved.map(r=>({...r}));
+  renderKeys();
+}
+
+/* ---------- 出站代理（网络出口） ---------- */
+function updateProxyPill(on){
+  const p=$('proxy-status'); if(!p) return;
+  p.textContent = on ? '已启用' : '未启用（直连）';
+  p.style.background = on ? '#ecfdf5' : '#f5f5f5';
+  p.style.color = on ? '#047857' : '#737373';
+}
+async function saveProxy(){
+  if(!settingsLoaded){toast('设置尚未加载，请先在模型参数页重新加载配置');return;}
+  const v=$('proxy-input').value.trim();
+  try{
+    const r=await fetch('/api/settings',{signal:AbortSignal.timeout(30000),method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxy_url:v})});
+    if(r.ok){ updateProxyPill(!!v); toast(v?'✅ 代理已保存并热生效（无需重启）':'已清空代理，恢复直连'); }
+    else{
+      let msg='保存失败';
+      try{ const d=await r.json(); if(d && d.error) msg=d.error; }catch(_){}
+      toast('❌ '+msg);
+    }
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+async function testProxy(){
+  const v=$('proxy-input').value.trim();
+  const box=$('proxy-test-result'); box.classList.remove('hidden');
+  box.innerHTML='<span class="text-neutral-500">🛰️ 正在测试（最长 8 秒）…</span>';
+  try{
+    const r=await fetch('/api/proxy/test',{signal:AbortSignal.timeout(30000),method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxy_url:v})});
+    const d=await r.json();
+    if(d.ok){
+      box.innerHTML=`<span style="color:#047857">✅ ${esc(d.message)} · 延迟 ${d.latency_ms} ms${d.via_proxy?(' · 经 '+esc(d.proxy)):''}</span>`;
+      toast('✅ 连通成功（'+d.latency_ms+' ms）');
+    }else{
+      box.innerHTML=`<span style="color:#be123c">❌ ${esc(d.message)} · ${d.latency_ms} ms<br>详细：${esc(d.error||'')}</span>`;
+      toast('❌ 连通失败');
+    }
+  }catch(e){
+    box.innerHTML='<span style="color:#be123c">❌ 请求测试端点失败（服务异常或代理地址格式非法）</span>';
+  }
+}
+
+/* ---------- Cookie 通道指纹伪装 ---------- */
+const FP_LABELS = {chrome:'Chrome',edge:'Edge',safari:'Safari',safari_ios:'Safari iOS',firefox:'Firefox',off:'关闭'};
+function updateFpPill(v){
+  const p=$('fp-status'); if(!p) return;
+  const on = v && v !== 'off';
+  p.textContent = on ? ('已伪装：'+(FP_LABELS[v]||v)) : '关闭（httpx 原始行为）';
+  p.style.background = on ? '#ecfdf5' : '#f5f5f5';
+  p.style.color = on ? '#047857' : '#737373';
+}
+async function saveFingerprint(){
+  if(!settingsLoaded){toast('设置尚未加载，请先在模型参数页重新加载配置');return;}
+  const v=$('cookie-impersonate').value;
+  try{
+    const r=await fetch('/api/settings',{signal:AbortSignal.timeout(30000),method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cookie_impersonate:v})});
+    if(r.ok){ updateFpPill(v); toast(v==='off'?'✅ 已关闭伪装（下一个请求生效）':'✅ 伪装已保存并热生效：'+(FP_LABELS[v]||v)); }
+    else{
+      let msg='保存失败';
+      try{ const d=await r.json(); if(d && d.error) msg=d.error; }catch(_){}
+      toast('❌ '+msg);
+    }
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+
+/* ---------- Express 通道请求头指纹 ---------- */
+const FP2_LABELS = {sdk:'官方 Python SDK',node:'Node.js SDK',gcloud:'gcloud CLI',custom:'自定义'};
+function updateExpressPill(v,custom){
+  const p=$('fp2-status'); if(!p) return;
+  const isDefault = !v || v==='sdk' || (v==='custom' && !(custom||'').trim());
+  p.textContent = isDefault ? '官方默认（SDK 自动）' : ('已接管：'+(FP2_LABELS[v]||v));
+  p.title=v==='custom'?(custom||''):'';
+  p.style.background = isDefault ? '#f5f5f5' : '#ecfdf5';
+  p.style.color = isDefault ? '#737373' : '#047857';
+}
+function updateExpressCustomVis(){
+  const sel=$('express-ua-profile'), inp=$('express-ua-custom');
+  if(sel && inp) inp.style.display = sel.value==='custom' ? '' : 'none';
+}
+async function saveExpressUa(){
+  if(!settingsLoaded){toast('设置尚未加载，请先在模型参数页重新加载配置');return;}
+  const v=$('express-ua-profile').value;
+  const c=$('express-ua-custom').value.trim();
+  try{
+    const r=await fetch('/api/settings',{signal:AbortSignal.timeout(30000),method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({express_ua_profile:v,express_ua_custom:c})});
+    if(r.ok){ updateExpressPill(v,c); updateExpressCustomVis();
+      toast(v==='sdk'||(v==='custom'&&!c)?'✅ 已恢复官方 SDK 原生形态（下一个请求生效）':'✅ 请求头指纹已保存并热生效：'+(FP2_LABELS[v]||v)); }
+    else{
+      let msg='保存失败';
+      try{ const d=await r.json(); if(d && d.error) msg=d.error; }catch(_){}
+      toast('❌ '+msg);
+    }
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+
+/* ---------- Params ---------- */
+function setV(id,v){ const el=$(id); if(!el) return; el.removeAttribute('aria-invalid'); if(el.type==='checkbox') el.checked=!!v; else el.value=(v===null||v===undefined)?'':v; }
+async function loadParams(){
+  captureModelDraft();
+  const selected=$('model-sel').value;
+  loadNotice('params','');
+  try{
+    const s=await readJSON('/api/settings');
+    GLOBAL_SETTINGS=s;
+    settingsLoaded=true;
+    curAR = s.image_aspect_ratio || "";
+    ['resumable_disconnect_grace_seconds','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','retry_jitter_seconds','fake_streaming_interval','prefill_mode','express_location','resumable_ttl_seconds','resumable_max_streams','request_timeout_seconds','upstream_max_concurrency','resumable_max_buffer_mb','resumable_max_total_mb'].forEach(k=>setV(k,s[k]));
+    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','resumable_enabled'].forEach(k=>setV(k,s[k]));
+    // 出站代理：回填输入框并刷新状态徽标
+    setV('proxy-input', s.proxy_url || '');
+    updateProxyPill(!!(s.proxy_url||'').trim());
+    // Cookie 通道指纹伪装：回填下拉框并刷新徽标
+    setV('cookie-impersonate', s.cookie_impersonate || 'chrome');
+    updateFpPill(s.cookie_impersonate || 'chrome');
+    // Express 通道请求头指纹：回填下拉/自定义框并刷新徽标
+    setV('express-ua-profile', s.express_ua_profile || 'sdk');
+    setV('express-ua-custom', s.express_ua_custom || '');
+    updateExpressPill(s.express_ua_profile || 'sdk', s.express_ua_custom || '');
+    updateExpressCustomVis();
+    // 向后兼容：旧版布尔开关映射到新的 native_thinking_mode 下拉
+    if((!s.native_thinking_mode || s.native_thinking_mode==='request')){
+      if(s.hide_thoughts) GLOBAL_SETTINGS.native_thinking_mode='off';
+      else if(s.thinking_force_console) GLOBAL_SETTINGS.native_thinking_mode='console';
+    }
+  }catch(e){loadNotice('params','设置'+e.message+'。重新加载成功后再保存。');}
+  try{
+    const c=await readJSON('/api/capabilities');
+    CAPS=c.capabilities||{};
+    OVERRIDES=c.overrides||{};
+    capabilitiesLoaded=true;
+    $('model-sel').innerHTML='<option value="__global__">＊ 全局默认（对所有模型）</option>'
+      + (c.models||[]).map(m=>{const star=OVERRIDES[m]?' ★':''; return `<option value="${esc(m)}">${esc(m)}${star}</option>`;}).join('');
+    if([...$('model-sel').options].some(option=>option.value===selected)) $('model-sel').value=selected;
+    renderCaps(false);
+  }catch(e){loadNotice('params','模型能力'+e.message+'。重新加载成功后再保存模型参数。');}
+}
+function readModelFields(){
+  return Object.fromEntries(PER_MODEL_KEYS.map(key=>[key,$(key).type==='checkbox'?$(key).checked:$(key).value]));
+}
+function captureModelDraft(){
+  if(!renderedModel || modelSnapshot===null) return;
+  const wasDirty=MODEL_DRAFTS.has(renderedModel);
+  const values=readModelFields();
+  if(JSON.stringify(values)===modelSnapshot) MODEL_DRAFTS.delete(renderedModel);
+  else MODEL_DRAFTS.set(renderedModel,values);
+  $('scope-draft-state').classList.toggle('hidden',!MODEL_DRAFTS.has(renderedModel));
+  if(wasDirty!==MODEL_DRAFTS.has(renderedModel)) refreshModelSelStars();
+}
+function finishModelRender(model){
+  modelSnapshot=JSON.stringify(readModelFields());
+  const draft=MODEL_DRAFTS.get(model);
+  if(draft) PER_MODEL_KEYS.forEach(key=>setV(key,draft[key]));
+  curAR=$('image_aspect_ratio').value;
+  renderedModel=model;
+  captureModelDraft();
+  refreshModelSelStars();
+  updateSamplingDisplay();
+}
+// 按编辑作用域回填模型参数：专属值优先，否则使用全局默认。
+function applyModelParamFields(model){
+  // __global__ = 全局默认作用域：只显示全局值，不掺任何模型专属值
+  const ov = (model==='__global__') ? {} : (OVERRIDES[model] || {});
+  PER_MODEL_KEYS.forEach(k=>{
+    const v = (k in ov) ? ov[k] : (k==='anti_truncation_mode' ? 'off' : GLOBAL_SETTINGS[k]);
+    if(k==='image_aspect_ratio'){ curAR = v || ""; }
+    else setV(k, v);
+  });
+  const isGlobal = (model==='__global__');
+  const has = !isGlobal && !!OVERRIDES[model] && Object.keys(OVERRIDES[model]).length>0;
+  $('ov-badge').classList.toggle('hidden', !has);
+  // 保存按钮的落点随作用域切换，避免"看着像全局、存进了专属"（或反过来）
+  $('btn-scope-save').textContent = isGlobal ? '保存为全局默认' : '保存为该模型专属';
+  $('btn-scope-clear').classList.toggle('hidden', isGlobal);
+  $('ov-hint').textContent = isGlobal
+    ? '当前编辑：全局默认。具体模型的专属值优先。'
+    : (has ? '当前编辑：模型专属参数（★）。保存仅影响此模型。'
+           : '当前继承默认值。保存后将创建此模型的专属参数。');
+}
+async function saveModelOverride(){
+  if(!settingsLoaded || !capabilitiesLoaded){toast('配置尚未加载，请先重新加载配置');return;}
+  const m=$('model-sel').value; if(!m) return;
+  const patch={
+    first_reply_timeout_seconds:numOr('first_reply_timeout_seconds',15),
+    anti_truncation_mode:$('anti_truncation_mode').value,
+    native_thinking_mode:$('native_thinking_mode').value,
+    thinking_g3_level:$('thinking_g3_level').value,
+    image_size:$('image_size').value,
+    image_aspect_ratio:$('image_aspect_ratio').value,
+    default_temperature:numOrNull('default_temperature'),
+    default_top_p:numOrNull('default_top_p'),
+    default_max_tokens:numOrNull('default_max_tokens'),
+    inject_system_instruction:$('inject_system_instruction').value,
+    inject_prefill:$('inject_prefill').value,
+    prefill_instruction:$('prefill_instruction').value,
+    image_system_instruction:$('image_system_instruction').checked,
+    inject_prefill_for_image:$('inject_prefill_for_image').checked,
+    sampling_policy:$('sampling_policy').value,
+    prefill_cot_guard:$('prefill_cot_guard').checked,
+  };
+  if(m==='__global__'){
+    delete patch.anti_truncation_mode;
+    // 全局默认作用域：写进全局设置，而不是任何模型的专属值
+    try{
+      const r=await fetch('/api/settings',{signal:AbortSignal.timeout(30000),method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});
+      if(r.ok){ Object.assign(GLOBAL_SETTINGS,patch); MODEL_DRAFTS.delete(m); renderCaps(false); toast('已保存为全局默认'); }
+      else toast(await responseError(r));
+    }catch(e){ toast('保存失败'); }
+    return;
+  }
+  try{
+    const r=await fetch('/api/model-overrides/'+encodeURIComponent(m),{signal:AbortSignal.timeout(30000),method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});
+    const d=await r.json();
+    if(r.ok){ OVERRIDES[m]=d.override||patch; MODEL_DRAFTS.delete(m); renderCaps(false); toast('已保存 '+m+' 专属参数'); }
+    else toast(await responseError(r,'保存失败',d));
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+async function clearModelOverride(){
+  if(!capabilitiesLoaded){toast('模型配置尚未加载，请先重新加载配置');return;}
+  const m=$('model-sel').value; if(!m) return;
+  if(!OVERRIDES[m]){ toast('该模型没有专属参数'); return; }
+  try{
+    const r=await fetch('/api/model-overrides/'+encodeURIComponent(m),{signal:AbortSignal.timeout(30000),method:'DELETE'});
+    if(r.ok){
+      const d=await r.json();
+      if(d.override && Object.keys(d.override).length) OVERRIDES[m]=d.override;
+      else delete OVERRIDES[m];
+      MODEL_DRAFTS.delete(m); renderCaps(false); toast('已恢复 '+m+' 默认参数');
+    }
+    else toast(await responseError(r,'清除失败'));
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+function refreshModelSelStars(){
+  const sel=$('model-sel'); const cur=sel.value;
+  [...sel.options].forEach(o=>{ const base=o.value; o.textContent = (base==='__global__'?'＊ 全局默认（对所有模型）':base+(OVERRIDES[base]?' ★':''))+(MODEL_DRAFTS.has(base)?' · 草稿':''); });
+  sel.value=cur;
+}
+function chip(t, accent,sampling=false){ return `<span class="pill${accent?' pill-accent':''}"${sampling?' data-sampling':''}>${esc(t)}</span>`; }
+function fillARFor(cap){
+  const sel=$('image_aspect_ratio');
+  const list = (cap && cap.is_image && cap.image_aspect_ratios.length) ? cap.image_aspect_ratios : COMMON_ARS;
+  sel.innerHTML='<option value="">自动</option>' + list.map(a=>`<option value="${esc(a)}">${esc(a)}</option>`).join('');
+  sel.value = (curAR && list.includes(curAR)) ? curAR : "";
+}
+function renderCaps(capture=true){
+  if(capture) captureModelDraft();
+  const m=$('model-sel').value;
+  if(m==='__global__'){
+    applyModelParamFields(m);
+    $('anti_truncation_mode').disabled=true;
+    $('anti-truncation-note').textContent='请先选择具体模型再设置其后缀；普通无后缀名称始终不启用抗截断。';
+    $('caps-summary').innerHTML='<span class="text-xs text-neutral-500">全局默认作用域：下面的值对所有未设 ★ 专属的模型生效。切到具体模型可查看该模型的能力与专属值。</span>';
+    ['thinking_g3_level','image_size','image_aspect_ratio'].forEach(id=>{const el=$(id); if(el) el.disabled=false;});
+    $('wrap-g3level').style.opacity='1';
+    $('think-note').textContent='全局默认：具体下发时仍按各模型能力自动裁剪（例如 Pro 上 minimal 会就近取 low）。';
+    $('image-note').textContent='全局默认：仅生图模型会用到。';
+    $('sampling-note').textContent='全局默认：已废弃采样参数的模型会自动剥离。';
+    fillARFor(null);
+    finishModelRender(m);
+    return;
+  }
+  const cap=CAPS[m]; if(!cap) return;
+  applyModelParamFields(m);   // 按模型填入专属/全局参数值（含 curAR）
+  $('anti_truncation_mode').disabled=!cap.supports_anti_truncation;
+  $('anti-truncation-note').textContent=cap.supports_anti_truncation
+    ? '保存为该模型专属后刷新客户端列表；仅选择已开启的抗截断后缀才使用抗截断，普通名称不启用。'
+    : '该模型不支持文本函数传输，不提供抗截断版本。';
+  const th=cap.thinking||{};
+  let sum=[chip('家族 '+cap.family, true)];
+  if(th.kind==='level') sum.push(chip('思考档位 '+(th.levels||[]).join(' / ')));
+  else sum.push(chip('无思考调节'));
+  if(cap.is_image){
+    sum.push(chip('分辨率 '+cap.image_sizes.join('/')));
+    sum.push(chip('比例 '+cap.image_aspect_ratios.length+' 种'));
+    sum.push(chip('不支持函数调用'));
+  } else {
+    sum.push(chip('采样',false,true));
+    sum.push(chip('支持函数调用'));
+  }
+  if(cap.supports_search) sum.push(chip('支持搜索'));
+  $('caps-summary').innerHTML=sum.join('');
+
+  const isLevel=th.kind==='level';
+  $('thinking_g3_level').disabled=!isLevel;
+  $('wrap-g3level').style.opacity=isLevel?'1':'.4';
+  let tn='';
+  if(cap.is_image) tn='生图模型思考档位（默认 high，可在上方调整）。';
+  else if(isLevel) tn='该模型用思考档位' + ((th.levels && !th.levels.includes('minimal')) ? '（此模型最低 low，无 minimal，且无法关闭）' : '（无法完全关闭，最省为 minimal）') + '。';
+  else tn='该模型不支持思考调节。';
+  $('think-note').textContent=tn;
+
+  const imgOn=cap.is_image;
+  $('image_size').disabled=!imgOn; $('image_aspect_ratio').disabled=!imgOn;
+  fillARFor(cap);
+  $('image-note').textContent = imgOn
+    ? ('该模型支持比例：' + cap.image_aspect_ratios.join('、') + '；分辨率 ' + cap.image_sizes.join('/') + '。选到不支持的比例不会报错，会自动回退为“由模型决定”。')
+    : '仅生图模型（名称含 image）使用此项。';
+
+  finishModelRender(m);
+}
+function updateSamplingDisplay(){
+  const model=$('model-sel').value,cap=CAPS[model],policy=$('sampling_policy').value;
+  if(model==='__global__'){
+    $('sampling-note').textContent=policy==='allowed'?'全局默认选择强制保留采样；生图模型仍会剥离，请确认其他模型支持。':policy==='deprecated'?'全局默认选择强制剥离采样参数。':'全局默认：按各模型内置规则自动处理采样参数。';
+    return;
+  }
+  if(!cap) return;
+  const advice=policy==='auto'?(cap.default_sampling_advice??cap.sampling_advice):policy==='deprecated'?'deprecated':'recommend_default';
+  const label=cap.is_image?'生图模型 · 自动剥离':policy==='allowed'?'强制保留':policy==='deprecated'?'强制剥离':advice==='deprecated'?'自动剥离':'自动判定';
+  const chip=$('caps-summary').querySelector('[data-sampling]');
+  if(chip) chip.textContent='采样 '+label;
+  $('sampling-note').textContent = cap.is_image
+    ? '生图模型会自动剥离采样参数。'
+    : policy==='allowed'?'当前选择强制保留采样参数；请确认上游模型支持此设置。保存后生效。'
+    : policy==='deprecated'?'当前选择强制剥离 temperature / top_p / top_k；保存后生效，其他参数仍按模型能力处理。'
+    : (advice==='deprecated'
+        ? '⚠️ 该模型已废弃 temperature/top_p/top_k（官方要求移除，现忽略、未来 400），代理会自动移除；如需更确定的输出请改用系统指令。candidate_count 在 3.x 也不支持。'
+        : advice==='recommend_default'
+          ? '官方建议 Gemini 3.x 保持采样默认值（可调，但改动可能致循环/降智）；留空即用模型默认。'
+          : '该模型支持采样参数；留空即用模型默认。');
+}
+function numOrNull(id){ const v=$(id).value.trim(); return v===''?null:Number(v); }
+function numOr(id,d){ const v=$(id).value.trim(); return v===''?d:Number(v); }
+// 说明折叠：点 ⓘ 展开/收起对应的说明块
+function hlp(el,id){const b=$(id);const on=b.classList.toggle('show');el.classList.toggle('on',on);el.setAttribute('aria-expanded',String(on));el.setAttribute('aria-label',on?'收起说明':'展开说明');}
+async function saveSettings(){
+  if(!settingsLoaded){toast('设置尚未加载，请先重新加载配置');return;}
+  // 只保存全局运行设置。
+  // 模型行为字段显示的是当前编辑对象的生效值，不能在这里一并提交。
+  // 一起提交会把某个模型的专属值（比如生图的注入内容）写成全局默认。
+  const patch={
+    img_compress_enabled:$('img_compress_enabled').checked,
+    img_compress_max_dim:numOr('img_compress_max_dim',1536),
+    img_compress_max_mb:numOr('img_compress_max_mb',1.5),
+    img_compress_quality:numOr('img_compress_quality',85),
+    retry_max:numOr('retry_max',10),
+    retry_backoff_seconds:numOr('retry_backoff_seconds',5),
+    retry_jitter_seconds:numOr('retry_jitter_seconds',1),
+    fake_streaming:$('fake_streaming').checked,
+    fake_streaming_interval:numOr('fake_streaming_interval',1),
+    roundrobin:$('roundrobin').checked,
+    safety_score:$('safety_score').checked,
+    cookie_debug:$('cookie_debug').checked,
+    debug_outbound:$('debug_outbound').checked,
+    prefill_mode:$('prefill_mode').value,
+    express_location:$('express_location').value,
+    prefill_suppress_thinking:$('prefill_suppress_thinking').checked,
+    resumable_enabled:$('resumable_enabled').checked,
+    resumable_disconnect_grace_seconds:numOr('resumable_disconnect_grace_seconds',10),
+    resumable_ttl_seconds:numOr('resumable_ttl_seconds',1800),
+    resumable_max_streams:numOr('resumable_max_streams',200),
+    request_timeout_seconds:numOr('request_timeout_seconds',1800),
+    upstream_max_concurrency:numOr('upstream_max_concurrency',32),
+    resumable_max_buffer_mb:numOr('resumable_max_buffer_mb',64),
+    resumable_max_total_mb:numOr('resumable_max_total_mb',256),
+  };
+  const m=$('model-sel').value;
+  const overriding = !!(OVERRIDES[m] && Object.keys(OVERRIDES[m]).length>0);
+  try{
+    const r=await fetch('/api/settings',{signal:AbortSignal.timeout(30000),method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});
+    if(r.ok){
+      const saved=await r.json();
+      // Another section may have saved model defaults while this response was in flight.
+      // Only merge the fields owned by this form, never an older full-state snapshot.
+      Object.keys(patch).forEach(key=>GLOBAL_SETTINGS[key]=saved[key]);
+      toast(overriding?'全局运行设置已保存；模型专属参数保持不变':'全局运行设置已保存');
+    }
+    else toast(await responseError(r));
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+
+/* ---------- Logs: filtering is local; the bounded SSE feed stays connected. ---------- */
+const logwin=$('logwin');
+let autoscroll=true;
+const LOG_DOM_MAX=500;
+function setLogFollow(value){
+  autoscroll=value;
+  $('log-follow').textContent='自动滚动：'+(value?'开':'关');
+  $('log-follow').setAttribute('aria-pressed',String(value));
+}
+logwin.addEventListener('scroll',()=>{if(autoscroll && logwin.scrollHeight-logwin.scrollTop-logwin.clientHeight>=50) setLogFollow(false);});
+function logLevel(text){
+  if(/❌|ERROR|失败/.test(text)) return 'error';
+  if(/⚠️|WARN|🔄|重试/.test(text)) return 'warning';
+  return 'info';
+}
+function logLine(text){
+  const level=logLevel(text);
+  const content=esc(text).replace(/(gemini-[a-zA-Z0-9.\-]+)/g,'<span class="log-model">$1</span>')
+    .replace(/\b(trace-[a-f0-9]{16})\b/g,'<button class="request-link" data-request="$1">$1</button>');
+  return `<div class="log-line ${level}" data-level="${level}">${content}</div>`;
+}
+function filterLogs(){
+  const query=$('log-search').value.trim().toLowerCase(),level=$('log-level').value;
+  let visible=0;
+  for(const row of logwin.children){
+    row.hidden=!(row.textContent.toLowerCase().includes(query)&&(level==='all'||row.dataset.level===level));
+    if(!row.hidden) visible++;
+  }
+  $('log-count').textContent=`${visible} / ${logwin.childElementCount} 条日志`;
+  logwin.dataset.empty=String(visible===0 && logwin.childElementCount>0);
+}
+$('log-search').addEventListener('input',filterLogs);
+$('log-level').addEventListener('change',filterLogs);
+$('log-follow').addEventListener('click',()=>{setLogFollow(!autoscroll);if(autoscroll) logwin.scrollTop=logwin.scrollHeight;});
+$('log-clear').addEventListener('click',()=>{logwin.replaceChildren();filterLogs();});
+try{
+  const es=new EventSource('/stream-logs');
+  es.onopen=()=>{$('log-state').textContent='已连接';$('log-connection').className='status-dot';};
+  es.onerror=()=>{$('log-state').textContent='连接中断，正在重连…';$('log-connection').className='status-dot error';};
+  es.onmessage=event=>{
+    if(event.data==='keep-alive') return;
+    const follow=autoscroll;
+    logwin.insertAdjacentHTML('beforeend',logLine(event.data));
+    while(logwin.childElementCount>LOG_DOM_MAX) logwin.firstElementChild.remove();
+    filterLogs();
+    if(follow && !$('view-logs').classList.contains('hidden')) logwin.scrollTop=logwin.scrollHeight;
+  };
+}catch(error){$('log-state').textContent='无法建立日志连接';$('log-connection').className='status-dot error';}
+
+/* ---------- Project ID auto-extract ---------- */
+$('project-input').addEventListener('input',e=>{ const v=e.target.value.trim(); const m=v.match(/[?&]project=([^&]+)/)||v.match(/\/projects\/([^\/]+)/); if(m) e.target.value=m[1]; });
+$('image_aspect_ratio').addEventListener('change', e=>{ curAR=e.target.value; });
+
+/* init */
+navigateHash();
+fetchStats(); setInterval(()=>{ if(!document.hidden) fetchStats(); },3000); loadRuntime(); loadParams(); loadExpressKeys();
+
+async function runAction(button,action){
+  if(button.matches(':disabled')) return;
+  const groups=button.closest('.inline-notice')?[...button.closest('.view').querySelectorAll('fieldset')]:[button.closest('fieldset')].filter(Boolean);
+  if(groups.some(group=>group.disabled)){toast('该分区正在处理，请稍后再试');return;}
+  const label=button.textContent;
+  button.disabled=true;button.setAttribute('aria-busy','true');button.textContent='处理中…';
+  const disabled=groups.map(group=>group.disabled);
+  groups.forEach(group=>{group.disabled=true;group.setAttribute('aria-busy','true');});
+  try{await action();}
+  finally{button.disabled=false;button.removeAttribute('aria-busy');button.textContent=label;groups.forEach((group,i)=>{group.disabled=disabled[i];group.removeAttribute('aria-busy');});}
+}
+document.addEventListener('input',event=>{
+  event.target.removeAttribute('aria-invalid');
+  if(PER_MODEL_KEYS.includes(event.target.id)){captureModelDraft();if(event.target.id==='sampling_policy') updateSamplingDisplay();}
+});
