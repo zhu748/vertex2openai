@@ -282,7 +282,7 @@ class FirstReplyTests(unittest.IsolatedAsyncioTestCase):
             async def __aiter__(self):
                 yield b'[{"usageMetadata":{"promptTokenCount":1}},'
                 yield b'{"candidates":[{"content":{"parts":[{"text":"\xe6'
-                yield b'\x80\x9d\xe8\x80\x83","thought":true}]}}]}'
+                yield b'\x80\x9d\xe8\x80\x83","thought":true}]},"finishReason":"STOP"}]}'
                 await asyncio.sleep(.04)
                 yield b']'
         response = httpx.Response(200, stream=NativeBytes())

@@ -19,7 +19,8 @@ import model_capabilities as mc
 from runtime_state import app_state
 from proxy_resolver import ProxyResolveError, mask_proxy_uri
 from proxy_failover import FailoverSDKClient, ProxyChain
-from schema_validation import SchemaValidationError, validate_request_schemas
+from schema_validation import SchemaValidationError
+from request_validation import validate_openai_request
 from request_tracking import configure as track_configure
 
 LEGACY_EXPRESS_PREFIX = "[EXPRESS] "
@@ -132,7 +133,7 @@ class ExpressSDKUpstream(BaseUpstream):
     async def chat_completions(self, request_obj: OpenAIRequest, fastapi_request: Request, *, credential_record=None):
         track_configure(channel="express")
         try:
-            validate_request_schemas(request_obj)
+            validate_openai_request(request_obj)
         except SchemaValidationError as exc:
             return JSONResponse(
                 status_code=400,

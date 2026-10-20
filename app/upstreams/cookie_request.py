@@ -15,6 +15,7 @@ from runtime_state import app_state
 from schema_validation import SchemaValidationError
 from thought_signatures import (
     encode_thought_signature,
+    google_metadata,
     is_thought_part,
     requires_signature,
     resolve_tool_call_signature,
@@ -254,13 +255,14 @@ def _parse_function_args(value: Any) -> dict:
 
 
 def _ordinary_wire_parts_from_extra(message: Any) -> Optional[list[dict]]:
-    google = (getattr(message, "extra_content", None) or {}).get("google") or {}
+    google = google_metadata(message)
     raw = google.get("ordinary_parts")
     if not isinstance(raw, list):
         return None
     parts = []
     for item in raw:
-        if not isinstance(item, dict) or item.get("kind") not in {"text", "thought", "signature_only"}:
+        if (not isinstance(item, dict) or not isinstance(item.get("kind"), str)
+                or item["kind"] not in {"text", "thought", "signature_only"}):
             return None
         text = item.get("text")
         if not isinstance(text, str) or (item["kind"] == "text" and "data:image/" in text):
@@ -393,7 +395,7 @@ def _convert_messages_to_contents(messages: list, model_name: str = "", native_t
                 ordinary_parts.extend(openai_content_to_wire_parts(content))
                 _attach_message_signature(ordinary_parts, msg)
 
-            google = (getattr(msg, "extra_content", None) or {}).get("google") or {}
+            google = google_metadata(msg)
             order = google.get("part_order")
             if isinstance(order, list):
                 parts, used_calls, used_ordinary = [], set(), set()

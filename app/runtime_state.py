@@ -51,7 +51,7 @@ class AppState:
                 # 顶层不是 JSON 对象（如被截断成数组/字符串）同样按损坏处理，
                 # 否则降级内存模式后的下一次 _save() 会把它静默覆盖掉。
                 raise ValueError("文件顶层不是 JSON 对象")
-            self._state.update(data)
+            self._state = data
             # 旧版本创建的文件可能是 0644（里面有完整 Google Cookie），
             # 加载后立即收紧；否则要等到下一次 _save 才被 chmod 修复。
             try:
@@ -395,6 +395,13 @@ class AppState:
                             merged[k] = copy.deepcopy(v)
                 if "proxy_urls" not in stored and "proxy_url" in stored:
                     merged["proxy_urls"] = parse_proxy_list(stored["proxy_url"])
+                # Migrate legacy switches before model overrides are applied.
+                # An explicitly saved modern mode always wins, including request.
+                if "native_thinking_mode" not in stored:
+                    if stored.get("hide_thoughts"):
+                        merged["native_thinking_mode"] = "off"
+                    elif stored.get("thinking_force_console"):
+                        merged["native_thinking_mode"] = "console"
             return merged
 
     def get_setting(self, key: str, default=None):

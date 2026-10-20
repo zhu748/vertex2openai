@@ -21,3 +21,5 @@ LICENSE
 docker-compose.yml
 Dockerfile
 .dockerignore
+bin/
+proxy-bridge/

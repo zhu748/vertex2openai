@@ -13,6 +13,7 @@ socks4:// hysteria2:// tuic:// 等分享链接——这些协议 httpx 无法直
   3. 统一入口 resolve_proxy_uri()：
        http/https/socks5/socks5h → 原样返回（零开销，不经 sing-box）；
        socks4/socks4a/vless/vmess/trojan/ss/hysteria2/tuic → 本地 socks5 URL；
+       turn/turns/sstp → 独立转换器提供的本地 socks5 URL；
        direct/none/直连 → 空串（强制直连）；空串 → 空串。
 
 设计决策（与用户确认过）：
@@ -30,8 +31,8 @@ sing-box 配置模板（每个实例一份）：
     "outbounds": [OB({"tag": "proxy"}), {"type": "direct", "tag": "direct"}],
     "route": {"final": "proxy"} }
 
-socks5 入站不开启 sniff：上游域名原样转给远端解析（等价 socks5h 语义，
-本地不出 DNS 查询，也不受容器 DNS 限制）。
+sing-box 的 socks5 入站不开启 sniff：上游域名交给该节点解析。
+TURN / SSTP 转换器需要目标 IP，使用本机 DNS；见 docs/proxy-turn-sstp.md。
 """
 
 from __future__ import annotations
@@ -51,12 +52,17 @@ import atexit
 from contextvars import ContextVar
 from typing import Any, Optional
 from urllib.parse import unquote, parse_qs, urlsplit, urlunsplit
-from proxy_config import DIRECT_TOKENS, ProxyFormatError, normalize_proxy_uri
+from proxy_config import (BRIDGE_PROXY_SCHEMES, DIRECT_TOKENS, ProxyFormatError,
+                          normalize_proxy_uri, parse_bridge_proxy_uri)
 
 
 class ProxyResolveError(Exception):
     """代理解析/转换失败。消息面向最终用户，须给出可操作的指引。"""
     code = 502
+
+    def __init__(self, message, *, retry_new_port=True):
+        super().__init__(message)
+        self.retry_new_port = retry_new_port
 
 
 current_proxy_usage = ContextVar("current_proxy_usage", default=None)
@@ -102,7 +108,7 @@ SINGBOX_PROXY_SCHEMES = {
 }
 
 # 「强制直连」哨兵值（Key 级代理里最常用，全局代理里等价于留空）
-ALL_PROXY_SCHEMES = NATIVE_PROXY_SCHEMES | SINGBOX_PROXY_SCHEMES
+ALL_PROXY_SCHEMES = NATIVE_PROXY_SCHEMES | SINGBOX_PROXY_SCHEMES | BRIDGE_PROXY_SCHEMES
 
 
 def _uri_scheme(uri: str) -> str:
@@ -113,7 +119,7 @@ def _uri_scheme(uri: str) -> str:
 
 
 def classify_proxy_uri(uri: str) -> str:
-    """分类代理 URI：native / singbox / direct / invalid。"""
+    """分类代理 URI：native / singbox / bridge / direct / invalid。"""
     try:
         value = normalize_proxy_uri(str(uri or ""))
     except ProxyFormatError:
@@ -127,6 +133,8 @@ def classify_proxy_uri(uri: str) -> str:
         return "native"
     if scheme in SINGBOX_PROXY_SCHEMES:
         return "singbox"
+    if scheme in BRIDGE_PROXY_SCHEMES:
+        return "bridge"
     return "invalid"
 
 
@@ -652,7 +660,7 @@ def _wait_socks5_ready(port: int, timeout: float = 10.0, process=None) -> bool:
                 s.settimeout(0.5)
                 s.sendall(b"\x05\x01\x00")    # SOCKS5 greeting：支持无认证
                 reply = s.recv(2)
-                if reply[:1] == b"\x05":
+                if reply == b"\x05\x00":
                     return True
         except OSError:
             pass
@@ -670,14 +678,16 @@ _MISSING_HINT = (
 )
 
 
-class SingboxManager:
-    """sing-box 子进程池：代理 URI → 本地 socks5 入站，惰性启动、稳定复用。
+class ProxyProcessManager:
+    """协议转换子进程池：代理 URI → 本地 socks5 入站，惰性启动、稳定复用。
 
     线程安全；同 URI 只起一个进程（**按 URI 加锁**，不同代理的启动
     互不阻塞）。崩溃的实例在下次取用时自动重启：优先复用原端口
     （客户端池签名不变，httpx 连接池无需重建）；原端口已被其他进程
     抢走时自动换新端口重试，不会卡死在同一个坏端口上。
     """
+
+    engine_name = "代理转换器"
 
     def __init__(self):
         self._lock = threading.Lock()          # 只保护下面两个 dict 的存取
@@ -704,10 +714,10 @@ class SingboxManager:
     # ---------- 对外 ----------
 
     def get_local_socks5(self, uri: str) -> str:
-        """URI → socks5://127.0.0.1:{port}。首次调用启动 sing-box（同步，约百毫秒级）。
+        """URI → socks5://127.0.0.1:{port}。首次调用启动对应的协议转换进程。
 
         阻塞提示：首次启动含子进程拉起与端口就绪等待（典型 ~100ms，
-        异常配置 10s 兑底超时）。异步上下文请先用 resolve_proxy_uri_async()
+        sing-box 最多等待 10s；SSTP 另含最多 30s 的握手）。异步上下文请先用 resolve_proxy_uri_async()
         预热，避免卡住事件循环。
         """
         uri = str(uri or "").strip()
@@ -728,12 +738,12 @@ class SingboxManager:
                 return f"socks5://127.0.0.1:{inst.port}"
             with self._lock:
                 if self._closed:
-                    raise ProxyResolveError("进程正在退出，sing-box 已停。")
+                    raise ProxyResolveError(f"进程正在退出，{self.engine_name} 已停。")
             stale_port = inst.port if inst is not None else None
             try:
                 inst = self._launch(uri, stale_port if stale_port else _find_free_port())
-            except ProxyResolveError:
-                if stale_port is None:
+            except ProxyResolveError as exc:
+                if stale_port is None or not exc.retry_new_port:
                     raise
                 # 崩溃重启偏好复用原端口（保池签名稳定），但原端口可能已被
                 # 其他进程抢走——那种情况下不重试会永远失败。换新端口重试
@@ -748,7 +758,7 @@ class SingboxManager:
             with self._lock:
                 if self._closed:            # 与停机竞态：刚起的进程立即回收
                     self._terminate(inst)
-                    raise ProxyResolveError("进程正在退出，sing-box 已停。")
+                    raise ProxyResolveError(f"进程正在退出，{self.engine_name} 已停。")
                 self._instances[uri] = inst
             return f"socks5://127.0.0.1:{inst.port}"
 
@@ -763,7 +773,7 @@ class SingboxManager:
             return lk
 
     def shutdown_all(self) -> None:
-        """停机：终止全部 sing-box 子进程（FastAPI shutdown / atexit 双保险）。"""
+        """停机：终止全部协议转换进程（FastAPI shutdown / atexit 双保险）。"""
         with self._lock:
             self._closed = True
             instances = list(self._instances.values())
@@ -780,13 +790,13 @@ class SingboxManager:
             self._closed = False
 
     def reap_idle(self) -> int:
-        """回收空闲实例（超过 SINGBOX_IDLE_MINUTES 未使用）。返回回收数量。
+        """按对应管理器的空闲阈值回收实例，返回回收数量。
 
         已崩溃的死实例即使空闲回收被关闭（SINGBOX_IDLE_MINUTES=0）也必须
         清理：旧实现直接 return，崩溃子进程的条目永远无人处理（僵尸进程
         要等下一次有人调它的 alive()/poll() 才被收尸，不再被访问就常驻）。
         """
-        idle_seconds = _idle_minutes() * 60.0
+        idle_seconds = self._idle_minutes() * 60.0
         now = time.time()
         with self._lock:
             dead = {k for k, v in self._instances.items()
@@ -807,9 +817,7 @@ class SingboxManager:
         with self._lock:
             items = list(self._instances.values())
         return {
-            "available": singbox_available(),
-            "binary": find_singbox_binary() or "",
-            "version": singbox_version(),
+            **self._runtime_info(),
             "instances": [
                 {"port": i.port, "uri": mask_proxy_uri(i.uri),
                  "alive": i.alive(), "started_at": int(i.started_at)}
@@ -817,7 +825,37 @@ class SingboxManager:
             ],
         }
 
-    # ---------- 内部 ----------
+    def _runtime_info(self):
+        raise NotImplementedError
+
+    def _idle_minutes(self):
+        return _idle_minutes()
+
+    def _launch(self, uri, port):
+        raise NotImplementedError
+
+    @staticmethod
+    def _terminate(inst: _SingboxInstance) -> None:
+        process = inst.process
+        if process is None or process.poll() is not None:
+            return
+        try:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+        except Exception:
+            pass
+
+
+class SingboxManager(ProxyProcessManager):
+    engine_name = "sing-box"
+
+    def _runtime_info(self):
+        return {"available": singbox_available(), "binary": find_singbox_binary() or "",
+                "version": singbox_version()}
 
     def _launch(self, uri: str, port: int) -> _SingboxInstance:
         binary = find_singbox_binary()
@@ -911,37 +949,141 @@ class SingboxManager:
         print(f"🛰️ [代理转换] sing-box 已启动：{mask_proxy_uri(uri)} → 127.0.0.1:{port}")
         return inst
 
-    @staticmethod
-    def _terminate(inst: _SingboxInstance) -> None:
-        process = inst.process
-        if process is None or process.poll() is not None:
-            return
+
+def find_bridge_binary() -> Optional[str]:
+    candidates = [os.environ.get("PROXY_BRIDGE_BIN", ""),
+                  "/usr/local/bin/vertex-proxy-bridge",
+                  os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "bin", "vertex-proxy-bridge")),
+                  shutil.which("vertex-proxy-bridge") or ""]
+    return next((os.path.abspath(path) for path in candidates
+                 if path and os.path.isfile(path) and os.access(path, os.X_OK)), None)
+
+
+def _wait_bridge_ready(instance, ready_file, timeout):
+    """Require the child's own bind acknowledgment before checking SOCKS5.
+
+    A foreign SOCKS5 process can take a released dynamic port while SSTP is
+    still negotiating. Its handshake must never count as our child's readiness.
+    """
+    deadline = time.monotonic() + timeout
+    while instance.alive() and time.monotonic() < deadline:
         try:
-            process.terminate()
-            try:
-                process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=3)
-        except Exception:
-            pass
+            with open(ready_file, encoding="ascii") as marker:
+                ready = marker.read(16) == "ready\n"
+        except OSError:
+            ready = False
+        if ready:
+            return _wait_socks5_ready(instance.port, timeout=max(0.1, deadline - time.monotonic()),
+                                      process=instance.process)
+        time.sleep(0.05)
+    return False
+
+
+class ProxyBridgeManager(ProxyProcessManager):
+    engine_name = "TURN/SSTP 转换器"
+
+    def __init__(self):
+        super().__init__()
+        self._file_namespace = os.urandom(6).hex()
+
+    def _runtime_info(self):
+        binary = find_bridge_binary()
+        return {"available": bool(binary), "binary": binary or "", "version": "1" if binary else ""}
+
+    def _idle_minutes(self):
+        try:
+            return max(0.0, float(os.environ.get("PROXY_BRIDGE_IDLE_MINUTES", "30")))
+        except ValueError:
+            return 30.0
+
+    def _launch(self, uri, port):
+        try:
+            config = parse_bridge_proxy_uri(uri)
+        except ProxyFormatError as exc:
+            raise ProxyResolveError(str(exc), retry_new_port=False) from None
+        binary = find_bridge_binary()
+        if not binary:
+            raise ProxyResolveError(
+                "未找到 TURN/SSTP 转换器 vertex-proxy-bridge。请使用包含该组件的新版本 Docker 镜像，"
+                "或在 proxybridge/ 目录执行 go build -o ../bin/vertex-proxy-bridge .；"
+                "也可通过 PROXY_BRIDGE_BIN 指定可执行文件。不会降级直连。", retry_new_port=False)
+        config.pop("options", None)
+        config["listen_port"] = port
+        directory = os.path.abspath(os.path.join(os.environ.get("STATE_DIR", "."), "proxy-bridge"))
+        digest = hashlib.sha256(uri.encode()).hexdigest()[:16]
+        prefix = f"bridge-{os.getpid()}-{self._file_namespace}-{digest}-"
+        config_path = os.path.join(directory, f"{prefix}{port}.json")
+        log_path = os.path.join(directory, f"{prefix}{port}.log")
+        ready_path = os.path.join(directory, f"{prefix}{port}.ready")
+        config["ready_file"] = ready_path
+        inst = None
+        try:
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+            os.chmod(directory, 0o700)
+            for stale in glob.glob(os.path.join(directory, prefix + "*")):
+                os.unlink(stale)
+            fd = os.open(config_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as file:
+                json.dump(config, file)
+            log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(log_fd, "ab", buffering=0) as log_file:
+                process = subprocess.Popen([binary, "-config", config_path],
+                                           stdout=log_file, stderr=subprocess.STDOUT,
+                                           stdin=subprocess.DEVNULL, start_new_session=True)
+            inst = _SingboxInstance(uri, port, process, config_path, log_path)
+            timeout = 35.0 if config["scheme"] == "sstp" else 10.0
+            if not _wait_bridge_ready(inst, ready_path, timeout) or not inst.alive():
+                self._terminate(inst)
+                # Never forward arbitrary child-process output: custom helpers or
+                # malformed peers could echo credentials in an error message.
+                known = {
+                    "ca_read_failed": "无法读取 CA 证书文件",
+                    "ca_invalid_pem": "CA 文件不是有效的 PEM 证书",
+                    "sstp_custom_ca_requires_linux": "SSTP 自定义 CA 当前需要 Linux",
+                    "sstp_auth_failed_requires_mschapv2": "SSTP 认证失败，需正确的 MS-CHAPv2 账号密码",
+                    "sstp_handshake_failed_check_tls_credentials_and_mschapv2": "SSTP TLS / PPP 握手失败",
+                    "listen_failed": "本地端口绑定失败",
+                    "ready_write_failed": "无法写入转换器就绪标记",
+                    "invalid_config": "转换器配置无效",
+                }
+                code = next((line.strip() for line in reversed(inst.log_tail().splitlines())
+                             if line.strip() in known), "")
+                detail = known.get(code, "启动超时或子进程退出")
+                raise ProxyResolveError(
+                    f"{config['scheme'].upper()} 转换失败：{detail}。"
+                    "请检查服务器连通性、账号密码、TLS 证书，以及 TURN RFC6062 / SSTP MS-CHAPv2 支持。",
+                    retry_new_port=code == "listen_failed")
+        except OSError:
+            if inst is not None:
+                self._terminate(inst)
+            raise ProxyResolveError("无法创建或启动 TURN/SSTP 转换器，请检查状态目录权限和可执行文件。") from None
+        finally:
+            # The helper reads the private configuration once. Remove credentials
+            # from transient files after startup, on both success and failure.
+            for path in (config_path, ready_path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+        print(f"🛰️ [代理转换] {config['scheme'].upper()} 已启动：{mask_proxy_uri(uri)} → 127.0.0.1:{port}")
+        return inst
 
 
 singbox_manager = SingboxManager()
+bridge_manager = ProxyBridgeManager()
 
 
 def _reaper_loop() -> None:
     """后台空闲回收线程（每 5 分钟扫一次，daemon）。"""
     while True:
         time.sleep(300)
-        try:
-            n = singbox_manager.reap_idle()
-            if n:
-                print(f"♻️ [代理转换] 已回收 {n} 个空闲/已退出的 sing-box 实例。")
-        except Exception as e:
-            # 回收线程必须永不退出，但异常也不能无声无息（旧实现裸 pass，
-            # 出问题只能靠猜）。
-            print(f"⚠️ [代理转换] sing-box 空闲回收线程异常（已忽略）：{type(e).__name__} - {e}")
+        for manager in (singbox_manager, bridge_manager):
+            try:
+                n = manager.reap_idle()
+                if n:
+                    print(f"♻️ [代理转换] 已回收 {n} 个空闲/已退出的 {manager.engine_name} 实例。")
+            except Exception as e:
+                print(f"⚠️ [代理转换] {manager.engine_name} 空闲回收异常（已忽略）：{type(e).__name__}")
 
 
 _reaper_started = False
@@ -949,7 +1091,7 @@ _reaper_lock = threading.Lock()
 
 
 def ensure_reaper() -> None:
-    """惰性启动空闲回收线程（首次成功创建 sing-box 实例时调用）。"""
+    """惰性启动空闲回收线程（首次成功创建转换实例时调用）。"""
     global _reaper_started
     with _reaper_lock:
         if _reaper_started:
@@ -960,6 +1102,7 @@ def ensure_reaper() -> None:
 
 
 atexit.register(singbox_manager.shutdown_all)
+atexit.register(bridge_manager.shutdown_all)
 
 
 # ============================================================
@@ -991,6 +1134,10 @@ def resolve_proxy_uri(uri: Optional[str]) -> str:
         url = singbox_manager.get_local_socks5(value)
         ensure_reaper()
         return url
+    if kind == "bridge":
+        url = bridge_manager.get_local_socks5(value)
+        ensure_reaper()
+        return url
     scheme = _uri_scheme(value)
     raise ProxyResolveError(
         f"不支持的代理协议「{scheme or '（无协议）'}」。"
@@ -1009,7 +1156,7 @@ async def resolve_proxy_uri_async(uri: Optional[str]) -> str:
 
 
 def validate_proxy_uri(uri: str) -> str:
-    """静态校验代理 URI，返回错误消息（空串 = 合法）。不启动 sing-box、不发包。
+    """静态校验代理 URI，返回错误消息（空串 = 合法）。不启动转换进程、不发包。
 
     合法性 = 能解析出该协议的必要字段；连通性请走 /api/proxy/test。
     """
@@ -1038,6 +1185,12 @@ def validate_proxy_uri(uri: str) -> str:
             return str(e)
         except Exception as e:
             return f"解析失败：{type(e).__name__}: {e}"
+    if kind == "bridge":
+        try:
+            parse_bridge_proxy_uri(value)
+            return ""
+        except ProxyFormatError as exc:
+            return str(exc)
     scheme = _uri_scheme(value)
     return (f"协议必须是 {'/'.join(sorted(ALL_PROXY_SCHEMES))} 之一"
             f"（或 direct = 强制直连），收到的是「{scheme or '（无协议）'}」")
@@ -1061,6 +1214,12 @@ def mask_proxy_uri(uri: str) -> str:
         return "direct（强制直连）"
     scheme = _uri_scheme(value)
     try:
+        if scheme in BRIDGE_PROXY_SCHEMES:
+            config = parse_bridge_proxy_uri(value)
+            host = config["server"]
+            if ":" in host:
+                host = f"[{host}]"
+            return f"{scheme}://***@{host}:{config['server_port']}"
         if scheme == "vmess":
             # vmess 整体是 base64，没有可提取的 host:port，只报长度
             return f"vmess://***({len(value)} 字符)"

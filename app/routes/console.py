@@ -127,13 +127,22 @@ async def stream_logs_endpoint(request: Request, _auth: bool = Depends(require_a
         try:
             last_id = -1
             raw = (request.headers.get("last-event-id") or "").strip()
-            if raw.isdigit():
-                last_id = int(raw)
-            for seq, msg in rt_logger.snapshot_history():
+            if raw.isdecimal():
+                try:
+                    last_id = int(raw)
+                except ValueError:
+                    pass
+            history = rt_logger.snapshot_history()
+            # EventSource survives deployments; the process-local sequence does
+            # not. An old future cursor must not hide all logs after a restart.
+            if last_id > (history[-1][0] if history else 0):
+                last_id = -1
+            for seq, msg in history:
                 if seq <= last_id:
                     continue  # 重连的调用者已经拿到过这条
                 for chunk in _event_chunks(seq, msg):
                     yield chunk
+                last_id = seq
             while True:
                 if await request.is_disconnected():
                     break
@@ -143,6 +152,7 @@ async def stream_logs_endpoint(request: Request, _auth: bool = Depends(require_a
                         continue  # 历史重放与订阅队列的竞态窗口内可能重复交付
                     for chunk in _event_chunks(seq, msg):
                         yield chunk
+                    last_id = seq
                 except asyncio.TimeoutError:
                     yield ": keep-alive heartbeat\n\n"
         finally:

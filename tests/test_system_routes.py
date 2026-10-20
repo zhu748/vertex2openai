@@ -21,6 +21,17 @@ from routes import system_api
 
 
 class SystemRoutesTests(unittest.IsolatedAsyncioTestCase):
+    async def test_proxy_editor_accepts_turn_sstp_and_preserves_tls_settings(self):
+        for scheme in ("turn", "turns", "sstp"):
+            options = {"sni": "cert.example.com", "ca": "/cert.pem"} if scheme != "turn" else {"realm": "fixture"}
+            response = await system_api.parse_proxy(system_api.ProxyParseBody(
+                type=scheme, host="proxy.example.com", username="user", password="p@ss", options=options), True)
+            self.assertEqual(response.status_code, 200)
+            fields = json.loads(response.body)["proxies"][0]
+            self.assertEqual(fields["type"], scheme)
+            self.assertEqual(fields["options"], options)
+            self.assertEqual(fields["password"], "p@ss")
+
     async def test_health_head_preserves_representation_headers_without_a_body(self):
         with mock.patch.object(system_api, "get_effective_proxy_url", return_value="direct"):
             get_response = await system_api.healthz_get()

@@ -245,8 +245,10 @@ TCP+TLS 握手（每次约省 100~300ms 与相应 CPU）；429 重试场景收�
 | `FAKE_STREAMING_INTERVAL` | 否 | `1.0` | 假流式等待期间 keep-alive 间隔秒数。可在控制台热改。 |
 | `MODELS_CONFIG_URL` | 否 | 仓库 `vertexModels.json` | 远程模型列表地址；改远程文件即可刷新，无需重部署。 |
 | `SAFETY_SCORE` | 否 | `false` | 是否把 Gemini safety ratings 附加到输出。可在控制台热改。 |
-| `PROXY_URL` | 否 | 空 | 全局出站代理（仅作初始值，控制台保存后以控制台为准）。支持：① 原生协议 `http://` `https://` `socks5://` `socks5h://`；② 分享链接 `vless://` `vmess://` `trojan://` `ss://` `socks4://` `hysteria2://` `tuic://`（镜像内置 sing-box，自动转本地 socks5）。保存时自动校验格式。 |
+| `PROXY_URL` | 否 | 空 | 全局出站代理（仅作初始值，控制台保存后以控制台为准）。支持 HTTP / SOCKS 原生代理、sing-box 分享链接，以及 `turn://` / `turns://` / `sstp://` 节点；镜像内置两种转换组件。保存时自动校验格式。 |
 | `PROXY_URLS` | 否 | 空 | 有序全局代理列表，JSON 字符串数组或每行一条；优先于 `PROXY_URL`。每次请求先尝试第一条，失败再尝试后续条目。 |
+| `PROXY_BRIDGE_BIN` | 否 | 自动探测 | TURN / SSTP 转换器路径；Docker 镜像内置，本地部署需编译 `proxybridge/`。 |
+| `PROXY_BRIDGE_IDLE_MINUTES` | 否 | 30 | TURN / SSTP 空闲实例回收时间，`0` 关闭空闲回收；在用实例保留，退出进程仍清理。 |
 | `SSL_CERT_FILE` | 否 | 空 | 自定义证书路径。 |
 | `VERTEX_BASE_URL` | 否 | 空 | **高级**：覆盖标准模式的上游 `base_url`，正常无需设置。要钉定区域请用控制台的「标准模式 location」（详见下方「标准模式的 location」）。 |
 | `GOOGLE_COOKIE` | 否 | 空 | 一个完整 Cookie 头，或每行一个账号的完整 Cookie；分号属于 Cookie 字段分隔符，不用于拆账号。兼容 Cookie-Editor JSON。 |
@@ -287,6 +289,7 @@ PROXY_URLS='["socks5://global-first:1080","http://global-second:8080"]'
 - 模型首回复期限按代理尝试分别计时，整轮请求仍受 `request_timeout_seconds` 限制。已经交付流式内容后不会通过切换代理重发同一段内容。
 - 全局列表为空表示直连；配置了代理并全部失败时，不会额外降级直连。账号单独填写 `direct` 可强制直连。也可在有序列表中显式加入 `direct`，自行选择直连顺位。
 - **原生协议**：HTTP / HTTPS / SOCKS5 / SOCKS5H。**分享链接**：VLESS、VMess、Trojan、SS、SOCKS4 / SOCKS4A、Hysteria2、TUIC，由内置 sing-box 转成本地 SOCKS5；非 Docker 环境需安装 sing-box 或设置 `SINGBOX_BIN`。
+- **TURN / TURNS / SSTP**：可直接粘贴节点链接或使用面板字段填写，由内置转换器转为本地 SOCKS5。TURN 需要 RFC 6062 TCP allocation；SSTP 支持 MS-CHAPv2 和 IPv4，不修改系统路由。目标域名在本机解析，详见 [TURN 与 SSTP 接入说明](docs/proxy-turn-sstp.md)。
 - **格式兼容**：支持 `socks5://user:pass@host:1080`、`socks5://host:1080@user:pass`、`socks5://host:1080:user:pass`、`socks5://user:pass:host:1080`；省略协议时按 SOCKS5 识别。HTTP 同样支持这些账号位置形式。IPv6 主机可使用 `[::1]`，账号密码中的特殊字符可通过弹窗字段填写，自动编码。
 - **面板操作**：「管理 / 添加代理」打开弹窗，选择类型并填写 IP、端口、账号和密码；粘贴单条地址可自动识别，粘贴多行或 JSON 数组可批量导入。列表可设为首选、上下移动、编辑、删除和逐条测试。应用草稿后，点击对应的保存按钮生效。
 - SDK、Cookie（httpx / curl）、Gemini 原生 REST、Key 探测和图片抓取均按对应账号的代理链执行；远程模型列表刷新使用全局列表。连接池按实际出口复用，切换不关闭其他请求正在使用的连接。
@@ -324,7 +327,7 @@ PROXY_URLS='["socks5://global-first:1080","http://global-second:8080"]'
 
 ## 控制台与模型参数
 
-控制台"模型参数"面板可在线调整全局默认值，并按所选模型显示其支持情况。可调项：思考强度（3.x 档位 / 2.5 预算）、生图分辨率与默认比例、采样默认值（temperature/top_p/max_tokens）、输入图压缩（开关/边长/质量）、重试次数与退避、假流式/轮询/安全分显示、预填充兼容模式与"预填充时压制原生思考"开关、续写指令模板、Cookie 调试日志。
+控制台"模型参数"面板可在线调整全局默认值，并按所选模型显示其支持情况。可调项：思考强度（按模型能力选择档位）、生图分辨率与默认比例、采样默认值（temperature/top_p/max_tokens）、输入图压缩（开关/边长/质量）、重试次数与退避、假流式/轮询/安全分显示、预填充兼容模式与"预填充时压制原生思考"开关、续写指令模板、Cookie 调试日志。
 
 ### 参数优先级
 

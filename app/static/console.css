@@ -183,6 +183,11 @@ body:has(#proxy-dialog[open]) { overflow: hidden; }
 .proxy-row-result:not(:empty) { margin-top: 10px; }
 .proxy-form-panel .lbl { display: block; margin-bottom: 7px; }
 .proxy-form-hint { font-size: 11px; line-height: 1.7; color: var(--muted); margin: 8px 0; }
+#proxy-protocol-hint:empty { display: none; }
+#proxy-advanced { margin-top: 16px; padding: 12px; border: 1px solid var(--border); border-radius: 8px; background: #fafbfe; }
+#proxy-advanced summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+#proxy-tls-fields > label { grid-column: 1 / -1; }
+#proxy-turn-fields, #proxy-sstp-fields { margin-top: 12px; }
 .proxy-recognize { font-size: 11px; padding: 6px 10px; margin-bottom: 18px; }
 .proxy-form-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, .8fr); gap: 14px; margin-top: 15px; }
 .proxy-form-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }

@@ -129,7 +129,7 @@ function proxyDraft(value){
   if(text.startsWith('[')){
     try{const list=JSON.parse(text);if(Array.isArray(list)) return proxyDraft(list);}catch(_){}
   }
-  return text.split(/\r?\n/).map(v=>v.trim()).filter(Boolean);
+  return text.split(/[\r\n]+|,\s*(?=[a-zA-Z][a-zA-Z0-9+.-]*:\/\/|turns?:)/i).map(v=>v.trim()).filter(Boolean);
 }
 function credentialCopy(record){return {...record,proxies:proxyDraft(record.proxies??record.proxy)};}
 function projectFromInput(value){
@@ -329,7 +329,7 @@ async function testProxy(){
   const box=$('proxy-test-result'); box.classList.remove('hidden');
   box.innerHTML='<span class="text-neutral-500">🛰️ 正在测试（最长 8 秒）…</span>';
   try{
-    const r=await fetch('/api/proxy/test',{signal:AbortSignal.timeout(30000),method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxy_url:v})});
+    const r=await fetch('/api/proxy/test',{signal:AbortSignal.timeout(60000),method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxy_url:v})});
     const d=await r.json();
     if(d.ok){
       box.innerHTML=`<span style="color:#047857">✅ ${esc(d.message)} · 延迟 ${d.latency_ms} ms${d.via_proxy?(' · 经 '+esc(d.proxy)):''}</span>`;
@@ -421,11 +421,8 @@ async function loadParams(){
     setV('express-ua-custom', s.express_ua_custom || '');
     updateExpressPill(s.express_ua_profile || 'sdk', s.express_ua_custom || '');
     updateExpressCustomVis();
-    // 向后兼容：旧版布尔开关映射到新的 native_thinking_mode 下拉
-    if((!s.native_thinking_mode || s.native_thinking_mode==='request')){
-      if(s.hide_thoughts) GLOBAL_SETTINGS.native_thinking_mode='off';
-      else if(s.thinking_force_console) GLOBAL_SETTINGS.native_thinking_mode='console';
-    }
+    // Legacy thinking switches are normalized by the server. Do not reinterpret
+    // an explicitly saved request mode using stale legacy flags.
   }catch(e){loadNotice('params','设置'+e.message+'。重新加载成功后再保存。');}
   try{
     const c=await readJSON('/api/capabilities');

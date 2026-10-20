@@ -23,7 +23,8 @@ from runtime_state import app_state
 import uvicorn, os
 app_state.set_express_keys([{'key':'ui-fixture-key','project_id':'fixture-project','project_source':'auto','enabled':True}])
 app_state.set_cookie_accounts([])
-app_state.update_settings({'image_aspect_ratio':'16:9','express_ua_profile':'custom','express_ua_custom':'fixture-gateway/'+'x'*360})
+app_state.update_settings({'image_aspect_ratio':'16:9','express_ua_profile':'custom','express_ua_custom':'fixture-gateway/'+'x'*360,
+                          'hide_thoughts':True,'native_thinking_mode':'request'})
 stats.total_requests=32
 stats.success_requests=25
 stats.error_requests=5
@@ -89,6 +90,9 @@ async function main() {
       executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || undefined,
       args: ['--no-sandbox']});
     const context = await browser.newContext({viewport: {width: 1440, height: 1000}});
+    // Ordinary remote HTTP origins do not expose randomUUID. Account creation
+    // must work there too; the server owns durable Cookie account identities.
+    await context.addInitScript(() => Object.defineProperty(Crypto.prototype, 'randomUUID', {value: undefined}));
     const errors = [], external = [];
     context.on('page', page => page.on('pageerror', error => errors.push(error.message)));
     await context.route('**/*', route => {
@@ -122,6 +126,7 @@ async function main() {
     check('导航支持键盘与 ARIA 状态');
 
     await openTab('params');
+    assert.equal(await page.inputValue('#native_thinking_mode'), 'request');
     await page.selectOption('#model-sel', 'gemini-4-argon');
     await page.fill('#first_reply_timeout_seconds', '28.5');
     await page.check('#prefill_cot_guard');
@@ -301,12 +306,52 @@ async function main() {
     await page.click('#proxy-dialog-apply');
     await page.waitForFunction(()=>!document.querySelector('#proxy-dialog').open);
     assert.equal(await page.inputValue('#proxy-input'),'http://proxy-second.invalid:8081\nsocks5://proxy-user:p%40ss@127.0.0.1:1080');
+    // The raw editor accepts the same comma-separated complete URLs as env.
+    await page.fill('#proxy-input','http://proxy-second.invalid:8081, socks5://proxy-user:p%40ss@127.0.0.1:1080');
     pending=responseFor('/api/settings');
     await page.locator('button[onclick*="saveProxy()"]').click();
     response=await pending;
     assert.equal(response.status(),200);
     assert.equal(response.request().postDataJSON().proxy_urls.length,2);
     check('代理弹窗识别供应商格式、字段填写、特殊字符、排序、编辑、测试与持久化');
+
+    await page.getByRole('button',{name:'管理 / 添加代理',exact:true}).click();
+    await page.selectOption('#proxy-type','sstp');
+    await page.fill('#proxy-host','vpn.example.com');
+    await page.fill('#proxy-username','domain\\fixture');
+    await page.fill('#proxy-password','private:@password');
+    await page.locator('#proxy-advanced summary').click();
+    await page.fill('#proxy-sni','certificate.example.com');
+    await page.fill('#proxy-ca','/app/certificates/company.pem');
+    await page.fill('#proxy-mtu','1280');
+    await page.click('#proxy-form-add');
+    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===3 && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    assert.ok(!(await page.locator('[data-proxy-index="2"] strong').textContent()).includes('private'));
+    await page.locator('[data-proxy-index="2"]').getByRole('button',{name:'编辑',exact:true}).click();
+    await page.waitForFunction(()=>document.querySelector('#proxy-type').value==='sstp' && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    assert.equal(await page.inputValue('#proxy-port'),'443');
+    assert.equal(await page.inputValue('#proxy-password'),'private:@password');
+    assert.equal(await page.inputValue('#proxy-sni'),'certificate.example.com');
+    assert.equal(await page.inputValue('#proxy-ca'),'/app/certificates/company.pem');
+    assert.equal(await page.inputValue('#proxy-mtu'),'1280');
+    await screenshot('proxy-editor-sstp');
+    await page.click('#proxy-form-add');
+    await page.waitForFunction(()=>document.querySelector('#proxy-type').value==='socks5' && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    await page.fill('#proxy-paste','turn:relay.example.com:3478?transport=tcp&username=fixture&password=private-turn-password');
+    await page.click('.proxy-recognize');
+    await page.waitForFunction(()=>document.querySelector('#proxy-type').value==='turn' && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    assert.equal(await page.inputValue('#proxy-host'),'relay.example.com');
+    assert.equal(await page.locator('#proxy-tls-fields').isVisible(),false);
+    await page.click('#proxy-form-add');
+    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===4 && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    await page.selectOption('#proxy-type','turns');
+    await page.fill('#proxy-host','relay-tls.example.com');
+    await page.fill('#proxy-username','fixture');
+    await page.fill('#proxy-password','private-turns-password');
+    await page.click('#proxy-form-add');
+    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===5 && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    await page.click('#proxy-dialog-cancel');
+    check('TURN / TURNS / SSTP 字段填写、默认端口、TLS 高级设置、标准 TURN URI 识别与凭据脱敏');
 
     await page.getByRole('button',{name:'管理 / 添加代理',exact:true}).click();
     const legacySsPayload=Buffer.from('chacha20-ietf-poly1305:private-password@9.9.9.9:9999').toString('base64');
@@ -375,6 +420,7 @@ async function main() {
     response=await pending;
     assert.equal(response.status(),200);
     await page.getByRole('button',{name:'＋ 添加 Cookie',exact:true}).click();
+    assert.equal(await page.evaluate(() => typeof crypto.randomUUID), 'undefined');
     await page.locator('.c-cookie').first().fill('SAPISID=ui-cookie-one; SID=ui-sid-one');
     await page.locator('.c-project').first().fill('https://console.cloud.google.com/?project=cookie-project-one');
     await page.getByRole('button',{name:'＋ 添加 Cookie',exact:true}).click();
@@ -478,6 +524,11 @@ async function main() {
       assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),`${width}px modal page overflow`);
       if(width===390) await screenshot('proxy-editor-mobile');
       if(width===320 || width===390){
+        await page.selectOption('#proxy-type','sstp');
+        await page.locator('#proxy-advanced summary').click();
+        await page.fill('#proxy-ca','/app/certificates/company.pem');
+        await page.fill('#proxy-mtu','1280');
+        assert.ok(await page.locator('#proxy-dialog').evaluate(el=>el.scrollWidth<=el.clientWidth),`${width}px SSTP advanced settings overflow`);
         await page.locator('#proxy-password').click();
         await page.fill('#proxy-host','mobile-draft.invalid');
         await page.fill('#proxy-port','1080');

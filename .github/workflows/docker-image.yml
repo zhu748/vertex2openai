@@ -48,8 +48,25 @@ jobs:
       - name: Offline regression and project checks
         run: python scripts/check_project.py
 
+  proxy-bridge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: proxybridge/go.mod
+          cache-dependency-path: proxybridge/go.sum
+      - name: Protocol integration and race checks
+        working-directory: proxybridge
+        run: go test -race -count=1 -timeout=90s ./...
+      - name: Build protocol converter
+        working-directory: proxybridge
+        run: CGO_ENABLED=0 go build -trimpath -o ../bin/vertex-proxy-bridge .
+
   build-and-push:
-    needs: test
+    needs: [test, proxy-bridge]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

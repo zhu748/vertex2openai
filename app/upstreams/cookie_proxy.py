@@ -38,7 +38,8 @@ from retry_policy import (
     wait_for_retry,
 )
 from runtime_state import app_state
-from schema_validation import SchemaValidationError, validate_request_schemas
+from schema_validation import SchemaValidationError
+from request_validation import validate_openai_request
 from streaming import HEARTBEAT, HEARTBEAT_FRAME, with_heartbeats
 from thought_signatures import (
     encode_thought_signature,
@@ -395,13 +396,15 @@ async def _execute_stream_request_generator(client, headers, body, sampler=None,
 
 
 async def _collect_full_response(project_id, base_model_name, request_obj, headers, client_kwargs,
-                                 retry_max, backoff_sec, jitter_sec, fastapi_request) -> dict:
+                                 retry_max, backoff_sec, jitter_sec, fastapi_request, *,
+                                 prefill_active=False, force_search=False) -> dict:
     """非流式地完整取回一次响应（供生图假流式复用）。返回 dict。"""
     # 请求体只构建一次：构建内部含远程图片下载 + PIL 压缩，旧实现每次
     # 重试都重建一遍 = 反复下载同一批图片。重试发同一个 body 本就是重试语义。
     if await fastapi_request.is_disconnected():
         return {"kind": "error", "message": "客户端已断开连接。"}
-    body = await build_request_body_async(project_id, base_model_name, request_obj)
+    body = await build_request_body_async(project_id, base_model_name, request_obj,
+                                          prefill_active=prefill_active, force_search=force_search)
     for attempt in range(retry_max + 1):
         if await fastapi_request.is_disconnected():
             return {"kind": "error", "message": "客户端已断开连接。"}
@@ -497,7 +500,7 @@ class CookieProxyUpstream(BaseUpstream):
     async def chat_completions(self, request_obj: OpenAIRequest, fastapi_request: Request, *, credential_record=None):
         track_configure(mode="stream" if request_obj.stream else "json", channel="cookie")
         try:
-            validate_request_schemas(request_obj)
+            validate_openai_request(request_obj)
             if request_obj.response_format and request_obj.response_format.get("type") not in (None, "text"):
                 raise SchemaValidationError("Cookie 通道尚未验证结构化输出支持，请改用 Express 通道。")
         except SchemaValidationError as exc:
@@ -594,7 +597,7 @@ class CookieProxyUpstream(BaseUpstream):
                             or app_state.get_setting("cookie_debug", False))
 
         # batchGraphql(Studio) 会忽略 includeThoughts=false（真机验证），因此当解析出的思考配置
-        # 要求不回传思考时，由本通道在响应侧主动剥离思考块。生图无思考，strip 恒 False。
+        # 要求不回传思考时，由本通道在响应侧主动剥离思考块，生图同样适用。
         # 复用 3. 段已取的 _inj_settings：同参数同模型，两次 get_effective_settings
         # 之间无任何设置写入点，旧实现白做一次全量深拷贝+合并（热路径，2026-10 优化）。
         _eff_settings = _inj_settings
@@ -628,6 +631,7 @@ class CookieProxyUpstream(BaseUpstream):
                 collect_task = asyncio.create_task(_collect_full_response(
                     project_id, base_model_name, request_obj, headers, client_kwargs,
                     retry_max, backoff_sec, jitter_sec, fastapi_request,
+                    prefill_active=prefill_active, force_search=force_builtin_search,
                 ))
                 try:
                     while True:
@@ -657,7 +661,7 @@ class CookieProxyUpstream(BaseUpstream):
                     full_text = res.get("full_text") or ""
                     if prefill_text:
                         full_text = prefill_text + strip_prefill_overlap(prefill_text, full_text)
-                    if res.get("reasoning_text"):
+                    if res.get("reasoning_text") and not strip_thoughts:
                         yield make_openai_chunk(response_id, model_display, reasoning_content=res["reasoning_text"])
                     # 关键：整张图作为单个 chunk 发出，绝不分块
                     yield make_openai_chunk(response_id, model_display, content=full_text or " ")

@@ -242,6 +242,27 @@ class ClassifyValidateMaskTests(unittest.TestCase):
         self.assertNotEqual(validate_proxy_uri("vless://only-uuid"), "")
         self.assertNotEqual(validate_proxy_uri("res://1.2.3.4:1"), "")
 
+    def test_turn_and_sstp_use_their_own_bridge(self):
+        cases = (
+            "turn:relay.example.com:3478?transport=tcp&username=private-user&password=private-pass",
+            "TURNS:[2001:db8::1]:5349?transport=tcp&username=private-user&password=private-pass",
+            "turn://private-user:private-pass@relay.example.com:3478",
+            "turns://private-user:private-pass@relay.example.com:5349",
+            "SSTP://private-user:private-pass@vpn.example.com:443",
+        )
+        with (mock.patch.object(pr.singbox_manager, "get_local_socks5") as launch,
+              mock.patch.object(pr.bridge_manager, "get_local_socks5", return_value="socks5://127.0.0.1:11080") as bridge,
+              mock.patch.object(pr, "ensure_reaper")):
+            for uri in cases:
+                with self.subTest(uri=uri.split(":", 1)[0]):
+                    self.assertEqual(classify_proxy_uri(uri), "bridge")
+                    self.assertEqual(validate_proxy_uri(uri), "")
+                    self.assertEqual(resolve_proxy_uri(uri), "socks5://127.0.0.1:11080")
+                    self.assertNotIn("private-user", mask_proxy_uri(uri))
+                    self.assertNotIn("private-pass", mask_proxy_uri(uri))
+            self.assertEqual(bridge.call_count, len(cases))
+            launch.assert_not_called()
+
     def test_mask_never_leaks_credentials(self):
         cases = {
             "socks5://user:pass@1.2.3.4:1080": "socks5://***@1.2.3.4:1080",

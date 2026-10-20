@@ -2,13 +2,13 @@
 
 import base64
 import hashlib
-import io
 import json
 import re
 import time
 from typing import Any, AsyncGenerator, Optional
 
 from response_validation import IncompleteResponseError
+from json_stream import MAX_JSON_OBJECT_BYTES, JsonObjects as _JsonObjects
 from signature_store import SignatureRecord, SignatureState, signature_store
 from thought_signatures import is_thought_part, thought_signature_extra
 
@@ -50,72 +50,6 @@ def openai_tool_call(response_id: str, call_index: int, call: dict) -> dict:
     if extra:
         payload["extra_content"] = extra
     return payload
-
-
-MAX_JSON_OBJECT_BYTES = 64 * 1024 * 1024
-_JSON_TOKENS = re.compile(r'["{}\\]')
-
-
-class _JsonObjects:
-    """跨网络块跟踪对象边界，仅在完整时解码一次 JSON。"""
-
-    def __init__(self, limit: int):
-        self.limit = limit
-        self.depth = 0
-        self.quoted = False
-        self.escaped = False
-        self.size = 0
-        self.buffer = io.StringIO()
-
-    def _append(self, fragment: str) -> None:
-        self.size += len(fragment.encode("utf-8"))
-        if self.size > self.limit:
-            raise IncompleteResponseError("上游单个 JSON 对象超过字节上限。")
-        self.buffer.write(fragment)
-
-    def feed(self, chunk: str):
-        start = 0 if self.depth else None
-        # 上一块在字符串的反斜线处结束，本块首字符仍属于转义序列。
-        skip_until = 1 if self.escaped else 0
-        self.escaped = False
-        for match in _JSON_TOKENS.finditer(chunk):
-            position = match.start()
-            if position < skip_until:
-                continue
-            token = match.group()
-            if not self.depth:
-                if token == "{":
-                    start = position
-                    self.depth = 1
-                continue
-            if self.quoted:
-                if token == "\\":
-                    skip_until = position + 2
-                elif token == '"':
-                    self.quoted = False
-            elif token == '"':
-                self.quoted = True
-            elif token == "{":
-                self.depth += 1
-            elif token == "}":
-                self.depth -= 1
-                if not self.depth:
-                    self._append(chunk[start : match.end()])
-                    try:
-                        obj = json.loads(self.buffer.getvalue())
-                    except json.JSONDecodeError as exc:
-                        raise IncompleteResponseError("上游返回无效的 JSON 对象。") from exc
-                    self.buffer = io.StringIO()
-                    self.size = 0
-                    start = None
-                    yield obj
-        if start is not None:
-            self._append(chunk[start:])
-        self.escaped = self.quoted and skip_until > len(chunk)
-
-    def finish(self) -> None:
-        if self.depth:
-            raise IncompleteResponseError("上游 JSON 对象尚未完整结束，连接已断开。")
 
 
 async def iter_json_objects(

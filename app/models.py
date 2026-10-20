@@ -72,7 +72,7 @@ class OpenAIRequest(BaseModel):
     # 流式用量开关（OpenAI: {"include_usage": true}）
     stream_options: dict[str, Any] | None = None
 
-    model_config = ConfigDict(extra='allow')
+    model_config = ConfigDict(extra='allow', allow_inf_nan=False)
 
 
 def message_text(content: Any) -> str:

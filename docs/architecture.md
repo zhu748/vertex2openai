@@ -30,6 +30,7 @@ Express SDK 或 Cookie 上游；Gemini 原生请求通过 Express REST 透传。
 | `app/upstreams/cookie_request.py` | batchGraphql 请求参数、消息及工具协议转换 |
 | `app/upstreams/cookie_response.py` | 连续 JSON 对象解析、事件与签名还原、响应诊断 |
 | `app/generation_config.py` | OpenAI 请求到 SDK 生成参数的映射与裁剪 |
+| `app/request_validation.py`、`app/schema_validation.py` | 两通道共用的消息、工具扩展字段和 JSON Schema 校验 |
 | `app/express_endpoint.py` | SDK 与原生 REST 共用的模型路径、项目区域钉定和兜底判据 |
 | `app/upstream_errors.py`、`app/response_validation.py` | 共享错误映射，以及响应拦截、完整性校验 |
 | `app/message_processing.py`、`app/model_capabilities.py` | SDK / OpenAI 消息及响应转换、模型能力判定 |
@@ -38,6 +39,7 @@ Express SDK 或 Cookie 上游；Gemini 原生请求通过 Express REST 透传。
 | `app/prefill.py` | 消息注入、预填充兼容、标签守卫与输出去重 |
 | `app/api_helpers.py` | SDK 响应适配、流式输出、调用与重试编排 |
 | `app/retry_policy.py`、`app/streaming.py` | 重试配置、可重试性、等待、断连检查和流式心跳 |
+| `app/json_stream.py` | 有界 JSON 对象增量分帧；Cookie 连续对象与原生 JSON 文档复用 |
 | `app/first_reply.py` | 每次尝试的首回复期限、有效输出识别、可重试超时及原生流预读 |
 | `app/request_connection.py` | 请求体结束后独占 ASGI receive，及时广播实际断连 |
 | `app/request_tracking.py` | 请求生命周期、分离连接/生成计数、首字时序、输出诊断与有界历史 |
@@ -45,6 +47,7 @@ Express SDK 或 Cookie 上游；Gemini 原生请求通过 Express REST 透传。
 | `app/usage.py` | SDK / REST 用量映射、用量开关与 OpenAI 用量尾块 |
 | `app/resumable.py`、`app/admission.py` | 有界响应缓冲、后台生成、期限与并发准入 |
 | `app/client_pool.py`、`app/impersonate.py`、`app/proxy_resolver.py` | 连接复用、传输适配和代理解析 |
+| `proxybridge/` | TURN RFC6062 / SSTP MS-CHAPv2 转本地 SOCKS5，独立进程与用户态网络栈 |
 | `tests/` | 不依赖真实凭据或远程上游的回归测试 |
 | `scripts/` | 统一检查入口、SDK 请求形态探针和手动诊断 |
 
@@ -60,8 +63,9 @@ Cookie 通道会额外检查历史函数往返，因此共享函数显式接收 
 不会重新读取另一个账号的 Cookie。Cookie 列表接口不返回原始凭证；空 Cookie 按记录 ID 保留。
 
 代理链是请求内状态：账号列表在前，允许回退时追加全局列表并去重；没有专属代理时继承全局。
-配置代理后不隐式追加直连。`ProxyChain` 在交付前的连接错误、407/502/503/504 或首回复超时后
-尝试下一条，独立于模型重试次数；每个代理尝试拥有自己的首回复期限，外层总期限继续有效。
+配置代理后不隐式追加直连。`ProxyChain` 在交付前的连接错误或 407/502/503/504 后
+尝试下一条，独立于模型重试次数。首回复超时交给模型重试，不作为切换出口的依据；
+每个实际代理尝试拥有自己的首回复期限，外层总期限继续有效。
 SDK 适配器预读首片，HTTP / curl 适配器在响应头交付前切换；交付后的流错误交回原流式处理。
 生成租约持有当前代理链，工作线程的远程图片抓取也继承该账号出口和 sing-box 生命周期。
 
@@ -86,7 +90,9 @@ SDK 的真流式、假流式和非流式统一检查上游请求拦截；这类�
 Cookie 执行器只编排认证、重试、协议降级与交付，不再承担请求构造和响应解析。
 流式 JSON 对象按边界增量收集、完整后解码一次；完整正文使用 C 解码器直接解析。
 单对象按 UTF-8 字节设上限，截断和畸形对象返回明确的 502，不能丢弃后继续报告成功。
+原生 JSON 流收到首回复后仍继续验证 JSON 闭合、错误对象和候选结束标记，按原字节转发。
 请求体构造中的思考配置复用该次读取的设置，避免重复深拷贝和热更新期间的参数混用。
+旧版思考布尔开关在状态读取时统一映射；显式保存的新模式优先，控制台与执行路径使用同一结果。
 
 签名缓存的访问顺序和过期顺序分别维护：读取只更新 LRU，写入更新绝对过期时间。
 清理先按过期顺序删除，再按 LRU 控制容量，两个索引都受同一个上限约束。

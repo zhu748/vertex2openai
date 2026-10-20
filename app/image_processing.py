@@ -9,7 +9,7 @@ import httpx
 from runtime_state import app_state, get_effective_proxy_url, get_effective_proxy_urls
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageOps
 except ImportError:
     Image = None
 
@@ -56,13 +56,14 @@ def optimize_image_bytes(
 
     try:
         with Image.open(io.BytesIO(image_data)) as img:
+            # Compression drops EXIF metadata. Apply camera orientation first
+            # so portrait photos do not silently turn sideways upstream.
+            img = ImageOps.exif_transpose(img)
             # 抹平透明通道以防转成 JPEG 时报错
             if img.mode in ("RGBA", "LA", "P"):
                 background = Image.new("RGB", img.size, (255, 255, 255))
-                if img.mode == "RGBA" or img.mode == "LA":
-                    background.paste(img, mask=img.split()[-1])
-                else:
-                    background.paste(img)
+                rgba = img.convert("RGBA")
+                background.paste(rgba, mask=rgba.getchannel("A"))
                 img = background
             elif img.mode != "RGB":
                 img = img.convert("RGB")

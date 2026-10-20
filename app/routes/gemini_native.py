@@ -58,6 +58,7 @@ from config import API_KEY
 from logger import stats
 from request_tracking import configure as track_configure, upstream_attempt, upstream_chunk
 from first_reply import FirstReplyGuard, native_has_reply
+from json_stream import MAX_JSON_OBJECT_BYTES, JsonObjects
 from streaming import prepare_sse
 from runtime_state import app_state
 import config as app_config
@@ -369,12 +370,16 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
                     first_reply.accept()
             elif upstream.status_code < 400:
                 is_sse = "sse" in parse_qs(query).get("alt", [])
-                if is_sse and "text/event-stream" in upstream.headers.get("content-type", "").lower():
+                if "text/event-stream" in upstream.headers.get("content-type", "").lower():
                     source = _native_sse_frames(upstream, reply_guard=first_reply)
                     prefetched = await first_reply.prefetch(source, lambda _frame: first_reply.ready)
-                elif not is_sse and first_reply.seconds:
+                elif not is_sse:
                     source = _native_json_chunks(upstream, first_reply)
-                    prefetched = await first_reply.prefetch(source, lambda _chunk: first_reply.ready)
+                    # A native JSON object may contain a whole generated image.
+                    # Its partial raw bytes are response data, not SSE metadata.
+                    prefetched = (await first_reply.prefetch(source, lambda _chunk: first_reply.ready,
+                                                           max_prefix_bytes=MAX_JSON_OBJECT_BYTES)
+                                  if first_reply.seconds else source)
         except asyncio.CancelledError:
             if upstream is not None:
                 with anyio.CancelScope(shield=True):
@@ -514,31 +519,70 @@ class NativeStreamError(RuntimeError):
         super().__init__(str(error))
 
 
-async def _native_json_chunks(upstream, reply_guard):
-    """Inspect complete JSON array items until output, preserving all raw bytes."""
+class _NativeStreamState:
+    """One completion/error contract for native SSE and JSON array streams."""
+    def __init__(self, reply_guard=None):
+        self.reply_guard = reply_guard
+        self.seen, self.finished = set(), set()
+        self.received = False
+
+    def inspect(self, payload):
+        for obj in payload if isinstance(payload, list) else [payload]:
+            if not isinstance(obj, dict):
+                raise IncompleteResponseError("上游事件不是 Gemini 响应对象。")
+            self.received = True
+            if obj.get("error"):
+                raise NativeStreamError(obj)
+            if not isinstance(obj.get("candidates", []), list):
+                raise IncompleteResponseError("上游 candidates 格式错误。")
+            for index, candidate in enumerate(obj.get("candidates") or []):
+                if not isinstance(candidate, dict):
+                    raise IncompleteResponseError("上游候选格式错误。")
+                content = candidate.get("content") or {}
+                if not isinstance(content, dict):
+                    raise IncompleteResponseError("上游候选内容格式错误。")
+                parts = content.get("parts") or []
+                if not isinstance(parts, list) or any(not isinstance(part, dict) for part in parts):
+                    raise IncompleteResponseError("上游候选 parts 格式错误。")
+                index = candidate.get("index", index)
+                if not isinstance(index, int) or index < 0:
+                    raise IncompleteResponseError("上游候选 index 格式错误。")
+                if parts:
+                    self.seen.add(index)
+                if has_finish_reason(candidate.get("finishReason")):
+                    self.finished.add(index)
+            if self.reply_guard and native_has_reply(obj):
+                self.reply_guard.accept()
+
+    def finish(self):
+        if not self.received:
+            raise IncompleteResponseError("上游流已结束，但未收到响应数据。")
+        if self.seen - self.finished:
+            raise IncompleteResponseError("上游连接已结束，但候选回复缺少结束标记。")
+
+
+async def _native_json_chunks(upstream, reply_guard=None):
+    """Validate complete JSON objects in linear time, preserving every raw byte."""
     decoder = codecs.getincrementaldecoder("utf-8")()
-    parser = json.JSONDecoder()
-    pending = ""
-    async for chunk in upstream.aiter_bytes():
-        if not reply_guard.ready:
-            pending += decoder.decode(chunk)
-            while pending:
-                pending = pending.lstrip("[\r\n\t ,")
-                try:
-                    obj, end = parser.raw_decode(pending)
-                except ValueError:
-                    break
-                pending = pending[end:]
-                if native_has_reply(obj):
-                    reply_guard.accept()
-                    pending = ""
-                    break
-        yield chunk
+    parser = JsonObjects(document=True)
+    state = _NativeStreamState(reply_guard)
+    try:
+        async for chunk in upstream.aiter_bytes():
+            if chunk:
+                upstream_chunk()
+            for obj in parser.feed(decoder.decode(chunk)):
+                state.inspect(obj)
+            yield chunk
+        for obj in parser.feed(decoder.decode(b"", final=True)):
+            state.inspect(obj)
+    except UnicodeError as exc:
+        raise IncompleteResponseError("上游 JSON 流包含无效 UTF-8。") from exc
+    parser.finish()
+    state.finish()
 
 
 async def _native_sse_frames(upstream, reply_guard=None):
-    seen, finished = set(), set()
-    received = False
+    state = _NativeStreamState(reply_guard)
     async def observed_bytes():
         async for chunk in upstream.aiter_bytes():
             if chunk:
@@ -553,30 +597,9 @@ async def _native_sse_frames(upstream, reply_guard=None):
                     payload = json.loads(data)
                 except (ValueError, UnicodeError):
                     raise IncompleteResponseError("上游 SSE 包含无效 JSON 事件。") from None
-                objects = payload if isinstance(payload, list) else [payload]
-                for obj in objects:
-                    if not isinstance(obj, dict):
-                        raise IncompleteResponseError("上游 SSE 事件不是 Gemini 响应对象。")
-                    received = True
-                    if obj.get("error"):
-                        raise NativeStreamError(obj)
-                    if not isinstance(obj.get("candidates", []), list):
-                        raise IncompleteResponseError("上游 SSE candidates 格式错误。")
-                    if reply_guard and native_has_reply(obj):
-                        reply_guard.accept()
-                    for index, candidate in enumerate(obj.get("candidates") or []):
-                        if not isinstance(candidate, dict) or not isinstance(candidate.get("content", {}), dict):
-                            raise IncompleteResponseError("上游 SSE 候选格式错误。")
-                        index = candidate.get("index", index)
-                        if (candidate.get("content") or {}).get("parts"):
-                            seen.add(index)
-                        if has_finish_reason(candidate.get("finishReason")):
-                            finished.add(index)
+                state.inspect(payload)
             yield frame
-        if not received:
-            raise IncompleteResponseError("上游 SSE 已结束，但未收到响应数据。")
-        if seen - finished:
-            raise IncompleteResponseError("上游连接已结束，但候选回复缺少结束标记。")
+        state.finish()
     finally:
         await frames.aclose()
 
@@ -616,9 +639,14 @@ async def _relay_stream(upstream: httpx.Response, *, keepalive=False, deadline=N
                             total += len(item)
                             yield item
                 else:
-                    async for chunk in source if source is not None else upstream.aiter_bytes():
+                    if source is not None:
+                        events = source
+                    elif "text/event-stream" in upstream.headers.get("content-type", "").lower():
+                        events = _native_sse_frames(upstream)
+                    else:
+                        events = _native_json_chunks(upstream)
+                    async for chunk in events:
                         if chunk:
-                            upstream_chunk()
                             total += len(chunk)
                             yield chunk
             completed = True

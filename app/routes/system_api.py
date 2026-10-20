@@ -4,13 +4,14 @@ import time
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from console_auth import require_auth
 import config
 from runtime_state import app_state, get_effective_proxy_url, get_effective_proxy_urls, mask_proxy_url
 from proxy_resolver import classify_proxy_uri, validate_proxy_uri
-from proxy_config import FORM_PROXY_SCHEMES, ProxyFormatError, build_proxy_uri, parse_proxy_list, proxy_fields
+from proxy_config import (BRIDGE_PROXY_SCHEMES, FORM_PROXY_SCHEMES, ProxyFormatError,
+                          build_proxy_uri, parse_proxy_list, proxy_fields)
 from proxy_failover import PROXY_FAILURE_STATUSES
 
 
@@ -72,13 +73,16 @@ class ProxyParseBody(BaseModel):
     port: str | int = ""
     username: str = ""
     password: str = ""
+    options: dict[str, str | int | bool] = Field(default_factory=dict)
 
 
 @router.post("/api/proxy/parse")
 async def parse_proxy(body: ProxyParseBody, _auth: bool = Depends(require_auth)):
     try:
-        value = body.text.strip() or build_proxy_uri(body.type, body.host, body.port, body.username, body.password)
-        proxies = parse_proxy_list(value, default_scheme=body.type if body.type in FORM_PROXY_SCHEMES else "socks5")
+        value = body.text.strip() or build_proxy_uri(body.type, body.host, body.port, body.username,
+                                                   body.password, options=body.options)
+        protocols = FORM_PROXY_SCHEMES | BRIDGE_PROXY_SCHEMES
+        proxies = parse_proxy_list(value, default_scheme=body.type if body.type in protocols else "socks5")
         if not proxies or len(proxies) > 32:
             raise ProxyFormatError("请填写 1–32 条代理。")
         for index, uri in enumerate(proxies):

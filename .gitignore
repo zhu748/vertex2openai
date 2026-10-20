@@ -154,3 +154,5 @@ web_state.json
 
 # sing-box 子进程的配置/日志（STATE_DIR 未设置时落在仓库根 singbox/）
 singbox/
+proxy-bridge/
+bin/vertex-proxy-bridge*

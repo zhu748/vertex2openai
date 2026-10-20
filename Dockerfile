@@ -1,3 +1,14 @@
+FROM --platform=$BUILDPLATFORM golang:1.27.3-bookworm AS proxy-bridge-build
+WORKDIR /src
+COPY proxybridge/go.mod proxybridge/go.sum ./
+RUN go mod download
+COPY proxybridge/ ./
+ARG TARGETOS
+ARG TARGETARCH
+ARG TARGETVARIANT
+RUN GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} GOARM=${TARGETVARIANT#v} \
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /vertex-proxy-bridge .
+
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -13,6 +24,8 @@ WORKDIR /app
 
 # 先建运行用户（后面的 COPY --chown 依赖它存在）
 RUN useradd --system --uid 1000 --create-home app
+COPY --from=proxy-bridge-build /vertex-proxy-bridge /usr/local/bin/vertex-proxy-bridge
+COPY --from=proxy-bridge-build /src/NOTICE.txt /usr/local/share/vertex-proxy-bridge/NOTICE.txt
 
 # Install sing-box（多协议代理转换，静态二进制约 30MB）。
 # slim 镜像没有 curl/wget，用 Python 标准库下载（跟随 GitHub 302 跳转）；

@@ -11,7 +11,8 @@ import express_key_probe
 from client_pool import close_all_clients
 from console_auth import DEFAULT_API_KEY
 from model_loader import close_models_refresh, get_models_config, schedule_models_refresh
-from proxy_resolver import singbox_available, singbox_manager, singbox_version
+from proxy_resolver import (bridge_manager, find_bridge_binary, singbox_available,
+                            singbox_manager, singbox_version)
 from resumable import resumable_store
 from runtime_state import app_state, get_effective_proxy_url, mask_proxy_url
 
@@ -53,6 +54,8 @@ async def _probe_express_projects_on_startup() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    singbox_manager.reopen()
+    bridge_manager.reopen()
     print("🚀 [服务启动] agentplatform2api 适配器已启动（Express API Key / Cookie 直连 双通道）。")
 
     # S-1：默认口令 + 公开托管 + 明文 Cookie 是很危险的组合，必须让人看见。
@@ -117,6 +120,8 @@ async def lifespan(app: FastAPI):
             )
     except Exception as _e:
         print(f"⚠️ [多协议代理] sing-box 状态探测失败：{_e}")
+    print("🛰️ [TURN/SSTP] 转换器就绪，节点首次使用时启动。" if find_bridge_binary()
+          else "ℹ️ [TURN/SSTP] 转换器未安装；使用新 Docker 镜像或设置 PROXY_BRIDGE_BIN 可启用。")
 
     # Cookie 通道指纹伪装状态（curl_cffi）
     try:
@@ -182,7 +187,5 @@ async def lifespan(app: FastAPI):
         await close_all_clients()
         # 终止全部 sing-box 子进程（vless/vmess 等协议转换进程；
         # atexit 里还有一道兑底，这里保证 FastAPI 优雅停机时先收掉）。
-        try:
-            singbox_manager.shutdown_all()
-        except Exception:
-            pass
+        await asyncio.gather(asyncio.to_thread(singbox_manager.shutdown_all),
+                             asyncio.to_thread(bridge_manager.shutdown_all), return_exceptions=True)

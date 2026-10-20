@@ -93,7 +93,8 @@ def ordinary_parts_from_extra(value: Any) -> Optional[List[types.Part]]:
             return None
         kind = item.get("kind")
         text = item.get("text")
-        if kind not in {"text", "thought", "signature_only"} or not isinstance(text, str):
+        if (not isinstance(kind, str) or kind not in {"text", "thought", "signature_only"}
+                or not isinstance(text, str)):
             return None
         # Generated images are flattened to markdown in OpenAI content. Let the
         # normal content path parse them back into inline_data rather than
@@ -147,7 +148,7 @@ def resolve_tool_call_signature(
     step when neither explicit metadata, the legacy id, nor the fallback store
     can recover a signature. Explicitly unsigned parallel followers stay bare.
     """
-    real_id = tool_call_id or ""
+    real_id = str(tool_call_id or "")
     sig: Optional[bytes] = explicit_signature
 
     if LEGACY_THOUGHT_SEP in real_id:

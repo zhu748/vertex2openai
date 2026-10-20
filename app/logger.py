@@ -68,7 +68,7 @@ class SSELogger:
     P1-5 修复的三个隐患：
       - `asyncio.Queue.put_nowait` 不是线程安全的，而 push() 可能从任意线程被调用
         （图片压缩线程、to_thread 里的消息转换等）。改为 loop.call_soon_threadsafe。
-      - 订阅者列表会被事件循环并发增删，遍历时可能 RuntimeError。改为持锁取快照。
+      - 订阅者列表与事件序号用同一把锁，增删订阅和多线程发布保持有序。
       - 队列原本无界，慢客户端会把内存撑爆。改为有界 + 满则丢最旧。
     """
 
@@ -129,16 +129,14 @@ class SSELogger:
             self.history.append((seq, formatted_msg))
             if len(self.history) > self.max_history:
                 self.history.pop(0)
-            subscribers = list(self._subscribers)
-
-        for q, loop in subscribers:
-            try:
-                if loop.is_closed():
-                    continue
-                loop.call_soon_threadsafe(self._offer, q, (seq, formatted_msg))
-            except RuntimeError:
-                # 事件循环已停止，忽略即可
-                pass
+            # Schedule under the sequence lock: concurrent worker threads must
+            # not enqueue seq N+1 before N, or reconnect deduplication loses N.
+            for q, loop in self._subscribers:
+                try:
+                    if not loop.is_closed():
+                        loop.call_soon_threadsafe(self._offer, q, (seq, formatted_msg))
+                except RuntimeError:
+                    pass  # Event loop stopped while publishing.
 
 
 rt_logger = SSELogger()

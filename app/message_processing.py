@@ -129,7 +129,7 @@ def _coerce_tool_response(content: Any) -> Dict[str, Any]:
         # content 可能是 OpenAI 的分段 list 等结构：数组包 result（与
         # str '[1,2]' 的解析路径同形），其余无法结构化的再退化成文本。
         if isinstance(content, list):
-            return {"result": content}
+            return {"result": [normalize_content_part(part) for part in content]}
         try:
             return {"result": json.dumps(content, ensure_ascii=False)}
         except Exception:
@@ -365,7 +365,9 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
 
                     elif part_item.get("type") == "image_url":
                         img_url_data = part_item.get("image_url") or {}
-                        if isinstance(img_url_data, dict):
+                        if isinstance(img_url_data, str):
+                            image_url = img_url_data
+                        elif isinstance(img_url_data, dict):
                             image_url = img_url_data.get("url", "")
                         else:
                             image_url = getattr(img_url_data, "url", "") or ""

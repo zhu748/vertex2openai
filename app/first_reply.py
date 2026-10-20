@@ -117,7 +117,7 @@ class FirstReplyGuard:
                 self.accept()
             yield item
 
-    async def prefetch(self, source, predicate):
+    async def prefetch(self, source, predicate, *, max_prefix_bytes=2 * 1024 * 1024):
         prefix = []
         size = 0
         try:
@@ -126,8 +126,8 @@ class FirstReplyGuard:
                 if self.ready:
                     break
                 size += len(item)
-                if size > 2 * 1024 * 1024:
-                    raise IncompleteResponseError("首回复前的元数据缓冲超过 2 MiB。")
+                if size > max_prefix_bytes:
+                    raise IncompleteResponseError("首回复前的响应缓冲超过字节上限。")
         except BaseException:
             await source.aclose()
             raise

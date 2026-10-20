@@ -59,7 +59,9 @@ async function loadCookieAccounts(){
 function addCookieAccount(){
   if(!cookiesLoaded){toast('Cookie 账号尚未加载，请先重新加载配置');return;}
   collectCookieAccounts();
-  COOKIE_ACCOUNTS.push({id:crypto.randomUUID(),cookie:'',project_id:'',note:'',enabled:true,proxies:[],proxy_fallback:true});
+  // The server assigns an account ID on save, including on ordinary HTTP sites
+  // where crypto.randomUUID() is unavailable.
+  COOKIE_ACCOUNTS.push({cookie:'',project_id:'',note:'',enabled:true,proxies:[],proxy_fallback:true});
   renderCookieAccounts();$('cookie-'+(COOKIE_ACCOUNTS.length-1)).focus();
 }
 function removeCookieAccount(index){collectCookieAccounts();COOKIE_ACCOUNTS.splice(index,1);renderCookieAccounts();}
@@ -77,7 +79,8 @@ async function saveCookieAccounts(){
 
 /* Proxy editor stores a draft until Apply; account list/global Save persists it. */
 // 可拆字段填写的原生代理协议；其余类型（sing-box 节点链接 / 直连）只走粘贴框。
-const STRUCTURED_PROXY_TYPES=['socks5','socks5h','http','https','socks4','socks4a'];
+const BRIDGE_PROXY_TYPES=['turn','turns','sstp'];
+const STRUCTURED_PROXY_TYPES=['socks5','socks5h','http','https','socks4','socks4a',...BRIDGE_PROXY_TYPES];
 function openProxyEditor(scope='global',index=0){
   if((scope==='key'&&!keysLoaded)||(scope==='cookie'&&!cookiesLoaded)||(scope==='global'&&!settingsLoaded)){
     toast('配置尚未加载，请先重新加载');return;
@@ -98,7 +101,7 @@ function closeProxyEditor(){
 function proxyLabel(uri){
   if(['direct','none','off','直连'].includes(uri.toLowerCase())) return '强制直连';
   try{
-    const url=new URL(uri);
+    const url=new URL(uri.replace(/^(turns?):(?!\/\/)/i,'$1://'));
     const proto=url.protocol.replace(/:$/,'');
     if(proto==='vmess'){
       // vmess:// 整体是 base64(JSON)：解出地址与备注才能区分多条同类节点。
@@ -112,7 +115,7 @@ function proxyLabel(uri){
     }
     if(proto==='ss'&&!url.username&&!url.password) return 'ss://（分享链接）';
     if(STRUCTURED_PROXY_TYPES.includes(proto))
-      return proto+'://'+((url.username||url.password)?'***@':'')+url.host;
+      return proto+'://'+((url.username||url.password||url.searchParams.has('username')||url.searchParams.has('password'))?'***@':'')+url.host;
     // 其余分享链接（vless/trojan/hy2/tuic 等）：显示端点与节点备注。
     let name='';
     try{name=decodeURIComponent(url.hash.replace(/^#/,'')).trim();}catch(_){name=url.hash.replace(/^#/,'').trim();}
@@ -148,7 +151,9 @@ function deleteProxy(index){
 }
 function resetProxyForm(){
   if(proxyEditor) proxyEditor.editing=null;
-  ['proxy-paste','proxy-host','proxy-port','proxy-username','proxy-password'].forEach(id=>$(id).value='');
+  ['proxy-paste','proxy-host','proxy-port','proxy-username','proxy-password','proxy-sni','proxy-ca','proxy-realm','proxy-mtu'].forEach(id=>$(id).value='');
+  $('proxy-insecure').checked=false;
+  $('proxy-advanced').open=false;
   $('proxy-type').value='socks5';$('proxy-form-add').textContent='加入列表';
   $('proxy-editor-error').textContent='';$('proxy-paste-hint').textContent='支持标准 URL、主机:端口:用户:密码、用户:密码:主机:端口及分享链接。';
   proxyTypeChanged();
@@ -157,6 +162,15 @@ function proxyTypeChanged(){
   const type=$('proxy-type').value;
   const structured=STRUCTURED_PROXY_TYPES.includes(type);
   $('proxy-structured-fields').classList.toggle('hidden',!structured);
+  const bridge=BRIDGE_PROXY_TYPES.includes(type), tls=type==='turns'||type==='sstp';
+  $('proxy-advanced').classList.toggle('hidden',!bridge);
+  $('proxy-tls-fields').classList.toggle('hidden',!tls);
+  $('proxy-turn-fields').classList.toggle('hidden',type!=='turn'&&type!=='turns');
+  $('proxy-sstp-fields').classList.toggle('hidden',type!=='sstp');
+  $('proxy-port').placeholder=({turn:'3478',turns:'5349',sstp:'443'})[type]||'1080';
+  document.querySelector('label[for="proxy-username"]').textContent=bridge?'账号（必填）':'账号（可选）';
+  document.querySelector('label[for="proxy-password"]').textContent=bridge?'密码（必填）':'密码（可选）';
+  $('proxy-protocol-hint').textContent=type==='sstp'?'SSTP 使用 MS-CHAPv2 认证，支持 IPv4 出口；默认校验服务器证书。':(type==='turn'||type==='turns'?'TURN 服务器必须支持 RFC 6062 TCP 中继；用户名和密码由服务器提供。':'');
   // 选中 sing-box 节点时，粘贴框即节点链接输入框。
   const nodeLink=type==='singbox';
   $('proxy-paste-label').textContent=nodeLink?'节点链接':'粘贴代理 · 自动识别';
@@ -174,6 +188,10 @@ function fillProxyFields(proxy){
   if(type!=='direct'&&!STRUCTURED_PROXY_TYPES.includes(type)) type='singbox';
   $('proxy-type').value=type;
   for(const field of ['host','port','username','password']) $('proxy-'+field).value=proxy[field]??'';
+  const options=proxy.options||{};
+  for(const field of ['sni','ca','realm','mtu']) $('proxy-'+field).value=options[field]??'';
+  $('proxy-insecure').checked=['true','1'].includes(String(options.insecure||'').toLowerCase());
+  $('proxy-advanced').open=Object.keys(options).some(key=>key!=='transport');
   if(!STRUCTURED_PROXY_TYPES.includes(type)) $('proxy-paste').value=proxy.url;
   proxyTypeChanged();
 }
@@ -218,6 +236,12 @@ async function addProxyDraft(){
       throw new Error('请先在上方粘贴节点链接（vless://、vmess:// 等）');
     const payload=structured?{type,host:$('proxy-host').value.trim(),port:$('proxy-port').value.trim(),username:$('proxy-username').value,password:$('proxy-password').value}
       :{text:type==='direct'?'direct':$('proxy-paste').value.trim()};
+    if(BRIDGE_PROXY_TYPES.includes(type)){
+      payload.options={};
+      const fields=type==='sstp'?['sni','ca','mtu']:(type==='turns'?['sni','ca','realm']:['realm']);
+      for(const field of fields){const value=$('proxy-'+field).value.trim();if(value) payload.options[field]=value;}
+      if(type!=='turn'&&$('proxy-insecure').checked) payload.options.insecure=true;
+    }
     const proxies=await parseProxyInput(payload);
     if(proxyEditor!==editor) return false;
     if(proxyEditor.editing!==null){proxyEditor.proxies.splice(proxyEditor.editing,1,proxies[0].url);}
@@ -250,7 +274,7 @@ async function testEditorProxy(index){
   const editor=proxyEditor, target=$('proxy-result-'+index);
   target.textContent='正在测试…';
   try{
-    const response=await fetch('/api/proxy/test',{method:'POST',signal:AbortSignal.timeout(30000),headers:{'Content-Type':'application/json'},body:JSON.stringify({proxy_url:editor.proxies[index]})});
+    const response=await fetch('/api/proxy/test',{method:'POST',signal:AbortSignal.timeout(60000),headers:{'Content-Type':'application/json'},body:JSON.stringify({proxy_url:editor.proxies[index]})});
     const result=await response.json();
     if(!response.ok) throw new Error(await responseError(response,'测试失败',result));
     if(proxyEditor===editor && target.isConnected){target.textContent=(result.ok?'✓ ':'✕ ')+result.message+' · '+result.latency_ms+' ms';target.classList.toggle('error-message',!result.ok);}

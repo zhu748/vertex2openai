@@ -4,10 +4,12 @@ import base64
 import ipaddress
 import json
 import re
-from urllib.parse import parse_qs, quote, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 
 DIRECT_TOKENS = {"direct", "none", "off", "直连", "无代理"}
 FORM_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h", "socks4", "socks4a"}
+BRIDGE_PROXY_SCHEMES = {"turn", "turns", "sstp"}
+BRIDGE_DEFAULT_PORTS = {"turn": 3478, "turns": 5349, "sstp": 443}
 _ALIASES = {"socks": "socks5", "socks5-hostname": "socks5h", "socks4-hostname": "socks4a"}
 
 # sing-box 转换的分享链接协议（见 proxy_resolver.SINGBOX_PROXY_SCHEMES）。
@@ -39,11 +41,13 @@ def _looks_like_host(value):
         return "." in host or host.lower() == "localhost"
 
 
-def build_proxy_uri(scheme, host, port, username="", password=""):
+def build_proxy_uri(scheme, host, port, username="", password="", *, options=None):
     """Build an unambiguous URL; reserved characters in credentials are encoded."""
     scheme = _ALIASES.get(str(scheme).lower(), str(scheme).lower())
-    if scheme not in FORM_PROXY_SCHEMES:
-        raise ProxyFormatError("请选择 HTTP、HTTPS 或 SOCKS 代理类型。")
+    if scheme not in FORM_PROXY_SCHEMES | BRIDGE_PROXY_SCHEMES:
+        raise ProxyFormatError("请选择 HTTP、HTTPS、SOCKS、TURN、TURNS 或 SSTP 代理类型。")
+    if scheme in BRIDGE_PROXY_SCHEMES and (port is None or str(port).strip() == ""):
+        port = BRIDGE_DEFAULT_PORTS[scheme]
     host = str(host or "").strip().strip("[]")
     if not host or any(c.isspace() or c in "/@?#\\" for c in host):
         raise ProxyFormatError("请填写有效的代理 IP 或主机名。")
@@ -70,7 +74,14 @@ def build_proxy_uri(scheme, host, port, username="", password=""):
     if password and not username:
         raise ProxyFormatError("填写密码时也需要填写用户名。")
     auth = (quote(username, safe="") + ":" + quote(password, safe="") + "@") if username else ""
-    return f"{scheme}://{auth}{host}:{port}"
+    uri = f"{scheme}://{auth}{host}:{port}"
+    if options:
+        if scheme not in BRIDGE_PROXY_SCHEMES or not isinstance(options, dict):
+            raise ProxyFormatError("高级代理参数仅适用于 TURN / TURNS / SSTP。")
+        query = {str(k): str(v).lower() if isinstance(v, bool) else str(v)
+                 for k, v in options.items() if v is not None and str(v) != ""}
+        uri += "?" + urlencode(query)
+    return uri
 
 
 def normalize_proxy_uri(value, default_scheme="socks5"):
@@ -88,6 +99,10 @@ def normalize_proxy_uri(value, default_scheme="socks5"):
         return "direct"
     if any(ord(c) < 32 or ord(c) == 127 for c in value):
         raise ProxyFormatError("单条代理地址不能包含换行或控制字符。")
+    # RFC 7065 TURN URI 使用 turn:host:port，而不是必须带 //。
+    # 保留给协议解析层，避免被误当成省略协议的 SOCKS5 地址。
+    if re.match(r"^turns?:", value, re.IGNORECASE):
+        return value
     match = re.match(r"^([a-zA-Z][a-zA-Z0-9+.-]*)://(.*)$", value)
     scheme, authority = (match.group(1).lower(), match.group(2)) if match else (default_scheme, value)
     scheme = _ALIASES.get(scheme, scheme)
@@ -187,7 +202,8 @@ def parse_proxy_list(value, *, default_scheme="socks5"):
             except ValueError:
                 raise ProxyFormatError("代理列表 JSON 无效，请使用字符串数组。") from None
         else:
-            value = re.split(r"[\r\n]+|,\s*(?=[a-zA-Z][a-zA-Z0-9+.-]*://)", stripped)
+            value = re.split(r"[\r\n]+|,\s*(?=[a-zA-Z][a-zA-Z0-9+.-]*://|turns?:)", stripped,
+                             flags=re.IGNORECASE)
     if not isinstance(value, list):
         raise ProxyFormatError("代理列表必须是数组或每行一条的地址。")
     out = []
@@ -206,6 +222,11 @@ def proxy_fields(uri):
         # 会被误报成 share（前端应选中"强制直连"）。
         return {"url": value, "type": "direct"}
     parts = urlsplit(value)
+    if parts.scheme in BRIDGE_PROXY_SCHEMES:
+        config = parse_bridge_proxy_uri(value)
+        return {"url": value, "type": config["scheme"], "host": config["server"],
+                "port": config["server_port"], "username": config["username"],
+                "password": config["password"], "options": config["options"]}
     if parts.scheme not in FORM_PROXY_SCHEMES:
         # 分享链接回传实际协议（vless/vmess/...），前端选中对应类型；
         # 未知协议保持通用 share（仅整条 URI 编辑）。
@@ -214,3 +235,63 @@ def proxy_fields(uri):
     return {"url": value, "type": parts.scheme, "host": parts.hostname,
             "port": parts.port, "username": unquote(parts.username or ""),
             "password": unquote(parts.password or "")}
+
+
+def parse_bridge_proxy_uri(uri):
+    """Parse TURN/TURNS/SSTP without network access or credential-bearing errors."""
+    value = str(uri).strip()
+    value = re.sub(r"^(turns?):(?!//)", r"\1://", value, flags=re.IGNORECASE)
+    try:
+        parts = urlsplit(value)
+        scheme = parts.scheme.lower()
+        if scheme not in BRIDGE_PROXY_SCHEMES:
+            raise ValueError
+        host = parts.hostname
+        port = parts.port if parts.port is not None else BRIDGE_DEFAULT_PORTS[scheme]
+        if not host or not 1 <= port <= 65535 or parts.path not in {"", "/"}:
+            raise ValueError
+        if any(c.isspace() or c in "%/@?#\\" for c in host):
+            raise ValueError
+        if ":" in host:
+            ipaddress.IPv6Address(host)
+        else:
+            host = host.encode("idna").decode("ascii")
+        query = parse_qs(parts.query, keep_blank_values=True, strict_parsing=True,
+                         encoding="utf-8", errors="strict")
+        if any(len(values) != 1 for values in query.values()):
+            raise ValueError
+        query = {key: values[0] for key, values in query.items()}
+        username = unquote(parts.username or "", errors="strict")
+        password = unquote(parts.password or "", errors="strict")
+        if (username or password) and ({"username", "password"} & query.keys()):
+            raise ValueError
+        username = username or query.pop("username", "")
+        password = password or query.pop("password", "")
+        if any(ord(c) < 32 or ord(c) == 127 for text in [host, username, password, *query.values()]
+               for c in text):
+            raise ValueError
+    except (ValueError, UnicodeError):
+        raise ProxyFormatError("TURN / SSTP 地址无效，请检查主机、端口、凭据编码和重复参数。") from None
+    if not username or not password:
+        raise ProxyFormatError("TURN / SSTP 需要同时填写用户名和密码；链接内的特殊字符须进行 URL 编码。")
+    allowed = {"sni", "ca", "insecure"}
+    allowed |= {"transport", "realm"} if scheme in {"turn", "turns"} else {"mtu"}
+    if query.keys() - allowed:
+        raise ProxyFormatError("TURN / SSTP 包含不支持的高级参数，请查看接入文档。")
+    if scheme in {"turn", "turns"} and query.get("transport", "tcp").lower() != "tcp":
+        raise ProxyFormatError("TURN 代理仅支持 RFC 6062 TCP 中继，transport 必须为 tcp。")
+    if scheme == "turn" and {"sni", "ca", "insecure"} & query.keys():
+        raise ProxyFormatError("TLS 参数仅适用于 turns:// 或 sstp://。")
+    if "insecure" in query and query["insecure"].lower() not in {"0", "1", "false", "true"}:
+        raise ProxyFormatError("insecure 必须是 true / false 或 1 / 0。")
+    try:
+        mtu = int(query.get("mtu", "1400"))
+        if not 576 <= mtu <= 9000:
+            raise ValueError
+    except ValueError:
+        raise ProxyFormatError("SSTP MTU 必须是 576–9000 的整数。") from None
+    return {"scheme": scheme, "server": host, "server_port": port,
+            "username": username, "password": password,
+            "tls_server_name": query.get("sni") or host, "ca_file": query.get("ca", ""),
+            "insecure": query.get("insecure", "false").lower() in {"true", "1"},
+            "realm": query.get("realm", ""), "mtu": mtu, "options": query}

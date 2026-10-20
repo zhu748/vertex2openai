@@ -30,6 +30,10 @@ services:
       # 支持 http:// / https:// / socks5:// / socks5h:// 原生协议，
       # 也可直接填 vless:// vmess:// trojan:// ss:// socks4:// hysteria2:// tuic://
       # 分享链接（镜像内已置 sing-box，自动转成本地 socks5）。
+      # TURN / TURNS / SSTP 节点也可直接填写（镜像内置 vertex-proxy-bridge）：
+      # - 'PROXY_URLS=["turns://user:pass@turn.example.com:5349","sstp://user:pass@vpn.example.com:443"]'
+      # - PROXY_BRIDGE_IDLE_MINUTES=30
+      # 自定义 CA 需只读挂载 PEM 文件，再在节点高级设置中填写容器内路径。
       # 每个 Key / Cookie 还可单独设多个代理；专属列表耗尽后默认回退全局，可单独关闭。
       # - 'PROXY_URLS=["socks5://global-first:1080","http://global-second:8080"]'
       # - PROXY_URL=vless://uuid@host:port?security=tls&type=ws&path=%2F&host=xxx&sni=xxx#name
