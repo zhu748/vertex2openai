@@ -1,10 +1,14 @@
-"""复现用户报告的场景：出口 1 首回复超时被切换、出口 2 快速成功。
+"""复现用户报告的场景并演示修正后的行为。
 
-验证两点：
-1. 修复前「第 N 次尝试等待 18.4 秒」把出口 1 的超时窗口累加进出口 2；
-   修复后 elapsed 归因到当前出口（约等于出口 2 的真实等待）。
-2. 切换日志不再武断输出英文类名 FirstReplyTimeout，而是提示
-   「首回复超时 N 秒窗口（模型思考较慢或出口不畅均可能…）」。
+设计意图（用户澄清）：出字超时 = 上游连思考分片都没吐（思考回传开启时
+思考也算首回复）= 上游无响应 → 应像 429 一样走外层自动重试，
+而不是切换代理出口。
+
+本脚本验证：
+1. 首回复超时不再触发 🔀 代理切换（出口没有故障证据，不能冤枉）；
+2. 超时说明已恢复：trace 事件「等待模型首回复超过 N 秒…」；
+3. 外层捕获 FirstReplyTimeout 后退避重试（与 429 同路径），重试成功；
+4. 「第 N 次尝试等待 X 秒」归因到当前尝试，不累加已失败尝试的等待。
 """
 import asyncio
 import os
@@ -20,50 +24,60 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 import httpx
 
-from first_reply import timed_call
+from first_reply import FirstReplyTimeout, timed_call
 from proxy_failover import ProxyChain
 import request_tracking
 from request_tracking import attempt_started_at, upstream_attempt
 
-WINDOW = 1.5      # 模拟 first_reply_timeout_seconds（真实场景 15s，压缩为 1.5s 加速复现）
-SECOND_EXIT_WAIT = 0.5  # 出口 2 的真实等待（对应真实场景的 3.4s）
+WINDOW = 1.5            # 模拟 first_reply_timeout_seconds（真实 15s，压缩加速）
+RETRY_WAIT = 0.05       # 退避等待
+SECOND_TRY_WAIT = 0.5   # 重试后上游吐字耗时
 
 
 async def main():
+    upstream_slow = True
     async def operation(raw, resolved):
-        if raw.endswith(":6370"):  # 出口 1：一直无首回复
-            await asyncio.Event().wait()
-        await asyncio.sleep(SECOND_EXIT_WAIT)  # 出口 2：等 0.5s 后出分片
+        nonlocal upstream_slow
+        if upstream_slow:
+            upstream_slow = False
+            await asyncio.Event().wait()   # 第 1 次尝试：上游不吐任何分片
+        await asyncio.sleep(SECOND_TRY_WAIT)  # 重试后：0.5s 出分片
         return httpx.Response(200)
 
-    upstream_attempt()  # 对应 api_helpers 外层 attempt 循环的首次记录
-    request_started = time.monotonic()
-    # 挂上 trace，展示多出口超时路径同样会发“超过 N 秒”的请求跟踪说明
-    # （单出口路径一直有；多出口 proxy_attempt 路径曾缺失，本次补齐）
+    chain = ProxyChain(candidates=["socks5://u:p@1.1.1.1:6370", "socks5://u:p@2.2.2.2:6361"])
     trace = request_tracking.RequestTrace("/v1/chat/completions")
     trace_token = request_tracking.current_trace.set(trace)
+    result, attempt = None, 0
     try:
-        with mock.patch("first_reply.timeout_seconds", return_value=WINDOW):
-            result = await timed_call(
-                "gemini-4-argon",
-                ProxyChain(candidates=["socks5://u:p@1.1.1.1:6370", "socks5://u:p@2.2.2.2:6361"]).run(operation))
+        while attempt <= 2:
+            upstream_attempt()  # 对应 api_helpers 外层 attempt 循环
+            request_started = time.monotonic()
+            try:
+                with mock.patch("first_reply.timeout_seconds", return_value=WINDOW):
+                    result = await timed_call(
+                        "gemini-4-argon",
+                        chain.run(operation))
+                break
+            except FirstReplyTimeout as exc:
+                elapsed = time.monotonic() - request_started
+                print(f"⚠️ [自动重试] 流式请求失败（HTTP 504，{str(exc).rstrip('。')}，"
+                      f"本次已等待 {elapsed:.1f} 秒）。第 {attempt + 1} 次退避重试，"
+                      f"等待 {RETRY_WAIT} 秒。")
+                attempt += 1
+                await asyncio.sleep(RETRY_WAIT)
     finally:
         request_tracking.current_trace.reset(trace_token)
 
-    # api_helpers:762 的修复后口径：归因到当前出口
-    elapsed_new = time.monotonic() - (attempt_started_at() or request_started)
-    # 修复前的口径：只在外层 attempt 循环重置（本复现里从未重置）
-    elapsed_old = time.monotonic() - request_started
-    print()
-    print(f"HTTP 状态: {result.status_code}")
     timeout_events = [e for e in trace.events if e["kind"] == "first_reply_timeout"]
-    assert len(timeout_events) == 1, "出口 1 超时应发出一条 first_reply_timeout 请求跟踪事件"
-    print(f"✅ 超时说明已恢复：trace 事件 → {timeout_events[0]['message'][:60]}...")
-    print(f"修复前日志口径: 📥 第 1 次尝试等待 {elapsed_old:.1f} 秒收到分片  (出口1超时 {WINDOW}s + 出口2 {SECOND_EXIT_WAIT}s 被累加)")
-    print(f"修复后日志口径: 📥 第 1 次尝试等待 {elapsed_new:.1f} 秒收到分片  (归因到当前出口的真实等待)")
-    assert elapsed_new < WINDOW, "修复后 elapsed 必须小于首回复窗口（不再包含出口 1 的超时时间）"
-    assert abs(elapsed_new - SECOND_EXIT_WAIT) < 0.3, "修复后 elapsed 应约为出口 2 的真实等待"
-    print("✅ 计时归因修复验证通过")
+    assert result is not None and result.status_code == 200, "重试后应成功"
+    assert attempt == 1, "应恰好自动重试一次后成功"
+    assert len(timeout_events) == 1, "超时应发出一条 first_reply_timeout 请求跟踪事件"
+    assert chain.index == 0, "超时不得切换出口（chain.index 应保持 0）"
+    print()
+    print(f"✅ 超时说明已恢复：{timeout_events[0]['message'][:52]}...")
+    print("✅ 未发生代理切换（全程无 🔀 日志，chain.index=0）——出口没有故障证据")
+    print(f"✅ 自动重试 1 次后成功（与 429 同路径），「第 {attempt + 1} 次尝试等待 "
+          f"{time.monotonic() - (attempt_started_at() or request_started):.1f} 秒」归因当前尝试")
 
 
 asyncio.run(main())

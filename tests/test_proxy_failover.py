@@ -169,7 +169,9 @@ class ChainTests(unittest.IsolatedAsyncioTestCase):
             await chain.run(exhausted)
         self.assertEqual(chain.index, 0)
 
-    async def test_proxy_timeouts_have_individual_first_reply_windows(self):
+    async def test_first_reply_timeout_retries_upstream_instead_of_switching_exits(self):
+        """首回复超时 = 上游无输出（思考回传开启时思考也算回复）：与 429 一样
+        交给外层自动重试，不切换出口——出口没有故障证据，不能冤枉。"""
         calls, cancelled = [], []
         async def operation(raw, resolved):
             calls.append(raw)
@@ -179,14 +181,31 @@ class ChainTests(unittest.IsolatedAsyncioTestCase):
                 finally:
                     cancelled.append(raw)
             return httpx.Response(200)
+        chain = ProxyChain(candidates=["http://first:80", "http://second:80"])
         with mock.patch("first_reply.timeout_seconds", return_value=0.015):
-            result = await timed_call("gemini-test", ProxyChain(candidates=["http://first:80", "http://second:80"]).run(operation))
-        self.assertEqual(result.status_code, 200)
-        self.assertEqual(len(calls), 2)
+            with self.assertRaises(FirstReplyTimeout):
+                await timed_call("gemini-test", chain.run(operation))
+        self.assertEqual(calls, ["http://first:80"])  # 未切换到第二个出口
         self.assertEqual(cancelled, ["http://first:80"])
+        self.assertEqual(chain.index, 0)
+        # 单出口/直连同样直接抛给外层重试
         with mock.patch("first_reply.timeout_seconds", return_value=0.01):
             with self.assertRaises(FirstReplyTimeout):
                 await timed_call("gemini-test", ProxyChain(candidates=["http://first:80"]).run(operation))
+
+    async def test_transport_errors_still_switch_exits(self):
+        """真传输错误（连接被重置）仍切换出口：这是代理切换的本职场景。"""
+        calls = []
+        async def operation(raw, resolved):
+            calls.append(raw)
+            if raw.endswith("first:80"):
+                raise httpx.ReadError("connection reset by peer")
+            return httpx.Response(200)
+        result = await timed_call(
+            "gemini-test",
+            ProxyChain(candidates=["http://first:80", "http://second:80"]).run(operation))
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(calls, ["http://first:80", "http://second:80"])
 
     async def test_attempt_started_resets_when_switching_exits(self):
         """出口切换后“第 N 次尝试等待 X 秒”必须归因到新出口，不累加已失败出口的等待。"""
@@ -196,25 +215,25 @@ class ChainTests(unittest.IsolatedAsyncioTestCase):
             async def operation(raw, resolved):
                 observed.append((raw, attempt_started_at()))
                 if raw.endswith("first:80"):
-                    await asyncio.Event().wait()
+                    # 传输错误（而非首回复超时）才触发出口切换
+                    raise httpx.ReadError("connection reset by peer")
                 return httpx.Response(200)
             upstream_attempt()  # 模拟 api_helpers 外层在首次调用前的记录
-            with mock.patch("first_reply.timeout_seconds", return_value=0.015):
-                result = await timed_call(
-                    "gemini-test",
-                    ProxyChain(candidates=["http://first:80", "http://second:80"]).run(operation))
+            result = await timed_call(
+                "gemini-test",
+                ProxyChain(candidates=["http://first:80", "http://second:80"]).run(operation))
             self.assertEqual(result.status_code, 200)
             self.assertEqual([raw for raw, _ in observed], ["http://first:80", "http://second:80"])
             first_started, second_started = observed[0][1], observed[1][1]
             self.assertIsNotNone(first_started)
             self.assertIsNotNone(second_started)
-            # 第二次出口尝试的起点被刷新（中间隔了超时窗口，必大于第一次）。
-            self.assertGreater(second_started, first_started)
+            # 第二次出口尝试的起点被刷新（切换后重新计时）。
+            self.assertGreaterEqual(second_started, first_started)
         finally:
             request_tracking._attempt_started.reset(token)
 
     async def test_first_reply_timeout_carries_window_seconds(self):
-        """FirstReplyTimeout 携带触发超时的窗口秒数，供切换日志归类原因。"""
+        """FirstReplyTimeout 携带触发超时的窗口秒数，供重试日志与诊断归类原因。"""
         with mock.patch("first_reply.timeout_seconds", return_value=0.01):
             guard = FirstReplyGuard("gemini-test")
             async def hang():
@@ -235,8 +254,8 @@ class ChainTests(unittest.IsolatedAsyncioTestCase):
                 request_tracking._attempt_started.reset(token)
             self.assertEqual(multi.exception.seconds, 0.01)
 
-    async def test_proxy_switch_log_explains_timeout_fairly(self):
-        """首回复超时切换时输出秒数而非英文类名；详情由 trace 事件单独说明。"""
+    async def test_first_reply_timeout_does_not_print_proxy_switch(self):
+        """首回复超时不触发代理切换：日志里不应出现 🔀 [代理切换]。"""
         token = request_tracking._attempt_started.set(None)
         try:
             async def operation(raw, resolved):
@@ -248,16 +267,13 @@ class ChainTests(unittest.IsolatedAsyncioTestCase):
                     await timed_call(
                         "gemini-test",
                         ProxyChain(candidates=["http://first:80", "http://second:80"]).run(operation))
-            text = output.getvalue()
-            self.assertIn("🔀 [代理切换]", text)
-            self.assertIn("首回复超时 0.015 秒", text)
-            self.assertNotIn("FirstReplyTimeout", text)
+            self.assertNotIn("🔀 [代理切换]", output.getvalue())
         finally:
             request_tracking._attempt_started.reset(token)
 
     async def test_proxy_attempt_timeout_emits_trace_event(self):
-        """多出口每出口窗口超时都发 first_reply_timeout trace 事件，
-        对齐单出口路径既有的“超过 N 秒”说明，不再只剩切换英文类名。"""
+        """多出口窗口超时同样发 first_reply_timeout trace 事件，
+        对齐单出口路径既有的“超过 N 秒”说明，并标明稍后自动重试。"""
         token = request_tracking._attempt_started.set(None)
         trace_token = None
         try:
@@ -271,11 +287,11 @@ class ChainTests(unittest.IsolatedAsyncioTestCase):
                         "gemini-test",
                         ProxyChain(candidates=["http://first:80", "http://second:80"]).run(operation))
             events = [e for e in trace.events if e["kind"] == "first_reply_timeout"]
-            self.assertEqual(len(events), 2)  # 每个出口各一条
+            self.assertEqual(len(events), 1)  # 超时后不切换出口，仅当前出口一条
             for item in events:
                 self.assertIn("等待模型首回复超过 0.015 秒", item["message"])
                 self.assertIn("本次上游读取已中断", item["message"])
-                self.assertIn("当前出口窗口", item["message"])
+                self.assertIn("自动重试", item["message"])
         finally:
             if trace_token is not None:
                 request_tracking.current_trace.reset(trace_token)
@@ -360,20 +376,20 @@ class ChainTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([chunk async for chunk in source], [blocked])
         self.assertEqual(calls, ["http://first:80"])
 
-    async def test_sdk_timeout_after_metadata_closes_source_before_switching(self):
+    async def test_sdk_timeout_after_metadata_closes_source_before_retrying(self):
+        """metadata 已流过来说明出口通畅：首回复超时应关闭旧 source 后抛给
+        外层自动重试，而不是切换出口。"""
         closed = []
-        answer = types.GenerateContentResponse(candidates=[types.Candidate(
-            content=types.Content(parts=[types.Part(text="answer")]))])
         def factory(raw, resolved):
             async def stream(**kwargs):
                 async def chunks():
                     try:
                         if raw.endswith("first:80"):
-                            yield types.GenerateContentResponse()
-                            await asyncio.Event().wait()
+                            yield types.GenerateContentResponse()  # 仅用量/空元数据
+                            await asyncio.Event().wait()           # 随后上游卡住不吐字
                         else:
-                            self.assertEqual(closed, ["http://first:80"])
-                            yield answer
+                            yield types.GenerateContentResponse(candidates=[types.Candidate(
+                                content=types.Content(parts=[types.Part(text="answer")]))])
                     finally:
                         closed.append(raw)
                 return chunks()
@@ -382,8 +398,10 @@ class ChainTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch("first_reply.timeout_seconds", return_value=0.02):
             guard = FirstReplyGuard("gemini-test")
             source = await guard.wait(facade.generate_content_stream())
-            self.assertEqual([chunk async for chunk in guard.iterate(source, sdk_has_reply)], [answer])
-        self.assertEqual(closed, ["http://first:80", "http://second:80"])
+            with self.assertRaises(FirstReplyTimeout):
+                [chunk async for chunk in guard.iterate(source, sdk_has_reply)]
+        # 只调用过第一个出口；其 source 在超时抛出前已被关闭（无泄漏）
+        self.assertEqual(closed, ["http://first:80"])
 
     async def test_stream_context_closes_on_exception_and_cancellation_without_replay(self):
         closed, entered = [], []

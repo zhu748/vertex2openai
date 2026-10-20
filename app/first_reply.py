@@ -35,13 +35,12 @@ async def proxy_attempt(enabled):
         if not attempt.expired():
             raise
         # 与 FirstReplyGuard.wait 的超时分支对齐：多出口路径同样要发 trace 事件，
-        # 否则监控面板与日志里只剩代理切换的英文类名，丢失“超过 N 秒”的说明。
+        # 否则监控面板与日志里只剩英文类名，丢失“超过 N 秒”的说明。
         if guard.trace:
             guard.trace.event(
                 "first_reply_timeout",
-                f"等待模型首回复超过 {guard.seconds:g} 秒（当前出口窗口），本次上游读取已中断。"
-                "模型思考较慢或出口不畅均可能触发；慢思考模型可在模型参数调大"
-                " first_reply_timeout_seconds。")
+                f"等待模型首回复超过 {guard.seconds:g} 秒（当前出口窗口；思考、正文、"
+                "工具调用或图片均算回复），本次上游读取已中断，稍后自动重试。")
         raise FirstReplyTimeout(
             f"当前出口等待模型首回复超过 {guard.seconds:g} 秒。", seconds=guard.seconds) from exc
     finally:

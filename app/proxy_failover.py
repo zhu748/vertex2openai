@@ -16,6 +16,12 @@ PROXY_FAILURE_STATUSES = {407, 502, 503, 504}
 
 
 def is_proxy_failure(error):
+    from first_reply import FirstReplyTimeout
+    if isinstance(error, FirstReplyTimeout):
+        # 首回复超时意味着上游连思考分片都没有输出（思考回传开启时思考也算
+        # 首回复）：语义上与 429 一样属于“上游无响应”，应交给外层自动重试
+        # （可换 Key），而不是切换出口——不能因为上游不吐字而冤枉当前出口。
+        return False
     if isinstance(error, ProxyResolveError):
         return True
     if isinstance(error, httpx.TransportError):
@@ -55,14 +61,7 @@ class ProxyChain:
         self.index += 1
         from logger import stats
         stats.add_retry()
-        from first_reply import FirstReplyTimeout
-        if isinstance(error, FirstReplyTimeout):
-            # 超时详情（“超过 N 秒”与调参提示）由 first_reply 的 trace 事件
-            # 说明；切换日志只保留简短原因，不输出英文类名。
-            seconds = getattr(error, "seconds", None)
-            reason = f"首回复超时 {seconds:g} 秒" if seconds else "首回复超时"
-        else:
-            reason = f"HTTP {status}" if status is not None else type(error).__name__
+        reason = f"HTTP {status}" if status is not None else type(error).__name__
         print(f"🔀 [代理切换] {mask_proxy_uri(previous) or '直连'} 失败（{reason}），"
               f"按顺序尝试 {self.index + 1}/{len(self.candidates)}："
               f"{mask_proxy_uri(self.current) or '直连'}")

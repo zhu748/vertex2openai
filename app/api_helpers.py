@@ -53,7 +53,7 @@ from upstream_errors import (
 from usage import make_usage_chunk, map_usage, wants_usage
 from request_tracking import (attempt_started_at, configure as track_configure,
                               upstream_attempt, upstream_chunk, record_usage)
-from first_reply import FirstReplyGuard, sdk_has_reply, timed_call
+from first_reply import FirstReplyGuard, FirstReplyTimeout, sdk_has_reply, timed_call
 
 
 def _safety_score_enabled() -> bool:
@@ -907,8 +907,12 @@ async def execute_gemini_call(
                             wait_time = exception_retry_delay(e_stream_call, backoff_sec, attempt, jitter_sec)
                             code, _ = extract_upstream_error(e_stream_call)
                             elapsed = time.monotonic() - attempt_started
+                            # 首回复超时等有完整中文说明的异常直接展示 message，
+                            # 与 429 重试日志一致可读，不再只报英文类名。
+                            detail = (str(e_stream_call).rstrip("。") if isinstance(e_stream_call, FirstReplyTimeout)
+                                      else type(e_stream_call).__name__)
                             print(f"⚠️ [自动重试] Agent Platform Express Mode 流式请求失败（HTTP {code}，"
-                                  f"{type(e_stream_call).__name__}，本次已等待 {elapsed:.1f} 秒）。"
+                                  f"{detail}，本次已等待 {elapsed:.1f} 秒）。"
                                   f"第 {attempt + 1} 次退避重试，等待 {wait_time:.1f} 秒。")
                             if await _client_gone():
                                 print(f"ℹ️ [客户端断开] 重试前检测到客户端已断开，停止调用模型 {model_to_call}。")
@@ -996,7 +1000,8 @@ async def execute_gemini_call(
                     continue
                 if is_retryable_exception(e_call) and not target_unavailable and attempt < max_retries:
                     wait_time = exception_retry_delay(e_call, backoff_sec, attempt, jitter_sec)
-                    print(f"⚠️ [自动重试] 上游繁忙或触发配额限制（{e_call.__class__.__name__}）。第 {attempt + 1} 次退避重试，等待 {wait_time} 秒。")
+                    detail = str(e_call).rstrip("。") if isinstance(e_call, FirstReplyTimeout) else e_call.__class__.__name__
+                    print(f"⚠️ [自动重试] 上游繁忙或触发配额限制（{detail}）。第 {attempt + 1} 次退避重试，等待 {wait_time} 秒。")
                     if not await wait_for_retry(fastapi_request, wait_time):
                         return JSONResponse(status_code=499, content=create_openai_error_response(
                             499, "客户端已断开连接，请求已取消。", "client_closed_request"))
