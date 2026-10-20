@@ -20,13 +20,15 @@ Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风
 
 ## 功能特性
 
-- **双上游通道，一键切换**
+- **多 Key / 多 Cookie 与混合调度**
+  - 支持只使用单个 / 多个 Key、单个 / 多个 Cookie，或 Key + Cookie 同时启用，统一随机或轮询调度。
   - Express API Key：多 Key 随机或轮询调用官方 SDK。
   - Cookie 直连反代：Cookie + SAPISIDHASH 直连 `batchGraphql`，走网页端配额（含最新预览模型），真流式、防 60s 超时。**注意：走的是私有接口，见下方风险提示。**
 - **OpenAI 兼容接口**：`GET /v1/models`、`POST /v1/chat/completions`。
 - **管理控制台（浅色风格，单文件，免构建）**
   - **仅密码登录**：打开根路径 `/`，输入密码（即 `API_KEY`）即可，无需账号。
-  - 标准模式 / Cookie 直连模式在线一键切换。
+  - 标准模式 / Cookie 直连 / Key + Cookie 混合模式在线切换；每个账号可独立启停。
+  - 全局与账号专属代理均支持有序列表，失败后依次切换；每个账号可关闭向全局代理回退。代理弹窗支持类型与字段填写、智能粘贴识别、排序与逐条测试。
   - 在线热更新并保存 Google Cookie 与 Project ID；智能解析 `Cookie-Editor` 导出的 JSON / Header String；自动从整条控制台 URL 提取 Project ID。
   - **模型参数面板**：按所选模型显示其支持能力，并在线调整思考强度、生图分辨率与比例、采样默认值、输入图压缩、重试、假流式/轮询/安全分显示、预填充兼容模式（详见下文）。
   - **实时监控**：运行日志推流、健康度图表（成功/错误/拥堵重试）、Express 通道 Token 消耗统计（包含思考 Token；Cookie 私有接口通常不返回可靠用量）。成功计数不依赖上游是否返回 Token 用量。
@@ -235,16 +237,21 @@ TCP+TLS 握手（每次约省 100~300ms 与相应 CPU）；429 重试场景收�
 | 变量 | 必填 | 默认值 | 说明 |
 |---|---:|---|---|
 | `API_KEY` | 是 | `123456` | 保护本代理的 Key，同时也是**控制台登录密码**。客户端请求用 `Authorization: Bearer <API_KEY>`。 |
-| `VERTEX_EXPRESS_API_KEY` | 否 | 空 | Gemini Express Mode API Key，多个用英文逗号分隔。标准模式使用。 |
-| `ROUNDROBIN` | 否 | `false` | 多 Express Key 轮询(`true`)或随机(`false`)。可在控制台热改。 |
+| `VERTEX_EXPRESS_API_KEY` | 否 | 空 | Gemini Express Key，支持逗号 / 换行分隔或 JSON 数组。首次启动导入，之后以控制台列表为准。 |
+| `VERTEX_EXPRESS_API_KEYS` | 否 | 空 | 多 Key 配置，优先于单数变量。支持字符串数组，或带 `key`、`project_id`、`proxies`、`proxy_fallback`、`enabled`、`note` 的对象数组。 |
+| `UPSTREAM_MODE` | 否 | 自动 | `api_key`（仅 Key）、`web_proxy`（仅 Cookie）、`mixed`（混合）。首次启动同时配置两类凭证时自动使用混合模式；已有控制台通道选择继续保留。 |
+| `ROUNDROBIN` | 否 | `false` | Key / Cookie 账号轮询(`true`)或随机(`false`)；混合模式下两类账号共同参与。可在控制台热改。 |
 | `FAKE_STREAMING` | 否 | `false` | 先非流式取回再模拟流式；生图模型始终强制启用。可在控制台热改。 |
 | `FAKE_STREAMING_INTERVAL` | 否 | `1.0` | 假流式等待期间 keep-alive 间隔秒数。可在控制台热改。 |
 | `MODELS_CONFIG_URL` | 否 | 仓库 `vertexModels.json` | 远程模型列表地址；改远程文件即可刷新，无需重部署。 |
 | `SAFETY_SCORE` | 否 | `false` | 是否把 Gemini safety ratings 附加到输出。可在控制台热改。 |
 | `PROXY_URL` | 否 | 空 | 全局出站代理（仅作初始值，控制台保存后以控制台为准）。支持：① 原生协议 `http://` `https://` `socks5://` `socks5h://`；② 分享链接 `vless://` `vmess://` `trojan://` `ss://` `socks4://` `hysteria2://` `tuic://`（镜像内置 sing-box，自动转本地 socks5）。保存时自动校验格式。 |
+| `PROXY_URLS` | 否 | 空 | 有序全局代理列表，JSON 字符串数组或每行一条；优先于 `PROXY_URL`。每次请求先尝试第一条，失败再尝试后续条目。 |
 | `SSL_CERT_FILE` | 否 | 空 | 自定义证书路径。 |
 | `VERTEX_BASE_URL` | 否 | 空 | **高级**：覆盖标准模式的上游 `base_url`，正常无需设置。要钉定区域请用控制台的「标准模式 location」（详见下方「标准模式的 location」）。 |
-| `GOOGLE_COOKIE` | 否 | 空 | Cookie 直连模式的 Google Cookie（初始值，后续可在控制台更新）。 |
+| `GOOGLE_COOKIE` | 否 | 空 | 一个完整 Cookie 头，或每行一个账号的完整 Cookie；分号属于 Cookie 字段分隔符，不用于拆账号。兼容 Cookie-Editor JSON。 |
+| `GOOGLE_COOKIES` | 否 | 空 | 优先于单数变量。JSON 字符串数组或带 `cookie`、`project_id`、`proxies`、`proxy_fallback`、`enabled`、`note` 的对象数组；也支持每行一个完整 Cookie。首次导入后以面板列表为准。 |
+| `GOOGLE_PROJECT_IDS` | 否 | 空 | Cookie 使用字符串列表时，可按相同顺序填写项目列表（JSON 数组或逗号 / 换行分隔），数量须一致。对象内的 `project_id` 优先；未填时使用 `GOOGLE_PROJECT_ID`。 |
 | `GOOGLE_PROJECT_ID` | 否 | 空 | Cookie 直连模式的 Project ID（初始值，后续可在控制台更新）。 |
 | `EXPERIMENT_FLAGS` | 否 | 空 | 可选：batchGraphql 的 `experimentFlagsBinary`，一般无需设置。 |
 | `STATE_DIR` | 否 | `.` | `web_state.json` 的存放目录。用 Docker 时请指向挂载卷，否则重建容器会丢失全部设置与 Cookie。 |
@@ -253,16 +260,37 @@ TCP+TLS 握手（每次约省 100~300ms 与相应 CPU）；429 重试场景收�
 | `SINGBOX_BIN` | 否 | 自动探测 | sing-box 可执行文件路径（默认依次找 `$SINGBOX_BIN` → `/usr/local/bin` 等常见路径 → 仓库根 `bin/sing-box` → `PATH`）。仅影响 vless/vmess 等分享链接协议；缺失时这些协议明确报错、不降级直连。 |
 | `SINGBOX_IDLE_MINUTES` | 否 | `30` | sing-box 空闲实例回收阈值（分钟；`0` = 永不回收）。每个代理链接占一个本地端口与一个子进程，长时间不用自动回收、下次请求时秒级重启。 |
 
+### 多账号与混合模式配置
+
+控制台「通道与凭证」支持三种模式：仅 Express Key、仅 Cookie、Key + Cookie 混合。每条记录可独立启用或停用，账号数量可以为一个或多个。Cookie 的 Project ID 和代理始终跟随该账号，请勿把其他账号的 Cookie 与项目混用。结构化输出请求会在混合模式中只选择 Express Key；Gemini 原生 REST 调用仍要求 Express Key。
+
+例如在 `.env` 中填写（以下均为占位值）：
+
+```dotenv
+API_KEY=change-me
+UPSTREAM_MODE=mixed
+ROUNDROBIN=true
+VERTEX_EXPRESS_API_KEYS='[{"key":"key-a","project_id":"key-project-a","proxies":["socks5://user:pass@proxy-a:1080","http://backup-a:8080"],"proxy_fallback":true},{"key":"key-b","project_id":"key-project-b"}]'
+GOOGLE_COOKIES='[{"cookie":"SAPISID=cookie-a; SID=sid-a","project_id":"cookie-project-a","proxies":["socks5://proxy-b:1080"],"proxy_fallback":false},{"cookie":"SAPISID=cookie-b; SID=sid-b","project_id":"cookie-project-b"}]'
+PROXY_URLS='["socks5://global-first:1080","http://global-second:8080"]'
+```
+
+简单配置也可以使用 `VERTEX_EXPRESS_API_KEY=key-a,key-b`；多个 Cookie 可在 `GOOGLE_COOKIES` 中填写字符串 JSON 数组，并通过 `GOOGLE_PROJECT_IDS` 指定对应项目。
+
+旧的单 Cookie、单代理和通道选择会自动兼容。账号列表首次导入并保存后，以面板中的持久化记录为准；清空列表后重启不会重新导入环境变量。面板只回显 Cookie 的配置状态，编辑已保存账号时 Cookie 留空即可保留原值。
+
 ### 出站代理与多协议支持
 
-所有发往 Google 上游的请求（Express SDK / Cookie 通道 / Gemini 原生透传 / Key 探测 / 图片抓取）都经过同一个出站代理层：
+代理列表按保存顺序尝试，每次新请求从第一条开始。账号有专属代理时，顺序为 **账号代理 1 → 账号代理 2 → 全局代理 1 → 全局代理 2**；取消该账号的「专属代理全部失效后，使用全局代理」，则在专属列表耗尽后返回错误。账号未设置专属列表时直接继承全局列表。
 
-- **原生协议**：`http://user:pass@host:port` / `https://` / `socks5://` / `socks5h://` 直接交给 httpx / curl_cffi，零额外开销；
-- **分享链接（sing-box 转换）**：`vless://`（含 REALITY / ws / grpc 传输）、`vmess://`（base64 分享格式）、`trojan://`、`ss://`（SIP002 与旧式 base64 均可）、`socks4://` / `socks4a://`、`hysteria2://`、`tuic://` —— 直接把机场/自建节点的分享链接粘进代理框即可。首个请求时自动在本地拉起一个 sing-box 子进程（127.0.0.1 动态端口的 socks5 入站 → 远端节点），Python 侧统一连本地 socks5，对 httpx / curl_cffi 完全透明；同一链接全生命周期复用同一端口，空闲超时（`SINGBOX_IDLE_MINUTES`）自动回收；
-- **优先级**：每个 Express Key 可在控制台「通道与凭证」页单独设置**专属代理**（优先于全局；填 `direct` = 该 Key 强制直连），Key 探测也走该 Key 自己的出口；
-- **安全策略**：配置了分享链接协议但环境里找不到 sing-box 时（非 Docker 部署），请求会**明确报错**并给出安装指引——绝不静默直连，防止真实出口 IP 意外泄露；
-- **环境变量**：`PROXY_URL` 作为全局初始值，控制台保存过一次后（含清空保存）以控制台为准；
-- **非 Docker 部署**：手动安装 sing-box（[releases](https://github.com/SagerNet/sing-box/releases)）、把二进制放进仓库根 `bin/sing-box`，或设 `SINGBOX_BIN` 指向可执行文件。http/socks5 原生协议不需要 sing-box。
+- 连接异常、网络超时、代理协议转换失败，以及 HTTP 407 / 502 / 503 / 504 会触发下一条代理；400 / 401 / 403 / 404 / 429 等参数、鉴权和配额问题沿用模型重试策略。代理切换独立于 `retry_max`，即使模型重试设为 0 也会尝试后续代理。
+- 模型首回复期限按代理尝试分别计时，整轮请求仍受 `request_timeout_seconds` 限制。已经交付流式内容后不会通过切换代理重发同一段内容。
+- 全局列表为空表示直连；配置了代理并全部失败时，不会额外降级直连。账号单独填写 `direct` 可强制直连。也可在有序列表中显式加入 `direct`，自行选择直连顺位。
+- **原生协议**：HTTP / HTTPS / SOCKS5 / SOCKS5H。**分享链接**：VLESS、VMess、Trojan、SS、SOCKS4 / SOCKS4A、Hysteria2、TUIC，由内置 sing-box 转成本地 SOCKS5；非 Docker 环境需安装 sing-box 或设置 `SINGBOX_BIN`。
+- **格式兼容**：支持 `socks5://user:pass@host:1080`、`socks5://host:1080@user:pass`、`socks5://host:1080:user:pass`、`socks5://user:pass:host:1080`；省略协议时按 SOCKS5 识别。HTTP 同样支持这些账号位置形式。IPv6 主机可使用 `[::1]`，账号密码中的特殊字符可通过弹窗字段填写，自动编码。
+- **面板操作**：「管理 / 添加代理」打开弹窗，选择类型并填写 IP、端口、账号和密码；粘贴单条地址可自动识别，粘贴多行或 JSON 数组可批量导入。列表可设为首选、上下移动、编辑、删除和逐条测试。应用草稿后，点击对应的保存按钮生效。
+- SDK、Cookie（httpx / curl）、Gemini 原生 REST、Key 探测和图片抓取均按对应账号的代理链执行；远程模型列表刷新使用全局列表。连接池按实际出口复用，切换不关闭其他请求正在使用的连接。
+- `PROXY_URLS` 优先于 `PROXY_URL`；单数变量也支持换行列表和逗号分隔的完整 URL。控制台保存过代理列表后（含清空保存），以控制台为准。
 
 > 提示：`ROUNDROBIN`、`FAKE_STREAMING(_INTERVAL)`、`SAFETY_SCORE` 等环境变量仅作为**初始值**，运行时以控制台设置为准。
 

@@ -2,10 +2,41 @@
 import asyncio
 import math
 import time
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 
 from runtime_state import app_state
 from request_tracking import current_trace
 from response_validation import IncompleteResponseError
+
+_active_wait = ContextVar("first_reply_wait", default=None)
+
+
+@asynccontextmanager
+async def proxy_attempt(enabled):
+    """Give each configured proxy its own first-reply window within the total deadline."""
+    active = _active_wait.get() if enabled else None
+    if active is None:
+        yield
+        return
+    guard, parent = active
+    parent.reschedule(None)
+    guard.deadline = time.monotonic() + guard.seconds
+    if guard.trace:
+        with guard.trace._lock:
+            guard.trace.data["first_reply_deadline"] = time.time() + guard.seconds
+    attempt = asyncio.timeout_at(guard.deadline)
+    completed = False
+    try:
+        async with attempt:
+            yield
+            completed = True
+    except TimeoutError as exc:
+        if not attempt.expired():
+            raise
+        raise FirstReplyTimeout(f"当前出口等待模型首回复超过 {guard.seconds:g} 秒。") from exc
+    finally:
+        parent.reschedule(guard.deadline if completed else None)
 
 
 class FirstReplyTimeout(TimeoutError):
@@ -36,6 +67,7 @@ class FirstReplyGuard:
         if self.ready or not self.seconds:
             return await operation
         deadline = asyncio.timeout(max(0.001, self.deadline - time.monotonic()))
+        token = _active_wait.set((self, deadline))
         try:
             async with deadline:
                 return await operation
@@ -45,6 +77,8 @@ class FirstReplyGuard:
             if self.trace:
                 self.trace.event("first_reply_timeout", f"等待模型首回复超过 {self.seconds:g} 秒，本次上游读取已中断。")
             raise FirstReplyTimeout(f"等待模型首回复超过 {self.seconds:g} 秒（思考、正文、工具调用或图片均算回复）。") from exc
+        finally:
+            _active_wait.reset(token)
 
     def accept(self):
         if self.ready:

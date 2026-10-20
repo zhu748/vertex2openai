@@ -4,6 +4,7 @@ import math
 
 import config
 from proxy_resolver import validate_proxy_uri
+from proxy_config import ProxyFormatError, parse_proxy_list
 
 
 _SETTING_ENUMS = {
@@ -34,7 +35,7 @@ _SETTING_NUMERIC_RANGE = {
     "upstream_max_concurrency": (1, 1000),
 }
 # 已有专项校验的键（代理格式 / 指纹档案白名单），通用层跳过避免重复
-_SETTING_SPECIAL_KEYS = {"proxy_url", "express_ua_profile", "express_ua_custom", "model_overrides"}
+_SETTING_SPECIAL_KEYS = {"proxy_url", "proxy_urls", "express_ua_profile", "express_ua_custom", "model_overrides"}
 
 
 def _check_setting_value(key: str, v) -> str | None:
@@ -103,12 +104,23 @@ def validate_global_settings_patch(patch: dict) -> dict | None:
     """全局设置额外校验通道参数；抗截断只能在模型专属设置启用。"""
     if "anti_truncation_mode" in patch and patch["anti_truncation_mode"] != "off":
         return {"error": "抗截断后缀只能按模型开启，请使用模型专属设置。", "field": "anti_truncation_mode"}
-    if "proxy_url" in patch:
-        if not isinstance(patch["proxy_url"], str):
-            return {"error": "proxy_url 必须是字符串。"}
-        err = validate_proxy_uri(patch["proxy_url"])
-        if err:
-            return {"error": "代理地址格式不合法：" + err, "field": "proxy_url"}
+    for field in ("proxy_url", "proxy_urls"):
+        if field not in patch:
+            continue
+        if field == "proxy_url" and not isinstance(patch[field], str):
+            return {"error": "proxy_url 必须是字符串。", "field": field}
+        if field == "proxy_urls" and not isinstance(patch[field], list):
+            return {"error": "proxy_urls 必须是数组。", "field": field}
+        try:
+            proxies = parse_proxy_list(patch[field])
+        except ProxyFormatError as exc:
+            return {"error": str(exc), "field": field}
+        if len(proxies) > 32:
+            return {"error": "每个代理列表最多 32 条。", "field": field}
+        for index, proxy in enumerate(proxies):
+            err = validate_proxy_uri(proxy)
+            if err:
+                return {"error": f"第 {index + 1} 条代理地址格式不合法：{err}", "field": field}
     if "express_ua_profile" in patch:
         from express_fingerprint import EXPRESS_UA_PROFILES
 

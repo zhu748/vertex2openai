@@ -12,7 +12,7 @@
 形如 …projects/{project}/locations/…/publishers/google/models/{fake}… was not found，
 从中提取 project。请求在模型解析阶段即失败，不产生任何 token、不消耗配额；
 Key 本身非法时则返回 400/401/403，顺带校验 Key 有效性。
-探测失败不影响调用：拿不到项目就退回全局 Project ID，再退回裸模型名（旧行为）。
+探测失败不影响调用：无可用项目时退回裸模型名；混合模式不会借用 Cookie 项目。
 """
 
 import asyncio
@@ -24,9 +24,10 @@ from typing import Optional, Tuple
 import httpx
 
 import config as app_config
-from runtime_state import app_state, get_effective_proxy_uri_for_key
+from runtime_state import app_state
 from express_fingerprint import build_direct_headers
-from proxy_resolver import ProxyResolveError, resolve_proxy_uri, resolve_proxy_uri_async
+from proxy_resolver import resolve_proxy_uri
+from proxy_failover import ProxyChain
 
 # 调模型的正确 URL（Express 全局端点格式），{model} 处填一个不存在的模型名来探测
 GENERATE_CONTENT_URL = (
@@ -43,7 +44,7 @@ def _client_args(key_proxy_raw: str = "") -> dict:
     实际出口——否则可能出现「代理 A 能通但探测走了代理 B 失败」的
     误判。vless 等分享链接在此转成本地 socks5。
     """
-    args = {"timeout": PROBE_TIMEOUT_SECONDS}
+    args = {"timeout": PROBE_TIMEOUT_SECONDS, "trust_env": False}
     proxy_url = resolve_proxy_uri(key_proxy_raw or "")
     if proxy_url:
         args["proxy"] = proxy_url
@@ -85,18 +86,11 @@ async def probe_project_id(key: str) -> Tuple[Optional[str], str]:
     # 该 Key 的出站代理（Key 级优先 / direct / 全局兑底）
     records = {r["key"]: r for r in app_state.get_express_keys()}
     rec = records.get(key)
-    key_proxy_raw = get_effective_proxy_uri_for_key(rec)
     try:
-        # 预热：sing-box 首次启动放线程池，不卡事件循环；_client_args 里的
-        # 同步 resolve 随后命中缓存。
-        await resolve_proxy_uri_async(key_proxy_raw)
-    except ProxyResolveError as e:
-        return None, f"该 Key 的出站代理不可用：{e}"
-    try:
-        async with httpx.AsyncClient(**_client_args(key_proxy_raw)) as client:
-            resp = await client.post(
-                url, content=json.dumps(body),
-                headers=build_direct_headers(key))
+        async def send(raw, resolved):
+            async with httpx.AsyncClient(**_client_args(raw)) as client:
+                return await client.post(url, content=json.dumps(body), headers=build_direct_headers(key))
+        resp = await ProxyChain(rec).run(send)
     except Exception as e:
         return None, f"探测请求失败：{type(e).__name__} - {e}"
 

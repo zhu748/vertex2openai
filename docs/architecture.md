@@ -22,6 +22,9 @@ Express SDK 或 Cookie 上游；Gemini 原生请求通过 Express REST 透传。
 | `app/auth.py`、`app/console_auth.py` | 分别处理 API Key 鉴权、控制台会话与登录限速 |
 | `app/settings_validation.py` | 管理入口的类型、范围和专项设置校验 |
 | `app/runtime_state.py`、`app/config.py` | 可持久化运行状态、环境变量和内置默认值 |
+| `app/credential_config.py`、`app/credential_manager.py` | 多 Key / Cookie 环境导入、混合账号选择，以及 Cookie 与项目绑定 |
+| `app/proxy_config.py`、`app/proxy_failover.py` | 代理输入归一化、有序候选链、账号到全局回退及交付前切换 |
+| `app/static/channel-config.js` | Cookie 账号列表、账号回退策略，以及共用代理编辑弹窗 |
 | `app/upstreams/` | 两种上游协议，以及共用的消息准备流程 |
 | `app/upstreams/cookie_request.py` | batchGraphql 请求参数、消息及工具协议转换 |
 | `app/upstreams/cookie_response.py` | 连续 JSON 对象解析、事件与签名还原、响应诊断 |
@@ -49,6 +52,17 @@ Express SDK 或 Cookie 上游；Gemini 原生请求通过 Express REST 透传。
 OpenAI 路由负责交付与上游分流，上游负责协议适配。两条通道先调用
 `upstreams/request_preparation.py` 处理控制台消息注入与预填充，再准备抗截断传输。
 Cookie 通道会额外检查历史函数往返，因此共享函数显式接收 `has_tools`，保留各通道的判断。
+
+通道模式为 `api_key` / `web_proxy` / `mixed`，旧布尔开关会映射为前两者。
+混合模式在已启用的两类记录间统一随机或轮询；结构化输出只选择 Express Key。
+一次 Cookie 生成使用同一条记录中的 Cookie、Project ID 和代理快照，重试时重新计算认证头，
+不会重新读取另一个账号的 Cookie。Cookie 列表接口不返回原始凭证；空 Cookie 按记录 ID 保留。
+
+代理链是请求内状态：账号列表在前，允许回退时追加全局列表并去重；没有专属代理时继承全局。
+配置代理后不隐式追加直连。`ProxyChain` 在交付前的连接错误、407/502/503/504 或首回复超时后
+尝试下一条，独立于模型重试次数；每个代理尝试拥有自己的首回复期限，外层总期限继续有效。
+SDK 适配器预读首片，HTTP / curl 适配器在响应头交付前切换；交付后的流错误交回原流式处理。
+生成租约持有当前代理链，工作线程的远程图片抓取也继承该账号出口和 sing-box 生命周期。
 
 Express 使用 `generation_config.py` 构造 SDK 参数，Cookie 保留 batchGraphql 专属请求体构造。
 思考强度、采样策略、图片比例和尺寸的规则由 `model_capabilities.py` 统一决定。

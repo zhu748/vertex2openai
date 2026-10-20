@@ -107,9 +107,10 @@ def validate_cookie(cookie_str: str) -> dict:
     """验证 Cookie 是否包含必要字段"""
     sapisid = parse_cookie_value(cookie_str, "SAPISID")
     sapisid_3p = parse_cookie_value(cookie_str, "__Secure-3PAPISID")
+    sapisid_1p = parse_cookie_value(cookie_str, "__Secure-1PAPISID")
     sid = parse_cookie_value(cookie_str, "SID") or parse_cookie_value(cookie_str, "__Secure-1PSID")
     
-    has_sapisid = bool(sapisid or sapisid_3p)
+    has_sapisid = bool(sapisid or sapisid_3p or sapisid_1p)
     has_sid = bool(sid)
     
     if has_sapisid and has_sid:

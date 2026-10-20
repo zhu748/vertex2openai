@@ -22,6 +22,7 @@ from request_tracking import request_registry
 from runtime_state import app_state
 import uvicorn, os
 app_state.set_express_keys([{'key':'ui-fixture-key','project_id':'fixture-project','project_source':'auto','enabled':True}])
+app_state.set_cookie_accounts([])
 app_state.update_settings({'image_aspect_ratio':'16:9','express_ua_profile':'custom','express_ua_custom':'fixture-gateway/'+'x'*360})
 stats.total_requests=32
 stats.success_requests=25
@@ -66,7 +67,8 @@ async function main() {
   const server = spawn(process.env.PYTHON || 'python', ['-u', '-c', fixture], {
     cwd: path.join(root, 'app'),
     env: {...process.env, STATE_DIR: state, API_KEY: 'ui-browser-test', UI_TEST_PORT: String(port),
-      VERTEX_EXPRESS_API_KEY: '', GOOGLE_COOKIE: '', GOOGLE_PROJECT_ID: '', PROXY_URL: '', MODELS_CONFIG_URL: ''},
+      VERTEX_EXPRESS_API_KEY: '', VERTEX_EXPRESS_API_KEYS: '', GOOGLE_COOKIE: '', GOOGLE_COOKIES: '',
+      GOOGLE_PROJECT_ID: '', GOOGLE_PROJECT_IDS: '', PROXY_URL: '', PROXY_URLS: '', UPSTREAM_MODE: 'api_key', MODELS_CONFIG_URL: ''},
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let serverOutput = '';
@@ -265,6 +267,129 @@ async function main() {
     await page.unroute('**/api/express-keys');
     check('凭证保存期间隔离编辑与探测，长请求头状态不撑开页面');
 
+    await page.getByRole('button',{name:'管理 / 添加代理',exact:true}).click();
+    await page.fill('#proxy-paste','socks5://127.0.0.1:1080:proxy-user:p%40ss');
+    await page.click('.proxy-recognize');
+    await page.waitForFunction(()=>document.querySelector('#proxy-username').value==='proxy-user' && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    assert.equal(await page.inputValue('#proxy-password'),'p@ss');
+    await page.click('#proxy-form-add');
+    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===1);
+    await page.selectOption('#proxy-type','http');
+    await page.fill('#proxy-paste','proxy-second.invalid:8080');
+    await page.click('.proxy-recognize');
+    await page.waitForFunction(()=>document.querySelector('#proxy-host').value==='proxy-second.invalid' && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    assert.equal(await page.inputValue('#proxy-type'),'http');
+    await page.click('#proxy-form-add');
+    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===2);
+    await page.locator('[data-proxy-index="1"]').getByRole('button',{name:'将第 2 条设为首选',exact:true}).click();
+    await page.locator('[data-proxy-index="0"]').getByRole('button',{name:'编辑',exact:true}).click();
+    await page.waitForFunction(()=>document.querySelector('#proxy-host').value==='proxy-second.invalid' && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    await page.fill('#proxy-port','8081');
+    await page.locator('[data-proxy-index="0"]').getByRole('button',{name:'下移第 1 条',exact:true}).click();
+    assert.equal(await page.inputValue('#proxy-port'),'8081');
+    assert.equal(await page.locator('[data-proxy-index="1"]').evaluate(el=>el.classList.contains('is-editing')),true);
+    assert.equal(await page.textContent('#proxy-form-add'),'更新第 2 条');
+    await page.locator('[data-proxy-index="1"]').getByRole('button',{name:'上移第 2 条',exact:true}).click();
+    assert.equal(await page.inputValue('#proxy-port'),'8081');
+    assert.equal(await page.textContent('#proxy-form-add'),'更新第 1 条');
+    await page.click('#proxy-form-add');
+    await page.waitForFunction(()=>document.querySelector('[data-proxy-index="0"] strong').textContent.includes('8081'));
+    await page.route('**/api/proxy/test',route=>route.fulfill({json:{ok:true,via_proxy:true,message:'代理连通成功',latency_ms:75,status_code:403}}));
+    await page.locator('[data-proxy-index="0"]').getByRole('button',{name:'测试',exact:true}).click();
+    await page.waitForFunction(()=>document.querySelector('#proxy-result-0').textContent.includes('75 ms') && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    await screenshot('proxy-editor-desktop');
+    await page.click('#proxy-dialog-apply');
+    await page.waitForFunction(()=>!document.querySelector('#proxy-dialog').open);
+    assert.equal(await page.inputValue('#proxy-input'),'http://proxy-second.invalid:8081\nsocks5://proxy-user:p%40ss@127.0.0.1:1080');
+    pending=responseFor('/api/settings');
+    await page.locator('button[onclick*="saveProxy()"]').click();
+    response=await pending;
+    assert.equal(response.status(),200);
+    assert.equal(response.request().postDataJSON().proxy_urls.length,2);
+    check('代理弹窗识别供应商格式、字段填写、特殊字符、排序、编辑、测试与持久化');
+
+    await page.getByRole('button',{name:'管理 / 添加代理',exact:true}).click();
+    const legacySsPayload=Buffer.from('chacha20-ietf-poly1305:private-password@9.9.9.9:9999').toString('base64');
+    await page.fill('#proxy-paste','ss://'+legacySsPayload);
+    await page.click('.proxy-recognize');
+    await page.waitForFunction(()=>document.querySelector('#proxy-type').value==='share' && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    await page.click('#proxy-form-add');
+    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===3 && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    assert.ok(!(await page.locator('[data-proxy-index="2"] strong').textContent()).includes(legacySsPayload));
+    await page.locator('[data-proxy-index="2"]').getByRole('button',{name:'删除第 3 条代理',exact:true}).click();
+    await page.fill('#proxy-paste',JSON.stringify(Array.from({length:30},(_,index)=>`http://draft-${index}.invalid:8080`)));
+    await page.click('.proxy-recognize');
+    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===32 && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    await page.fill('#proxy-paste','["http://draft-0.invalid:8080","http://draft-1.invalid:8080"]');
+    await page.click('.proxy-recognize');
+    await page.waitForFunction(()=>document.querySelector('#proxy-paste').value==='' && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    assert.equal(await page.textContent('#proxy-editor-error'),'');
+    assert.equal(await page.locator('[data-proxy-index]').count(),32);
+    await page.click('#proxy-dialog-cancel');
+    assert.equal(await page.inputValue('#proxy-input'),'http://proxy-second.invalid:8081\nsocks5://proxy-user:p%40ss@127.0.0.1:1080');
+    check('编辑代理时排序保留输入，重复批量导入按去重后的数量校验，取消不保存草稿');
+
+    await page.locator('#keys-list .field-heading button').first().click();
+    await page.locator('[data-proxy-index="0"]').getByRole('button',{name:'删除第 1 条代理',exact:true}).click();
+    await page.fill('#proxy-paste','["socks5://10.0.0.1:1080:user:pass","http://dedicated-backup:8080"]');
+    await page.click('.proxy-recognize');
+    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===2 && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    await page.click('#proxy-dialog-apply');
+    await page.waitForFunction(()=>!document.querySelector('#proxy-dialog').open);
+    await page.locator('.k-fallback').first().uncheck();
+    pending=responseFor('/api/express-keys');
+    await page.locator('button[onclick*="saveExpressKeys"]').click();
+    response=await pending;
+    assert.equal(response.status(),200);
+    const savedKeys=await response.json();
+    assert.equal(savedKeys.keys[0].proxies.length,2);
+    assert.equal(savedKeys.keys[0].proxy_fallback,false);
+    check('账号专属代理批量导入与全局回退开关保存');
+
+    pending=responseFor('/api/settings/mode');
+    await page.click('input[name=mode][value=mixed]');
+    response=await pending;
+    assert.equal(response.status(),200);
+    await page.getByRole('button',{name:'＋ 添加 Cookie',exact:true}).click();
+    await page.locator('.c-cookie').first().fill('SAPISID=ui-cookie-one; SID=ui-sid-one');
+    await page.locator('.c-project').first().fill('https://console.cloud.google.com/?project=cookie-project-one');
+    await page.getByRole('button',{name:'＋ 添加 Cookie',exact:true}).click();
+    await page.locator('.c-cookie').nth(1).fill('SAPISID=ui-cookie-two; SID=ui-sid-two');
+    await page.locator('.c-project').nth(1).fill('cookie-project-two');
+    await page.locator('#cookies-list .field-heading button').first().click();
+    await page.fill('#proxy-host','cookie-proxy.invalid');
+    await page.fill('#proxy-port','1080');
+    await page.fill('#proxy-username','cookie-user');
+    await page.fill('#proxy-password','private:password');
+    await page.click('#proxy-form-add');
+    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===1);
+    await page.click('#proxy-dialog-apply');
+    await page.waitForFunction(()=>!document.querySelector('#proxy-dialog').open);
+    assert.equal(await page.locator('.c-cookie').nth(1).inputValue(),'SAPISID=ui-cookie-two; SID=ui-sid-two');
+    await page.locator('.c-fallback').first().uncheck();
+    pending=responseFor('/api/cookie-accounts');
+    await page.locator('button[onclick*="saveCookieAccounts"]').click();
+    response=await pending;
+    assert.equal(response.status(),200);
+    assert.ok(!(await response.text()).includes('ui-cookie-one'));
+    await page.waitForFunction(()=>document.querySelector('.c-cookie').value==='' && !document.querySelector('.c-cookie').matches(':disabled'));
+    assert.equal(await page.locator('.c-project').first().inputValue(),'cookie-project-one');
+    await page.locator('.c-project').first().fill('changed-cookie-project');
+    await page.locator('.c-enabled').nth(1).uncheck();
+    pending=responseFor('/api/cookie-accounts');
+    await page.locator('button[onclick*="saveCookieAccounts"]').click();
+    response=await pending;
+    assert.equal(response.status(),200);
+    const savedCookies=await response.json();
+    assert.equal(savedCookies.enabled,1);
+    assert.equal(savedCookies.accounts[0].cookie_configured,true);
+    assert.equal(savedCookies.accounts[0].proxy_fallback,false);
+    assert.equal(savedCookies.accounts[0].proxies[0],'socks5://cookie-user:private%3Apassword@cookie-proxy.invalid:1080');
+    assert.equal((await (await page.request.get(origin+'/api/settings/runtime')).json()).mode,'mixed');
+    await page.selectOption('#credential-strategy','roundrobin');
+    await page.waitForFunction(()=>!document.querySelector('#credential-strategy').disabled && document.querySelector('#roundrobin').checked);
+    check('混合模式、多 Cookie 项目与代理绑定、空值保留凭证、独立启停和轮询');
+
     await openTab('requests');
     await page.waitForSelector('#request-rows tr[data-request]');
     assert.equal(await page.locator('#request-rows tr[data-request]').count(), 25);
@@ -323,6 +448,27 @@ async function main() {
       assert.ok(await page.locator('#request-dialog').evaluate(el => el.scrollWidth <= el.clientWidth), `${width}px dialog overflow`);
       if (width === 390) await screenshot('request-detail-mobile');
       await page.keyboard.press('Escape');
+      await openTab('channel');
+      await page.getByRole('button',{name:'管理 / 添加代理',exact:true}).click();
+      assert.ok(await page.locator('#proxy-dialog').evaluate(el=>el.scrollWidth<=el.clientWidth),`${width}px proxy dialog overflow`);
+      assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),`${width}px modal page overflow`);
+      if(width===390) await screenshot('proxy-editor-mobile');
+      if(width===320 || width===390){
+        await page.locator('#proxy-password').click();
+        await page.fill('#proxy-host','mobile-draft.invalid');
+        await page.fill('#proxy-port','1080');
+        await page.fill('#proxy-password','mobile-draft');
+        const fieldBounds=await page.locator('#proxy-password').evaluate(el=>{
+          const rect=el.getBoundingClientRect(), header=document.querySelector('.proxy-dialog-head').getBoundingClientRect(), footer=document.querySelector('.proxy-dialog-foot').getBoundingClientRect();
+          return {top:rect.top,bottom:rect.bottom,header:header.bottom,footer:footer.top};
+        });
+        await screenshot(`proxy-editor-${width}-fields`);
+        // Layout coordinates use fractional CSS pixels while native focus
+        // scrolling rounds to device pixels. Allow one pixel of rounding.
+        assert.ok(fieldBounds.top>=fieldBounds.header-1 && fieldBounds.bottom<=fieldBounds.footer+1,`${width}px mobile password field obscured: ${JSON.stringify(fieldBounds)}`);
+      }
+      await page.keyboard.press('Escape');
+      assert.equal(await page.locator('#proxy-dialog').evaluate(el=>el.open),false);
     }
     check('五个页面及长请求详情通过 320 / 390 / 768 / 1024 / 1440px 宽度检查');
 

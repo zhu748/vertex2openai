@@ -16,7 +16,12 @@ services:
       - API_KEY=change-me-please
       # Required: one or more Gemini Express Mode API keys, separated by commas.
       - VERTEX_EXPRESS_API_KEY=your_vertex_express_api_key
-      # Optional: set true to rotate Express keys in order instead of random selection.
+      # Optional: Key + Cookie simultaneous use. With both configured on first boot,
+      # mixed mode is inferred; saved console settings take precedence thereafter.
+      # - UPSTREAM_MODE=mixed
+      # - 'VERTEX_EXPRESS_API_KEYS=[{"key":"key-a","project_id":"project-a"},{"key":"key-b","project_id":"project-b"}]'
+      # - 'GOOGLE_COOKIES=[{"cookie":"SAPISID=cookie-a; SID=sid-a","project_id":"project-a"},{"cookie":"SAPISID=cookie-b; SID=sid-b" ,"project_id":"project-b"}]'
+      # Optional: set true to rotate all enabled accounts in order instead of random selection.
       - ROUNDROBIN=false
       # Optional: fake streaming keeps client connections alive while waiting for non-streaming Gemini responses.
       - FAKE_STREAMING=false
@@ -25,7 +30,8 @@ services:
       # 支持 http:// / https:// / socks5:// / socks5h:// 原生协议，
       # 也可直接填 vless:// vmess:// trojan:// ss:// socks4:// hysteria2:// tuic://
       # 分享链接（镜像内已置 sing-box，自动转成本地 socks5）。
-      # 每个 Express Key 还可在控制台「通道与凭证」页单独设代理（Key 级优先）。
+      # 每个 Key / Cookie 还可单独设多个代理；专属列表耗尽后默认回退全局，可单独关闭。
+      # - 'PROXY_URLS=["socks5://global-first:1080","http://global-second:8080"]'
       # - PROXY_URL=vless://uuid@host:port?security=tls&type=ws&path=%2F&host=xxx&sni=xxx#name
       # sing-box 二进制路径（默认自动探测 /usr/local/bin/sing-box）：
       # - SINGBOX_BIN=/usr/local/bin/sing-box

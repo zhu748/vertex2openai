@@ -198,7 +198,19 @@ async def open_upstream_client(client_kwargs: dict):
 
     client_kwargs 是 httpx 语义（timeout/follow_redirects/proxy），由工厂内部转换。
     """
-    client = _upstream_client_pool.get(client_kwargs, _create_upstream_client)
+    from proxy_failover import FailoverHTTPClient
+    options = dict(client_kwargs)
+    chain = options.pop("_proxy_chain", None)
+    if chain is not None:
+        def factory(raw, resolved):
+            candidate = dict(options)
+            candidate.pop("proxy", None)
+            if resolved:
+                candidate["proxy"] = resolved
+            return _upstream_client_pool.get(candidate, _create_upstream_client)
+        yield FailoverHTTPClient(chain, factory)
+        return
+    client = _upstream_client_pool.get(options, _create_upstream_client)
     yield client
 
 

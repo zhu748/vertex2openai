@@ -10,8 +10,10 @@ import config
 import express_key_probe
 from console_auth import require_auth
 from cookie_auth import validate_cookie
+from credential_config import parse_cookie_header
 from lifecycle import start_background_task
 from proxy_resolver import validate_proxy_uri
+from proxy_config import ProxyFormatError, parse_proxy_list
 from runtime_state import app_state
 
 
@@ -45,6 +47,24 @@ def _express_keys_payload() -> dict:
     }
 
 
+def _validate_account_proxies(item, label):
+    if "proxy_fallback" in item and not isinstance(item["proxy_fallback"], bool):
+        return f"{label} 的 proxy_fallback 必须是布尔值。"
+    if "enabled" in item and not isinstance(item["enabled"], bool):
+        return f"{label} 的 enabled 必须是布尔值。"
+    try:
+        proxies = parse_proxy_list(item.get("proxies") if "proxies" in item else item.get("proxy", ""))
+    except ProxyFormatError as exc:
+        return f"{label}：{exc}"
+    if len(proxies) > 32:
+        return f"{label} 最多设置 32 条代理。"
+    for index, proxy in enumerate(proxies):
+        err = validate_proxy_uri(proxy)
+        if err:
+            return f"{label} 第 {index + 1} 条专属代理格式不合法：{err}"
+    return None
+
+
 @router.get("/api/express-keys")
 async def list_express_keys(_auth: bool = Depends(require_auth)):
     return JSONResponse(content=_express_keys_payload())
@@ -61,9 +81,8 @@ async def save_express_keys(body: ExpressKeysBody, request: Request, _auth: bool
     """
     for idx, item in enumerate(body.keys):
         if not isinstance(item, dict):
-            continue
-        key_proxy = str(item.get("proxy", "") or "").strip()
-        err = validate_proxy_uri(key_proxy)
+            return JSONResponse(status_code=400, content={"error": "每条 Key 记录必须是对象。"})
+        err = _validate_account_proxies(item, f"第 {idx + 1} 个 Key")
         if err:
             masked = express_key_probe.mask_key(str(item.get("key", "") or ""))
             return JSONResponse(
@@ -81,6 +100,66 @@ async def save_express_keys(body: ExpressKeysBody, request: Request, _auth: bool
     payload = _express_keys_payload()
     payload["status"] = "success"
     return JSONResponse(content=payload)
+
+
+class CookieAccountsBody(BaseModel):
+    accounts: list = []
+
+
+def _cookie_accounts_payload():
+    from routes.settings_api import mask_cookie
+    records = app_state.get_cookie_accounts()
+    accounts = [{**{k: v for k, v in rec.items() if k != "cookie"},
+                 "cookie_configured": bool(rec["cookie"]), "cookie_preview": mask_cookie(rec["cookie"])}
+                for rec in records]
+    return {"accounts": accounts, "total": len(accounts), "enabled": sum(r["enabled"] for r in accounts)}
+
+
+@router.get("/api/cookie-accounts")
+async def list_cookie_accounts(_auth: bool = Depends(require_auth)):
+    return JSONResponse(content=_cookie_accounts_payload(), headers={"Cache-Control": "no-store"})
+
+
+@router.post("/api/cookie-accounts")
+async def save_cookie_accounts(body: CookieAccountsBody, _auth: bool = Depends(require_auth)):
+    existing = {rec["id"]: rec for rec in app_state.get_cookie_accounts()}
+    clean, ids, cookies = [], set(), set()
+    for index, item in enumerate(body.accounts):
+        label = f"第 {index + 1} 个 Cookie 账号"
+        if not isinstance(item, dict):
+            return JSONResponse(status_code=400, content={"error": f"{label}必须是对象。"})
+        record = dict(item)
+        record_id = record.get("id", "")
+        if not isinstance(record_id, str) or len(record_id) > 100:
+            return JSONResponse(status_code=400, content={"error": f"{label}的 ID 无效。"})
+        cookie = record.get("cookie", "")
+        if not isinstance(cookie, str):
+            return JSONResponse(status_code=400, content={"error": f"{label}的 Cookie 必须是字符串。"})
+        if cookie.strip():
+            try:
+                cookie = parse_cookie_header(cookie)
+            except (ValueError, TypeError):
+                return JSONResponse(status_code=400, content={"error": f"{label}的 Cookie JSON 无效。"})
+        else:
+            cookie = existing.get(record_id, {}).get("cookie", "")
+        validation = validate_cookie(cookie)
+        if not validation["valid"]:
+            return JSONResponse(status_code=400, content={"error": f"{label}：{validation['message']}"})
+        project = str(record.get("project_id", "") or "").strip()
+        if record.get("enabled", True) and not project:
+            return JSONResponse(status_code=400, content={"error": f"{label}启用前需要填写 Project ID。"})
+        error = _validate_account_proxies(record, label)
+        if error:
+            return JSONResponse(status_code=400, content={"error": error})
+        if (record_id and record_id in ids) or cookie in cookies:
+            return JSONResponse(status_code=400, content={"error": f"{label}与前面的账号重复。"})
+        ids.add(record_id)
+        cookies.add(cookie)
+        record.update(cookie=cookie, project_id=project)
+        clean.append(record)
+    await asyncio.to_thread(app_state.set_cookie_accounts, clean)
+    return JSONResponse(content={"status": "success", **_cookie_accounts_payload()},
+                        headers={"Cache-Control": "no-store"})
 
 
 @router.post("/api/express-keys/probe")

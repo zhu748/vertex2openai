@@ -10,6 +10,7 @@ import time
 
 # 引入运行状态管理器与多通道分发策略
 from runtime_state import app_state
+from credential_manager import credential_manager
 from upstreams.express_sdk import ExpressSDKUpstream
 from upstreams.cookie_proxy import CookieProxyUpstream
 from upstream_errors import extract_upstream_error, create_openai_error_response
@@ -46,10 +47,20 @@ cookie_upstream = CookieProxyUpstream()
 
 @limit_generation
 async def _call_upstream(request_obj: OpenAIRequest, fastapi_request: Request):
-    """按控制台开关分流到两条上游通道（与原来完全一致）。"""
+    """Select an enabled upstream credential using the saved channel mode."""
     deadline = time.monotonic() + request_timeout_seconds()
     async def prepare():
         async with asyncio.timeout(max(0.001, deadline - time.monotonic())):
+            if app_state.get_channel_mode() == "mixed":
+                structured = bool(request_obj.response_format and request_obj.response_format.get("type") not in (None, "text"))
+                record = credential_manager.get_mixed_record(
+                    fastapi_request.app.state.express_key_manager, express_only=structured)
+                if record is None:
+                    return JSONResponse(status_code=401, content=create_openai_error_response(
+                        401, "没有可用的上游账号。请启用 Express Key 或填写完整的 Cookie 与 Project ID；结构化输出需要 Express Key。",
+                        "authentication_error"))
+                upstream = cookie_upstream if record["channel"] == "cookie" else express_upstream
+                return await upstream.chat_completions(request_obj, fastapi_request, credential_record=record)
             if app_state.is_web_proxy_enabled():
                 return await cookie_upstream.chat_completions(request_obj, fastapi_request)
             return await express_upstream.chat_completions(request_obj, fastapi_request)
@@ -304,9 +315,7 @@ async def _resumable_json(fastapi_request: Request, request_obj: OpenAIRequest, 
 async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api_key: str = Depends(get_api_key)):
     """
     /v1/chat/completions 动态分流路由器
-    根据大盘设置的全局开关，决定将 OpenAI 请求路由至：
-    - True  -> CookieProxyUpstream (Cookie 网页通道)
-    - False -> ExpressSDKUpstream (官方 API Key 标准通道)
+    按仅 Key、仅 Cookie 或混合模式选择上游；混合时两类启用账号共同参与调度。
 
     弱网可靠传输（resumable_enabled 开启时，默认开）：
     响应先落服务端缓冲（带序列号），上游读取与前端连接解绑；
@@ -318,7 +327,8 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
     """
     try:
         track_configure(model=request.model, protocol="openai", stream=bool(request.stream),
-                        channel="cookie" if app_state.is_web_proxy_enabled() else "express")
+                        channel="mixed" if app_state.get_channel_mode() == "mixed" else
+                        "cookie" if app_state.is_web_proxy_enabled() else "express")
         # 普通聊天客户端通常把“取消后重发”理解为重新生成；允许单次请求
         # 直通，避免相同请求体反复接回一个仍在等待的后台任务。
         resume_disabled = fastapi_request.headers.get("x-resumable", "").strip().lower() in ("0", "false", "no")

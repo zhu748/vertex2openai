@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 import os
 import tempfile
@@ -7,6 +8,8 @@ import time
 from typing import Optional
 
 import config as app_config
+from credential_config import parse_cookie_records
+from proxy_config import parse_proxy_list
 
 # S-3：允许把状态落到挂载卷，避免 docker compose 重建后设置与 Cookie 全部丢失。
 STATE_DIR = os.environ.get("STATE_DIR", ".")
@@ -32,7 +35,7 @@ class AppState:
 
     def __init__(self):
         self._lock = threading.RLock()
-        self._state = {"use_web_proxy": False}
+        self._state = {}
         self._load_from_disk()
         self._committed = copy.deepcopy(self._state)
 
@@ -96,29 +99,69 @@ class AppState:
                 self._state["google_cookie"] = cookie
             if project_id:
                 self._state["google_project_id"] = project_id
+            if isinstance(self._state.get("cookie_accounts"), list):
+                records = self.get_cookie_accounts()
+                if records:
+                    if cookie:
+                        records[0]["cookie"] = cookie
+                    if project_id:
+                        records[0]["project_id"] = project_id
+                elif cookie:
+                    records = [self._normalize_cookie_record({"cookie": cookie, "project_id": project_id})]
+                self._state["cookie_accounts"] = records
             self._save()
 
     # ---------- 通道开关与凭证 ----------
 
     def enable_web_proxy(self, enabled: bool):
+        self.set_channel_mode("web_proxy" if enabled else "api_key")
+
+    def set_channel_mode(self, mode: str):
+        if mode not in ("api_key", "web_proxy", "mixed"):
+            raise ValueError("通道必须是 api_key、web_proxy 或 mixed。")
         with self._lock:
-            self._state["use_web_proxy"] = bool(enabled)
+            self._state["upstream_mode"] = mode
+            self._state["use_web_proxy"] = mode == "web_proxy"
             self._save()
-            print(f"🔄 [状态管理器] 网页反代状态已更新：{enabled}")
+            print(f"🔄 [状态管理器] 上游调度模式已更新：{mode}")
+
+    def get_channel_mode(self) -> str:
+        with self._lock:
+            mode = self._state.get("upstream_mode")
+            if mode in ("api_key", "web_proxy", "mixed"):
+                return mode
+            if "use_web_proxy" in self._state:
+                return "web_proxy" if self._state["use_web_proxy"] else "api_key"
+            return app_config.UPSTREAM_MODE
+
+    def initialize_channel_mode_once(self):
+        with self._lock:
+            if "upstream_mode" not in self._state and "use_web_proxy" not in self._state:
+                self.set_channel_mode(app_config.UPSTREAM_MODE)
 
     def is_web_proxy_enabled(self) -> bool:
         with self._lock:
-            return bool(self._state.get("use_web_proxy", False))
+            return self.get_channel_mode() == "web_proxy"
 
     def set_google_cookie(self, cookie_str: str):
         with self._lock:
             self._state["google_cookie"] = cookie_str
+            if isinstance(self._state.get("cookie_accounts"), list):
+                records = self.get_cookie_accounts()
+                if records:
+                    if cookie_str:
+                        records[0]["cookie"] = cookie_str
+                    else:
+                        records.pop(0)
+                elif cookie_str:
+                    records = [self._normalize_cookie_record({"cookie": cookie_str, "project_id": self.get_project_id()})]
+                self._state["cookie_accounts"] = records
             self._save()
             print("🔄 [状态管理器] 谷歌独立 Cookie 已保存到运行状态")
 
     def get_google_cookie(self) -> str:
         with self._lock:
-            return self._state.get("google_cookie", app_config.GOOGLE_COOKIE or "")
+            return next((r["cookie"] for r in self.get_cookie_accounts() if r["enabled"]), "")
 
     def set_project_id(self, project_id: str):
         with self._lock:
@@ -137,6 +180,12 @@ class AppState:
     # 一个 Key 对应一个谷歌账号/项目，所以 Project ID 必须**跟着 Key 走**，
     # 不能共用 Cookie 通道那份全局 Project ID（见 express_sdk.resolve_express_model_path）。
     # proxy 同理：多账号常来自不同网络环境，各自挂各自的出口。
+
+    @staticmethod
+    def _account_proxy_fields(item) -> dict:
+        proxies = parse_proxy_list(item.get("proxies") if "proxies" in item else item.get("proxy", ""))
+        return {"proxies": proxies, "proxy": proxies[0] if proxies else "",
+                "proxy_fallback": bool(item.get("proxy_fallback", True))}
 
     @staticmethod
     def _normalize_express_record(item) -> dict:
@@ -159,7 +208,7 @@ class AppState:
             "enabled": bool(item.get("enabled", True)),
             # Key 级出站代理：支持 http/https/socks5/socks4/vless/vmess/trojan/ss/
             # hysteria2/tuic 等 URI（见 proxy_resolver.py）；空 = 跟随全局，direct = 强制直连。
-            "proxy": str(item.get("proxy", "") or "").strip(),
+            **AppState._account_proxy_fields(item),
         }
 
     def get_express_keys(self) -> list:
@@ -238,12 +287,12 @@ class AppState:
                 self._save()
                 return 0
             clean, seen = [], set()
-            for k in (env_keys or []):
-                k = str(k or "").strip()
-                if not k or k in seen:
+            for item in (env_keys or []):
+                rec = self._normalize_express_record(item)
+                if not rec or rec["key"] in seen:
                     continue
-                seen.add(k)
-                clean.append(self._normalize_express_record({"key": k}))
+                seen.add(rec["key"])
+                clean.append(rec)
             self._state["express_keys"] = clean
             self._state["express_keys_initialized"] = True
             self._save()
@@ -251,6 +300,65 @@ class AppState:
                 print(f"📥 [状态管理器] 已从环境变量 VERTEX_EXPRESS_API_KEY 一次性导入 {len(clean)} 个 Key，"
                       "此后以控制台保存的列表为准。")
             return len(clean)
+
+    # ---------- Cookie accounts (legacy singleton credentials are migrated once) ----------
+
+    @staticmethod
+    def _normalize_cookie_record(item) -> dict:
+        if isinstance(item, str):
+            item = {"cookie": item}
+        if not isinstance(item, dict):
+            return {}
+        cookie = str(item.get("cookie", "") or "").strip()
+        if not cookie:
+            return {}
+        record_id = str(item.get("id", "") or "").strip()
+        if not record_id:
+            record_id = "cookie-" + hashlib.sha256(cookie.encode()).hexdigest()[:24]
+        return {"id": record_id, "cookie": cookie,
+                "project_id": str(item.get("project_id", "") or "").strip(),
+                "note": str(item.get("note", "") or "").strip(),
+                "enabled": bool(item.get("enabled", True)),
+                **AppState._account_proxy_fields(item)}
+
+    def get_cookie_accounts(self) -> list:
+        with self._lock:
+            stored = self._state.get("cookie_accounts")
+            if not isinstance(stored, list):
+                if "google_cookie" in self._state:
+                    stored = [{"cookie": self._state["google_cookie"], "project_id": self.get_project_id()}]
+                elif app_config.GOOGLE_COOKIES is not None:
+                    stored = app_config.ENV_COOKIE_ACCOUNTS
+                elif app_config.GOOGLE_COOKIE:
+                    stored = parse_cookie_records(app_config.GOOGLE_COOKIE, self.get_project_id())
+                else:
+                    stored = app_config.ENV_COOKIE_ACCOUNTS
+            return [rec for item in stored if (rec := self._normalize_cookie_record(item))]
+
+    def set_cookie_accounts(self, records: list) -> list:
+        clean, ids, cookies = [], set(), set()
+        for item in records:
+            rec = self._normalize_cookie_record(item)
+            if not rec or rec["id"] in ids or rec["cookie"] in cookies:
+                continue
+            ids.add(rec["id"])
+            cookies.add(rec["cookie"])
+            clean.append(rec)
+        with self._lock:
+            self._state["cookie_accounts"] = clean
+            self._state["cookie_accounts_initialized"] = True
+            # Old credentials must not resurrect after deleting every account.
+            self._state.pop("google_cookie", None)
+            self._save()
+        return clean
+
+    def import_env_cookie_accounts_once(self) -> int:
+        with self._lock:
+            if self._state.get("cookie_accounts_initialized"):
+                return 0
+            records = self.get_cookie_accounts()
+            self.set_cookie_accounts(records)
+            return len(records)
 
     # ---------- 控制台可调设置 ----------
 
@@ -272,6 +380,8 @@ class AppState:
                                         merged[k].setdefault(model, {}).update(copy.deepcopy(override))
                         else:
                             merged[k] = copy.deepcopy(v)
+                if "proxy_urls" not in stored and "proxy_url" in stored:
+                    merged["proxy_urls"] = parse_proxy_list(stored["proxy_url"])
             return merged
 
     def get_setting(self, key: str, default=None):
@@ -318,6 +428,10 @@ class AppState:
                 if k in app_config.DEFAULT_SETTINGS and k != "model_overrides":
                     current[k] = v
                     accepted += 1
+            if "proxy_urls" in patch or "proxy_url" in patch:
+                proxies = parse_proxy_list(patch.get("proxy_urls") if "proxy_urls" in patch else patch["proxy_url"])
+                current["proxy_urls"] = proxies
+                current["proxy_url"] = proxies[0] if proxies else ""
             self._state["settings"] = current
             self._save()
             print(f"🔧 [状态管理器] 已更新 {accepted} 项运行时设置。")
@@ -412,29 +526,40 @@ app_state = AppState()
 
 
 # ============================================================
-# 出站代理统一读取口（热改支持）
-# 所有需要代理的上游请求（Express SDK / Cookie 通道 / 模型列表 /
-# Key 探测 / 图片抓取）都必须经过 get_effective_proxy_url()，
-# 这样控制台改完代理后所有出站路径立即同步，无需重启。
+# 出站代理统一读取口（热改支持）。新调用使用账号候选列表 + ProxyChain；
+# 两个单值 getter 保留给客户端池构造和旧调用方读取第一条。
 # ============================================================
 def get_effective_proxy_url() -> str:
-    """当前生效的出站代理 URL：控制台保存过（含保存为空=直连）优先，否则用环境变量。
+    """Legacy first-entry view of the global list; saved empty means direct."""
+    proxies = get_effective_proxy_urls()
+    return proxies[0] if proxies else ""
 
-    返回**原始 URI**（可能是 vless:// 等分享链接形态，尚未转换），
-    空字符串 = 直连。调用方直接判断 truthy 即可。
-    需要 httpx/curl_cffi 可消费的 URL 时走 proxy_resolver.resolve_proxy_uri()，
-    或直接用下面的 get_effective_proxy_uri_for_key()。
-    注意不能用 `stored or env` 的写法：用户把代理清空保存（存 ""）时
-    会被环境变量 PROXY_URL 抢回来，“恢复直连”就永远做不到了。
-    """
-    try:
+
+def get_effective_proxy_urls() -> list[str]:
+    """Ordered global candidates; a saved empty list explicitly restores direct access."""
+    stored = app_state.get_raw_stored_setting("proxy_urls")
+    if stored is None:
         stored = app_state.get_raw_stored_setting("proxy_url")
-    except Exception:
-        stored = None
-    if stored is not None:          # 用户在控制台保存过 → 以它为准（空值=直连）
-        return str(stored or "").strip()
-    # 从未在控制台保存过 → 跟随环境变量初始值
-    return str(app_config.PROXY_URL or "").strip()
+    if stored is None:
+        stored = app_config.PROXY_URLS if app_config.PROXY_URLS is not None else app_config.PROXY_URL
+    return parse_proxy_list(stored)
+
+
+def get_effective_proxy_uris_for_account(record=None) -> list[str]:
+    """Account candidates precede globals. Never add an implicit direct fallback.
+
+    An account with no proxies inherits globals. A sole direct sentinel retains
+    the old force-direct meaning, regardless of the fallback checkbox.
+    """
+    global_proxies = get_effective_proxy_urls()
+    if not isinstance(record, dict):
+        return global_proxies or [""]
+    own = parse_proxy_list(record.get("proxies") if "proxies" in record else record.get("proxy", ""))
+    if not own:
+        return global_proxies or [""]
+    if own == ["direct"] or not record.get("proxy_fallback", True):
+        return own
+    return list(dict.fromkeys(own + global_proxies))
 
 
 def get_effective_proxy_uri_for_key(key_record=None) -> str:
@@ -447,15 +572,8 @@ def get_effective_proxy_uri_for_key(key_record=None) -> str:
     返回的仍是原始 URI（未做 sing-box 转换），消费方再交给
     proxy_resolver.resolve_proxy_uri() 拿到 httpx 可用的 URL。
     """
-    key_proxy = ""
-    if isinstance(key_record, dict):
-        key_proxy = str(key_record.get("proxy", "") or "").strip()
-    if key_proxy:
-        from proxy_resolver import DIRECT_TOKENS
-        if key_proxy.lower() in DIRECT_TOKENS:
-            return ""
-        return key_proxy
-    return get_effective_proxy_url()
+    value = get_effective_proxy_uris_for_account(key_record)[0]
+    return "" if value == "direct" else value
 
 
 def mask_proxy_url(url: str) -> str:

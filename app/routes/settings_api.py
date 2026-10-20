@@ -1,6 +1,7 @@
 """全局设置、模型专属设置与能力摘要。"""
 
 import asyncio
+from typing import Literal
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
@@ -30,15 +31,18 @@ def mask_cookie(cookie_str: str) -> str:
 
 
 class ModeSetting(BaseModel):
-    mode: str
+    mode: Literal["api_key", "web_proxy", "mixed"]
 
 
 @router.get("/api/settings/runtime")
 async def get_runtime_settings(_auth: bool = Depends(require_auth)):
-    cookie = app_state.get_google_cookie()
+    accounts = app_state.get_cookie_accounts()
+    cookie = next((r["cookie"] for r in accounts if r["enabled"]), "")
     return JSONResponse(
         content={
             "use_web_proxy": app_state.is_web_proxy_enabled(),
+            "mode": app_state.get_channel_mode(),
+            "cookie_accounts": {"total": len(accounts), "enabled": sum(r["enabled"] for r in accounts)},
             # S-1：只回显掩码。完整 Cookie 等价于该 Google 账号的完整访问权，
             # 没有任何理由让它出现在前端 JS / 浏览器缓存 / 截图里。
             "google_cookie": mask_cookie(cookie),
@@ -50,7 +54,7 @@ async def get_runtime_settings(_auth: bool = Depends(require_auth)):
 
 @router.post("/api/settings/mode")
 async def set_settings_mode(setting: ModeSetting, _auth: bool = Depends(require_auth)):
-    await asyncio.to_thread(app_state.enable_web_proxy, setting.mode == "web_proxy")
+    await asyncio.to_thread(app_state.set_channel_mode, setting.mode)
     return JSONResponse(content={"status": "success"})
 
 

@@ -410,7 +410,7 @@ class NativeResponseLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: upstream)) as client:
                     with mock.patch.object(gemini_native, "get_retry_settings", return_value=(retries, 0, 0)), \
                          mock.patch.object(gemini_native, "_resolve_upstream_model_path", return_value="gemini-test"), \
-                         mock.patch.object(gemini_native, "get_effective_proxy_uri_for_key", return_value=""), \
+                         mock.patch("proxy_failover.get_effective_proxy_uris_for_account", return_value=[""]), \
                          mock.patch.object(gemini_native, "passthrough_client_pool", types.SimpleNamespace(get=lambda *args: client)):
                         task = asyncio.create_task(gemini_native._passthrough_request(
                             request, "gemini-test", "streamGenerateContent", "alt=sse", b"{}"))

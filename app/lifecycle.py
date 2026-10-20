@@ -72,7 +72,11 @@ async def lifespan(app: FastAPI):
 
     # 多账号 Express Key：环境变量只做**一次性**初始导入，之后以控制台保存的列表为准。
     # （用户在控制台把列表清空并保存后，这里不会再把环境变量里的 Key 复种回来。）
-    app_state.import_env_express_keys_once(config.VERTEX_EXPRESS_API_KEY_VAL)
+    app_state.import_env_express_keys_once(config.ENV_EXPRESS_KEYS)
+    app_state.import_env_cookie_accounts_once()
+    app_state.initialize_channel_mode_once()
+    print(f"🔀 [通道调度] {app_state.get_channel_mode()}；"
+          f"Cookie 账号 {sum(r['enabled'] for r in app_state.get_cookie_accounts())} 个启用。")
     if express_key_manager.get_total_keys() > 0:
         print(f"✅ [密钥配置] 已加载 {express_key_manager.get_total_keys()} 个 Express API Key。")
     else:

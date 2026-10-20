@@ -51,10 +51,12 @@ import atexit
 from contextvars import ContextVar
 from typing import Any, Optional
 from urllib.parse import unquote, parse_qs, urlsplit, urlunsplit
+from proxy_config import DIRECT_TOKENS, ProxyFormatError, normalize_proxy_uri
 
 
 class ProxyResolveError(Exception):
     """代理解析/转换失败。消息面向最终用户，须给出可操作的指引。"""
+    code = 502
 
 
 current_proxy_usage = ContextVar("current_proxy_usage", default=None)
@@ -100,8 +102,6 @@ SINGBOX_PROXY_SCHEMES = {
 }
 
 # 「强制直连」哨兵值（Key 级代理里最常用，全局代理里等价于留空）
-DIRECT_TOKENS = {"direct", "none", "off", "直连", "无代理"}
-
 ALL_PROXY_SCHEMES = NATIVE_PROXY_SCHEMES | SINGBOX_PROXY_SCHEMES
 
 
@@ -114,7 +114,10 @@ def _uri_scheme(uri: str) -> str:
 
 def classify_proxy_uri(uri: str) -> str:
     """分类代理 URI：native / singbox / direct / invalid。"""
-    value = str(uri or "").strip()
+    try:
+        value = normalize_proxy_uri(str(uri or ""))
+    except ProxyFormatError:
+        return "invalid"
     if not value:
         return "direct"
     if value.lower() in DIRECT_TOKENS:
@@ -976,7 +979,10 @@ def resolve_proxy_uri(uri: Optional[str]) -> str:
     结果稳定：同一 URI 在进程生命周期内永远映射到同一端口，
     客户端池签名不会因重复 resolve 而抖动。
     """
-    value = str(uri or "").strip()
+    try:
+        value = normalize_proxy_uri(str(uri or ""))
+    except ProxyFormatError as exc:
+        raise ProxyResolveError(str(exc)) from None
     if not value or value.lower() in DIRECT_TOKENS:
         return ""
     kind = classify_proxy_uri(value)
@@ -1008,7 +1014,10 @@ def validate_proxy_uri(uri: str) -> str:
 
     合法性 = 能解析出该协议的必要字段；连通性请走 /api/proxy/test。
     """
-    value = str(uri or "").strip()
+    try:
+        value = normalize_proxy_uri(uri)
+    except ProxyFormatError as exc:
+        return str(exc)
     if not value or value.lower() in DIRECT_TOKENS:
         return ""
     kind = classify_proxy_uri(value)
@@ -1042,6 +1051,11 @@ def mask_proxy_uri(uri: str) -> str:
     保证日志/healthz 里绝不泄露凭据。
     """
     value = str(uri or "").strip()
+    try:
+        value = normalize_proxy_uri(value)
+    except ProxyFormatError:
+        digest = hashlib.sha1(value.encode("utf-8")).hexdigest()[:8]
+        return f"proxy:{digest}(格式无法解析)"
     if not value:
         return ""
     if value.lower() in DIRECT_TOKENS:
@@ -1052,10 +1066,16 @@ def mask_proxy_uri(uri: str) -> str:
             # vmess 整体是 base64，没有可提取的 host:port，只报长度
             return f"vmess://***({len(value)} 字符)"
         parts = urlsplit(value)
+        if scheme == "ss" and "@" not in parts.netloc:
+            # Legacy SS embeds credentials and the endpoint in one base64
+            # authority. urlsplit can mistake that payload for a hostname.
+            return f"ss://***({len(value)} 字符)"
         host = parts.hostname or ""
         if not host:
             raise ValueError
         port = f":{parts.port}" if parts.port else ""
+        if ":" in host:
+            host = f"[{host}]"
         cred = parts.username or parts.password
         masked_netloc = f"***@{host}{port}" if cred else f"{host}{port}"
         # ss 旧式整体 base64 无 @：host 解析不出来，落到 except

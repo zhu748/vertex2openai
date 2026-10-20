@@ -1,10 +1,14 @@
 ﻿from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from credential_config import parse_cookie_records, parse_key_records
+from proxy_config import parse_proxy_list
 
 
 class AppSettings(BaseSettings):
     API_KEY: str = "123456"
     VERTEX_EXPRESS_API_KEY: Optional[str] = None
+    VERTEX_EXPRESS_API_KEYS: Optional[str] = None  # JSON records or comma/newline-separated keys
+    UPSTREAM_MODE: Optional[str] = None  # api_key | web_proxy | mixed; inferred on first boot
     FAKE_STREAMING: bool = False
     FAKE_STREAMING_INTERVAL: float = 1.0
     MODELS_CONFIG_URL: str = ""
@@ -13,11 +17,12 @@ class AppSettings(BaseSettings):
     # 出站代理（全局默认）：支持 http:// https:// socks5:// socks5h:// 原生协议，
     # 以及 vless:// vmess:// trojan:// ss:// socks4:// hysteria2:// tuic:// 等分享链接
     # （经内置 sing-box 转成本地 socks5，见 app/proxy_resolver.py）。
-    # 环境变量是全局初始值，控制台保存后以控制台为准；每个 Express Key 还可
-    # 在控制台单独设置代理（Key 级优先），Key 填 direct 则强制直连。
+    # 环境变量是全局初始值，控制台保存后以控制台为准；每个 Key / Cookie 还可
+    # 单独设置有序代理列表，按需关闭向全局回退；填 direct 则强制直连。
     # sing-box 可执行文件可用环境变量 SINGBOX_BIN 指定；空闲实例回收间隔
     # 用 SINGBOX_IDLE_MINUTES（默认 30，0 = 不回收）。
     PROXY_URL: Optional[str] = None
+    PROXY_URLS: Optional[str] = None  # ordered JSON array or one proxy per line
     SSL_CERT_FILE: Optional[str] = None
     # 标准（Express）模式的上游 base_url 覆盖。留空 = 用 SDK 默认（全局端点）。
     # 仅在确有需要时使用；要钉住 location 请用控制台的
@@ -26,7 +31,9 @@ class AppSettings(BaseSettings):
 
     # Cookie direct mode settings (Recommended for cloud deployments like Render)
     GOOGLE_COOKIE: Optional[str] = None         # Google Cookie string
+    GOOGLE_COOKIES: Optional[str] = None        # JSON records: cookie + project_id + proxies
     GOOGLE_PROJECT_ID: Optional[str] = None     # Google Cloud Project ID
+    GOOGLE_PROJECT_IDS: Optional[str] = None    # optional positional projects for Cookie strings
     EXPERIMENT_FLAGS: Optional[str] = None      # experimentFlagsBinary (optional; paste from a console request if needed)
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
@@ -36,11 +43,10 @@ _settings = AppSettings()
 
 API_KEY = _settings.API_KEY
 
-raw_vertex_keys = _settings.VERTEX_EXPRESS_API_KEY
-if raw_vertex_keys:
-    VERTEX_EXPRESS_API_KEY_VAL = [key.strip() for key in raw_vertex_keys.split(",") if key.strip()]
-else:
-    VERTEX_EXPRESS_API_KEY_VAL = []
+ENV_EXPRESS_KEYS = parse_key_records(_settings.VERTEX_EXPRESS_API_KEYS
+                                   if _settings.VERTEX_EXPRESS_API_KEYS is not None
+                                   else _settings.VERTEX_EXPRESS_API_KEY)
+VERTEX_EXPRESS_API_KEY_VAL = [rec.get("key", "") for rec in ENV_EXPRESS_KEYS]
 
 FAKE_STREAMING_ENABLED = _settings.FAKE_STREAMING
 FAKE_STREAMING_INTERVAL_SECONDS = _settings.FAKE_STREAMING_INTERVAL
@@ -48,12 +54,23 @@ MODELS_CONFIG_URL = _settings.MODELS_CONFIG_URL
 ROUNDROBIN = _settings.ROUNDROBIN
 SAFETY_SCORE = _settings.SAFETY_SCORE
 PROXY_URL = _settings.PROXY_URL
+PROXY_URLS = _settings.PROXY_URLS
+INITIAL_PROXY_URLS = parse_proxy_list(PROXY_URLS if PROXY_URLS is not None else PROXY_URL)
 SSL_CERT_FILE = _settings.SSL_CERT_FILE
 VERTEX_BASE_URL = _settings.VERTEX_BASE_URL
 
 GOOGLE_COOKIE = _settings.GOOGLE_COOKIE
+GOOGLE_COOKIES = _settings.GOOGLE_COOKIES
 GOOGLE_PROJECT_ID = _settings.GOOGLE_PROJECT_ID
 EXPERIMENT_FLAGS = _settings.EXPERIMENT_FLAGS
+ENV_COOKIE_ACCOUNTS = parse_cookie_records(
+    _settings.GOOGLE_COOKIES if _settings.GOOGLE_COOKIES is not None else GOOGLE_COOKIE,
+    GOOGLE_PROJECT_ID or "", _settings.GOOGLE_PROJECT_IDS or "")
+UPSTREAM_MODE = _settings.UPSTREAM_MODE or (
+    "mixed" if ENV_EXPRESS_KEYS and ENV_COOKIE_ACCOUNTS else
+    "web_proxy" if ENV_COOKIE_ACCOUNTS else "api_key")
+if UPSTREAM_MODE not in ("api_key", "web_proxy", "mixed"):
+    raise ValueError("UPSTREAM_MODE 必须是 api_key、web_proxy 或 mixed。")
 
 REASONING_TAG = "agent_platform_think_tag"
 # 向后兼容别名（历史代码引用 VERTEX_REASONING_TAG）
@@ -174,9 +191,9 @@ DEFAULT_SETTINGS = {
     # 支持：标准 URL（http://user:pass@host:port / socks5://host:port 等），
     # 以及 vless:// vmess:// trojan:// ss:// socks4:// hysteria2:// tuic:// 分享链接
     # （经 sing-box 转本地 socks5，详见 app/proxy_resolver.py）。
-    # 清空 = 直连上游。两条通道（Express / Cookie）共用这一个**全局**代理；
-    # 每个 Express Key 可另设 Key 级代理（优先于全局，填 direct = 该 Key 直连）。
-    "proxy_url": PROXY_URL or "",
+    # 清空 = 直连上游。两条通道共用有序全局列表，每个账号可另设专属列表。
+    "proxy_url": INITIAL_PROXY_URLS[0] if INITIAL_PROXY_URLS else "",  # legacy first-entry alias
+    "proxy_urls": INITIAL_PROXY_URLS,
     # ===== Cookie 通道 TLS/浏览器指纹伪装（curl_cffi，热开关）=====
     # off = 关闭（回退 httpx 原始行为）；chrome（默认）/ edge / safari / firefox / safari_ios
     # = 用 curl_cffi 伪装成真实浏览器的 TLS 指纹，并补齐 UA / sec-ch-ua / sec-fetch 等浏览器头。

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import List, Dict, Optional
 
 import config as app_config
-from runtime_state import get_effective_proxy_url
+from proxy_failover import ProxyChain
 from express_fingerprint import build_direct_headers
 
 _model_cache: Optional[Dict[str, List[str]]] = None
@@ -68,43 +68,34 @@ async def fetch_and_parse_models_config() -> Optional[Dict[str, List[str]]]:
             urls_to_try.append(fallback_url)
 
     client_args = {"timeout": 20.0, "trust_env": False}
-    # vless/vmess 等分享链接 → 本地 socks5（sing-box 转换）。模型列表刷新是
-    # 附属功能：转换失败保留本地缓存，不意外直连或替换用户指定的模型来源。
-    try:
-        from proxy_resolver import resolve_proxy_uri_async
-        # 异步版：sing-box 首次启动放线程池，不卡事件循环
-        proxy_url = await resolve_proxy_uri_async(get_effective_proxy_url())
-    except Exception as exc:
-        print(f"⚠️ [模型配置] 出站代理不可用，保留本地模型缓存：{type(exc).__name__}")
-        return None
-    if proxy_url:
-        client_args["proxy"] = proxy_url
     if app_config.SSL_CERT_FILE:
         client_args["verify"] = app_config.SSL_CERT_FILE
-
-    async with httpx.AsyncClient(**client_args) as client:
-        # 指纹头跟随控制台 express_ua_profile：GitHub CDN 虽不风控 UA，
-        # 但统一出站形态（也顺带避开个别镜像站封 python-httpx）。
-        fp_headers = build_direct_headers()
-        for index, url in enumerate(urls_to_try, start=1):
-            print(f"🌐 [模型配置] 正在获取远程模型配置（第 {index} 个地址）：{url}")
-            try:
-                response = await client.get(url, headers=fp_headers)
-                response.raise_for_status()
-                normalized = _normalize_models_config(response.json())
-                if normalized is not None:
-                    print(f"✅ [模型配置] 远程模型配置加载成功，共 {len(normalized['models'])} 个模型。")
-                    return normalized
-                print(f"⚠️ [模型配置] 远程模型配置结构无效，准备尝试下一个地址：{url}")
-            except httpx.HTTPStatusError as exc:
-                print(f"⚠️ [模型配置] 远程模型配置地址返回 HTTP {exc.response.status_code}，准备尝试下一个地址：{url}")
-            except httpx.RequestError as exc:
-                print(f"⚠️ [模型配置] 获取远程模型配置失败，准备尝试下一个地址。网络错误：{exc}")
-            except json.JSONDecodeError as exc:
-                print(f"⚠️ [模型配置] 远程模型配置不是有效 JSON，准备尝试下一个地址。解析错误：{exc}")
-            except Exception as exc:
-                print(f"⚠️ [模型配置] 加载远程模型配置时出现异常，准备尝试下一个地址：{exc}")
-
+    chain = ProxyChain()
+    fp_headers = build_direct_headers()
+    for index, url in enumerate(urls_to_try, start=1):
+        print(f"🌐 [模型配置] 正在获取远程模型配置（第 {index} 个地址）：{url}")
+        try:
+            async def fetch(raw, resolved):
+                options = dict(client_args)
+                if resolved:
+                    options["proxy"] = resolved
+                async with httpx.AsyncClient(**options) as client:
+                    return await client.get(url, headers=fp_headers)
+            response = await chain.run(fetch)
+            response.raise_for_status()
+            normalized = _normalize_models_config(response.json())
+            if normalized is not None:
+                print(f"✅ [模型配置] 远程模型配置加载成功，共 {len(normalized['models'])} 个模型。")
+                return normalized
+            print(f"⚠️ [模型配置] 远程模型配置结构无效，准备尝试下一个地址：{url}")
+        except httpx.HTTPStatusError as exc:
+            print(f"⚠️ [模型配置] 远程模型配置地址返回 HTTP {exc.response.status_code}，准备尝试下一个地址：{url}")
+        except httpx.RequestError as exc:
+            print(f"⚠️ [模型配置] 获取远程模型配置失败，准备尝试下一个地址。网络错误：{exc}")
+        except json.JSONDecodeError as exc:
+            print(f"⚠️ [模型配置] 远程模型配置不是有效 JSON，准备尝试下一个地址。解析错误：{exc}")
+        except Exception as exc:
+            print(f"⚠️ [模型配置] 加载远程模型配置时出现异常，准备尝试下一个地址：{exc}")
     print("⚠️ [模型配置] 所有远程地址都不可用，保留当前模型缓存。")
     return None
 

@@ -22,7 +22,8 @@ from logger import stats
 from message_processing import _create_safety_ratings_html
 from models import OpenAIRequest
 from prefill import PrefillDeduper, strip_prefill_overlap
-from proxy_resolver import ProxyResolveError, resolve_proxy_uri_async
+from proxy_failover import ProxyChain
+from credential_manager import credential_manager
 from response_validation import (
     AntiTruncationError,
     IncompleteResponseError,
@@ -36,7 +37,7 @@ from retry_policy import (
     retry_delay,
     wait_for_retry,
 )
-from runtime_state import app_state, get_effective_proxy_url
+from runtime_state import app_state
 from schema_validation import SchemaValidationError, validate_request_schemas
 from streaming import HEARTBEAT, HEARTBEAT_FRAME, with_heartbeats
 from thought_signatures import (
@@ -298,9 +299,10 @@ async def _execute_stream_request_generator_once(
                         yield "retryable_error" if retryable else "fatal_error", error
                         return
 
-            if has_content and not got_finish:
+            if not got_finish:
                 yield "fatal_error", _StreamRequestError(
-                    "上游连接已结束，但回复缺少结束标记，内容可能不完整。", status_code=502)
+                    "上游连接已结束，但回复缺少结束标记，内容可能不完整。" if has_content else
+                    "上游连接已结束，但未收到模型回复或结束标记。", status_code=502)
 
     except Exception as e:
         err_msg = str(e)
@@ -348,33 +350,43 @@ async def _execute_stream_request_generator_raw(
 
 
 async def _execute_stream_request_generator(client, headers, body, sampler=None, fallback_body=None, *, model=""):
-    source = _execute_stream_request_generator_raw(client, headers, body, sampler, fallback_body)
-    guard = FirstReplyGuard(model)
-    pending = []
-    pending_bytes = 0
-    try:
-        async for item in guard.iterate(source, lambda event: event[0] in ("text", "thought", "image", "function_call") and bool(event[1])):
-            status, data = item
-            if status in ("retryable_error", "fatal_error", "cookie_error", "blocked"):
+    chain = getattr(client, "chain", None)
+    while True:
+        source = _execute_stream_request_generator_raw(client, headers, body, sampler, fallback_body)
+        guard = FirstReplyGuard(model)
+        pending, pending_bytes = [], 0
+        switch_proxy = False
+        try:
+            async for item in guard.iterate(source, lambda event: event[0] in ("text", "thought", "image", "function_call") and bool(event[1])):
+                status, data = item
+                if status in ("retryable_error", "fatal_error", "cookie_error", "blocked"):
+                    if not guard.ready and chain is not None and status in ("retryable_error", "fatal_error"):
+                        switch_proxy = chain.advance(status=getattr(data, "status_code", None))
+                        if switch_proxy:
+                            break
+                    yield item
+                    return
+                if not guard.ready:
+                    pending_bytes += len(str(data).encode("utf-8"))
+                    if pending_bytes > 2 * 1024 * 1024:
+                        raise IncompleteResponseError("首回复前的元数据缓冲超过 2 MiB。")
+                    pending.append(item)
+                    continue
+                for prefix in pending:
+                    yield prefix
                 pending.clear()
                 yield item
+            if not switch_proxy:
+                for prefix in pending:
+                    yield prefix
                 return
-            if not guard.ready:
-                pending_bytes += len(str(data).encode("utf-8"))
-                if pending_bytes > 2 * 1024 * 1024:
-                    raise IncompleteResponseError("首回复前的元数据缓冲超过 2 MiB。")
-                pending.append(item)
-                continue
-            for prefix in pending:
-                yield prefix
-            pending.clear()
-            yield item
-        for prefix in pending:
-            yield prefix
-    except FirstReplyTimeout as exc:
-        yield "retryable_error", _StreamRequestError(str(exc), status_code=504)
-    finally:
-        await source.aclose()
+        except FirstReplyTimeout as exc:
+            switch_proxy = not guard.ready and chain is not None and chain.advance(exc)
+            if not switch_proxy:
+                yield "retryable_error", _StreamRequestError(str(exc), status_code=504)
+                return
+        finally:
+            await source.aclose()
 
 
 async def _collect_full_response(project_id, base_model_name, request_obj, headers, client_kwargs,
@@ -391,7 +403,7 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
         if attempt:
             stats.add_retry()
         try:
-            req_headers = build_headers(_get_cookie_string()) or headers
+            req_headers = build_headers(headers.get("cookie", "")) or headers
             async with open_upstream_client(client_kwargs) as client:
                 upstream_attempt()
                 response = await timed_call(base_model_name, client.post(BATCH_GRAPHQL_URL, headers=req_headers, json=body))
@@ -473,7 +485,7 @@ class CookieProxyUpstream(BaseUpstream):
     使用 Cookie + SAPISIDHASH 鉴权调用 batchGraphql 端点。
     """
 
-    async def chat_completions(self, request_obj: OpenAIRequest, fastapi_request: Request):
+    async def chat_completions(self, request_obj: OpenAIRequest, fastapi_request: Request, *, credential_record=None):
         track_configure(mode="stream" if request_obj.stream else "json", channel="cookie")
         try:
             validate_request_schemas(request_obj)
@@ -485,7 +497,8 @@ class CookieProxyUpstream(BaseUpstream):
             })
 
         # ===== 1. 验证认证 =====
-        cookie_str = _get_cookie_string()
+        record = credential_record or credential_manager.get_cookie_record()
+        cookie_str = record["cookie"] if record else _get_cookie_string()
         if not cookie_str:
             return JSONResponse(status_code=401, content={"error": {"message": (
                 "未配置 Google Cookie。\n"
@@ -493,7 +506,8 @@ class CookieProxyUpstream(BaseUpstream):
                 "或设置环境变量 GOOGLE_COOKIE 和 GOOGLE_PROJECT_ID。"
             ), "type": "auth_error"}})
 
-        project_id = _get_project_id()
+        project_id = record["project_id"] if record else _get_project_id()
+        track_configure(project_id=project_id)
         if not project_id:
             return JSONResponse(status_code=400, content={"error": {"message": (
                 "未配置 Google Cloud Project ID。\n"
@@ -545,10 +559,8 @@ class CookieProxyUpstream(BaseUpstream):
             prefill=prefill_active or bool(prefill_text))
 
         # ===== 4. HTTP 客户端配置 =====
-        # 代理走统一读取口：控制台热改后立即生效（与 Express 通道同步）。
-        # Cookie 通道没有 Key 概念，永远用全局代理；vless/vmess/trojan/ss/
-        # socks4 等分享链接在这里 resolve 成本地 socks5（sing-box 转换，
-        # curl_cffi / httpx 均可直接消费）。
+        # One account snapshot binds Cookie, project and proxy chain for this
+        # generation. The transport tries dedicated candidates before globals.
         client_kwargs = {
             "timeout": httpx.Timeout(connect=30.0, read=180.0, write=30.0, pool=10.0),
             "follow_redirects": False,
@@ -556,21 +568,7 @@ class CookieProxyUpstream(BaseUpstream):
         }
         if app_config.SSL_CERT_FILE:
             client_kwargs["verify"] = app_config.SSL_CERT_FILE
-        _proxy_raw = get_effective_proxy_url()
-        if _proxy_raw:
-            try:
-                # 异步版：sing-box 首次启动放线程池，不卡事件循环
-                _proxy_url = await resolve_proxy_uri_async(_proxy_raw)
-            except ProxyResolveError as e:
-                # 不静默直连（防真实 IP 泄露）：返回明确的 5xx。
-                print(f"❌ [Studio] 全局出站代理不可用：{e}")
-                return JSONResponse(
-                    status_code=502,
-                    content={"error": {"message": f"出站代理不可用：{e}",
-                                      "type": "proxy_error", "code": 502}},
-                )
-            if _proxy_url:
-                client_kwargs["proxy"] = _proxy_url
+        client_kwargs["_proxy_chain"] = ProxyChain(record).bind_to_generation()
 
         # 重试配置（控制台可调）；语义与 Express 通道统一：总尝试次数 = retry_max + 1
         # 间隔为固定值 + 抖动（backoff ± jitter/2，不随次数放大）
@@ -699,7 +697,7 @@ class CookieProxyUpstream(BaseUpstream):
                         async def fallback_body():
                             native_fallback_state["latched"] = True
                             return await _cached_body(False)
-                    req_headers = build_headers(_get_cookie_string()) or headers
+                    req_headers = build_headers(cookie_str) or headers
                     if cookie_debug:
                         print(f"🔎 [Studio 调试] 出站 generationConfig: "
                               f"{json.dumps(body['variables'].get('generationConfig', {}), ensure_ascii=False)}")
@@ -976,7 +974,7 @@ class CookieProxyUpstream(BaseUpstream):
                             async def fallback_body():
                                 native_fallback_state["latched"] = True
                                 return await _cached_body(False)
-                        req_headers = build_headers(_get_cookie_string()) or headers
+                        req_headers = build_headers(cookie_str) or headers
                         if cookie_debug:
                             print(f"🔎 [Studio 调试] 出站 generationConfig: "
                                   f"{json.dumps(body['variables'].get('generationConfig', {}), ensure_ascii=False)}")

@@ -8,7 +8,7 @@ from runtime_state import app_state
 def resolve_express_model_path(base_model_name: str, settings: dict, key_project_id: str = "") -> str:
     """保留完整资源路径，或按当前 Key 的项目和配置区域钉定裸模型名。
 
-    项目优先级为 Key 自己的 Project ID、全局 Project ID；项目或区域为空时
+    使用 Key 自己的项目；仅非混合模式保留旧全局项目兜底。项目或区域为空时
     返回裸模型名，由 Express 后端路由，不给 SDK Client 传互斥的项目参数。
     """
     if base_model_name.startswith(("projects/", "publishers/", "models/", "tunedModels/", "endpoints/")):
@@ -18,7 +18,10 @@ def resolve_express_model_path(base_model_name: str, settings: dict, key_project
     if not location:
         return base_model_name
 
-    project = (str(key_project_id or "").strip() or app_state.get_project_id() or "").strip()
+    # The legacy shared project may belong to a Cookie account. Mixed routing
+    # must not silently pin an unrelated Express Key to that account's project.
+    legacy_project = app_state.get_project_id() if app_state.get_channel_mode() != "mixed" else ""
+    project = (str(key_project_id or "").strip() or legacy_project or "").strip()
     if not project:
         print(
             "⚠️ [上游端点] 已选择钉定 location，但该 Key 没有可用的 Project ID"

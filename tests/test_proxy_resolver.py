@@ -254,6 +254,11 @@ class ClassifyValidateMaskTests(unittest.TestCase):
             for secret in ("12345678", "user:pass", "pass@"):
                 self.assertNotIn(secret, masked)
         self.assertIn("vmess://***", mask_proxy_uri(_vmess_uri()))
+        legacy_ss = base64.b64encode(b"chacha20-ietf-poly1305:private-password@9.9.9.9:9999").decode()
+        masked_ss = mask_proxy_uri(f"ss://{legacy_ss}#private-label")
+        self.assertIn("ss://***", masked_ss)
+        self.assertNotIn(legacy_ss.lower(), masked_ss.lower())
+        self.assertNotIn("private", masked_ss)
         self.assertEqual(mask_proxy_uri(""), "")
         self.assertIn("direct", mask_proxy_uri("direct"))
 

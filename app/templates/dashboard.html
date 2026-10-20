@@ -7,6 +7,7 @@
   <meta content="#f6f7fb" name="theme-color"/>
   <link href="/static/dashboard.css" rel="stylesheet"/>
   <link href="/static/console.css" rel="stylesheet"/>
+  <script defer="" src="/static/channel-config.js"></script>
   <script defer="" src="/static/dashboard.js">
   </script>
   <script defer="" src="/static/request-monitor.js">
@@ -237,7 +238,7 @@
      <div class="inline-notice hidden" id="channel-load-error" role="alert">
       <span>
       </span>
-      <button class="btn-ghost" onclick="runAction(this,async()=&gt;{loadNotice('channel','');await Promise.all([loadRuntime(),loadExpressKeys()]);})">重新加载配置</button>
+      <button class="btn-ghost" onclick="runAction(this,async()=&gt;{loadNotice('channel','');await Promise.all([loadRuntime(),loadExpressKeys(),loadCookieAccounts(),loadParams()]);})">重新加载配置</button>
      </div>
      <div class="channel-grid">
       <fieldset class="card settings-card channel-wide">
@@ -248,17 +249,22 @@
          <input class="mt-1" name="mode" onchange="updateMode('api_key')" type="radio" value="api_key"/>
          <div>
           <div class="font-medium text-sm">Express API Key（标准）</div>
-          <div class="text-xs text-neutral-500 mt-0.5">用 VERTEX_EXPRESS_API_KEY 调官方 SDK</div>
+          <div class="text-xs text-neutral-500 mt-0.5">仅使用启用的 Express Key，可单个或多个</div>
          </div>
         </label>
         <label class="channel-option" id="opt-web">
          <input class="mt-1" name="mode" onchange="updateMode('web_proxy')" type="radio" value="web_proxy"/>
          <div>
           <div class="font-medium text-sm">Cookie 直连反代</div>
-          <div class="text-xs text-neutral-500 mt-0.5">用控制台 Cookie 调 batchGraphql</div>
+          <div class="text-xs text-neutral-500 mt-0.5">仅使用启用的 Cookie 账号，可单个或多个</div>
          </div>
         </label>
+        <label class="channel-option" id="opt-mixed">
+         <input class="mt-1" name="mode" onchange="updateMode('mixed')" type="radio" value="mixed"/>
+         <div><div class="font-medium text-sm">Key + Cookie 混合</div><div class="text-xs text-neutral-500 mt-0.5">两类账号同时启用，共同参与调度</div></div>
+        </label>
        </div>
+       <div class="credential-strategy"><label for="credential-strategy">账号调度</label><select id="credential-strategy" class="inp" onchange="updateCredentialStrategy(this)"><option value="random">随机使用</option><option value="roundrobin">按顺序轮询</option></select><span>仅调度已启用的账号；混合模式下每次请求选择一个身份。</span></div>
       </fieldset>
       <!-- Express API Key 列表（多账号，热编辑） -->
       <fieldset class="card settings-card channel-wide">
@@ -269,7 +275,7 @@
           Express API Key 列表
           <button aria-controls="h_keys" aria-expanded="false" aria-label="展开说明" class="helpq" onclick="hlp(this,'h_keys')" type="button">?</button>
          </div>
-         <div class="text-xs text-neutral-500 mt-0.5">多个谷歌账号的 Key 可一起放这里，按「多 Key 轮询」开关随机或轮询使用</div>
+         <div class="text-xs text-neutral-500 mt-0.5">多个 Key 可同时启用，每个 Key 可设置自己的项目、代理列表与回退策略</div>
         </div>
         <div class="toolbar-actions">
          <span class="pill" id="keys-count" style="text-transform:none">0 个</span>
@@ -315,7 +321,7 @@
         </code>
         ，后台自动探测不会覆盖手填值；手动点击探测会重新识别已保存的项目）。
         <br/>
-        探测失败不影响调用：拿不到项目就退回全局 Project ID，再退回裸模型名（旧行为）。
+        探测失败不影响调用：无可用项目时使用裸模型名，由后端解析；混合模式不会借用 Cookie 账号的项目。
         <br/>
         <b>
          环境变量
@@ -343,157 +349,22 @@
        <p class="empty-state hidden" id="keys-empty">当前没有任何 Express Key。点「＋ 添加 Key」粘贴一个，再点「保存 Key 列表」。</p>
       </fieldset>
       <fieldset class="card settings-card channel-wide" id="cookie-box">
-       <legend class="visually-hidden">上游调用通道</legend>
-       <label class="lbl mb-2" for="cookie-input">Google Cookie（含 HttpOnly 字段）</label>
-       <textarea class="inp log mb-3" id="cookie-input" placeholder="粘贴 console.cloud.google.com 的完整 Cookie（支持 Cookie-Editor 导出的 JSON / Header String，自动解析）" rows="3"></textarea>
-       <label class="lbl mb-2" for="project-input">Google Cloud Project ID</label>
-       <input class="inp mb-3" id="project-input" placeholder="可直接粘贴含 ?project=xxx 的整条 URL，自动提取"/>
-       <div class="flex items-center justify-between">
-        <span class="text-xs text-neutral-500">保存后自动校验是否包含 SAPISID</span>
-        <button class="btn px-4 py-2 text-sm" onclick="runAction(this,()=&gt;saveCookie())">保存 Cookie</button>
+       <legend class="visually-hidden">Cookie 账号列表</legend>
+       <div class="card-toolbar"><div><div class="text-sm font-semibold">Cookie 账号列表</div><div class="text-xs text-neutral-500 mt-0.5">每个账号独立绑定 Cookie、Project ID 和代理；已保存的 Cookie 留空即可保留</div></div>
+        <div class="toolbar-actions"><span class="pill" id="cookies-count">0 个</span><button type="button" onclick="addCookieAccount()">＋ 添加 Cookie</button><button type="button" class="btn px-4 py-1.5 text-sm" onclick="runAction(this,()=>saveCookieAccounts())">保存 Cookie 列表</button></div>
        </div>
-       <p class="text-xs text-neutral-500 mt-3 leading-relaxed">💡 Cookie 通常较为持久（可维持数周甚至更久，取决于账号会话是否有效）；仅当出现 Permission Denied 等权限错误时再重新获取粘贴即可，并非只有 1–2 小时。</p>
+       <div id="cookies-list"></div>
+       <p class="empty-state hidden" id="cookies-empty">尚未配置 Cookie 账号。添加一个或多个账号，并填写各自的 Project ID。</p>
+       <p class="text-xs text-neutral-500 mt-3 leading-relaxed">支持粘贴完整 Cookie 头或 Cookie-Editor JSON；Project ID 可直接粘贴含项目参数的控制台 URL。Cookie 不在面板中明文回显。</p>
       </fieldset>
-      <!-- 网络出口：出站代理（热改 + 连通性测试） -->
       <fieldset class="card settings-card channel-wide">
-       <legend class="visually-hidden">出站代理（网络出口）</legend>
-       <div class="card-toolbar">
-        <div>
-         <div class="text-sm font-semibold">
-          出站代理（网络出口）
-          <button aria-controls="h_proxy" aria-expanded="false" aria-label="展开说明" class="helpq" onclick="hlp(this,'h_proxy')" type="button">?</button>
-         </div>
-         <div class="text-xs text-neutral-500 mt-0.5">访问 Google 上游的出口；Express / Cookie 两条通道共用。保存后热生效，无需重启</div>
-        </div>
-        <div class="toolbar-actions">
-         <span class="pill" id="proxy-status" style="text-transform:none;background:#f5f5f5;color:#737373">未启用（直连）</span>
-         <button class="px-3 py-1.5 text-sm rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="runAction(this,()=&gt;testProxy())">测试连通性</button>
-         <button class="btn px-4 py-1.5 text-sm" onclick="runAction(this,()=&gt;saveProxy())">保存代理</button>
-        </div>
+       <legend class="visually-hidden">全局代理列表</legend>
+       <div class="card-toolbar"><div><div class="text-sm font-semibold">全局代理列表 <button aria-controls="h_proxy" aria-expanded="false" aria-label="展开说明" class="helpq" onclick="hlp(this,'h_proxy')" type="button">?</button></div><div class="text-xs text-neutral-500 mt-0.5">从第一条开始使用，失败后依次切换。账号专属代理优先于此列表</div></div>
+        <div class="toolbar-actions"><span class="pill" id="proxy-status">未启用（直连）</span><button type="button" onclick="openProxyEditor('global')">管理 / 添加代理</button><button type="button" onclick="runAction(this,()=>testProxy())">测试首条</button><button type="button" class="btn px-4 py-1.5 text-sm" onclick="runAction(this,()=>saveProxy())">保存代理</button></div>
        </div>
-       <div class="helpbox" id="h_proxy">
-        <b>
-         格式
-        </b>
-        ：
-        <code>
-         协议://用户名:密码@IP:端口
-        </code>
-        或直接粘贴分享链接。支持：
-        <br/>
-        ·
-        <b>
-         原生协议
-        </b>
-        ：
-        <code>
-         http://
-        </code>
-        /
-        <code>
-         https://
-        </code>
-        /
-        <code>
-         socks5://
-        </code>
-        /
-        <code>
-         socks5h://
-        </code>
-        <br/>
-        ·
-        <b>
-         多协议（内置 sing-box 转换）
-        </b>
-        ：
-        <code>
-         vless://
-        </code>
-        /
-        <code>
-         vmess://
-        </code>
-        /
-        <code>
-         trojan://
-        </code>
-        /
-        <code>
-         ss://
-        </code>
-        /
-        <code>
-         socks4://
-        </code>
-        /
-        <code>
-         hysteria2://
-        </code>
-        /
-        <code>
-         tuic://
-        </code>
-        —— 直接把机场/自建的分享链接粘进来即可，首个请求时自动转成本地 socks5
-        <br/>
-        代理商给的
-        <code>
-         socks5://IP:端口:用户名:密码
-        </code>
-        是展示格式，要转成标准格式：
-        <b>
-         用户名密码放到 @ 前面
-        </b>
-        ，例：
-        <code>
-         socks5://user:pass@1.2.3.4:1080
-        </code>
-        。
-        <br/>
-        <b>
-         Key 级代理
-        </b>
-        ：每个 Express Key 可在凭证列表里单独设置出口（优先于这里的全局代理；填
-        <code>
-         direct
-        </code>
-        = 该 Key 强制直连）。
-        <br/>
-        <b>
-         热生效
-        </b>
-        ：保存即写入
-        <code>
-         web_state.json
-        </code>
-        并立即作用于全部出站请求（模型调用 / Cookie 通道 / Key 探测 / 模型列表刷新）；环境变量
-        <code>
-         PROXY_URL
-        </code>
-        只作为首次启动的初始值，控制台保存后以控制台为准。
-        <br/>
-        <b>
-         清空 = 直连
-        </b>
-        ：删光输入框内容并保存，即恢复直连。
-        <br/>
-        <b>
-         先测后存
-        </b>
-        ：「测试连通性」按输入框
-        <b>
-         当前
-        </b>
-        的值测试（还没保存也能测，vless 等协议同样支持），通过代理请求一次 Google 端点并汇报延迟；任何 HTTP 状态码都算链路可达。
-        <br/>
-        <b>
-         云部署提示
-        </b>
-        ：Render / HuggingFace 等海外平台本就能直连 Google，通常无需配置；代理不稳定反而会拖垮服务，配置前请先用测试按钮确认代理质量。
-       </div>
-       <input aria-label="全局出站代理" class="inp log" id="proxy-input" placeholder="留空 = 直连。示例：socks5://user:pass@1.2.3.4:1080 / http://1.2.3.4:8080，或直接粘贴 vless:// vmess:// trojan:// ss:// 分享链接"/>
-       <div class="text-xs mt-2 hidden leading-relaxed" id="proxy-test-result">
-       </div>
+       <div class="helpbox" id="h_proxy">每行一条，或用「管理 / 添加代理」填写类型、IP、端口、账号、密码，也可粘贴后自动识别。支持 HTTP / HTTPS / SOCKS5 / SOCKS5H，以及由 sing-box 转换的 SOCKS4、VLESS、VMess、Trojan、SS、Hysteria2、TUIC。<br>连接异常、代理超时或 HTTP 407 / 502 / 503 / 504 时尝试下一条；账号鉴权、配额与参数错误沿用模型重试策略。<br>账号专属代理全部失败后，默认继续尝试全局列表；可在每个账号下取消此回退。清空全局列表并保存即可直连；已配置代理全部失败时，不会额外增加直连出口。账号填写 <code>direct</code> 可强制直连。</div>
+       <textarea aria-label="全局出站代理" class="inp log" id="proxy-input" rows="3" spellcheck="false" autocomplete="off" placeholder="每行一条，第一条为首选；留空 = 直连。点击「管理 / 添加代理」填写或识别代理"></textarea>
+       <div class="text-xs mt-2 hidden leading-relaxed" id="proxy-test-result"></div>
       </fieldset>
       <!-- Cookie 通道 TLS/浏览器指纹伪装（curl_cffi，热开关） -->
       <fieldset class="card settings-card">
@@ -1376,9 +1247,9 @@
           <input aria-label="resumable_max_streams" class="inp" id="resumable_max_streams" step="10" style="width:90px" type="number"/>
          </div>
          <div class="flex items-center justify-between">
-          <span class="text-sm">多 Key 轮询（round-robin）</span>
+          <span class="text-sm">账号轮询（Key / Cookie）（round-robin）</span>
           <label class="switch">
-           <input aria-label="多 Key 轮询（round-robin）" id="roundrobin" type="checkbox"/>
+           <input aria-label="账号轮询（Key / Cookie）（round-robin）" id="roundrobin" type="checkbox"/>
            <span class="slider">
            </span>
           </label>
@@ -1702,6 +1573,24 @@
   </div>
   <div aria-live="polite" class="toast" id="toast" role="status">
   </div>
+  <dialog id="proxy-dialog" aria-labelledby="proxy-dialog-title" aria-describedby="proxy-dialog-hint">
+   <div class="proxy-dialog-head"><div><h2 id="proxy-dialog-title">代理列表</h2><p id="proxy-dialog-hint"></p></div><button type="button" class="btn-ghost" id="proxy-dialog-close" aria-label="关闭代理编辑器">关闭</button></div>
+   <div class="proxy-dialog-body">
+    <fieldset class="proxy-list-panel"><legend class="visually-hidden">按优先级排序的代理列表</legend><div class="field-heading"><strong>出口优先级</strong><span class="pill" id="proxy-editor-count">0 / 32 条</span></div><div id="proxy-editor-list"></div></fieldset>
+    <fieldset class="proxy-form-panel"><legend class="visually-hidden">代理填写与识别</legend>
+     <label class="lbl" for="proxy-paste">粘贴代理 · 自动识别</label><textarea id="proxy-paste" class="inp log" rows="3" spellcheck="false" autocomplete="off" placeholder="粘贴一条自动填入字段，粘贴多条可批量导入"></textarea>
+     <p class="proxy-form-hint" id="proxy-paste-hint"></p><button type="button" class="btn-ghost proxy-recognize" onclick="runAction(this,()=>recognizeProxyPaste())">识别粘贴内容</button>
+     <label class="lbl" for="proxy-type">代理类型</label><select class="inp" id="proxy-type" onchange="proxyTypeChanged()"><option value="socks5">SOCKS5</option><option value="socks5h">SOCKS5H（远程 DNS）</option><option value="http">HTTP</option><option value="https">HTTPS</option><option value="socks4">SOCKS4</option><option value="socks4a">SOCKS4A</option><option value="share">其他协议分享链接</option><option value="direct">强制直连</option></select>
+     <div id="proxy-structured-fields" class="proxy-form-grid">
+      <div><label class="lbl" for="proxy-host">IP / 主机名</label><input class="inp log" id="proxy-host" spellcheck="false" placeholder="127.0.0.1 或 proxy.example.com" autocomplete="off"/></div><div><label class="lbl" for="proxy-port">端口</label><input class="inp log" id="proxy-port" inputmode="numeric" placeholder="1080" autocomplete="off"/></div>
+      <div><label class="lbl" for="proxy-username">账号（可选）</label><input class="inp log" id="proxy-username" spellcheck="false" autocomplete="off"/></div><div><label class="lbl" for="proxy-password">密码（可选）</label><input class="inp log" id="proxy-password" type="password" autocomplete="new-password"/></div>
+     </div>
+     <div class="proxy-form-actions"><button type="button" class="btn-ghost" onclick="resetProxyForm();renderProxyEditor()">清空表单</button><button type="button" class="btn" id="proxy-form-add" onclick="runAction(this,()=>addProxyDraft())">加入列表</button></div>
+    </fieldset>
+   </div>
+   <div class="proxy-editor-error" id="proxy-editor-error" role="alert"></div>
+   <div class="proxy-dialog-foot"><span>排序、删除和编辑仅修改当前草稿</span><div><button type="button" class="btn-ghost" id="proxy-dialog-cancel">取消</button><button type="button" class="btn" id="proxy-dialog-apply" onclick="runAction(this,()=>applyProxyEditor())">应用到配置</button></div></div>
+  </dialog>
   <dialog aria-describedby="request-detail-id" aria-labelledby="request-detail-title" id="request-dialog">
    <div class="request-detail-head">
     <div>

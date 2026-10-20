@@ -8,8 +8,10 @@ from pydantic import BaseModel
 
 from console_auth import require_auth
 import config
-from runtime_state import app_state, get_effective_proxy_url, mask_proxy_url
+from runtime_state import app_state, get_effective_proxy_url, get_effective_proxy_urls, mask_proxy_url
 from proxy_resolver import classify_proxy_uri, validate_proxy_uri
+from proxy_config import FORM_PROXY_SCHEMES, ProxyFormatError, build_proxy_uri, parse_proxy_list, proxy_fields
+from proxy_failover import PROXY_FAILURE_STATUSES
 
 
 router = APIRouter()
@@ -24,15 +26,19 @@ def _healthz_payload() -> dict:
     return {
         "status": "ok",
         "service": "agentplatform2api",
-        "mode": "cookie" if app_state.is_web_proxy_enabled() else "express",
+        "mode": "mixed" if app_state.get_channel_mode() == "mixed" else
+                "cookie" if app_state.is_web_proxy_enabled() else "express",
         "express_keys": {
             "total": len(express_keys),
             "enabled": sum(1 for r in express_keys if r.get("enabled", True)),
         },
         "cookie_configured": cookie_configured,
+        "cookie_accounts": {"total": len(app_state.get_cookie_accounts()),
+                            "enabled": sum(r["enabled"] for r in app_state.get_cookie_accounts())},
         "proxy": {
             "enabled": classify_proxy_uri(proxy_url) != "direct",
             "url": mask_proxy_url(proxy_url),  # 脱敏：绝不回传认证凭据
+            "urls": [mask_proxy_url(uri) for uri in get_effective_proxy_urls()],
         },
         "time": int(time.time()),
     }
@@ -52,6 +58,32 @@ async def healthz_head():
 
 class ProxyTestBody(BaseModel):
     proxy_url: str = ""
+
+
+class ProxyParseBody(BaseModel):
+    text: str = ""
+    type: str = "socks5"
+    host: str = ""
+    port: str | int = ""
+    username: str = ""
+    password: str = ""
+
+
+@router.post("/api/proxy/parse")
+async def parse_proxy(body: ProxyParseBody, _auth: bool = Depends(require_auth)):
+    try:
+        value = body.text.strip() or build_proxy_uri(body.type, body.host, body.port, body.username, body.password)
+        proxies = parse_proxy_list(value, default_scheme=body.type if body.type in FORM_PROXY_SCHEMES else "socks5")
+        if not proxies or len(proxies) > 32:
+            raise ProxyFormatError("请填写 1–32 条代理。")
+        for index, uri in enumerate(proxies):
+            error = validate_proxy_uri(uri)
+            if error:
+                raise ProxyFormatError(f"第 {index + 1} 条代理：{error}")
+        return JSONResponse(content={"proxies": [proxy_fields(uri) for uri in proxies]},
+                            headers={"Cache-Control": "no-store"})
+    except ProxyFormatError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
 
 
 @router.post("/api/proxy/test")
@@ -120,17 +152,23 @@ async def test_proxy(body: ProxyTestBody, _auth: bool = Depends(require_auth)):
 
             resp = await client.get(PROXY_TEST_TARGET, headers=build_direct_headers())
         latency_ms = int((time.monotonic() - started) * 1000)
-        # 任何 HTTP 状态码（包括 404/403）都证明「TCP+TLS+HTTP」整条链路通，
-        # 即代理本身可用；只有连接异常（超时/拒绝/DNS 失败）才算连通失败。
+        # 403/404 等目标站响应证明链路可达；407 与网关错误则与实际
+        # 请求的代理切换规则一致，不能向用户显示为可用出口。
+        ok = resp.status_code not in PROXY_FAILURE_STATUSES
+        if resp.status_code == 407:
+            message = "代理认证失败（HTTP 407），请检查代理账号和密码"
+        elif not ok:
+            message = f"代理或上游网关返回 HTTP {resp.status_code}，请稍后重测或更换出口"
+        else:
+            message = ("代理连通成功" if via_proxy else "直连 Google 成功") + f"，目标站返回 HTTP {resp.status_code}"
         return JSONResponse(
             content={
-                "ok": True,
+                "ok": ok,
                 "via_proxy": via_proxy,
                 "proxy": mask_proxy_url(target) if via_proxy else "（直连）",
                 "status_code": resp.status_code,
                 "latency_ms": latency_ms,
-                "message": ("代理连通成功" if via_proxy else "直连 Google 成功")
-                + f"，上游返回 HTTP {resp.status_code}（任意状态码都代表链路可达）",
+                "message": message,
             }
         )
     except Exception as e:

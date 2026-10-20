@@ -30,7 +30,7 @@ function loadNotice(section,message){
 async function responseError(response,fallback='保存失败',result=null){
   if(response.status===401) return '登录已过期，请重新登录';
   const data=result || await response.json().catch(()=>({}));
-  const aliases={proxy_url:'proxy-input',express_ua_custom:'express-ua-custom',express_ua_profile:'express-ua-profile',cookie_impersonate:'cookie-impersonate'};
+  const aliases={proxy_url:'proxy-input',proxy_urls:'proxy-input',express_ua_custom:'express-ua-custom',express_ua_profile:'express-ua-profile',cookie_impersonate:'cookie-impersonate'};
   const field=$(aliases[data.field]||data.field);
   if(field){
     field.setAttribute('aria-invalid','true');
@@ -123,14 +123,17 @@ function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,
 
 /* ---------- Channel ---------- */
 let currentMode='api_key';
+function renderMode(mode){
+  $('cookie-box').classList.toggle('hidden',mode==='api_key');
+  $('mode-pill').textContent=({api_key:'通道 Express API',web_proxy:'通道 Cookie 直连',mixed:'通道 Key + Cookie 混合'})[mode];
+}
 async function updateMode(m){
   if(!runtimeLoaded){document.querySelectorAll('input[name=mode]').forEach(r=>r.checked=false);toast('通道状态尚未加载，请先重新加载配置');return;}
   const pill=$('mode-pill'), prev=pill.textContent, previousMode=currentMode;
   const radios=document.querySelectorAll('input[name=mode]');
   radios.forEach(r=>r.disabled=true);
   // 先乐观切显示，请求失败则弹提示并回滚（旧版无错误处理，后端 500 时 UI 与实际状态脱节）
-  $('cookie-box').classList.toggle('hidden', m!=='web_proxy');
-  pill.textContent = m==='web_proxy' ? '通道 Cookie 直连' : '通道 Express API';
+  renderMode(m);
   try{
     const r=await fetch('/api/settings/mode',{signal:AbortSignal.timeout(30000),method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:m})});
     if(!r.ok){ throw new Error('HTTP '+r.status); }
@@ -138,44 +141,18 @@ async function updateMode(m){
   }catch(e){
     pill.textContent=prev;
     document.querySelector(`input[name=mode][value=${previousMode}]`).checked=true;
-    $('cookie-box').classList.toggle('hidden', previousMode!=='web_proxy');
+    renderMode(previousMode);
     toast('❌ 通道切换失败，已回滚：'+e.message);
   }finally{radios.forEach(r=>r.disabled=false);}
-}
-function parseCookies(str){
-  str=(str||'').trim();
-  if(str.startsWith('[')&&str.endsWith(']')){ try{ const a=JSON.parse(str); if(Array.isArray(a)) return a.map(c=>{const n=c.name||c.key,v=c.value; return (n&&v)?`${n}=${v}`:'';}).filter(Boolean).join('; ');}catch(e){} }
-  return str;
-}
-async function saveCookie(){
-  let ck=parseCookies($('cookie-input').value); let pid=$('project-input').value.trim();
-  const m=pid.match(/[?&]project=([^&]+)/)||pid.match(/\/projects\/([^\/]+)/); if(m) pid=m[1];
-  $('cookie-input').value=ck; $('project-input').value=pid;
-  if(!pid){ toast('请填写 Project ID'); return; }
-  try{
-    const r=await fetch('/api/cookie',{signal:AbortSignal.timeout(30000),method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cookie:ck,project_id:pid})});
-    const d=await r.json(); toast(r.ok?(d.message||'Cookie 已保存'):('❌ '+(d.error||'保存失败')));
-  }catch(e){ toast('❌ 网络请求失败'); }
 }
 async function loadRuntime(){
   try{
     const s=await readJSON('/api/settings/runtime');
-    const m=s.use_web_proxy?'web_proxy':'api_key';
+    const m=s.mode||(s.use_web_proxy?'web_proxy':'api_key');
     currentMode=m;
     runtimeLoaded=true;
     document.querySelector(`input[name=mode][value=${m}]`).checked=true;
-    $('mode-pill').textContent = m==='web_proxy' ? '通道 Cookie 直连' : '通道 Express API';
-    $('cookie-box').classList.toggle('hidden', m!=='web_proxy');
-    /* S-1：后端只返回掩码，绝不回填到输入框（否则保存时会把真实 Cookie 覆盖成掩码）。
-       输入框留空 = 保持现有 Cookie；填了才更新。 */
-    const ci=$('cookie-input');
-    if(ci){
-      ci.value='';
-      ci.placeholder = s.google_cookie_configured
-        ? ('已配置：'+s.google_cookie+'　（留空则保持不变，需更新时粘贴新 Cookie）')
-        : '粘贴完整 Cookie 头或 Cookie-Editor 导出内容';
-    }
-    if(s.google_project_id) $('project-input').value=s.google_project_id;
+    renderMode(m);
   }catch(e){loadNotice('channel','通道状态'+e.message+'。可重新加载配置。');}
 }
 
@@ -187,12 +164,12 @@ function keySrcPill(rec){
   return '<span class="pill" style="text-transform:none;color:#b45309">未探测</span>';
 }
 function keyProxyPill(rec){
-  const v=(rec.proxy||'').trim().toLowerCase();
+  const proxies=proxyDraft(rec.proxies??rec.proxy), v=(proxies[0]||'').trim().toLowerCase();
   if(!v) return '';
   if(v==='direct'||v==='none'||v==='直连') return '<span class="pill" style="text-transform:none;background:#f5f5f5;color:#737373">强制直连</span>';
-  const proto=(rec.proxy||'').split(':')[0]||'proxy';
+  const proto=(proxies[0]||'').split(':')[0]||'proxy';
   const native=['http','https','socks5','socks5h'].includes(proto)?'#047857':'#1d4ed8';
-  return `<span class="pill" style="text-transform:none;color:${native}">专属代理 ${esc(proto+'://')}</span>`;
+  return `<span class="pill" style="text-transform:none;color:${native}">专属代理 ${proxies.length} 条</span>`;
 }
 function renderKeys(){
   const box=$('keys-list');
@@ -208,8 +185,8 @@ function renderKeys(){
       </div>
       <div class="key-fields">
         <div><label for="key-${i}">Express API Key</label><input id="key-${i}" class="inp log k-key" placeholder="粘贴 Express API Key" spellcheck="false" autocomplete="off" value="${esc(rec.key)}"></div>
-        <div><label for="project-${i}">Project ID</label><input id="project-${i}" class="inp log k-project" placeholder="留空 = 等待自动探测" spellcheck="false" value="${esc(rec.project_id)}"></div>
-        <div><label for="proxy-${i}">专属代理</label><input id="proxy-${i}" class="inp log k-proxy" placeholder="留空跟随全局；direct 强制直连" spellcheck="false" value="${esc(rec.proxy)}"></div>
+        <div><label for="project-${i}">Project ID</label><input id="project-${i}" class="inp log k-project" placeholder="留空 = 等待自动探测" spellcheck="false" value="${esc(rec.project_id)}"><label class="note-label" for="key-note-${i}">备注</label><input id="key-note-${i}" class="inp k-note" placeholder="便于区分账号" value="${esc(rec.note)}"></div>
+        ${accountProxyFields('key',i,rec)}
       </div>
       ${rec.detected_at?`<div class="key-meta">上次探测：${esc(new Date(rec.detected_at*1000).toLocaleString('zh-CN',{hour12:false}))}</div>`:''}
       ${rec._msg?`<div class="key-meta ${rec._msg_ok===false?'error-message':''}" role="status">${esc(rec._msg)}</div>`:''}
@@ -223,21 +200,23 @@ function collectKeys(){
     const i=Number(row.dataset.i);
     if(!KEYS[i]) return;
     KEYS[i].key = row.querySelector('.k-key').value.trim();
-    const pid = row.querySelector('.k-project').value.trim();
+    const pid = projectFromInput(row.querySelector('.k-project').value);
     if(pid !== (KEYS[i].project_id||'')){ KEYS[i].project_id = pid; KEYS[i].project_source = pid?'manual':''; }
     const kProxy = row.querySelector('.k-proxy');
-    if(kProxy) KEYS[i].proxy = kProxy.value.trim();
+    if(kProxy){ KEYS[i].proxies=proxyDraft(kProxy.value); KEYS[i].proxy=KEYS[i].proxies[0]||''; }
+    KEYS[i].proxy_fallback=row.querySelector('.k-fallback').checked;
+    KEYS[i].note=row.querySelector('.k-note').value.trim();
     KEYS[i].enabled = row.querySelector('.k-enabled').checked;
   });
   return KEYS.filter(r=>r.key);
 }
-function addKeyRow(){ if(!keysLoaded){toast('凭证列表尚未加载，请先重新加载配置');return;} collectKeys(); KEYS.push({key:'',project_id:'',project_source:'',proxy:'',enabled:true}); renderKeys(); $('key-'+(KEYS.length-1)).focus(); }
+function addKeyRow(){ if(!keysLoaded){toast('凭证列表尚未加载，请先重新加载配置');return;} collectKeys(); KEYS.push({key:'',project_id:'',project_source:'',proxy:'',proxies:[],proxy_fallback:true,enabled:true}); renderKeys(); $('key-'+(KEYS.length-1)).focus(); }
 function removeKeyRow(i){ collectKeys(); KEYS.splice(i,1); renderKeys(); }
 async function loadExpressKeys(){
   try{
     const d=await readJSON('/api/express-keys');
-    KEYS=(d.keys||[]).map(r=>Object.assign({},r));
-    SAVED_KEYS=KEYS.map(r=>({...r}));
+    KEYS=(d.keys||[]).map(credentialCopy);
+    SAVED_KEYS=KEYS.map(credentialCopy);
     keysLoaded=true;
     renderKeys();
   }catch(e){loadNotice('channel','凭证列表'+e.message+'。重新加载成功后再保存 Key。');}
@@ -249,7 +228,7 @@ async function saveExpressKeys(){
   try{
     const r=await fetch('/api/express-keys',{signal:AbortSignal.timeout(30000),method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keys:payload})});
     const d=await r.json();
-    if(r.ok){ KEYS=(d.keys||[]).map(x=>Object.assign({},x)); SAVED_KEYS=KEYS.map(r=>({...r})); renderKeys(); toast('已保存 '+KEYS.length+' 个 Key（已热生效）'); }
+    if(r.ok){ KEYS=(d.keys||[]).map(credentialCopy); SAVED_KEYS=KEYS.map(credentialCopy); renderKeys(); toast('已保存 '+KEYS.length+' 个 Key（已热生效）'); }
     else toast('❌ '+(d.error||'保存失败'));
   }catch(e){ toast('❌ 网络请求失败'); }
 }
@@ -297,23 +276,23 @@ function mergeProbeResults(results,saved){
       hit._msg=res.message||'';hit._msg_ok=!!res.ok;
     });
   });
-  SAVED_KEYS=saved.map(r=>({...r}));
+  SAVED_KEYS=saved.map(credentialCopy);
   renderKeys();
 }
 
 /* ---------- 出站代理（网络出口） ---------- */
 function updateProxyPill(on){
   const p=$('proxy-status'); if(!p) return;
-  p.textContent = on ? '已启用' : '未启用（直连）';
+  p.textContent = on ? (typeof on==='number'?'已配置 '+on+' 条':'已启用') : '未启用（直连）';
   p.style.background = on ? '#ecfdf5' : '#f5f5f5';
   p.style.color = on ? '#047857' : '#737373';
 }
 async function saveProxy(){
   if(!settingsLoaded){toast('设置尚未加载，请先在模型参数页重新加载配置');return;}
-  const v=$('proxy-input').value.trim();
+  const proxies=proxyDraft($('proxy-input').value);
   try{
-    const r=await fetch('/api/settings',{signal:AbortSignal.timeout(30000),method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxy_url:v})});
-    if(r.ok){ updateProxyPill(!!v); toast(v?'✅ 代理已保存并热生效（无需重启）':'已清空代理，恢复直连'); }
+    const r=await fetch('/api/settings',{signal:AbortSignal.timeout(30000),method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxy_urls:proxies})});
+    if(r.ok){ const saved=await r.json(); GLOBAL_SETTINGS.proxy_urls=saved.proxy_urls;GLOBAL_SETTINGS.proxy_url=saved.proxy_url;$('proxy-input').value=saved.proxy_urls.join('\n');updateProxyPill(saved.proxy_urls.length); toast(proxies.length?'✅ 已保存 '+saved.proxy_urls.length+' 条代理（按顺序故障切换）':'已清空代理，恢复直连'); }
     else{
       let msg='保存失败';
       try{ const d=await r.json(); if(d && d.error) msg=d.error; }catch(_){}
@@ -322,7 +301,7 @@ async function saveProxy(){
   }catch(e){ toast('❌ 网络请求失败'); }
 }
 async function testProxy(){
-  const v=$('proxy-input').value.trim();
+  const v=proxyDraft($('proxy-input').value)[0]||'direct';
   const box=$('proxy-test-result'); box.classList.remove('hidden');
   box.innerHTML='<span class="text-neutral-500">🛰️ 正在测试（最长 8 秒）…</span>';
   try{
@@ -406,9 +385,10 @@ async function loadParams(){
     curAR = s.image_aspect_ratio || "";
     ['resumable_disconnect_grace_seconds','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','retry_jitter_seconds','fake_streaming_interval','prefill_mode','express_location','resumable_ttl_seconds','resumable_max_streams','request_timeout_seconds','upstream_max_concurrency','resumable_max_buffer_mb','resumable_max_total_mb'].forEach(k=>setV(k,s[k]));
     ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','resumable_enabled'].forEach(k=>setV(k,s[k]));
+    setV('credential-strategy',s.roundrobin?'roundrobin':'random');
     // 出站代理：回填输入框并刷新状态徽标
-    setV('proxy-input', s.proxy_url || '');
-    updateProxyPill(!!(s.proxy_url||'').trim());
+    setV('proxy-input', proxyDraft(s.proxy_urls??s.proxy_url).join('\n'));
+    updateProxyPill(proxyDraft(s.proxy_urls??s.proxy_url).length);
     // Cookie 通道指纹伪装：回填下拉框并刷新徽标
     setV('cookie-impersonate', s.cookie_impersonate || 'chrome');
     updateFpPill(s.cookie_impersonate || 'chrome');
@@ -718,23 +698,23 @@ try{
 }catch(error){$('log-state').textContent='无法建立日志连接';$('log-connection').className='status-dot error';}
 
 /* ---------- Project ID auto-extract ---------- */
-$('project-input').addEventListener('input',e=>{ const v=e.target.value.trim(); const m=v.match(/[?&]project=([^&]+)/)||v.match(/\/projects\/([^\/]+)/); if(m) e.target.value=m[1]; });
 $('image_aspect_ratio').addEventListener('change', e=>{ curAR=e.target.value; });
 
 /* init */
 navigateHash();
-fetchStats(); setInterval(()=>{ if(!document.hidden) fetchStats(); },3000); loadRuntime(); loadParams(); loadExpressKeys();
+initProxyEditor();
+fetchStats(); setInterval(()=>{ if(!document.hidden) fetchStats(); },3000); loadRuntime(); loadParams(); loadExpressKeys(); loadCookieAccounts();
 
 async function runAction(button,action){
   if(button.matches(':disabled')) return;
-  const groups=button.closest('.inline-notice')?[...button.closest('.view').querySelectorAll('fieldset')]:[button.closest('fieldset')].filter(Boolean);
+  const groups=button.closest('dialog')?[...button.closest('dialog').querySelectorAll('fieldset')]:button.closest('.inline-notice')?[...button.closest('.view').querySelectorAll('fieldset')]:[button.closest('fieldset')].filter(Boolean);
   if(groups.some(group=>group.disabled)){toast('该分区正在处理，请稍后再试');return;}
   const label=button.textContent;
   button.disabled=true;button.setAttribute('aria-busy','true');button.textContent='处理中…';
   const disabled=groups.map(group=>group.disabled);
   groups.forEach(group=>{group.disabled=true;group.setAttribute('aria-busy','true');});
   try{await action();}
-  finally{button.disabled=false;button.removeAttribute('aria-busy');button.textContent=label;groups.forEach((group,i)=>{group.disabled=disabled[i];group.removeAttribute('aria-busy');});}
+  finally{button.disabled=false;button.removeAttribute('aria-busy');if(button.textContent==='处理中…') button.textContent=label;groups.forEach((group,i)=>{group.disabled=disabled[i];group.removeAttribute('aria-busy');});}
 }
 document.addEventListener('input',event=>{
   event.target.removeAttribute('aria-invalid');

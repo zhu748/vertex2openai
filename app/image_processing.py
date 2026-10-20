@@ -6,7 +6,7 @@ from typing import Optional, Tuple
 
 import config as app_config
 import httpx
-from runtime_state import app_state, get_effective_proxy_url
+from runtime_state import app_state, get_effective_proxy_url, get_effective_proxy_urls
 
 try:
     from PIL import Image
@@ -141,69 +141,73 @@ def fetch_remote_image(url: str, timeout: float = 10.0) -> Optional[Tuple[bytes,
     Runs in a worker thread. Every redirect is validated, including when using
     a proxy; proxy conversion failure never causes an unexpected direct fetch.
     """
+    from proxy_failover import ProxyChain
+    from proxy_resolver import current_proxy_usage
+
+    usage = current_proxy_usage.get()
+    chain = getattr(usage, "route", None) if usage else None
+    if chain is None:
+        candidates = get_effective_proxy_urls() or [get_effective_proxy_url()]
+        chain = ProxyChain(candidates=candidates)
+    try:
+        return chain.run_sync(lambda raw, resolved: _fetch_remote_image_once(url, timeout, resolved))
+    except Exception as exc:
+        print(f"⚠️ [图片处理] 获取远程图片失败，已跳过：{url[:120]}，原因：{type(exc).__name__}")
+        return None
+
+
+def _fetch_remote_image_once(url, timeout, proxy_url):
     from urllib.parse import urlparse
 
-    from proxy_resolver import resolve_proxy_uri
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"不支持的 URL 协议：{parsed.scheme or '(空)'}")
+    if _is_blocked_host(parsed.hostname or ""):
+        raise ValueError("目标地址指向内网/环回/链路本地，已拒绝")
 
-    raw_proxy = get_effective_proxy_url()
-    try:
-        proxy_url = resolve_proxy_uri(raw_proxy)
-    except Exception as exc:
-        print(f"⚠️ [图片处理] 出站代理不可用，未抓取远程图片：{type(exc).__name__}")
-        return None
-    try:
-        parsed = urlparse(url)
-        if parsed.scheme not in ("http", "https"):
-            raise ValueError(f"不支持的 URL 协议：{parsed.scheme or '(空)'}")
-        if _is_blocked_host(parsed.hostname or ""):
-            raise ValueError("目标地址指向内网/环回/链路本地，已拒绝")
+    client_args = {"timeout": timeout, "follow_redirects": False, "trust_env": False}
+    if proxy_url:
+        client_args["proxy"] = proxy_url
+    if getattr(app_config, "SSL_CERT_FILE", None):
+        client_args["verify"] = app_config.SSL_CERT_FILE
 
-        client_args = {"timeout": timeout, "follow_redirects": False, "trust_env": False}
-        if proxy_url:
-            client_args["proxy"] = proxy_url
-        if getattr(app_config, "SSL_CERT_FILE", None):
-            client_args["verify"] = app_config.SSL_CERT_FILE
+    with httpx.Client(**client_args) as client:
+        current = url
+        for _ in range(MAX_REMOTE_IMAGE_REDIRECTS + 1):
+            original_url = httpx.URL(current)
+            if original_url.username or original_url.password:
+                raise ValueError("图片 URL 不允许包含认证凭据")
+            # Pin the checked address for direct and proxy connections,
+            # preserving Host and TLS SNI. DNS cannot change between the
+            # safety check and the actual connection (DNS rebinding).
+            address = _public_image_addresses(original_url.host)[0]
+            pinned_url = original_url.copy_with(host=address)
+            image_headers = dict(_IMAGE_FETCH_HEADERS, Host=original_url.netloc.decode("ascii"))
+            with client.stream(
+                "GET",
+                pinned_url,
+                headers=image_headers,
+                extensions={"sni_hostname": original_url.raw_host.decode("ascii")},
+            ) as resp:
+                if resp.is_redirect:
+                    # 每跳复查，且重定向响应体无需下载。
+                    location = resp.headers.get("location", "")
+                    current = str(original_url.join(location)) if location else ""
+                    nxt = urlparse(current)
+                    if nxt.scheme not in ("http", "https"):
+                        raise ValueError(f"重定向到不支持的协议：{nxt.scheme or '(空)'}")
+                    if _is_blocked_host(nxt.hostname or ""):
+                        raise ValueError("重定向指向内网/环回/链路本地，已拒绝")
+                    continue
 
-        with httpx.Client(**client_args) as client:
-            current = url
-            for _ in range(MAX_REMOTE_IMAGE_REDIRECTS + 1):
-                original_url = httpx.URL(current)
-                if original_url.username or original_url.password:
-                    raise ValueError("图片 URL 不允许包含认证凭据")
-                # Pin the checked address for direct and proxy connections,
-                # preserving Host and TLS SNI. DNS cannot change between the
-                # safety check and the actual connection (DNS rebinding).
-                address = _public_image_addresses(original_url.host)[0]
-                pinned_url = original_url.copy_with(host=address)
-                image_headers = dict(_IMAGE_FETCH_HEADERS, Host=original_url.netloc.decode("ascii"))
-                with client.stream(
-                    "GET",
-                    pinned_url,
-                    headers=image_headers,
-                    extensions={"sni_hostname": original_url.raw_host.decode("ascii")},
-                ) as resp:
-                    if resp.is_redirect:
-                        # 每跳复查，且重定向响应体无需下载。
-                        location = resp.headers.get("location", "")
-                        current = str(original_url.join(location)) if location else ""
-                        nxt = urlparse(current)
-                        if nxt.scheme not in ("http", "https"):
-                            raise ValueError(f"重定向到不支持的协议：{nxt.scheme or '(空)'}")
-                        if _is_blocked_host(nxt.hostname or ""):
-                            raise ValueError("重定向指向内网/环回/链路本地，已拒绝")
-                        continue
-
-                    resp.raise_for_status()
-                    mime = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
-                    if mime and not mime.startswith("image/"):
-                        raise ValueError(f"响应不是图片（content-type={mime}）")
-                    data = bytearray()
-                    for chunk in resp.iter_bytes(chunk_size=64 * 1024):
-                        if len(data) + len(chunk) > MAX_REMOTE_IMAGE_BYTES:
-                            raise ValueError(f"图片超过 {MAX_REMOTE_IMAGE_BYTES // (1024 * 1024)}MB 上限")
-                        data.extend(chunk)
-                    return bytes(data), mime or "image/jpeg"
-            raise ValueError("重定向次数过多")
-    except Exception as e:
-        print(f"⚠️ [图片处理] 获取远程图片失败，已跳过：{url[:120]}，原因：{e}")
-        return None
+                resp.raise_for_status()
+                mime = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+                if mime and not mime.startswith("image/"):
+                    raise ValueError(f"响应不是图片（content-type={mime}）")
+                data = bytearray()
+                for chunk in resp.iter_bytes(chunk_size=64 * 1024):
+                    if len(data) + len(chunk) > MAX_REMOTE_IMAGE_BYTES:
+                        raise ValueError(f"图片超过 {MAX_REMOTE_IMAGE_BYTES // (1024 * 1024)}MB 上限")
+                    data.extend(chunk)
+                return bytes(data), mime or "image/jpeg"
+        raise ValueError("重定向次数过多")

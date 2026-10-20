@@ -110,7 +110,7 @@ class SDKTests(unittest.IsolatedAsyncioTestCase):
                 request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(express_key_manager=manager)),
                                           is_disconnected=mock.AsyncMock(return_value=False))
                 with mock.patch.object(express_sdk, "get_pooled_express_client", side_effect=get_client), \
-                     mock.patch.object(express_sdk, "resolve_proxy_uri_async", new=mock.AsyncMock()) as resolve, \
+                     mock.patch("proxy_failover.resolve_proxy_uri_async", new=mock.AsyncMock()) as resolve, \
                      mock.patch.object(express_sdk, "_log_resolved_endpoint"), \
                      mock.patch.object(express_sdk, "create_gemini_prompt", return_value=[]), \
                      mock.patch.object(runtime_state.app_state, "get_effective_settings", return_value=settings), \
@@ -124,7 +124,8 @@ class SDKTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(response.status_code, 200)
                 self.assertEqual([(key, proxy) for key, proxy, _ in calls],
                                  [("A", "http://proxy-a:8080"), ("B", "http://proxy-b:8080"), ("B", "http://proxy-b:8080")])
-                self.assertEqual(resolve.await_count, 2)
+                self.assertEqual({call.args[0] for call in resolve.await_args_list},
+                                 {"http://proxy-a:8080", "http://proxy-b:8080"})
 
 
 class PoolTests(unittest.IsolatedAsyncioTestCase):

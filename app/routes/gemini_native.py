@@ -58,13 +58,14 @@ from logger import stats
 from request_tracking import configure as track_configure, upstream_attempt, upstream_chunk
 from first_reply import FirstReplyGuard, native_has_reply
 from streaming import prepare_sse
-from runtime_state import app_state, get_effective_proxy_uri_for_key
+from runtime_state import app_state
 import config as app_config
 from express_endpoint import resolve_express_model_path, is_location_pin_failure
 from model_loader import get_express_models
 from express_fingerprint import build_direct_headers
 from client_pool import passthrough_client_pool
-from proxy_resolver import ProxyResolveError, resolve_proxy_uri, resolve_proxy_uri_async
+from proxy_resolver import ProxyResolveError, resolve_proxy_uri
+from proxy_failover import ProxyChain
 from streaming import sse_frames, with_heartbeats, HEARTBEAT, HEARTBEAT_FRAME
 from resumable import (resumable_store, resolve_buffer, ResumeRequestError, BufferCapacityError,
                        DetachedRequest, sse_from_buffer, within_request_deadline,
@@ -317,13 +318,13 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
             # Key 级代理：该 Key 自己的出口优先，全局兑底（vless 等分享链接
             # 在池签名里转本地 socks5）。解析失败（sing-box 缺失/链接非法）
             # 不静默直连：预算内重选 Key，耗尽后返回明确错误。
-            current_proxy_uri = get_effective_proxy_uri_for_key(record)
+            proxy_chain = ProxyChain(record)
+            def client_for(raw, resolved):
+                return passthrough_client_pool.get(lambda: _new_client(raw), raw)
             try:
                 # 预热（sing-box 首启放线程池）；随后池签名/工厂里的同步
                 # resolve 命中缓存，不卡事件循环。
-                await resolve_proxy_uri_async(current_proxy_uri)
-                client = passthrough_client_pool.get(
-                    lambda: _new_client(current_proxy_uri), current_proxy_uri)
+                await proxy_chain.prepare(client_for)
             except ProxyResolveError as e:
                 print(f"❌ [Gemini 透传] 出站代理不可用：{e}")
                 if key_attempts >= retry_max:
@@ -345,9 +346,11 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
         try:
             upstream_attempt()
             first_reply = FirstReplyGuard(model)
-            upstream = await first_reply.wait(_passthrough_once(
-                client, express_key, model_path, action, query, payload,
-                stream=is_stream))
+            async def send(raw, resolved):
+                return await _passthrough_once(
+                    client_for(raw, resolved), express_key, model_path, action, query, payload,
+                    stream=is_stream)
+            upstream = await first_reply.wait(proxy_chain.run(send))
             if not is_stream:
                 upstream_chunk()
                 if upstream.status_code < 400:
@@ -368,6 +371,11 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
         except Exception as e:
             if upstream is not None:
                 await _close_upstream(upstream)
+            # The HTTP handshake can succeed and the body then fail before
+            # prefetch has exposed any output. Try the same account's next
+            # proxy before consuming model retry budget or selecting a Key.
+            if proxy_chain.advance(e):
+                continue
             last_error_headers = {k: v for k, v in upstream.headers.items()
                                   if k.lower() == "retry-after"} if upstream is not None else {}
             if isinstance(e, NativeStreamError):
@@ -846,7 +854,7 @@ async def native_list_models(fastapi_request: Request,
                              _auth: str = Depends(get_gemini_auth)):
     """把内部模型清单映射成 Gemini 原生 models.list 响应。"""
     manager = fastapi_request.app.state.express_key_manager
-    has_any = manager.get_total_keys() > 0 or app_state.is_web_proxy_enabled()
+    has_any = manager.get_total_keys() > 0 or app_state.get_channel_mode() in ("web_proxy", "mixed")
     raw = await get_express_models() if has_any else []
 
     methods = ["generateContent", "streamGenerateContent", "countTokens"]
@@ -870,7 +878,7 @@ async def native_get_model(model_action: str, fastapi_request: Request,
     # 与 native_list_models 一致：未配置任何通道时不返回模型详情
     # （旧实现缺这个检查，无 Key 也照常返回目录条目，与列表行为矛盾）。
     manager = fastapi_request.app.state.express_key_manager
-    has_any = manager.get_total_keys() > 0 or app_state.is_web_proxy_enabled()
+    has_any = manager.get_total_keys() > 0 or app_state.get_channel_mode() in ("web_proxy", "mixed")
     model, action = _split_model_action(model_action)
     if action:
         return _native_error(400, f"GET 不支持 :{action}，请用 POST。")

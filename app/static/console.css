@@ -145,6 +145,60 @@ input[type=radio], input[type=checkbox] { accent-color: var(--accent); }
 .key-fields > div:first-child { grid-column: 1 / -1; }
 .key-fields label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 6px; }
 .key-meta { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 6px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.key-fields .note-label { margin-top: 12px; }
+.field-heading { display: flex; gap: 10px; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.field-heading label { margin-bottom: 0; }
+.field-heading .btn-ghost { font-size: 11px; padding: 4px 8px; white-space: nowrap; }
+.fallback-option { display: flex !important; align-items: start; gap: 7px; margin: 9px 0 0 !important; font-size: 11px; line-height: 1.6; }
+.fallback-option input { margin-top: 3px; flex-shrink: 0; }
+.account-proxy-field { min-width: 0; }
+.account-proxy-field textarea, #proxy-input { overflow-wrap: anywhere; word-break: break-all; }
+.credential-strategy { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 16px; font-size: 12px; }
+.credential-strategy .inp { width: auto; min-width: 140px; }
+.credential-strategy > span { color: var(--muted); font-size: 11px; }
+#proxy-dialog { width: min(1060px, calc(100% - 40px)); max-height: calc(100dvh - 48px); overflow: hidden; padding: 0; border: 1px solid var(--border); border-radius: 16px; color: var(--fg); background: #fff; box-shadow: 0 24px 100px #18233a33; }
+#proxy-dialog[open] { display: flex; flex-direction: column; }
+#proxy-dialog::backdrop { background: #202b4066; backdrop-filter: blur(3px); }
+body:has(#proxy-dialog[open]) { overflow: hidden; }
+.proxy-dialog-head { flex-shrink: 0; display: flex; align-items: start; justify-content: space-between; gap: 18px; padding: 22px 24px; border-bottom: 1px solid var(--border); background: #fff; }
+.proxy-dialog-head > div { min-width: 0; }
+.proxy-dialog-head h2 { font-size: 16px; font-weight: 600; }
+.proxy-dialog-head p { color: var(--muted); font-size: 12px; line-height: 1.7; margin-top: 6px; }
+.proxy-dialog-head > button { flex-shrink: 0; font-size: 12px; padding: 7px 10px; }
+.proxy-dialog-body { min-height: 0; overflow-y: auto; overscroll-behavior: contain; scroll-padding-block: 16px; display: grid; grid-template-columns: 1fr 1fr; gap: 24px; padding: 24px; }
+.proxy-list-panel, .proxy-form-panel { min-width: 0; border: 0; padding: 0; margin: 0; }
+.proxy-list-panel > .field-heading { font-size: 13px; margin-bottom: 12px; }
+.proxy-row { background: #fafbfe; border: 1px solid var(--border); border-radius: 10px; padding: 13px; margin-bottom: 10px; }
+.proxy-row.is-editing { border-color: #acacec; background: #f7f7ff; }
+.proxy-row.is-editing small { color: var(--accent); }
+.proxy-row-title { display: flex; gap: 10px; align-items: center; }
+.proxy-order { display: grid; place-items: center; background: #ededff; color: var(--accent); width: 28px; height: 28px; border-radius: 8px; font-size: 12px; flex-shrink: 0; }
+.proxy-row-title > div { min-width: 0; }
+.proxy-row-title strong { display: block; font-size: 12px; font-weight: 500; overflow-wrap: anywhere; }
+.proxy-row-title small { font-size: 10px; color: var(--muted); }
+.proxy-row-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; margin-top: 12px; }
+.proxy-row-actions button { border: 1px solid var(--border); border-radius: 6px; padding: 5px 9px; font-size: 11px; background: #fff; }
+.proxy-row-actions .danger { color: var(--danger); margin-left: auto; }
+.proxy-row-result { font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
+.proxy-row-result:not(:empty) { margin-top: 10px; }
+.proxy-form-panel .lbl { display: block; margin-bottom: 7px; }
+.proxy-form-hint { font-size: 11px; line-height: 1.7; color: var(--muted); margin: 8px 0; }
+.proxy-recognize { font-size: 11px; padding: 6px 10px; margin-bottom: 18px; }
+.proxy-form-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, .8fr); gap: 14px; margin-top: 15px; }
+.proxy-form-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }
+.proxy-form-actions button, .proxy-dialog-foot button { font-size: 12px; padding: 9px 15px; }
+.proxy-editor-error { flex-shrink: 0; color: var(--danger); font-size: 12px; line-height: 1.7; padding: 0 24px; overflow-wrap: anywhere; }
+.proxy-editor-error:not(:empty) { padding-bottom: 18px; }
+.proxy-dialog-foot { flex-shrink: 0; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; padding: 16px 24px; border-top: 1px solid var(--border); background: #fff; }
+.proxy-dialog-foot > span { font-size: 11px; color: var(--muted); }
+.proxy-dialog-foot > div { display: flex; gap: 10px; margin-left: auto; }
+@media (max-width: 767px) {
+  #proxy-dialog { width: calc(100% - 20px); max-height: calc(100dvh - 24px); border-radius: 12px; }
+  .proxy-dialog-head, .proxy-dialog-foot { padding: 16px; }
+  .proxy-dialog-body { grid-template-columns: 1fr; gap: 22px; padding: 16px; }
+  .proxy-editor-error { padding-left: 16px; padding-right: 16px; }
+  .proxy-form-grid { gap: 10px; }
+}
 .empty-state { text-align: center; background: #f7f8fc; padding: 28px 16px; border: 1px dashed #dce0eb; border-radius: 10px; font-size: 12px; line-height: 1.9; }
 .settings-jump { display: flex; gap: 9px; margin-bottom: 18px; flex-wrap: wrap; }
 .settings-jump a { display: inline-flex; align-items: center; gap: 12px; padding: 8px 12px; background: #fff; border: 1px solid var(--border); border-radius: 7px; font-size: 12px; font-weight: 500; text-decoration: none; }
