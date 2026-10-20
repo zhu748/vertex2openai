@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import json
 import time
+import traceback
 
 # 引入运行状态管理器与多通道分发策略
 from runtime_state import app_state
@@ -351,9 +352,19 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
                 return await _resumable_stream(fastapi_request, request, api_key)
             return await _resumable_json(fastapi_request, request, api_key)
         return await _call_upstream(request, fastapi_request)
+    except ResumeRequestError as exc:
+        # 续传参数错误是客户端 400，不是上游错误：单独分支保持
+        # invalid_resume_request 分类（与 _resumable_stream 同口径），
+        # 避免被兜底 except 重写成误导性的 upstream_error。
+        print(f"⚠️ [路由兜底] 模型 {request.model} 续传参数无效 | HTTP {exc.code} | {str(exc)[:200]}")
+        return JSONResponse(status_code=exc.code, content=create_openai_error_response(
+            exc.code, str(exc), "invalid_resume_request"))
     except Exception as e:
+        # 兜底 except 会把编程错误（AttributeError/TypeError 等）也归类成
+        # 上游错误；留下 traceback 才能定位真正的缺陷。
         code, msg = extract_upstream_error(e)
         print(f"❌ [路由兜底] 模型 {request.model} 调用失败 | HTTP {code} | {msg[:200]}")
+        traceback.print_exc()
         return JSONResponse(status_code=code, content=create_openai_error_response(code, msg, "upstream_error"))
 
 

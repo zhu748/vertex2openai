@@ -4,15 +4,17 @@
 
 | 类型 | 默认端口 | 客户端实现 | 服务器要求 |
 |---|---|---|---|
-| TURN | 3478 | Pion TURN，TCP 控制和数据连接 | RFC 6062 TCP allocation、有效账号密码、允许访问目标地址 |
-| TURNS | 5349 | Pion TURN，TLS 控制和数据连接 | 同上，并提供可校验的 TLS 证书 |
-| SSTP | 443 | yuhaiin 用户态 SSTP / TCP/IP 栈 | MS-CHAPv2 认证、IPv4 地址协商和目标网络访问权限 |
+| TURN | 3478 | Pion TURN（标准认证）或内置裸客户端（匿名分配），TCP 控制和数据连接 | RFC 6062 TCP allocation、允许访问目标地址；标准服务器需账号密码，开放服务器（未认证 Allocate 直接成功）可省略凭据 |
+| TURNS | 5349 | 同上（TLS） | 同上，并提供可校验的 TLS 证书 |
+| SSTP | 443 | yuhaiin 用户态 SSTP / TCP/IP 栈 | MS-CHAPv2 认证（账号密码强制）、IPv4 地址协商和目标网络访问权限 |
 
 SSTP 客户端不创建系统 TUN / PPP 设备，不修改宿主机路由，也不需要 `NET_ADMIN`、`privileged` 或 `/dev/ppp`。Docker 应用继续以普通用户运行。
 
 ## 在面板填写
 
-在「通道与凭证」中打开「管理 / 添加代理」，选择 TURN、TURNS 或 SSTP，填写服务器主机名、端口、账号和密码。端口留空时使用上表默认值。账号密码含特殊字符时，字段方式会自动完成 URL 编码。
+在「通道与凭证」中打开「管理 / 添加代理」，选择 TURN、TURNS 或 SSTP，填写服务器主机名、端口、账号和密码。端口留空时使用上表默认值。账号密码含特殊字符时，字段方式会自动完成 URL 编码。TURN / TURNS 的账号密码可以留空：开放服务器（未认证 Allocate 直接成功）无需凭据；转换器启动时会探测一次，匿名服务器走内置裸客户端，标准服务器仍按账号密码认证。
+
+> 注意：部分开放 TURN 服务器接受完整的匿名分配流程但不真正转发数据（连接建立后无响应甚至立即断开），这类节点无法用作代理；中继是否能到达目标地址还受服务器出口策略限制。
 
 「高级连接设置」可填写证书名称（SNI）、自定义 CA 文件、TURN Realm 或 SSTP MTU。默认校验 TLS 证书，只有明确勾选「允许未受信任的服务器证书」才会跳过校验。
 
@@ -26,6 +28,7 @@ SSTP 客户端不创建系统 TUN / PPP 设备，不修改宿主机路由，也�
 turn://username:password@turn.example.com:3478
 turns://username:password@turn.example.com:5349?sni=turn.example.com
 sstp://username:password@vpn.example.com:443?sni=vpn.example.com&mtu=1400
+turn://open-relay.example.com:3479          ← 匿名分配服务器可省略凭据
 ```
 
 也支持 RFC 7065 的无斜线 TURN URI，凭据放在扩展查询参数中：
@@ -35,7 +38,7 @@ turn:turn.example.com:3478?transport=tcp&username=username&password=password
 turns:turn.example.com:5349?transport=tcp&username=username&password=password
 ```
 
-用户名和密码中的 `@`、`:`、`#`、`&` 等保留字符须进行 URL 编码，例如密码 `p@ss:word` 应写成 `p%40ss%3Aword`。面板字段方式无需手动编码。标准 TURN URI 本身不定义凭据参数，这里的 `username` / `password` 是本项目用于传入凭据的扩展。
+用户名和密码中的 `@`、`:`、`#`、`&` 等保留字符须进行 URL 编码，例如密码 `p@ss:word` 应写成 `p%40ss%3Aword`。面板字段方式无需手动编码。标准 TURN URI 本身不定义凭据参数，这里的 `username` / `password` 是本项目用于传入凭据的扩展。也支持 `协议://Base64(用户名:密码)@主机:端口` 形态。
 
 ### 智能识别与批量导入
 
@@ -53,7 +56,7 @@ vpn.example.com:443
 
 URL 中的账号密码需要进行 URL 编码；空格和 `|` 四字段格式中的凭据按原文读取。也支持 `协议://Base64(用户名:密码)@主机:端口`。IPv6 地址使用方括号。省略协议的记录使用当前选择的类型；环境变量中请写明协议。
 
-在面板先选择协议，再粘贴到「粘贴代理 · 自动识别」框，会自动填入字段。单独的 `主机:端口` 也可以先识别，TURN / TURNS / SSTP 随后补齐账号密码。批量粘贴可混合完整凭据和纯地址，纯地址会在草稿列表标记「待补齐账号 / 密码」，点击编辑补齐后才能应用配置。添加后会保留当前协议类型，方便继续粘贴同类节点。HTTP / SOCKS 等可拆字段类型采用同样的粘贴方式。
+在面板先选择协议，再粘贴到「粘贴代理 · 自动识别」框，会自动填入字段。单独的 `主机:端口` 也可以先识别，TURN / TURNS 随后补齐账号密码（可留空），SSTP 必须补齐。批量粘贴可混合完整凭据和纯地址，纯地址的 SSTP 节点会在草稿列表标记「待补齐账号 / 密码」，点击编辑补齐后才能应用配置；TURN / TURNS 无凭据节点直接可用。添加后会保留当前协议类型，方便继续粘贴同类节点。
 
 端口不会改变所选协议：例如选择 TURN 后粘贴 `主机:5349` 仍按 TURN 填入；需要 TLS 时请选择 TURNS，或粘贴明确的 `turns://` 链接。
 
@@ -100,7 +103,7 @@ PROXY_URLS='["turns://user:pass@turn.example.com:5349","sstp://user:pass@vpn.exa
 | `insecure=true` | TURNS / SSTP | 默认 `false`；设为 `true` 才跳过证书验证 |
 | `mtu` | SSTP | 1400，可指定 576–9000，作为内部 MTU 上限 |
 
-重复参数、未知参数、缺少凭据及不支持的传输方式会在保存时拒绝。自定义 CA 需要挂载到应用容器，例如将宿主机证书目录以只读方式挂载到 `/app/certificates`，然后填写 `/app/certificates/company.pem`。SSTP 自定义 CA 目前支持 Linux。
+重复参数、未知参数及不支持的传输方式会在保存时拒绝；SSTP 缺少凭据同样拒绝，TURN / TURNS 允许无凭据。自定义 CA 需要挂载到应用容器，例如将宿主机证书目录以只读方式挂载到 `/app/certificates`，然后填写 `/app/certificates/company.pem`。SSTP 自定义 CA 目前支持 Linux。
 
 ## 安装转换器
 
@@ -135,13 +138,13 @@ go build -trimpath -o ../bin/vertex-proxy-bridge .
 
 ## 验证
 
-Python 离线回归覆盖 URI / 高级参数、面板接口、配置文件权限、缺少二进制时的明确错误、端口复用、在用实例保留及失败清理：
+Python 离线回归覆盖 URI / 高级参数、匿名分配节点、面板接口、配置文件权限、缺少二进制时的明确错误、端口复用、在用实例保留及失败清理：
 
 ```bash
 python scripts/check_project.py
 ```
 
-Go 测试会在 loopback 上启动实际 Pion TURN 服务器，验证 TURN / TURNS、分片响应、并发、证书验证、错误凭据、取消与 SOCKS5 转发：
+Go 测试会在 loopback 上启动实际 Pion TURN 服务器，验证 TURN / TURNS、分片响应、并发、证书验证、错误凭据、取消与 SOCKS5 转发；匿名分配路径由内置假服务器覆盖（探测选择、裸 Allocate / Connect / ConnectionBind / 中继往返、取消清理）：
 
 ```bash
 cd proxybridge

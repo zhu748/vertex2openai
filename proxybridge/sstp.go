@@ -51,7 +51,10 @@ func (c config) startSSTP(ctx context.Context, cancel context.CancelFunc) (dialF
 	// Cancel the full handshake on process shutdown, including library calls
 	// that do not themselves attach the caller's context to every read.
 	carrierDial := func(dialCtx context.Context, _, _ string) (net.Conn, error) {
-		raw, err := (&net.Dialer{KeepAlive: 30 * time.Second}).DialContext(dialCtx, "tcp", net.JoinHostPort(c.Server, strconv.Itoa(c.Port)))
+		// dialer() attaches systemResolver: net.DefaultResolver is
+		// hijacked by yuhaiin's netapi package (see dns.go), and the
+		// carrier address may be a hostname.
+		raw, err := dialer().DialContext(dialCtx, "tcp", net.JoinHostPort(c.Server, strconv.Itoa(c.Port)))
 		if err != nil {
 			return nil, err
 		}
@@ -74,12 +77,15 @@ func (c config) startSSTP(ctx context.Context, cancel context.CancelFunc) (dialF
 			carrier.Close()
 		}
 		packets.Close()
+		// Auth refusal must win over the deadline check: a server that
+		// rejects credentials right at the 30s edge would otherwise be
+		// misreported as a timeout and misdirect debugging.
+		if errors.Is(err, client.ErrAuth) {
+			return nil, nil, errors.New("sstp_auth_failed_requires_mschapv2")
+		}
 		var timeout net.Error
 		if handshakeCtx.Err() != nil || (errors.As(err, &timeout) && timeout.Timeout()) {
 			return nil, nil, errors.New("sstp_handshake_timeout")
-		}
-		if errors.Is(err, client.ErrAuth) {
-			return nil, nil, errors.New("sstp_auth_failed_requires_mschapv2")
 		}
 		return nil, nil, errors.New("sstp_handshake_failed_check_tls_credentials_and_mschapv2")
 	}

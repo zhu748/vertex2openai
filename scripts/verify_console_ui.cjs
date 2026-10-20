@@ -325,7 +325,7 @@ async function main() {
     await page.fill('#proxy-ca','/app/certificates/company.pem');
     await page.fill('#proxy-mtu','1280');
     await page.click('#proxy-form-add');
-    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===3 && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===3 && !document.querySelector('#proxy-form-add').matches(':disabled'),undefined,{polling:100});
     assert.ok(!(await page.locator('[data-proxy-index="2"] strong').textContent()).includes('private'));
     await page.locator('[data-proxy-index="2"]').getByRole('button',{name:'编辑',exact:true}).click();
     await page.waitForFunction(()=>document.querySelector('#proxy-type').value==='sstp' && !document.querySelector('#proxy-form-add').matches(':disabled'));
@@ -343,7 +343,7 @@ async function main() {
     assert.equal(await page.inputValue('#proxy-host'),'relay.example.com');
     assert.equal(await page.locator('#proxy-tls-fields').isVisible(),false);
     await page.click('#proxy-form-add');
-    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===4 && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===4 && !document.querySelector('#proxy-form-add').matches(':disabled'),undefined,{polling:100});
     await page.selectOption('#proxy-type','turns');
     await page.fill('#proxy-host','relay-tls.example.com');
     await page.fill('#proxy-username','fixture');
@@ -354,7 +354,7 @@ async function main() {
     await page.fill('#proxy-paste','vpn-supplier.example|443|domain\\fixture|private@password');
     // Add also recognizes fresh paste without clicking Recognize first.
     await page.click('#proxy-form-add');
-    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===6 && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===6 && !document.querySelector('#proxy-form-add').matches(':disabled'),undefined,{polling:100});
     assert.match(await page.locator('[data-proxy-index="5"] strong').textContent(),/sstp:\/\/\*\*\*@vpn-supplier.example:443/);
     await page.fill('#proxy-paste',JSON.stringify({iceServers:[{urls:'stun:discovery.example'},{
       urls:['turn:ice.example:3478?transport=tcp','turns:ice.example:5349?transport=tcp'],username:'fixture',credential:'private+ice%password'}]}));
@@ -402,37 +402,35 @@ async function main() {
       },value);
     };
     await pasteProxy('test:1234@192.0.2.10:3478');
-    await page.waitForFunction(()=>document.querySelector('#proxy-password').value==='1234' && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    await page.waitForFunction(()=>document.querySelector('#proxy-password').value==='1234' && !document.querySelector('#proxy-form-add').matches(':disabled'),undefined,{polling:100});
     assert.equal(await page.inputValue('#proxy-type'),'turn');
     assert.equal(await page.inputValue('#proxy-host'),'192.0.2.10');
     await page.click('#proxy-form-add');
-    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===3 && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===3 && !document.querySelector('#proxy-form-add').matches(':disabled'),undefined,{polling:100});
     assert.equal(await page.inputValue('#proxy-type'),'turn');
     await pasteProxy('192.0.2.20:5349');
     await page.waitForFunction(()=>document.querySelector('#proxy-host').value==='192.0.2.20' && !document.querySelector('#proxy-form-add').matches(':disabled'));
     assert.equal(await page.inputValue('#proxy-type'),'turn'); // Port does not choose TLS.
     assert.equal(await page.inputValue('#proxy-port'),'5349');
     assert.equal(await page.inputValue('#proxy-username'),'');
-    assert.match(await page.textContent('#proxy-paste-hint'),/补齐账号.*密码/);
+    // 匿名 TURN（RFC 7065）合法：不再提示补齐凭据，前后端 missing_fields 均为空。
+    assert.match(await page.textContent('#proxy-paste-hint'),/已识别.*检查后加入列表/);
+    assert.deepEqual(await page.evaluate(()=>proxyMissingFields('turn://12.192.169.147:3479')),[]);
+    // SSTP 的 MS-CHAPv2 认证协议强制：无凭据节点仍被标记待补齐（与后端同口径）。
+    assert.deepEqual(await page.evaluate(()=>proxyMissingFields('sstp://192.0.2.50:443')),['账号','密码']);
     await page.fill('#proxy-username','test');await page.fill('#proxy-password','test');
     await page.click('#proxy-form-add');
-    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===4 && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===4 && !document.querySelector('#proxy-form-add').matches(':disabled'),undefined,{polling:100});
     await pasteProxy('test:1234@192.0.2.30:3478\n192.0.2.40:3479');
-    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===6 && !document.querySelector('#proxy-form-add').matches(':disabled'));
-    assert.match(await page.locator('[data-proxy-index="5"] small').textContent(),/待补齐账号.*密码/);
-    assert.equal(await page.locator('[data-proxy-index="5"]').getByRole('button',{name:'测试',exact:true}).isDisabled(),true);
-    await page.click('#proxy-dialog-apply');
-    await page.waitForFunction(()=>document.querySelector('#proxy-editor-error').textContent.includes('第 6 条代理待补齐'));
-    await page.locator('[data-proxy-index="5"]').getByRole('button',{name:'编辑',exact:true}).click();
-    await page.waitForFunction(()=>document.querySelector('#proxy-host').value==='192.0.2.40' && !document.querySelector('#proxy-form-add').matches(':disabled'));
-    await page.fill('#proxy-username','test');await page.fill('#proxy-password','test');
-    await page.click('#proxy-form-add');
-    await page.waitForFunction(()=>!document.querySelector('[data-proxy-index="5"] small').textContent.includes('待补齐') && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===6 && !document.querySelector('#proxy-form-add').matches(':disabled'),undefined,{polling:100});
+    // 无凭据 TURN 节点直接加入：可测试、可直接应用，不再阻断保存。
+    assert.equal((await page.locator('[data-proxy-index="5"] small').textContent()).includes('待补齐'),false);
+    assert.equal(await page.locator('[data-proxy-index="5"]').getByRole('button',{name:'测试',exact:true}).isDisabled(),false);
     await page.click('#proxy-dialog-apply');
     await page.waitForFunction(()=>!document.querySelector('#proxy-dialog').open);
     assert.equal((await page.inputValue('#proxy-input')).split('\n').length,6);
     await page.fill('#proxy-input',originalProxyDraft);
-    check('所选协议下粘贴即填字段，纯地址先补凭据，混合批量保留待完成节点并阻止遗漏保存');
+    check('所选协议下粘贴即填字段，匿名 TURN 免凭据直通，SSTP 仍强制凭据');
 
     await page.getByRole('button',{name:'管理 / 添加代理',exact:true}).click();
     const legacySsPayload=Buffer.from('chacha20-ietf-poly1305:private-password@9.9.9.9:9999').toString('base64');
@@ -440,7 +438,7 @@ async function main() {
     await page.click('.proxy-recognize');
     await page.waitForFunction(()=>document.querySelector('#proxy-type').value==='singbox' && !document.querySelector('#proxy-form-add').matches(':disabled'));
     await page.click('#proxy-form-add');
-    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===3 && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===3 && !document.querySelector('#proxy-form-add').matches(':disabled'),undefined,{polling:100});
     assert.ok(!(await page.locator('[data-proxy-index="2"] strong').textContent()).includes(legacySsPayload));
     await page.locator('[data-proxy-index="2"]').getByRole('button',{name:'删除第 3 条代理',exact:true}).click();
     // 分享链接协议：下拉统一归入 sing-box 节点选项，列表行显示协议://端点 与节点名。
@@ -453,7 +451,7 @@ async function main() {
     assert.equal(await page.inputValue('#proxy-paste'),'vless://12345678-90ab-4cde-8f90-1234567890ab@203.0.113.10:2096?security=tls&type=ws&path=%2F#NL%20Node');
     await screenshot('proxy-editor-singbox-node');
     await page.click('#proxy-form-add');
-    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===3 && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===3 && !document.querySelector('#proxy-form-add').matches(':disabled'),undefined,{polling:100});
     const vlessLabel=await page.locator('[data-proxy-index="2"] strong').textContent();
     assert.ok(vlessLabel.includes('vless://203.0.113.10:2096') && vlessLabel.includes('NL Node'),vlessLabel);
     const vmessPayload=Buffer.from(JSON.stringify({v:'2',ps:'东京 01',add:'vm.example.com',port:'443',id:'11111111-2222-3333-4444-555555555555',aid:'0',scy:'auto',net:'ws',type:'none',host:'',path:'/ws',tls:'tls',sni:'',alpn:'',fp:''})).toString('base64');
@@ -461,7 +459,7 @@ async function main() {
     await page.click('.proxy-recognize');
     await page.waitForFunction(()=>document.querySelector('#proxy-type').value==='singbox' && !document.querySelector('#proxy-form-add').matches(':disabled'));
     await page.click('#proxy-form-add');
-    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===4 && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===4 && !document.querySelector('#proxy-form-add').matches(':disabled'),undefined,{polling:100});
     const vmessLabel=await page.locator('[data-proxy-index="3"] strong').textContent();
     assert.ok(vmessLabel.includes('vmess://vm.example.com:443') && vmessLabel.includes('东京 01'),vmessLabel);
     assert.ok(!vmessLabel.includes(vmessPayload));

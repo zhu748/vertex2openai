@@ -133,10 +133,12 @@ class ConsoleRoutesTests(unittest.TestCase):
             for url in urls:
                 asset = self.client.get(url)
                 self.assertEqual(asset.status_code, 200)
-                self.assertIn("must-revalidate", asset.headers["cache-control"])
+                # 版本化 URL 由内容哈希锁定：内容一变哈希/URL 一起变，
+                # 长缓存不会复用上一个部署的代码；无版本 URL 仍强制 revalidate。
+                self.assertIn("immutable", asset.headers["cache-control"])
                 cached = self.client.get(url, headers={"If-None-Match": asset.headers["etag"]})
                 self.assertEqual(cached.status_code, 304)
-                self.assertIn("must-revalidate", cached.headers["cache-control"])
+                self.assertIn("immutable", cached.headers["cache-control"])
             # Browsers that still have old HTML also revalidate bare URLs.
             self.assertIn("must-revalidate", self.client.get('/static/dashboard.js').headers["cache-control"])
 

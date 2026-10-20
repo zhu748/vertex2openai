@@ -203,20 +203,29 @@ class AsyncProtocolTests(unittest.IsolatedAsyncioTestCase):
             for field in fields[5:]:
                 self.assertEqual(field["username"], "")
                 self.assertEqual(field["password"], "")
+                # TURN / TURNS 无凭据是合法形态（匿名分配服务器）；仅 SSTP 强制。
                 self.assertEqual(field.get("missing_fields", []),
-                                 ["username", "password"] if scheme in ("turn", "turns", "sstp") else [])
+                                 ["username", "password"] if scheme == "sstp" else [])
 
     async def test_draft_does_not_relax_runtime_or_settings_validation(self):
         from settings_validation import validate_global_settings_patch
 
-        for scheme in ("turn", "turns", "sstp"):
-            uri = f"{scheme}://192.0.2.10:3478"
+        # SSTP 的 MS-CHAPv2 认证是强制的：草稿、保存、运行时都拒绝缺凭据。
+        uri = "sstp://192.0.2.10:3478"
+        response = await system_api.parse_proxy(system_api.ProxyParseBody(text=uri), True)
+        self.assertEqual(response.status_code, 400)
+        self.assertTrue(validate_global_settings_patch({"proxy_urls": [uri]}))
+        self.assertTrue(pr.validate_proxy_uri(uri))
+        with self.assertRaises(pr.ProxyResolveError):
+            pr.resolve_proxy_uri(uri)
+        # TURN / TURNS 无凭据（匿名分配服务器）现在是合法形态：保存、设置、
+        # 校验全链路放行，连通性交给转换器的探测与实际拨号。
+        for uri in ("turn://192.0.2.10:3478", "turns://192.0.2.10:5349"):
             response = await system_api.parse_proxy(system_api.ProxyParseBody(text=uri), True)
-            self.assertEqual(response.status_code, 400)
-            self.assertTrue(validate_global_settings_patch({"proxy_urls": [uri]}))
-            self.assertTrue(pr.validate_proxy_uri(uri))
-            with self.assertRaises(pr.ProxyResolveError):
-                pr.resolve_proxy_uri(uri)
+            self.assertEqual(response.status_code, 200)
+            self.assertFalse(validate_global_settings_patch({"proxy_urls": [uri]}))
+            self.assertEqual(pr.validate_proxy_uri(uri), "")
+        # 草稿模式允许缺凭据（标记待补齐），但非法参数仍然拒绝。
         for uri in ("turn://host?transport=udp", "turn://host:0", "sstp://host?unknown=secret",
                     "sstp://host?mtu=100", "turn://host?realm=a&realm=b", "vless://["):
             response = await system_api.parse_proxy(system_api.ProxyParseBody(text=uri, draft=True), True)

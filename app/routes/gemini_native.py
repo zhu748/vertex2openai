@@ -302,6 +302,9 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
         return httpx.AsyncClient(**client_kwargs)
 
     is_stream = action == "streamGenerateContent"
+    # query 在整个请求生命周期不变：提前解析一次，重试循环里
+    # 三处分支不再重复 parse_qs 同一字符串。
+    is_sse_request = "sse" in parse_qs(query).get("alt", [])
     retry_max, backoff_seconds, jitter_seconds = get_retry_settings()
     # 请求级设置快照：重试循环内 _resolve_upstream_model_path 每次都
     # get_settings()（锁内全量深拷贝），最多 51 次；拍一次快照复用，
@@ -369,7 +372,7 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
                 if upstream.status_code < 400:
                     first_reply.accept()
             elif upstream.status_code < 400:
-                is_sse = "sse" in parse_qs(query).get("alt", [])
+                is_sse = is_sse_request
                 if "text/event-stream" in upstream.headers.get("content-type", "").lower():
                     source = _native_sse_frames(upstream, reply_guard=first_reply)
                     prefetched = await first_reply.prefetch(source, lambda _frame: first_reply.ready)
@@ -427,7 +430,7 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
               + (f" ← {upstream.request.url}"
                  if app_state.get_setting("debug_outbound", False) else ""))
         if (is_stream and upstream.status_code < 400
-                and "sse" in parse_qs(query).get("alt", [])
+                and is_sse_request
                 and "text/event-stream" not in _ct.lower()):
             # 仅 alt=sse 的请求才要求 SSE 形态：不带 alt=sse 的 streamGenerateContent
             # 返回分块 JSON 数组是合法形态（上方 _native_json_chunks 专门支持），
@@ -464,7 +467,7 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
         # 成功 / 不可重试错误 / Key 轮换预算耗尽 → 透传
         if is_stream and upstream.status_code < 400:
             return await _relay_stream(
-                upstream, keepalive="sse" in parse_qs(query).get("alt", []),
+                upstream, keepalive=is_sse_request,
                 deadline=deadline, source=prefetched)
 
         # 错误（或非流式响应）：缓冲 body 再透传，顺带供钉定失败判定

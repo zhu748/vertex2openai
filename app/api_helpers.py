@@ -4,6 +4,7 @@ import inspect
 import json
 import math
 import time
+import uuid
 from contextlib import suppress
 from typing import Any, Callable, Dict, List, Optional
 
@@ -328,7 +329,7 @@ async def _chunk_openai_response_dict_for_sse(
     response_id_override: Optional[str] = None, 
     model_name_override: Optional[str] = None
 ):
-    resp_id = response_id_override or openai_response_dict.get("id", f"chatcmpl-fakestream-{int(time.time())}")
+    resp_id = response_id_override or openai_response_dict.get("id", f"chatcmpl-fakestream-{int(time.time())}-{uuid.uuid4().hex[:12]}")
     model_name = model_name_override or openai_response_dict.get("model", "unknown")
     created_time = openai_response_dict.get("created", int(time.time()))
     
@@ -409,8 +410,9 @@ def _prepend_prefill(openai_dict: Dict[str, Any], prefill_text: str) -> Dict[str
                 continue
             existing = msg.get("content") or ""
             msg["content"] = prefill_text + strip_prefill_overlap(prefill_text, existing)
-    except Exception:
-        pass
+    except Exception as e:
+        # 预填充拼回失败静默丢弃会让「兼容模式突然失效」无从排查。
+        print(f"⚠️ [预填充] 拼回响应失败（{e}），本条按原始输出返回。")
     return openai_dict
 
 
@@ -443,7 +445,12 @@ def _dedup_chunk_payload(payload: dict, deduper: PrefillDeduper, force_flush: bo
             choice["delta"] = delta
             return payload
         return None  # 纯 content 且被暂存 → 整条跳过
-    except Exception:
+    except Exception as e:
+        # 去重器状态一旦异常绝不能停留在未完成态继续吃缓冲：置为 done
+        # 强制后续 chunk 原样透传（宁可重复，不可卡死或无界暂存），并
+        # 留下可排查的日志。
+        print(f"⚠️ [预填充去重] 处理异常（{e}），后续内容原样透传。")
+        deduper.done = True
         return payload
 
 
@@ -698,7 +705,7 @@ async def execute_gemini_call(
                             thinking_level=(gen_config_dict.get("thinking_config") or {}).get("thinking_level"),
                             include_thoughts=(gen_config_dict.get("thinking_config") or {}).get("include_thoughts"),
                             max_output_tokens=gen_config_dict.get("max_output_tokens"))
-            response_id_for_stream = f"chatcmpl-realstream-{int(time.time())}"
+            response_id_for_stream = f"chatcmpl-realstream-{int(time.time())}-{uuid.uuid4().hex[:12]}"
             async def _gemini_real_stream_generator_inner():
                 # 钉定失败要在这里改写模型名与客户端，必须声明 nonlocal。
                 nonlocal model_to_call, current_client, fallback_model

@@ -39,7 +39,9 @@ func (c config) tlsConfig() (*tls.Config, error) {
 }
 
 func dialServer(ctx context.Context, address string, cfg *tls.Config) (net.Conn, *net.TCPConn, error) {
-	raw, err := (&net.Dialer{KeepAlive: 30 * time.Second}).DialContext(ctx, "tcp", address)
+	// dialer() attaches systemResolver: the server address may be a
+	// hostname, and net.DefaultResolver is hijacked by yuhaiin (dns.go).
+	raw, err := dialer().DialContext(ctx, "tcp", address)
 	if err != nil {
 		return nil, nil, errors.New("server_connect_failed")
 	}
@@ -117,6 +119,15 @@ func (c config) dialTURN(ctx context.Context, peer *net.TCPAddr, tlsConfig *tls.
 	}
 	adapter.binding = false
 	data.SetDeadline(time.Time{})
+	// Cancel/success race: if the dial context fired while DialTCPWithConn
+	// was completing, the AfterFunc callbacks already closed control and
+	// data (stop reports false). Fail instead of handing the caller a dead
+	// connection that the cleanup path would close a second time.
+	if ctx.Err() != nil || !stop() || !stopData() {
+		success = false
+		data.Close()
+		return nil, errors.New("turn_dial_cancelled")
+	}
 	success = true
 	return &managedConn{Conn: bound, cleanup: func() {
 		allocation.Close()

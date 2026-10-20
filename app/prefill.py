@@ -319,4 +319,10 @@ class PrefillDeduper:
 
     def _resolve(self) -> str:
         out, self.buffer, self.done = self.buffer, "", True
-        return strip_prefill_overlap(self.prefill, out)
+        try:
+            return strip_prefill_overlap(self.prefill, out)
+        except Exception as e:
+            # 裁剪失败必须保底放行原文：此刻 buffer 已清空，若连原文也丢，
+            # 客户端会看到响应开头缺一段字。宁可重复，不可丢字。
+            print(f"⚠️ [预填充去重] 重叠裁剪失败（{e}），本段按原文放行。")
+            return out

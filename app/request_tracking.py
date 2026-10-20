@@ -18,6 +18,15 @@ current_trace = ContextVar("request_trace", default=None)
 _attempt_started = ContextVar("attempt_started", default=None)
 MAX_INSPECTION_BYTES = 2 * 1024 * 1024
 
+# SSE 帧分隔符：PayloadObserver 每个网络块都会扫描，必须预编译。
+_FRAME_SEP_RE = re.compile(rb"\r\n\r\n|\n\n|\r\r")
+
+# redact 在每条日志/每个 SSE 块上都会执行，必须用预编译 pattern。
+_RE_URL_CREDS = re.compile(r"(?i)(https?|socks\w*)://[^/\s@]+@")
+_RE_QUERY_KEY = re.compile(r"(?i)([?&](?:key|api_key|access_token)=)[^&\s'\"]+")
+_RE_BEARER = re.compile(r"(?i)(bearer\s+)[\w.\-]+")
+_RE_GOOGLE_KEY = re.compile(r"AIza[\w\-]{20,}")
+
 
 def numeric_usage(usage):
     return {k: v for k, v in usage.items() if isinstance(v, int) or isinstance(v, float) and math.isfinite(v)}
@@ -25,10 +34,10 @@ def numeric_usage(usage):
 
 def redact(text):
     text = str(text)
-    text = re.sub(r"(?i)(https?|socks\w*)://[^/\s@]+@", r"\1://***@", text)
-    text = re.sub(r"(?i)([?&](?:key|api_key|access_token)=)[^&\s'\"]+", r"\1***", text)
-    text = re.sub(r"(?i)(bearer\s+)[\w.\-]+", r"\1***", text)
-    text = re.sub(r"AIza[\w\-]{20,}", "***API_KEY***", text)
+    text = _RE_URL_CREDS.sub(r"\1://***@", text)
+    text = _RE_QUERY_KEY.sub(r"\1***", text)
+    text = _RE_BEARER.sub(r"\1***", text)
+    text = _RE_GOOGLE_KEY.sub("***API_KEY***", text)
     return text
 
 
@@ -246,6 +255,9 @@ class PayloadObserver:
         self.trace, self.sent, self.sse = trace, sent, sse
         self.buffer = bytearray()
         self.skipping = False
+        # 已确认无分隔符的前缀长度：下个块从末尾 3 字节重叠处继续扫，
+        # 避免每块都从 0 重扫整个缓冲（最坏 O(n²)）。
+        self._scan = 0
 
     def feed(self, chunk, final=False):
         raw = chunk.encode("utf-8") if isinstance(chunk, str) else bytes(chunk)
@@ -255,6 +267,7 @@ class PayloadObserver:
             with self.trace._lock:
                 self.trace.data["inspection_skipped_bytes"] += len(raw)
             self.buffer.clear()
+            self._scan = 0
             self.skipping = True
         if self.skipping:
             # Resume only after the oversized frame has ended; never decode its tail.
@@ -266,13 +279,17 @@ class PayloadObserver:
             if final:
                 self._payload(bytes(self.buffer))
                 self.buffer.clear()
+                self._scan = 0
             return
         while True:
-            match = re.search(rb"\r\n\r\n|\n\n|\r\r", self.buffer)
+            match = _FRAME_SEP_RE.search(self.buffer, self._scan)
             if not match:
+                # 分隔符可能横跨两个网络块，保留末尾 3 字节重叠下次接着扫。
+                self._scan = max(0, len(self.buffer) - 3)
                 return
             frame = bytes(self.buffer[:match.start()])
             del self.buffer[:match.end()]
+            self._scan = 0
             data = b"\n".join(line[5:].lstrip() for line in frame.splitlines() if line.startswith(b"data:"))
             if data and data != b"[DONE]":
                 with self.trace._lock:

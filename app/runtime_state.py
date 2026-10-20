@@ -10,6 +10,7 @@ from typing import Optional
 
 import config as app_config
 from credential_config import parse_cookie_records
+from model_capabilities import _strip_known_suffixes
 from proxy_config import parse_proxy_list
 
 # S-3：允许把状态落到挂载卷，避免 docker compose 重建后设置与 Cookie 全部丢失。
@@ -66,6 +67,14 @@ class AppState:
             backup = f"{STATE_FILE}.corrupt-{int(time.time())}"
             try:
                 os.replace(STATE_FILE, backup)
+                # 备份继承了原文件的权限：旧版本可能是 0644，而里面同样有
+                # 完整 Cookie，必须与主文件一样立即收紧，否则这个备份会
+                # 永久滞留磁盘且全局可读。
+                try:
+                    os.chmod(backup, 0o600)
+                except OSError:
+                    print(f"⚠️ [状态管理器] 备份文件 {os.path.basename(backup)} "
+                          f"权限收紧失败，请手动处理。")
                 print(f"⚠️ [状态管理器] 配置文件无法读取（{e}），已备份为 "
                       f"{os.path.basename(backup)}，本次启动降级为内存模式。")
             except OSError:
@@ -532,13 +541,11 @@ class AppState:
         key = (model_name or "").strip()
         ov = overrides.get(key)
         if not isinstance(ov, dict):
-            try:
-                from model_capabilities import _strip_known_suffixes
-                stripped = _strip_known_suffixes(key)
-                if stripped != key:
-                    ov = overrides.get(stripped)
-            except Exception:
-                ov = None
+            # 顶部导入（无循环依赖）：此函数在每请求/每模型路径上执行，
+            # 旧写法的函数内 import 在热路径上反复做模块查找。
+            stripped = _strip_known_suffixes(key)
+            if stripped != key:
+                ov = overrides.get(stripped)
         if isinstance(ov, dict):
             for k in app_config.PER_MODEL_KEYS:
                 if k in ov:

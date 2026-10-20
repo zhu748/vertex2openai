@@ -41,4 +41,7 @@ services:
       # - SINGBOX_BIN=/usr/local/bin/sing-box
       # sing-box 空闲实例回收阈值（分钟，0 = 不回收，默认 30）：
       # - SINGBOX_IDLE_MINUTES=30
+    # init: true 用 tini 兜底收尸：桥接子进程（vertex-proxy-bridge/sing-box）
+    # 异常退出后不留僵尸进程，Python 侧的回收器只做兜底。
+    init: true
     restart: unless-stopped

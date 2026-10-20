@@ -1125,6 +1125,7 @@ class ProxyBridgeManager(ProxyProcessManager):
                     "sstp_handshake_timeout": "SSTP 握手超时（包含 TCP / TLS / PPP 的 30 秒总预算）",
                     "sstp_ipv4_address_missing": "SSTP 服务器未分配可用的 IPv4 地址",
                     "sstp_network_stack_failed": "SSTP 用户态网络栈初始化失败",
+                    "turn_probe_failed_check_server": "TURN 服务器探测失败：连接或分配请求无响应",
                     "listen_failed": "本地端口绑定失败",
                     "ready_write_failed": "无法写入转换器就绪标记",
                     "invalid_config": "转换器配置无效",
@@ -1166,7 +1167,8 @@ def _reaper_loop() -> None:
                 if n:
                     print(f"♻️ [代理转换] 已回收 {n} 个空闲/已退出的 {manager.engine_name} 实例。")
             except Exception as e:
-                print(f"⚠️ [代理转换] {manager.engine_name} 空闲回收异常（已忽略）：{type(e).__name__}")
+                print(f"⚠️ [代理转换] {manager.engine_name} 空闲回收异常（已忽略）："
+                      f"{type(e).__name__}: {e}")
 
 
 _reaper_started = False
@@ -1315,7 +1317,10 @@ def mask_proxy_uri(uri: str) -> str:
             host = config["server"]
             if ":" in host:
                 host = f"[{host}]"
-            return f"{scheme}://***@{host}:{config['server_port']}"
+            # 匿名分配 TURN 节点可以没有凭据，此时不显示 ***@ 占位
+            if config["username"] or config["password"]:
+                return f"{scheme}://***@{host}:{config['server_port']}"
+            return f"{scheme}://{host}:{config['server_port']}"
         if scheme == "vmess":
             # vmess 整体是 base64，没有可提取的 host:port，只报长度
             return f"vmess://***({len(value)} 字符)"

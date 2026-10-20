@@ -78,8 +78,14 @@ func run(path string) error {
 	var cfg config
 	err = json.NewDecoder(io.LimitReader(f, 65536)).Decode(&cfg)
 	f.Close()
-	if err != nil || cfg.Server == "" || cfg.Username == "" || cfg.Password == "" ||
-		cfg.Port < 1 || cfg.Port > 65535 || cfg.ListenPort < 1 || cfg.ListenPort > 65535 {
+	if err != nil || cfg.Server == "" || cfg.Port < 1 || cfg.Port > 65535 ||
+		cfg.ListenPort < 1 || cfg.ListenPort > 65535 {
+		return errors.New("invalid_config")
+	}
+	// SSTP authenticates with MS-CHAPv2, so it always needs credentials.
+	// TURN/TURNS may omit them on open servers that accept unauthenticated
+	// allocations; those use the anonymous dialer chosen below.
+	if cfg.Scheme == "sstp" && (cfg.Username == "" || cfg.Password == "") {
 		return errors.New("invalid_config")
 	}
 	if cfg.Scheme == "sstp" && cfg.MTU != 0 && (cfg.MTU < 576 || cfg.MTU > 9000) {
@@ -106,8 +112,18 @@ func run(path string) error {
 		if err != nil {
 			return err
 		}
+		// One probe decides the client flavor: open servers that accept
+		// unauthenticated allocations break the Pion client (it expects
+		// a 401 challenge first), so they get the raw dialer instead.
+		mode, err := detectTURNMode(ctx, cfg, tlsConfig)
+		if err != nil {
+			return errors.New("turn_probe_failed_check_server")
+		}
 		dial = func(ctx context.Context, target string) (net.Conn, error) {
 			return dialResolved(ctx, target, false, func(ctx context.Context, addr *net.TCPAddr) (net.Conn, error) {
+				if mode == "anonymous" {
+					return cfg.dialTURNAnonymous(ctx, addr, tlsConfig)
+				}
 				return cfg.dialTURN(ctx, addr, tlsConfig)
 			})
 		}
@@ -142,7 +158,9 @@ func dialResolved(ctx context.Context, target string, ipv4Only bool, dial func(c
 	if err != nil || port < 1 || port > 65535 {
 		return nil, errors.New("invalid_target")
 	}
-	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	// Must not use net.DefaultResolver: yuhaiin's netapi package replaces it
+	// with an uninitialized bootstrap resolver (see dns.go).
+	ips, err := systemResolver.LookupIPAddr(ctx, host)
 	if err != nil {
 		return nil, errors.New("target_dns_failed")
 	}
@@ -155,13 +173,31 @@ func dialResolved(ctx context.Context, target string, ipv4Only bool, dial func(c
 			}
 		}
 	}
+	if len(ordered) == 0 {
+		// DNS succeeded but returned no usable A/AAAA record: report the
+		// resolution failure instead of the misleading family error.
+		return nil, errors.New("target_dns_failed")
+	}
 	err = errors.New("target_address_family_unsupported")
-	for _, ip := range ordered {
+	for i, ip := range ordered {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
+		// Spread the remaining dial budget across the remaining
+		// candidates so one black-holed address cannot starve the
+		// rest; a single candidate keeps the whole budget.
+		dialCtx := ctx
+		var cancelDial context.CancelFunc
+		if deadline, ok := ctx.Deadline(); ok && len(ordered)-i > 1 {
+			if per := time.Until(deadline) / time.Duration(len(ordered)-i); per > 0 {
+				dialCtx, cancelDial = context.WithTimeout(ctx, per)
+			}
+		}
 		var conn net.Conn
-		conn, err = dial(ctx, &net.TCPAddr{IP: ip.IP, Zone: ip.Zone, Port: port})
+		conn, err = dial(dialCtx, &net.TCPAddr{IP: ip.IP, Zone: ip.Zone, Port: port})
+		if cancelDial != nil {
+			cancelDial()
+		}
 		if err == nil {
 			return conn, nil
 		}
@@ -196,6 +232,11 @@ func serveSOCKS(ctx context.Context, listener net.Listener, dial dialFunc) error
 				handleSOCKS(ctx, conn, dial)
 			}()
 		default:
+			// Overloaded: finish enough of the SOCKS exchange to
+			// reply with a real failure code instead of a bare
+			// reset, so the Python side can tell proxy saturation
+			// apart from a network error and fail over correctly.
+			refuseOverloaded(conn)
 			conn.Close()
 		}
 	}
@@ -204,6 +245,30 @@ func serveSOCKS(ctx context.Context, listener net.Listener, dial dialFunc) error
 func socksReply(conn net.Conn, code byte) error {
 	_, err := conn.Write([]byte{5, code, 0, 1, 0, 0, 0, 0, 0, 0})
 	return err
+}
+
+// refuseOverloaded answers a CONNECT with "general SOCKS server failure"
+// when the bridge is at its concurrency limit. Best effort: any parse
+// error just drops the connection.
+func refuseOverloaded(conn net.Conn) {
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(conn, header); err != nil || header[0] != 5 || header[1] == 0 {
+		return
+	}
+	methods := make([]byte, int(header[1]))
+	if _, err := io.ReadFull(conn, methods); err != nil {
+		return
+	}
+	if _, err := conn.Write([]byte{5, 0}); err != nil {
+		return
+	}
+	request := make([]byte, 4)
+	if _, err := io.ReadFull(conn, request); err != nil {
+		return
+	}
+	socksReply(conn, 1)
+	diagnostic("socks_overloaded")
 }
 
 func handleSOCKS(ctx context.Context, conn net.Conn, dial dialFunc) {

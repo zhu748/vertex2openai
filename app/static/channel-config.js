@@ -128,7 +128,12 @@ function proxyLabel(uri){
 function proxyMissingFields(uri){
   try{
     const url=new URL(uri.replace(/^(turns?):(?!\/\/)/i,'$1://'));
-    if(!BRIDGE_PROXY_TYPES.includes(url.protocol.slice(0,-1))) return [];
+    const proto=url.protocol.slice(0,-1);
+    if(!BRIDGE_PROXY_TYPES.includes(proto)) return [];
+    // 与后端 parse_bridge_proxy_uri 同口径：TURN/TURNS 无凭据是合法形态
+    //（匿名分配服务器，RFC 7065 允许无 userinfo 的 URI）；仅 SSTP 的
+    // MS-CHAPv2 认证协议强制，缺了才提醒补齐。
+    if(proto!=='sstp') return [];
     return [['username','账号'],['password','密码']].filter(([key])=>!(url[key]||url.searchParams.get(key))).map(([,label])=>label);
   }catch(_){return [];}
 }
@@ -179,9 +184,11 @@ function proxyTypeChanged(){
   $('proxy-turn-fields').classList.toggle('hidden',type!=='turn'&&type!=='turns');
   $('proxy-sstp-fields').classList.toggle('hidden',type!=='sstp');
   $('proxy-port').placeholder=({turn:'3478',turns:'5349',sstp:'443',http:'80',https:'443'})[type]||'1080';
-  document.querySelector('label[for="proxy-username"]').textContent=bridge?'账号（必填）':'账号（可选）';
-  document.querySelector('label[for="proxy-password"]').textContent=bridge?'密码（必填）':'密码（可选）';
-  $('proxy-protocol-hint').textContent=type==='sstp'?'SSTP：MS-CHAPv2、IPv4 出口、本机 DNS；默认校验证书。可粘贴 用户:密码@主机:端口 或 主机:端口，再补齐凭据。':(type==='turn'||type==='turns'?'TURN：需要 RFC 6062 TCP 中继，使用本机 DNS。可粘贴 用户:密码@主机:端口 或 主机:端口，再补齐凭据；无前缀时沿用所选类型。':'');
+  // 桥接类型里只有 SSTP 协议强制凭据；TURN/TURNS 匿名节点允许留空。
+  const credentialsRequired=type==='sstp';
+  document.querySelector('label[for="proxy-username"]').textContent=credentialsRequired?'账号（必填）':'账号（可选）';
+  document.querySelector('label[for="proxy-password"]').textContent=credentialsRequired?'密码（必填）':'密码（可选）';
+  $('proxy-protocol-hint').textContent=type==='sstp'?'SSTP：MS-CHAPv2、IPv4 出口、本机 DNS；默认校验证书。可粘贴 用户:密码@主机:端口 或 主机:端口，再补齐凭据。':(type==='turn'||type==='turns'?'TURN：需要 RFC 6062 TCP 中继，使用本机 DNS。可粘贴 用户:密码@主机:端口 或 主机:端口；开放服务器可留空凭据（匿名分配），无前缀时沿用所选类型。':'');
   // 选中 sing-box 节点时，粘贴框即节点链接输入框。
   const nodeLink=type==='singbox';
   $('proxy-paste-label').textContent=nodeLink?'节点链接':'粘贴代理 · 自动识别';
@@ -326,5 +333,5 @@ function initProxyEditor(){
 window.consoleChannels={load:loadCookieAccounts,init:initProxyEditor,open:openProxyEditor};
 Object.assign(window,{updateCredentialStrategy,loadCookieAccounts,addCookieAccount,removeCookieAccount,saveCookieAccounts,
   closeProxyEditor,moveProxy,deleteProxy,resetProxyForm,proxyTypeChanged,recognizeProxyPaste,editProxy,addProxyDraft,
-  applyProxyEditor,testEditorProxy,renderProxyEditor});
+  applyProxyEditor,testEditorProxy,renderProxyEditor,proxyMissingFields});
 })();

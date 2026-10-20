@@ -59,16 +59,20 @@ async def lifespan(app: FastAPI):
     print("🚀 [服务启动] agentplatform2api 适配器已启动（Express API Key / Cookie 直连 双通道）。")
 
     # S-1：默认口令 + 公开托管 + 明文 Cookie 是很危险的组合，必须让人看见。
-    if config.API_KEY == DEFAULT_API_KEY:
+    # 弱口令清单同时覆盖代码默认值与 compose 示例里的占位口令——两者都是
+    # 公开已知的，用它运行形同把控制台（可读写完整 Google Cookie）敞开。
+    weak_api_keys = (DEFAULT_API_KEY, "change-me-please")
+    if config.API_KEY in weak_api_keys:
         public_host = any(os.environ.get(k) for k in ("SPACE_ID", "SPACE_HOST", "HF_SPACE_ID"))
+        shown_key = config.API_KEY
         if public_host and os.environ.get("ALLOW_DEFAULT_KEY", "").lower() not in ("1", "true", "yes"):
             raise RuntimeError(
-                "检测到公开托管环境（HuggingFace Space 等）且 API_KEY 仍为默认值 123456。\n"
+                f"检测到公开托管环境（HuggingFace Space 等）且 API_KEY 仍为弱口令 {shown_key}。\n"
                 "该口令同时是控制台登录密码，而控制台可以读写完整的 Google 会话 Cookie。\n"
                 "请设置一个强 API_KEY 后重启；确需临时放行可设 ALLOW_DEFAULT_KEY=true。"
             )
         print(
-            "🔴 [安全警告] API_KEY 仍是默认值 123456！它既是本代理的 Key，也是控制台登录口令，"
+            f"🔴 [安全警告] API_KEY 仍是弱口令 {shown_key}！它既是本代理的 Key，也是控制台登录口令，"
             "请立刻改成强口令。"
         )
     express_key_manager = app.state.express_key_manager
@@ -155,18 +159,8 @@ async def lifespan(app: FastAPI):
         " / :streamGenerateContent / :countTokens（鉴权与 OpenAI 端点一致，三种原生 Key 写法均支持）。"
     )
 
-    # 默认口令告警：API_KEY 未通过环境变量覆盖时，对外 API 与控制台共用
-    # 已知默认值 "123456"，公网部署形同裸奔（可被任意人消耗凭据配额、
-    # 读取控制台明文 Key）。这里在启动日志里给一个醒目提示。
-    try:
-        from config import API_KEY as _deployed_key, DEFAULT_API_KEY as _default_key
-        if _deployed_key == _default_key:
-            print(
-                "⚠️ [安全告警] 当前仍在使用默认 API_KEY（123456），对外接口与控制台登录"
-                "均可用该默认值访问！公网部署请立即通过环境变量 API_KEY 设置强口令。"
-            )
-    except Exception:
-        pass
+    # 默认口令告警已在 lifespan 开头的弱口令检查中输出（弱口令清单覆盖
+    # "123456" 与 compose 占位口令 change-me-please），此处不再重复打印。
 
     # 启动时自动探测各 Key 归属的 GCP Project ID（location 钉定要用）。
     # 放后台任务里跑：探测走外网，绝不能阻塞服务启动。

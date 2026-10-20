@@ -404,8 +404,10 @@ async function loadParams(){
   captureModelDraft();
   const selected=$('model-sel').value;
   loadNotice('params','');
-  try{
-    const s=await readJSON('/api/settings');
+  // 设置与模型能力两个接口互不依赖：并行拉取，面板加载不再串行等两次往返。
+  const [sRes,cRes]=await Promise.allSettled([readJSON('/api/settings'),readJSON('/api/capabilities')]);
+  if(sRes.status==='fulfilled'){
+    const s=sRes.value;
     GLOBAL_SETTINGS=s;
     settingsLoaded=true;
     curAR = s.image_aspect_ratio || "";
@@ -425,9 +427,9 @@ async function loadParams(){
     updateExpressCustomVis();
     // Legacy thinking switches are normalized by the server. Do not reinterpret
     // an explicitly saved request mode using stale legacy flags.
-  }catch(e){loadNotice('params','设置'+e.message+'。重新加载成功后再保存。');}
-  try{
-    const c=await readJSON('/api/capabilities');
+  }else{loadNotice('params','设置'+sRes.reason.message+'。重新加载成功后再保存。');}
+  if(cRes.status==='fulfilled'){
+    const c=cRes.value;
     CAPS=c.capabilities||{};
     OVERRIDES=c.overrides||{};
     capabilitiesLoaded=true;
@@ -435,7 +437,7 @@ async function loadParams(){
       + (c.models||[]).map(m=>{const star=OVERRIDES[m]?' ★':''; return `<option value="${esc(m)}">${esc(m)}${star}</option>`;}).join('');
     if([...$('model-sel').options].some(option=>option.value===selected)) $('model-sel').value=selected;
     renderCaps(false);
-  }catch(e){loadNotice('params','模型能力'+e.message+'。重新加载成功后再保存模型参数。');}
+  }else{loadNotice('params','模型能力'+cRes.reason.message+'。重新加载成功后再保存模型参数。');}
 }
 function readModelFields(){
   return Object.fromEntries(PER_MODEL_KEYS.map(key=>[key,$(key).type==='checkbox'?$(key).checked:$(key).value]));
@@ -694,13 +696,27 @@ function logLine(text){
 }
 function filterLogs(){
   const query=$('log-search').value.trim().toLowerCase(),level=$('log-level').value;
+  const noFilter=query===''&&level==='all';
   let visible=0;
-  for(const row of logwin.children){
-    row.hidden=!(row.textContent.toLowerCase().includes(query)&&(level==='all'||row.dataset.level===level));
-    if(!row.hidden) visible++;
+  if(noFilter && !logwin.querySelector('[hidden]')){
+    // 无过滤且没有隐藏行：跳过对最多 500 行 DOM 的全量文本读取
+    // （每条 SSE 日志都会走到这里，突发时是每秒数千次字符串物化）。
+    visible=logwin.childElementCount;
+  }else{
+    for(const row of logwin.children){
+      row.hidden=!noFilter&&!(row.textContent.toLowerCase().includes(query)&&(level==='all'||row.dataset.level===level));
+      if(!row.hidden) visible++;
+    }
   }
   $('log-count').textContent=`${visible} / ${logwin.childElementCount} 条日志`;
   logwin.dataset.empty=String(visible===0 && logwin.childElementCount>0);
+}
+let logFilterTimer=null;
+function scheduleLogFilter(){
+  // 突发日志合并刷新：150ms 内的多条消息只做一次全量过滤；
+  // 无过滤条件时走上面的快速路径，仍然只是计数更新。
+  if(logFilterTimer) return;
+  logFilterTimer=setTimeout(()=>{logFilterTimer=null;filterLogs();},150);
 }
 $('log-search').addEventListener('input',filterLogs);
 $('log-level').addEventListener('change',filterLogs);
@@ -715,7 +731,9 @@ try{
     const follow=autoscroll;
     logwin.insertAdjacentHTML('beforeend',logLine(event.data));
     while(logwin.childElementCount>LOG_DOM_MAX) logwin.firstElementChild.remove();
-    filterLogs();
+    // 无过滤时新行天然可见；有过滤时 150ms 合并刷新一次，
+    // 避免每条消息都触发全量 DOM 过滤。
+    scheduleLogFilter();
     if(follow && !$('view-logs').classList.contains('hidden')) logwin.scrollTop=logwin.scrollHeight;
   };
 }catch(error){$('log-state').textContent='无法建立日志连接';$('log-connection').className='status-dot error';}

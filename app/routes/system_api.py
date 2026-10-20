@@ -200,6 +200,8 @@ async def test_proxy(body: ProxyTestBody, _auth: bool = Depends(require_auth)):
                 "latency_ms": latency_ms,
                 "error": f"{type(e).__name__}: {e}",
                 "message": ("代理连通失败" if via_proxy else "直连 Google 失败")
-                + "：请检查代理地址格式（协议://用户名:密码@IP:端口）、账号密码与代理服务器状态",
+                + "：请检查代理地址格式（协议://用户名:密码@IP:端口）、账号密码与代理服务器状态。"
+                "若节点实为 TURN / TURNS / SSTP，请在代理编辑器先选择对应类型再粘贴"
+                "（不带协议前缀的地址会被识别成 SOCKS5/HTTP），保存后重测。",
             }
         )

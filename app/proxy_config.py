@@ -381,9 +381,12 @@ def proxy_fields(uri, *, allow_incomplete=False):
                 "port": config["server_port"], "username": config["username"],
                 "password": config["password"], "options": config["options"],
                 "name": unquote(parts.fragment)}
-        missing = [field for field in ("username", "password") if not config[field]]
-        if missing:
-            fields["missing_fields"] = missing
+        # TURN / TURNS 无凭据是合法形态（匿名分配服务器），不标记缺失；
+        # SSTP 的 MS-CHAPv2 认证是强制的，缺了要在草稿里提醒补齐。
+        if config["scheme"] == "sstp":
+            missing = [field for field in ("username", "password") if not config[field]]
+            if missing:
+                fields["missing_fields"] = missing
         return fields
     if parts.scheme not in FORM_PROXY_SCHEMES:
         # 分享链接回传实际协议（vless/vmess/...），前端选中对应类型；
@@ -423,6 +426,17 @@ def parse_bridge_proxy_uri(uri, *, require_credentials=True):
         query = {key: values[0] for key, values in query.items()}
         username = unquote(parts.username or "", errors="strict")
         password = unquote(parts.password or "", errors="strict")
+        # 协议://Base64(用户名:密码)@主机 形态：与 SOCKS/HTTP 解析器一致的
+        # base64 userinfo 解码。旧实现靠“缺凭据报错→回退 socks5 解析器”
+        # 间接支持；凭据改为仅 SSTP 强制后需在这里原生处理。
+        if username and not password and ":" not in username:
+            try:
+                decoded = base64.b64decode(username + "=" * (-len(username) % 4),
+                                           altchars=b"-_", validate=True).decode()
+                if ":" in decoded:
+                    username, _, password = decoded.partition(":")
+            except (ValueError, UnicodeError):
+                pass
         if (username or password) and ({"username", "password"} & query.keys()):
             raise ValueError
         username = username or query.pop("username", "")
@@ -433,8 +447,10 @@ def parse_bridge_proxy_uri(uri, *, require_credentials=True):
             raise ValueError
     except (ValueError, UnicodeError):
         raise ProxyFormatError("TURN / SSTP 地址无效，请检查主机、端口、凭据编码和重复参数。") from None
-    if require_credentials and (not username or not password):
-        raise ProxyFormatError("TURN / SSTP 需要同时填写用户名和密码；链接内的特殊字符须进行 URL 编码。")
+    # SSTP 认证（MS-CHAPv2）必须提供凭据；TURN / TURNS 允许匿名分配服务器
+    # （未认证 Allocate 直接成功）省略账号密码，由转换器按探测结果走裸客户端。
+    if require_credentials and scheme == "sstp" and (not username or not password):
+        raise ProxyFormatError("SSTP 需要同时填写用户名和密码；链接内的特殊字符须进行 URL 编码。")
     allowed = {"sni", "ca", "insecure"}
     allowed |= {"transport", "realm"} if scheme in {"turn", "turns"} else {"mtu"}
     if query.keys() - allowed:

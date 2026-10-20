@@ -88,15 +88,20 @@ def _extract_markdown_images_to_parts(text: str) -> Tuple[List[types.Part], str]
     
     if matches:
         extracted = 0
-        for match in reversed(matches):
-            mime_type = match.group(1)
-            b64_data = match.group(2)
+        # 一次重组替代逐图「前缀+后缀」重建：多图场景下旧写法每张图都
+        # 复制一遍全量剩余文本（O(n²)），数 MB 的 base64 历史会被放大成
+        # 数十 MB 的 memcpy。
+        kept = []
+        cursor = 0
+        for match in matches:
             try:
+                mime_type = match.group(1)
+                b64_data = match.group(2)
                 raw_bytes = decode_data_url_image(b64_data)
                 opt_bytes, opt_mime = optimize_image_bytes(raw_bytes, mime_type)
                 parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
-                start, end = match.span()
-                remaining_text = remaining_text[:start] + remaining_text[end:]
+                kept.append(text[cursor:match.start()])
+                cursor = match.end()
                 extracted += 1
             except Exception as e:
                 print(f"⚠️ [图片处理] 提取 Markdown 图片失败，已跳过该图片：{e}")
@@ -106,7 +111,8 @@ def _extract_markdown_images_to_parts(text: str) -> Tuple[List[types.Part], str]
         # 酒馆预设的排版）都被悄悄改写；全部提取失败时同样不该改写文本。
         # 文本保真优先。
         if extracted:
-            remaining_text = re.sub(r"[ \t]+", " ", remaining_text).strip()
+            kept.append(text[cursor:])
+            remaining_text = re.sub(r"[ \t]+", " ", "".join(kept)).strip()
 
     return parts, remaining_text
 

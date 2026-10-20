@@ -15,10 +15,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-# sing-box 版本（出站代理多协议转换引擎：vless/vmess/trojan/ss/socks4/
-# hysteria2/tuic 分享链接 → 本地 socks5，见 app/proxy_resolver.py）。
-# 需要更新时改这一个 ARG 即可；构建时可 --build-arg SINGBOX_VERSION=vX.Y.Z 覆盖。
+# sing-box 版本与各架构 tar.gz 的 SHA256（出站代理多协议转换引擎：vless/vmess/
+# trojan/ss/socks4/hysteria2/tuic 分享链接 → 本地 socks5，见 app/proxy_resolver.py）。
+# 需要更新时改这几个 ARG 即可；构建时可 --build-arg SINGBOX_VERSION=vX.Y.Z 覆盖，
+# 自定义版本时必须同步提供 --build-arg SINGBOX_SHA256_<arch>（留空则跳过校验，不推荐）。
 ARG SINGBOX_VERSION=1.14.3
+ARG SINGBOX_SHA256_amd64=e2bdf179c15a3652955dc44867e33ca0965c9c9b91b34267dcc5a5d639a5feee
+ARG SINGBOX_SHA256_arm64=29dae24d76bea3bc62d07dd3e60cfc12003de7debbd6b768df9be9c68360174e
+ARG SINGBOX_SHA256_armv7=8e81ee6bc1db6fec6e0342360e1de7bfabecec8d2e9c480a3563d129f84fb034
 
 WORKDIR /app
 
@@ -33,15 +37,22 @@ COPY --from=proxy-bridge-build /src/NOTICE.txt /usr/local/share/vertex-proxy-bri
 # 国内构建环境若访问 GitHub 困难，可 --build-arg SINGBOX_MIRROR=https://ghproxy.example/
 # 走镜像前缀（须以 / 结尾、支持原样透传路径）。
 ARG SINGBOX_MIRROR=""
+# 下载后做 SHA256 校验（哈希与镜像前缀无关，SINGBOX_MIRROR 的文件内容不同
+# 会被直接拒绝——sing-box 是流量出口安全组件，镜像被劫持/中间人会直接进镜像）。
 RUN set -eux; \
     case "$(dpkg --print-architecture)" in \
-        amd64) SINGBOX_ARCH=amd64 ;; \
-        arm64) SINGBOX_ARCH=arm64 ;; \
-        armhf) SINGBOX_ARCH=armv7 ;; \
+        amd64) SINGBOX_ARCH=amd64; SINGBOX_SHA256="$SINGBOX_SHA256_amd64" ;; \
+        arm64) SINGBOX_ARCH=arm64; SINGBOX_SHA256="$SINGBOX_SHA256_arm64" ;; \
+        armhf) SINGBOX_ARCH=armv7; SINGBOX_SHA256="$SINGBOX_SHA256_armv7" ;; \
         *) echo "unsupported architecture for sing-box: $(dpkg --print-architecture)"; exit 1 ;; \
     esac; \
     SINGBOX_URL="${SINGBOX_MIRROR}https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-${SINGBOX_ARCH}.tar.gz"; \
     python -c "import sys, urllib.request; urllib.request.urlretrieve('${SINGBOX_URL}', '/tmp/singbox.tgz')"; \
+    if [ -n "$SINGBOX_SHA256" ]; then \
+        echo "${SINGBOX_SHA256}  /tmp/singbox.tgz" | sha256sum -c -; \
+    else \
+        echo "WARNING: SINGBOX_SHA256_${SINGBOX_ARCH} is empty; integrity check skipped"; \
+    fi; \
     tar -xzf /tmp/singbox.tgz -C /tmp; \
     mv "/tmp/sing-box-${SINGBOX_VERSION}-linux-${SINGBOX_ARCH}/sing-box" /usr/local/bin/sing-box; \
     chmod 0755 /usr/local/bin/sing-box; \

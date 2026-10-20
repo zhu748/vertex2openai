@@ -235,6 +235,10 @@ class ResumableBuffer:
         self.owner_key_digest = ""
         self.bytes_stored = 0
         self._account_bytes = None
+        # per-buffer 限额在创建时快照：append 每个 SSE 帧都会检查，
+        # 旧写法每帧都进 app_state 锁读设置（变更频率极低，纯浪费）。
+        # 全局总预算（resumable_max_total_mb）仍实时读，保证放宽后立即生效。
+        self.max_buffer_bytes = _byte_limit("resumable_max_buffer_mb", 64)
         self._cond = asyncio.Condition()
 
     # ---------- 写入端（后台泵任务持有） ----------
@@ -245,7 +249,7 @@ class ResumableBuffer:
             if self.done:
                 return None
             size = len(frame.encode("utf-8"))
-            if self.bytes_stored + size > _byte_limit("resumable_max_buffer_mb", 64):
+            if self.bytes_stored + size > self.max_buffer_bytes:
                 raise BufferCapacityError("单次响应超过续传缓冲字节上限。")
             if self._account_bytes and not self._account_bytes(size, False):
                 raise BufferCapacityError("响应缓冲总字节预算已满，请稍后重试。")
@@ -263,7 +267,7 @@ class ResumableBuffer:
             self.error = error
             if payload is not None:
                 size = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
-                fits = self.bytes_stored + size <= _byte_limit("resumable_max_buffer_mb", 64)
+                fits = self.bytes_stored + size <= self.max_buffer_bytes
                 if fits and self._account_bytes:
                     fits = self._account_bytes(size, False)
                 if not fits:

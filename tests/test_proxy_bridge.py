@@ -46,7 +46,7 @@ class BridgeConfigurationTests(unittest.TestCase):
 
     def test_invalid_protocol_options_are_rejected_without_secrets(self):
         base = "sstp://private-user:private-password@host:443"
-        cases = ("turn:host:3478?transport=tcp", "turn://u:p@host?transport=udp",
+        cases = ("turn://u:p@host?transport=udp",
                  "turn://u:p@host?sni=other", base + "?mtu=100", base + "?mtu=nan",
                  base + "?insecure=maybe", base + "?ca=a&ca=b", base + "?unused=secret",
                  base + "?password=private-password", base + "/unsupported",
@@ -57,6 +57,22 @@ class BridgeConfigurationTests(unittest.TestCase):
                     parse_bridge_proxy_uri(uri)
                 self.assertNotIn("private-password", str(error.exception))
                 self.assertNotEqual(pr.validate_proxy_uri(uri), "")
+
+    def test_anonymous_allocation_turn_nodes_are_accepted(self):
+        # 开放 TURN 服务器（未认证 Allocate 直接成功）没有凭据也能导入/保存；
+        # SSTP 的 MS-CHAPv2 认证仍然强制。
+        for uri in ("turn://192.0.2.10:3479", "turn:host.example.com:3478?transport=tcp",
+                    "turn:192.0.2.10:3478?transport=tcp&username=&password="):
+            with self.subTest(uri=uri):
+                config = parse_bridge_proxy_uri(uri)
+                self.assertEqual((config["username"], config["password"]), ("", ""))
+                self.assertEqual(pr.validate_proxy_uri(uri), "")
+        fields = proxy_fields("turn://192.0.2.10:3479")
+        self.assertNotIn("missing_fields", fields)
+        self.assertNotIn("***@", pr.mask_proxy_uri("turn://192.0.2.10:3479"))
+        self.assertIn("***@", pr.mask_proxy_uri("turn://u:p@192.0.2.10:3479"))
+        with self.assertRaises(ProxyFormatError):
+            parse_bridge_proxy_uri("sstp://192.0.2.10:443")
 
     def test_ordered_lists_accept_standard_and_url_turn_forms(self):
         turn = "turn:host:3478?username=u&password=p&transport=tcp"
