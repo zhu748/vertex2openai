@@ -364,6 +364,11 @@ async def _execute_stream_request_generator(client, headers, body, sampler=None,
                         switch_proxy = chain.advance(status=getattr(data, "status_code", None))
                         if switch_proxy:
                             break
+                    # 错误前已缓冲的元数据（finish/usage/safety）先冲刷再报错，
+                    # 与正常收尾路径一致，不静默丢弃上游给出的诊断线索。
+                    for prefix in pending:
+                        yield prefix
+                    pending.clear()
                     yield item
                     return
                 if not guard.ready:
@@ -618,45 +623,53 @@ class CookieProxyUpstream(BaseUpstream):
                     project_id, base_model_name, request_obj, headers, client_kwargs,
                     retry_max, backoff_sec, jitter_sec, fastapi_request,
                 ))
-                while True:
-                    done, _pending = await asyncio.wait({collect_task}, timeout=10.0)
-                    if done:
-                        break
-                    if await fastapi_request.is_disconnected():
-                        collect_task.cancel()
-                        print("ℹ️ [Studio] 客户端已断开连接，取消生图收集。")
-                        return
-                    yield HEARTBEAT_FRAME
                 try:
-                    res = collect_task.result()
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    res = {"kind": "error", "code": 502,
-                           "message": f"batchGraphql proxy error: {type(e).__name__}: {e}"}
-                yield make_openai_chunk(response_id, model_display, role="assistant")
-                if res.get("kind") != "ok":
-                    stats.add_error()
-                    print(f"❌ [Studio] 生图失败 | {res.get('message', '')[:150]}")
-                    error = create_openai_error_response(
-                        res.get("code", 502), res.get("message", "生图失败"), "upstream_error")
-                    yield "data: " + json.dumps(error, ensure_ascii=False) + "\n\n"
+                    while True:
+                        done, _pending = await asyncio.wait({collect_task}, timeout=10.0)
+                        if done:
+                            break
+                        if await fastapi_request.is_disconnected():
+                            print("ℹ️ [Studio] 客户端已断开连接，取消生图收集。")
+                            return
+                        yield HEARTBEAT_FRAME
+                    try:
+                        res = collect_task.result()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        res = {"kind": "error", "code": 502,
+                               "message": f"batchGraphql proxy error: {type(e).__name__}: {e}"}
+                    yield make_openai_chunk(response_id, model_display, role="assistant")
+                    if res.get("kind") != "ok":
+                        stats.add_error()
+                        print(f"❌ [Studio] 生图失败 | {res.get('message', '')[:150]}")
+                        error = create_openai_error_response(
+                            res.get("code", 502), res.get("message", "生图失败"), "upstream_error")
+                        yield "data: " + json.dumps(error, ensure_ascii=False) + "\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
+                    full_text = res.get("full_text") or ""
+                    if prefill_text:
+                        full_text = prefill_text + strip_prefill_overlap(prefill_text, full_text)
+                    if res.get("reasoning_text"):
+                        yield make_openai_chunk(response_id, model_display, reasoning_content=res["reasoning_text"])
+                    # 关键：整张图作为单个 chunk 发出，绝不分块
+                    yield make_openai_chunk(response_id, model_display, content=full_text or " ")
+                    stats.add_success()
+                    usage = map_usage(res.get("usage_meta"))
+                    if want_usage:
+                        yield make_usage_chunk(response_id, model_display, usage)
+                    yield make_openai_chunk(response_id, model_display, finish_reason=res.get("finish_reason", "stop"))
                     yield "data: [DONE]\n\n"
-                    return
-                full_text = res.get("full_text") or ""
-                if prefill_text:
-                    full_text = prefill_text + strip_prefill_overlap(prefill_text, full_text)
-                if res.get("reasoning_text"):
-                    yield make_openai_chunk(response_id, model_display, reasoning_content=res["reasoning_text"])
-                # 关键：整张图作为单个 chunk 发出，绝不分块
-                yield make_openai_chunk(response_id, model_display, content=full_text or " ")
-                stats.add_success()
-                usage = map_usage(res.get("usage_meta"))
-                if want_usage:
-                    yield make_usage_chunk(response_id, model_display, usage)
-                yield make_openai_chunk(response_id, model_display, finish_reason=res.get("finish_reason", "stop"))
-                yield "data: [DONE]\n\n"
-                print(f"✅ [Studio] {base_model_name} | 生图假流式完成")
+                    print(f"✅ [Studio] {base_model_name} | 生图假流式完成")
+                finally:
+                    # 生成器被提前关闭（断连/停机/缓冲淘汰都会 aclose 本生成器，
+                    # GeneratorExit 打进 asyncio.wait 的挂起点）时必须收尸：
+                    # 孤儿任务会带着完整重试循环（retry_max × 退避）继续打上游，
+                    # 浪费配额且此时并发名额已归还，完全绕过 upstream_max_concurrency。
+                    if not collect_task.done():
+                        collect_task.cancel()
+                    await asyncio.gather(collect_task, return_exceptions=True)
             return StreamingResponse(image_fake_stream(), media_type="text/event-stream")
 
         # ========== 流式处理（彻底解决 60s 超时的真·流式机制） ==========

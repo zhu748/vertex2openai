@@ -93,7 +93,11 @@ class ProxyChain:
             return result
 
     def run_sync(self, operation):
-        """Worker-thread equivalent, used for bounded remote image downloads."""
+        """Worker-thread equivalent, used for bounded remote image downloads.
+
+        与 run 不同，这里不做基于返回值状态码的切换：operation 必须对失败
+        状态自行抛出异常（如 raise_for_status()），否则不会触发换出口。
+        """
         from proxy_resolver import resolve_proxy_uri
         while True:
             try:
@@ -160,8 +164,10 @@ async def _entered_context(context, response):
     try:
         yield response
     except BaseException as exc:
-        if not await context.__aexit__(type(exc), exc, exc.__traceback__):
-            raise
+        # 不依赖 __aexit__ 的返回值决定是否重抛：带重试语义的 CM 返回 True
+        # 会把消费者的异常静默吞掉。资源释放后必须无条件向上抛。
+        await context.__aexit__(type(exc), exc, exc.__traceback__)
+        raise
     else:
         await context.__aexit__(None, None, None)
 

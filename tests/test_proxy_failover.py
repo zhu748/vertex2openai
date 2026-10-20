@@ -22,7 +22,8 @@ from google.genai import types
 from client_pool import close_all_clients
 from first_reply import FirstReplyGuard, FirstReplyTimeout, sdk_has_reply, timed_call
 from impersonate import open_upstream_client
-from proxy_config import ProxyFormatError, normalize_proxy_uri, parse_proxy_list, proxy_fields
+from proxy_config import (ProxyFormatError, build_proxy_uri, normalize_proxy_uri,
+                          parse_proxy_list, proxy_fields)
 from proxy_failover import FailoverHTTPClient, FailoverSDKClient, ProxyChain
 from proxy_resolver import ProxyResolveError, mask_proxy_uri
 from runtime_state import app_state
@@ -92,6 +93,46 @@ class FormatTests(unittest.TestCase):
         self.assertEqual(proxy_fields("mystery://a:1")["type"], "share")
         fields = proxy_fields("socks5://u:p@1.2.3.4:1080")
         self.assertEqual((fields["type"], fields["host"], fields["port"]), ("socks5", "1.2.3.4", 1080))
+
+    def test_query_strings_do_not_corrupt_credentials(self):
+        """回归：query/fragment 里的 @ 不再把链接错切成凭据/端点两半。"""
+        # 凭据在 query 键里且值含 @：应从 query 恢复，而不是把 "p@ss" 拆成凭据。
+        self.assertEqual(normalize_proxy_uri("socks5://host:1080?username=a&password=p@ss"),
+                         "socks5://a:p%40ss@host:1080")
+        # 无关 query 值含 @：不得凭空生成凭据。
+        self.assertEqual(normalize_proxy_uri("socks5://host:1080?peer=a@b"), "socks5://host:1080")
+        # 正常凭据 + 无关 query 值含 @：凭据/端点不受污染。
+        self.assertEqual(normalize_proxy_uri("socks5://user:pass@host:1080?peer=a@b"),
+                         "socks5://user:pass@host:1080")
+        # fragment 里含 @ 的分享链接形态也不受影响（FORM 代理 URL 的 fragment 丢弃）。
+        self.assertEqual(normalize_proxy_uri("http://user:pass@host:8080#frag@ment"),
+                         "http://user:pass@host:8080")
+
+    def test_ambiguous_supplier_shapes_and_precise_errors(self):
+        """回归：裸主机名四段式不再静默错位；报错信息精确到具体原因。"""
+        # LAN 裸主机名 + 纯数字密码（真歧义）：按供应商列表惯例取 主机:端口:用户:密码。
+        # 旧实现会静默错位成 user:pass:host:port（host=admin、password=1080）。
+        self.assertEqual(normalize_proxy_uri("myhost:1080:admin:12345"),
+                         "socks5://admin:12345@myhost:1080")
+        self.assertEqual(normalize_proxy_uri("socks5://myhost:1080:admin:123456"),
+                         "socks5://admin:123456@myhost:1080")
+        # 裸主机名的用户:密码:主机:端口形态（第四段是端口、第二段非纯数字）不受影响。
+        self.assertEqual(normalize_proxy_uri("user:pass:myhost:8080"), "socks5://user:pass@myhost:8080")
+        # 精确报错不再被兜底 handler 替换成笼统的“无法识别”。
+        for text in ("socks5://host", "socks5://user:pass@host:99999"):
+            with self.subTest(text=text):
+                with self.assertRaises(ProxyFormatError) as error:
+                    normalize_proxy_uri(text)
+                self.assertIn("1–65535", str(error.exception))
+        # 全角数字端口不再被 int() 静默接受。
+        with self.assertRaises(ProxyFormatError):
+            build_proxy_uri("socks5", "host", "１０８０")
+
+    def test_direct_tokens_report_their_own_type(self):
+        """回归：direct 哨兵在 proxy_fields 中回传 direct，不再误报成 share。"""
+        for token in ("direct", "none", "off", "直连"):
+            with self.subTest(token=token):
+                self.assertEqual(proxy_fields(token), {"url": "direct", "type": "direct"})
 
 
 class ChainTests(unittest.IsolatedAsyncioTestCase):

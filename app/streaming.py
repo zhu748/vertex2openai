@@ -97,7 +97,9 @@ async def with_heartbeats(source, request=None, interval=None):
                 await pending
         close = getattr(iterator, "aclose", None)
         if close is not None:
-            with suppress(Exception):
+            # 清理期间可能再来一次取消（外层超时叠加/停机 gather）：
+            # CancelledError 属 BaseException，不补进来会跳过 source.aclose()。
+            with suppress(asyncio.CancelledError, Exception):
                 await close()
 
 

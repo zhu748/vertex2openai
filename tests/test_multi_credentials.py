@@ -135,6 +135,32 @@ class EnvironmentTests(StateFixture, unittest.TestCase):
             self.assertEqual(get_effective_proxy_uris_for_account({}), [""])
             self.assertEqual(get_effective_proxy_uris_for_account(record), record["proxies"])
 
+    def test_corrupt_state_file_is_backed_up_before_memory_mode(self):
+        """回归：损坏的状态文件先改名备份，降级后的保存不得覆盖原文件。"""
+        path = Path(runtime_state.STATE_FILE)
+        # 半截 JSON（进程崩溃 / 磁盘写坏）：里面还有可手工修复的 Cookie。
+        path.write_text('{"settings": {"a": 1}, "google_cookie": "SAPISID=precious",',
+                        encoding="utf-8")
+        state = AppState()
+        self.assertEqual(state._state, {})          # 降级为内存模式
+        backups = list(Path(self.directory.name).glob("web_state.json.corrupt-*"))
+        self.assertEqual(len(backups), 1)           # 原文件已改名保留
+        self.assertIn("SAPISID=precious", backups[0].read_text(encoding="utf-8"))
+        self.assertFalse(path.exists())             # 原位已让位给后续新写入
+        # 内存模式下的保存生成全新文件，不再原子覆盖损坏原文件。
+        state._state["settings"] = {"fresh": True}
+        state._save()
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"settings": {"fresh": True}})
+        self.assertIn("SAPISID=precious", backups[0].read_text(encoding="utf-8"))
+        # 顶层非 JSON 对象同样按损坏备份处理。
+        state2_dir = tempfile.TemporaryDirectory(dir=_TEMP.name)
+        self.addCleanup(state2_dir.cleanup)
+        with mock.patch.object(runtime_state, "STATE_FILE",
+                               str(Path(state2_dir.name) / "web_state.json")):
+            Path(state2_dir.name, "web_state.json").write_text('["not", "an", "object"]', encoding="utf-8")
+            AppState()
+            self.assertEqual(len(list(Path(state2_dir.name).glob("web_state.json.corrupt-*"))), 1)
+
 
 class ManagementTests(StateFixture, unittest.TestCase):
     def setUp(self):

@@ -54,7 +54,12 @@ def build_proxy_uri(scheme, host, port, username="", password=""):
             raise ProxyFormatError("IPv6 地址无效。") from None
         host = f"[{host}]"
     try:
-        port = int(str(port))
+        port_text = str(port).strip()
+        # 严格十进制：拒绝全角数字、"+80"、空串等 int() 能吞的形态
+        # （这是表单校验入口，宽松会放过手误）。
+        if not re.fullmatch(r"[0-9]{1,5}", port_text):
+            raise ValueError
+        port = int(port_text)
         if not 1 <= port <= 65535:
             raise ValueError
     except (TypeError, ValueError):
@@ -95,12 +100,15 @@ def normalize_proxy_uri(value, default_scheme="socks5"):
     # the suffix is not itself a valid standard URL endpoint.
     right_endpoint = authority.rsplit("@", 1)[-1].split("?", 1)[0].split("#", 1)[0].rstrip("/")
     if supplier and (("@" in authority and not _host_port(right_endpoint)) or
-                     ("@" not in authority and (_looks_like_host(supplier[1]) or not supplier[4].isdecimal()))):
+                     ("@" not in authority and (_looks_like_host(supplier[0]) or not supplier[4].isdecimal()))):
         host, port, username, password = supplier.groups()
         return build_proxy_uri(scheme, host, port, unquote(username), unquote(password))
-    if "@" in authority:
-        left, right = authority.rsplit("@", 1)
-        endpoint = right.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    # netloc 先剥掉 query/fragment 再做 @ 分析：否则 "?peer=a@b" 这类查询参数
+    # 里的 @ 会把链接错切成凭据/端点两半，静默生成错误凭据。
+    netloc = authority.split("?", 1)[0].split("#", 1)[0]
+    if "@" in netloc:
+        left, right = netloc.rsplit("@", 1)
+        endpoint = right.rstrip("/")
         left_hp, right_hp = _host_port(left), _host_port(endpoint)
         reversed_auth = left_hp and (not right_hp or (
             _looks_like_host(left_hp[0]) and not _looks_like_host(right_hp[0])))
@@ -118,7 +126,7 @@ def normalize_proxy_uri(value, default_scheme="socks5"):
         username, _, password = credentials.partition(":")
         username, password = unquote(username), unquote(password)
     else:
-        endpoint = authority.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+        endpoint = netloc.rstrip("/")
         # Colon and whitespace supplier formats. IPv6 endpoints must use brackets.
         tokens = re.split(r"\s+|\|", endpoint) if re.search(r"\s|\|", endpoint) else None
         four = re.match(r"^(\[[^\]]+\]|[^:]+):([^:]+):([^:]+):(.+)$", endpoint)
@@ -131,12 +139,22 @@ def normalize_proxy_uri(value, default_scheme="socks5"):
             return build_proxy_uri(scheme, host, port, username, password)
         if four:
             a, b, c, d = four.groups()
-            if b.isdecimal() and (_looks_like_host(a) or not d.isdecimal()):
+            b_is_port = b.isdecimal() and len(b) <= 5 and 1 <= int(b) <= 65535
+            d_is_port = d.isdecimal() and len(d) <= 5 and 1 <= int(d) <= 65535
+            if _looks_like_host(a) and b.isdecimal():
+                # 主机:端口:用户:密码：host 带点/IP/localhost 时无歧义；端口段
+                # 越界也先进此分支，由 build_proxy_uri 给出精确报错。
                 endpoint, username, password = f"{a}:{b}", unquote(c), unquote(d)
-            elif d.isdecimal():
+            elif _looks_like_host(c) and d_is_port:
+                # 用户:密码:主机:端口：第三段是主机且第四段为合法端口。
                 username, password, endpoint = unquote(a), unquote(b), f"{c}:{d}"
-            elif b.isdecimal():
+            elif b_is_port:
+                # 两端都不含点（LAN 裸主机名）且密码恰为纯数字时真歧义：按供应
+                # 商列表惯例（docstring 第一种格式）取 主机:端口:用户:密码，
+                # 不再静默错位成 user:pass:host:port。
                 endpoint, username, password = f"{a}:{b}", unquote(c), unquote(d)
+            elif d_is_port:
+                username, password, endpoint = unquote(a), unquote(b), f"{c}:{d}"
         query = parse_qs(authority.split("?", 1)[1].split("#", 1)[0]) if "?" in authority else {}
         username = (query.get("username") or query.get("user") or [username])[0]
         password = (query.get("password") or query.get("pass") or [password])[0]
@@ -144,10 +162,17 @@ def normalize_proxy_uri(value, default_scheme="socks5"):
         parts = urlsplit("//" + endpoint)
         if parts.path or not parts.hostname or parts.username:
             raise ValueError
-        port = parts.port if parts.port is not None else {"http": 80, "https": 443}.get(scheme)
-        return build_proxy_uri(scheme, parts.hostname, port, username, password)
     except (ValueError, TypeError):
         raise ProxyFormatError("无法识别代理地址；支持 协议://用户:密码@主机:端口、主机:端口:用户:密码、用户:密码:主机:端口。") from None
+    try:
+        # urlsplit 的 .port 访问时才做范围校验，单独包一层给出精确报错；
+        # build_proxy_uri 自身的 ProxyFormatError 则原样向上抛。
+        port = parts.port
+    except ValueError:
+        raise ProxyFormatError("代理端口必须是 1–65535 的整数。") from None
+    if port is None:
+        port = {"http": 80, "https": 443}.get(scheme)
+    return build_proxy_uri(scheme, parts.hostname, port, username, password)
 
 
 def parse_proxy_list(value, *, default_scheme="socks5"):
@@ -176,6 +201,10 @@ def parse_proxy_list(value, *, default_scheme="socks5"):
 def proxy_fields(uri):
     """Return normalized form fields for the proxy editor."""
     value = normalize_proxy_uri(uri)
+    if not value or value.lower() in DIRECT_TOKENS:
+        # direct 哨兵与空串不走 urlsplit：urlsplit("direct") 的 scheme 为空，
+        # 会被误报成 share（前端应选中"强制直连"）。
+        return {"url": value, "type": "direct"}
     parts = urlsplit(value)
     if parts.scheme not in FORM_PROXY_SCHEMES:
         # 分享链接回传实际协议（vless/vmess/...），前端选中对应类型；

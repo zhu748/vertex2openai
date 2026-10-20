@@ -47,8 +47,11 @@ class AppState:
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if isinstance(data, dict):
-                self._state.update(data)
+            if not isinstance(data, dict):
+                # 顶层不是 JSON 对象（如被截断成数组/字符串）同样按损坏处理，
+                # 否则降级内存模式后的下一次 _save() 会把它静默覆盖掉。
+                raise ValueError("文件顶层不是 JSON 对象")
+            self._state.update(data)
             # 旧版本创建的文件可能是 0644（里面有完整 Google Cookie），
             # 加载后立即收紧；否则要等到下一次 _save 才被 chmod 修复。
             try:
@@ -56,7 +59,17 @@ class AppState:
             except OSError:
                 pass
         except Exception as e:
-            print(f"⚠️ [状态管理器] 无法读取持久化配置文件，已自动降级为内存模式: {e}")
+            # 损坏/不可读：先把原文件改名备份再降级为内存模式。不备份的话，
+            # 用户在控制台改任何一项设置都会触发 _save() 用近空状态原子替换
+            # 掉原文件——里面可能手工可修的 Key/Cookie 将无声丢失。
+            backup = f"{STATE_FILE}.corrupt-{int(time.time())}"
+            try:
+                os.replace(STATE_FILE, backup)
+                print(f"⚠️ [状态管理器] 配置文件无法读取（{e}），已备份为 "
+                      f"{os.path.basename(backup)}，本次启动降级为内存模式。")
+            except OSError:
+                print(f"⚠️ [状态管理器] 配置文件无法读取且备份失败（{e}）；"
+                      f"注意：下次成功保存将覆盖该文件。")
 
     def _save(self) -> None:
         """原子写：先写同目录临时文件再 os.replace（同一文件系统内是原子操作）。"""

@@ -474,11 +474,10 @@ def _parse_tuic(uri: str) -> dict:
     if not server:
         raise ProxyResolveError("tuic 链接缺少服务器地址。")
     port = _require_port(parts, "tuic")
+    q = _qs(parts.query)
     ob: dict[str, Any] = {"type": "tuic", "server": server, "server_port": port,
                           "uuid": user, "password": password,
-                          "congestion_control": str(_qs(parts.query).get("congestion_control")
-                                                    or "bbr")}
-    q = _qs(parts.query)
+                          "congestion_control": str(q.get("congestion_control") or "bbr")}
     tls: dict[str, Any] = {"enabled": True}
     sni = str(q.get("sni") or "").strip()
     if sni:
