@@ -112,7 +112,17 @@ async def save_model_override(model_name: str, request: Request, _auth: bool = D
     verr = validate_settings_patch(patch, keys_scope=set(config.PER_MODEL_KEYS))
     if verr:
         return JSONResponse(status_code=400, content={"error": verr["error"], "field": verr["field"]})
-    saved = await asyncio.to_thread(app_state.set_model_override, model_name, patch)
+    # 空/全未知键的 patch 不落盘：validate_settings_patch 对 scope 外的键
+    # 静默跳过，旧实现仍会执行 set_model_override——为从未设置过的模型创建
+    # 空 override 条目，控制台徽标误显示「已有覆盖」且只能靠 DELETE 清除
+    # （2026-10 修复）。保持 200 语义不变（既有契约：全未知键返回成功、
+    # 不写入），仅消除幽灵条目。
+    clean = {k: v for k, v in patch.items() if k in config.PER_MODEL_KEYS}
+    if not clean:
+        current = await asyncio.to_thread(app_state.get_model_overrides)
+        return JSONResponse(content={"status": "success", "model": model_name,
+                                     "override": current.get(model_name, {})})
+    saved = await asyncio.to_thread(app_state.set_model_override, model_name, clean)
     return JSONResponse(content={"status": "success", "model": model_name, "override": saved})
 
 

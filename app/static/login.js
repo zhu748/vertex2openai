@@ -14,7 +14,10 @@ document.getElementById('login-form').addEventListener('submit', async event => 
   const error = document.getElementById('err');
   if (button.disabled) return;
   button.disabled = true;
-  button.textContent = '正在登录…';
+  // 只改文本节点，保留内部装饰性箭头 span（aria-hidden，读屏器应忽略）。
+  // 旧实现用 textContent 赋值会销毁 span，恢复后的箭头变成裸文本节点。
+  const label = button.firstChild;
+  if (label) label.textContent = '正在登录…';
   error.textContent = '';
   password.removeAttribute('aria-invalid');
   try {
@@ -36,6 +39,7 @@ document.getElementById('login-form').addEventListener('submit', async event => 
     error.textContent = err.name === 'TimeoutError' ? '连接超时，请稍后再试' : '无法连接服务，请检查网络后重试';
   } finally {
     button.disabled = false;
-    button.textContent = '进入控制台 →';
+    const label = button.firstChild;
+    if (label) label.textContent = '进入控制台 ';
   }
 });

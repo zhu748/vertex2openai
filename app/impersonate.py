@@ -141,13 +141,14 @@ class _CurlRespShim:
 class _CurlClientShim:
     """把 curl_cffi AsyncSession 适配成 httpx.AsyncClient 的使用面（post/stream）。"""
 
-    def __init__(self, session, total_timeout: float):
+    def __init__(self, session, post_timeout: float, stream_timeout: float):
         self._s = session
-        self._total_timeout = total_timeout
+        self._post_timeout = post_timeout
+        self._stream_timeout = stream_timeout
 
     async def post(self, url: str, *, headers=None, json=None):
         resp = await self._s.post(url, headers=headers, json=json,
-                                  timeout=self._total_timeout)
+                                  timeout=self._post_timeout)
         return _CurlRespShim(resp, from_stream=False)
 
     def stream(self, method: str, url: str, *, headers=None, json=None):
@@ -156,25 +157,35 @@ class _CurlClientShim:
     @asynccontextmanager
     async def _stream_ctx(self, method: str, url: str, *, headers=None, json=None):
         async with self._s.stream(method, url, headers=headers, json=json,
-                                  timeout=self._total_timeout) as resp:
+                                  timeout=self._stream_timeout) as resp:
             yield _CurlRespShim(resp, from_stream=True)
 
     async def aclose(self) -> None:
         await self._s.close()
 
 
-def _httpx_timeout_to_curl(timeout: Any) -> float:
-    """httpx.Timeout / (connect, read, write, pool) 语义 → curl 总超时。"""
+def _httpx_timeout_to_curl(timeout: Any) -> tuple:
+    """httpx.Timeout / (connect, read, write, pool) 语义 → curl 总超时。
+
+    curl_cffi 的 timeout 是整个请求的硬超时（CURLOPT_TIMEOUT_MS），没有
+    "两块数据之间"的 read 超时概念，因此按用途拆两个值（2026-10 修复）：
+      - 非流式：max(2×read, 60s)。旧实现统一 max(total*2, 1800) 把
+        "2× read"意图恒吞掉，非流式 POST 也挂满 30 分钟，同一故障在
+        伪装开关下的探测时间差 10 倍（httpx 180s vs curl 1800s）。
+      - 流式：保留 1800s 硬下限（首回复之后可能有长思考停顿，放宽是有意
+        行为，且外层 within_request_deadline 有同值总期限兑底）。
+    """
     try:
         if isinstance(timeout, httpx.Timeout):
             total = max(timeout.connect or 0, timeout.read or 0, timeout.write or 0,
                         timeout.pool or 0)
-            return max(total * 2, _CURL_TOTAL_TIMEOUT_SECONDS)
+            return max(total * 2, 60.0), max(total * 2, _CURL_TOTAL_TIMEOUT_SECONDS)
         if isinstance(timeout, (int, float)):
-            return max(float(timeout), _CURL_TOTAL_TIMEOUT_SECONDS)
+            v = float(timeout)
+            return max(v, 60.0), max(v, _CURL_TOTAL_TIMEOUT_SECONDS)
     except Exception:
         pass
-    return _CURL_TOTAL_TIMEOUT_SECONDS
+    return 60.0, _CURL_TOTAL_TIMEOUT_SECONDS
 
 
 @asynccontextmanager
@@ -222,10 +233,11 @@ def _create_upstream_client(client_kwargs: dict):
     from curl_cffi.requests import AsyncSession
 
     proxy = client_kwargs.get("proxy")
-    total_timeout = _httpx_timeout_to_curl(client_kwargs.get("timeout"))
+    post_timeout, stream_timeout = _httpx_timeout_to_curl(client_kwargs.get("timeout"))
     session_kwargs: dict[str, Any] = {
         "impersonate": profile,
-        "timeout": total_timeout,
+        # session 级默认取流式值；shim 的 post/stream 每次都显式传参覆盖它。
+        "timeout": stream_timeout,
         "allow_redirects": bool(client_kwargs.get("follow_redirects", False)),
         "verify": client_kwargs.get("verify", True),
         "trust_env": False,
@@ -233,7 +245,7 @@ def _create_upstream_client(client_kwargs: dict):
     }
     if proxy:
         session_kwargs["proxy"] = proxy
-    return _CurlClientShim(AsyncSession(**session_kwargs), total_timeout)
+    return _CurlClientShim(AsyncSession(**session_kwargs), post_timeout, stream_timeout)
 
 
 # ============================================================

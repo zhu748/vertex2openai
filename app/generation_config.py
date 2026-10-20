@@ -28,7 +28,8 @@ _IMAGE_SEARCH_NAMES = {"google_search", "googlesearch", "web_search", "websearch
 def _system_instruction(request: OpenAIRequest) -> str | None:
     texts = []
     for message in request.messages:
-        if message.role != "system" or not message.content:
+        # developer 与 system 同语义：进 system_instruction，不降级为 user 轮。
+        if message.role not in ("system", "developer") or not message.content:
             continue
         if isinstance(message.content, str):
             texts.append(message.content)
@@ -56,7 +57,9 @@ def _request_parameters(request: OpenAIRequest) -> dict[str, Any]:
     max_tokens = request.max_tokens if request.max_tokens is not None else request.max_completion_tokens
     if max_tokens is not None:
         result["max_output_tokens"] = max_tokens
-    if request.stop is not None:
+    if request.stop:
+        # truthiness 判断：stop="" / [] 时不发（与 Cookie 通道一致；
+        # 空串停止词对 Gemini 是非法入参，旧实现会下发 [""]）。
         result["stop_sequences"] = [request.stop] if isinstance(request.stop, str) else list(request.stop)
 
     if request.response_logprobs is not None:

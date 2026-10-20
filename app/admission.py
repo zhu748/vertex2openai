@@ -21,8 +21,10 @@ class GenerationLimiter:
 
     def reserve(self):
         trace = current_trace.get()
-        limit = max(1, int(app_state.get_setting("upstream_max_concurrency", 32)))
         with self._lock:
+            # limit 的读取必须在临界区内：控制台热调 upstream_max_concurrency
+            # 的瞬间，锁外读取会让并发 reserve 沿用旧值（TOCTOU，2026-10 修复）。
+            limit = max(1, int(app_state.get_setting("upstream_max_concurrency", 32)))
             if self.active >= limit:
                 raise GenerationCapacityError("上游生成并发已满，请稍后重试。")
             self.active += 1

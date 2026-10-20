@@ -798,9 +798,14 @@ def _passthrough_endpoint():
               f" | 原生协议透传（Express 通道）")
         try:
             sse = is_stream and "sse" in parse_qs(query).get("alt", [])
+            # 续传识别与 chat 通道（resume_cursor）同口径：x-resumable 头、
+            # X-Resume-Id、Last-Event-ID（带生成 ID 的 rid 游标或裸数字序号）、
+            # ?resume_from=。旧实现漏掉后两者，?resume_from= 会被当全新请求
+            # 重复烧上游配额（该参数 791 行已从转发 query 剥离，表明本就支持）。
             resume = (request.headers.get("x-resumable", "").lower() in ("1", "true", "yes")
                       or request.headers.get("x-resume-id")
-                      or ":" in request.headers.get("last-event-id", ""))
+                      or bool(request.headers.get("last-event-id", "").strip())
+                      or bool(request.query_params.get("resume_from", "").strip()))
             if resume and not sse:
                 return _native_error(400, "原生续传需要 streamGenerateContent?alt=sse。")
             if sse and resume and resumable_enabled():

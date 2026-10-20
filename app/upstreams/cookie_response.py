@@ -225,8 +225,13 @@ class RawSampler:
 
 
 def extract_events(obj: dict):
-    if "error" in obj:
-        yield ("error", obj["error"])
+    # 真值判断而非 "error" in obj：该端点的 Proto JSON 会序列化默认空值
+    # （同文件 thoughtSignature/functionCall 的空值过滤同理），若某个块
+    # 带出 "error": null / {}，旧实现会把它当真实错误，整个回合以 502
+    # "None"/"{}" 终结。真实错误对象恒为真值，此改动对其无影响。
+    err = obj.get("error")
+    if err:
+        yield ("error", err)
         return
 
     results = obj.get("results", [])

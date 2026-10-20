@@ -71,6 +71,7 @@ async def resolve_buffer(store, request, api_key: str, fingerprint: str, *, mode
     """Resolve an immutable generation, or atomically admit a new request."""
     request_key, source = compute_stream_id(request.headers, api_key, fingerprint)
     fingerprint_key, _ = compute_stream_id({}, api_key, fingerprint)
+    owner_key_digest = hashlib.sha256((api_key or "").encode("utf-8")).hexdigest() if api_key else ""
     generation, start, reconnect = resume_cursor(request)
     if reconnect:
         buf = await (store.get_exact(generation) if generation else store.get(request_key))
@@ -78,6 +79,10 @@ async def resolve_buffer(store, request, api_key: str, fingerprint: str, *, mode
             raise ResumeRequestError(404, "续传缓冲不存在或已过期；重新生成请移除续传 ID 与游标。")
         if buf.fingerprint_key and buf.fingerprint_key != fingerprint_key:
             raise ResumeRequestError(409, "续传请求体与原请求不一致。")
+        if buf.owner_key_digest and owner_key_digest and buf.owner_key_digest != owner_key_digest:
+            # 同一 rid 不可能属于另一把 Key（rid 混入 Key+指纹），不一致说明
+            # 调用者拿着别人的生成 ID 在试。404 不泄露存在性。
+            raise ResumeRequestError(404, "续传缓冲不存在或已过期；重新生成请移除续传 ID 与游标。")
         if buf.resume_expired():
             await store.drop(buf.id, expected=buf, reason="客户端断开已超过续传窗口。", superseded=True)
             raise ResumeRequestError(410, "客户端断开已超过续传窗口；重新生成请移除旧续传 ID 与游标。")
@@ -88,6 +93,10 @@ async def resolve_buffer(store, request, api_key: str, fingerprint: str, *, mode
     idempotent = bool(request.headers.get("idempotency-key") or request.headers.get("x-idempotency-key"))
     buf, new = await store.get_or_create_request(
         request_key, model=model, kind=kind, fingerprint_key=fingerprint_key, idempotent=idempotent)
+    if owner_key_digest:
+        # 新建时记录归属；命中已有缓冲时为幂等回写（同一 Key 必然得到同一摘要，
+        # 老版本缓冲无此字段时补齐，空 Key 部署不动）。
+        buf.owner_key_digest = owner_key_digest
     _track_buffer(buf, new, request)
     return buf, new, 0, source
 
@@ -220,6 +229,10 @@ class ResumableBuffer:
         self.request_key = ""
         self.trace_id = None
         self.fingerprint_key = ""
+        # 发起者 API Key 的 sha256 摘要：轮询端点无法携带原请求体，
+        # 用它校验 /v1/resumable/{id} 的归属，防止拿到他人 rid 后跨租户读取
+        # 或抢先标记交付。不存明文，摘要不可逆推原 Key。
+        self.owner_key_digest = ""
         self.bytes_stored = 0
         self._account_bytes = None
         self._cond = asyncio.Condition()

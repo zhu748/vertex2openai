@@ -150,6 +150,19 @@ async def lifespan(app: FastAPI):
         " / :streamGenerateContent / :countTokens（鉴权与 OpenAI 端点一致，三种原生 Key 写法均支持）。"
     )
 
+    # 默认口令告警：API_KEY 未通过环境变量覆盖时，对外 API 与控制台共用
+    # 已知默认值 "123456"，公网部署形同裸奔（可被任意人消耗凭据配额、
+    # 读取控制台明文 Key）。这里在启动日志里给一个醒目提示。
+    try:
+        from config import API_KEY as _deployed_key, DEFAULT_API_KEY as _default_key
+        if _deployed_key == _default_key:
+            print(
+                "⚠️ [安全告警] 当前仍在使用默认 API_KEY（123456），对外接口与控制台登录"
+                "均可用该默认值访问！公网部署请立即通过环境变量 API_KEY 设置强口令。"
+            )
+    except Exception:
+        pass
+
     # 启动时自动探测各 Key 归属的 GCP Project ID（location 钉定要用）。
     # 放后台任务里跑：探测走外网，绝不能阻塞服务启动。
     start_background_task(_probe_express_projects_on_startup())

@@ -20,6 +20,7 @@ from message_processing import (
     _convert_image_to_markdown,
     _create_safety_ratings_html,
     convert_to_openai_format,
+    logprobs_payload_from_candidate,
     parse_gemini_response_for_reasoning_and_content,
 )
 from models import OpenAIMessage, OpenAIRequest
@@ -295,9 +296,18 @@ def _build_chunk_payload(chunk: Any, model_name: str, response_id: str, candidat
     if not delta_payload and openai_finish_reason is None:
         delta_payload["content"] = ""
 
+    choice_item = {"index": output_index, "delta": delta_payload, "finish_reason": openai_finish_reason}
+    # 流式 logprobs：读真实字段 logprobs_result（旧实现误用 hasattr(candidate,
+    # "logprobs") 恒 False），与 OpenAI 流式格式一致地挂在 choice 层级。
+    logprobs_payload = logprobs_payload_from_candidate(
+        chunk.candidates[candidate_index]) if (
+        hasattr(chunk, "candidates") and chunk.candidates
+        and len(chunk.candidates) > candidate_index) else None
+    if logprobs_payload is not None:
+        choice_item["logprobs"] = logprobs_payload
     chunk_data = {
         "id": response_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model_name,
-        "choices": [{"index": output_index, "delta": delta_payload, "finish_reason": openai_finish_reason}]
+        "choices": [choice_item]
     }
     return chunk_data
 

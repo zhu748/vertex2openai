@@ -105,7 +105,23 @@ class _GracefulCloser:
         return entry[2]
 
     def schedule(self, close: Callable[[], Any], *, key=None, resource=None) -> None:
-        self.ensure_capacity()
+        # 容量不足时直接关闭而非抛错：淘汰中的旧客户端（同 Key 换签名 + LRU
+        # 可一次产生 2 个 stale）已从池字典弹出，若在 schedule 内抛
+        # PoolCapacityError，这些客户端既不在池也不在 pending——连接/fd
+        # 只能等 GC 兜底（2026-10 修复）。直接关闭对调用方无感：延迟回收
+        # 只是优化，立即回收不会影响活跃请求（被淘汰者已无引用）。
+        # get() 入口的 ensure_capacity 预检仍保留 503 语义，拦截高频换签名的场景。
+        try:
+            self.ensure_capacity()
+        except PoolCapacityError:
+            result = close()
+            if inspect.isawaitable(result):
+                task = asyncio.get_running_loop().create_task(result)
+                task.add_done_callback(lambda _: None)
+            if key is not None:
+                self._retired.pop(key, None)
+            return
+
         async def _close_later():
             from resumable import request_timeout_seconds
             await asyncio.sleep(max(_GRACE_CLOSE_SECONDS, request_timeout_seconds() + 30))

@@ -3,9 +3,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from credential_config import parse_cookie_records, parse_key_records
 from proxy_config import parse_proxy_list
 
+# 出厂默认口令：定义成常量供启动告警比对（lifecycle.py）。
+DEFAULT_API_KEY = "123456"
+
 
 class AppSettings(BaseSettings):
-    API_KEY: str = "123456"
+    # 默认口令仅限本机体验；生产/公网部署必须用环境变量覆盖（启动时若
+    # 仍在用默认值会在日志里打醒目告警，见 lifecycle.py）。
+    API_KEY: str = DEFAULT_API_KEY
     VERTEX_EXPRESS_API_KEY: Optional[str] = None
     VERTEX_EXPRESS_API_KEYS: Optional[str] = None  # JSON records or comma/newline-separated keys
     UPSTREAM_MODE: Optional[str] = None  # api_key | web_proxy | mixed; inferred on first boot
@@ -46,7 +51,6 @@ API_KEY = _settings.API_KEY
 ENV_EXPRESS_KEYS = parse_key_records(_settings.VERTEX_EXPRESS_API_KEYS
                                    if _settings.VERTEX_EXPRESS_API_KEYS is not None
                                    else _settings.VERTEX_EXPRESS_API_KEY)
-VERTEX_EXPRESS_API_KEY_VAL = [rec.get("key", "") for rec in ENV_EXPRESS_KEYS]
 
 FAKE_STREAMING_ENABLED = _settings.FAKE_STREAMING
 FAKE_STREAMING_INTERVAL_SECONDS = _settings.FAKE_STREAMING_INTERVAL

@@ -107,11 +107,17 @@ async def request_detail(request_id: str, _auth: bool = Depends(require_auth)):
 
 @router.get("/stream-logs")
 async def stream_logs_endpoint(request: Request, _auth: bool = Depends(require_auth)):
-    def _event_chunks(msg: str):
+    def _event_chunks(seq, msg: str):
         # SSE 规范写法：多行消息必须拆成多个 `data:` 行，浏览器会用换行拼回 e.data。
         # 之前是 yield f"data: {msg}\n\n"，msg 里的裸换行会导致换行后的每一行被浏览器
         # 当成未知字段直接丢弃——多行诊断、traceback 在控制台永远只剩第一行，
         # 只能去 Docker 日志看完整版（2026-10-04 修复）。
+        #
+        # id 字段携带全局递增 seq：浏览器 EventSource 断线自动重连时会回传
+        # Last-Event-ID，服务端据此增量重放——旧实现每次重连全量重放 100 条
+        # 历史，前端无条件 append 导致日志成片重复、计数虚高（2026-10 修复）。
+        # 不识别 id 的客户端退化为旧行为（全量重放），不受影响。
+        yield f"id: {seq}\n"
         for line in msg.splitlines() or [""]:
             yield f"data: {line}\n"
         yield "\n"
@@ -119,15 +125,23 @@ async def stream_logs_endpoint(request: Request, _auth: bool = Depends(require_a
     async def log_generator():
         q = rt_logger.subscribe()
         try:
-            for msg in rt_logger.snapshot_history():
-                for chunk in _event_chunks(msg):
+            last_id = -1
+            raw = (request.headers.get("last-event-id") or "").strip()
+            if raw.isdigit():
+                last_id = int(raw)
+            for seq, msg in rt_logger.snapshot_history():
+                if seq <= last_id:
+                    continue  # 重连的调用者已经拿到过这条
+                for chunk in _event_chunks(seq, msg):
                     yield chunk
             while True:
                 if await request.is_disconnected():
                     break
                 try:
-                    msg = await asyncio.wait_for(q.get(), timeout=1.0)
-                    for chunk in _event_chunks(msg):
+                    seq, msg = await asyncio.wait_for(q.get(), timeout=1.0)
+                    if seq <= last_id:
+                        continue  # 历史重放与订阅队列的竞态窗口内可能重复交付
+                    for chunk in _event_chunks(seq, msg):
                         yield chunk
                 except asyncio.TimeoutError:
                     yield ": keep-alive heartbeat\n\n"

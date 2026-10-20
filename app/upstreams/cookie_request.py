@@ -314,7 +314,9 @@ def _convert_messages_to_contents(messages: list, model_name: str = "", native_t
         role = msg.role
         content = msg.content
 
-        if role == "system":
+        # developer 与 system 同语义（OpenAI 新约定的最高优先级指令）：
+        # 统一收集进 system_parts，不降级为 user 轮混进对话。
+        if role in ("system", "developer"):
             if isinstance(content, str):
                 system_parts.append(content)
             else:
@@ -324,7 +326,9 @@ def _convert_messages_to_contents(messages: list, model_name: str = "", native_t
                         system_parts.append(p.get("text", ""))
             continue
 
-        if role == "tool":
+        # 旧版 functions 协议的结果消息是 role="function"（与 Express 通道的
+        # message_processing 保持同一兼容口径），漏掉会被当成 model 自述文本。
+        if role in ("tool", "function"):
             name = getattr(msg, "name", None) or call_names.get(getattr(msg, "tool_call_id", "") or "")
             if native_tools and name:
                 contents.append(

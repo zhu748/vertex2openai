@@ -2,9 +2,17 @@
 import asyncio
 import anyio
 from starlette.requests import ClientDisconnect
+from starlette.responses import JSONResponse
 
 from request_tracking import PayloadObserver, current_trace, request_registry
 from request_connection import ClientConnection, ConnectionReceiver
+
+# 请求体体积上限：与原生透传通道（gemini_native.MAX_NATIVE_BODY_BYTES）的
+# 32MiB 防护对齐。/v1/chat/completions 的 body 由 FastAPI/Pydantic 全量读入
+# 解析（含巨型 messages / base64 图片），不设限等于允许认证后的内存放大。
+# 此处在进入 FastAPI 前只看 content-length；chunked 无长度头的场景由 native
+# 通道自身的两段式检查覆盖，chat 通道极罕见（主流客户端对 JSON body 必带长度头）。
+MAX_CHAT_BODY_BYTES = 32 * 1024 * 1024
 
 
 class StatsMiddleware:
@@ -20,6 +28,20 @@ class StatsMiddleware:
         if not tracked:
             return await self.app(scope, receive, send)
         stats.increment_total()
+        declared_length = ""
+        for key, value in scope.get("headers", []):
+            if key == b"content-length":
+                declared_length = value.decode("latin-1", "")
+                break
+        if declared_length.isdigit() and int(declared_length) > MAX_CHAT_BODY_BYTES:
+            stats.add_error()
+            response = JSONResponse(
+                status_code=413,
+                content={"error": {"message": f"请求体超过 {MAX_CHAT_BODY_BYTES // (1024 * 1024)}MiB 上限。",
+                                  "type": "invalid_request_error", "code": 413}},
+            )
+            await response(scope, receive, send)
+            return
         trace = request_registry.create(path)
         token = current_trace.set(trace)
         started = False

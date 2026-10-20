@@ -23,6 +23,9 @@ def _healthz_payload() -> dict:
     proxy_url = get_effective_proxy_url()
     express_keys = app_state.get_express_keys()
     cookie_configured = bool(app_state.get_google_cookie())
+    # healthz 是被监控高频轮询的公开端点：Cookie 账号列表取一次复用，
+    # 不再每条各取一遍（每次调用都做全量记录归一化，全程持锁）。
+    accounts = app_state.get_cookie_accounts()
     return {
         "status": "ok",
         "service": "agentplatform2api",
@@ -33,8 +36,8 @@ def _healthz_payload() -> dict:
             "enabled": sum(1 for r in express_keys if r.get("enabled", True)),
         },
         "cookie_configured": cookie_configured,
-        "cookie_accounts": {"total": len(app_state.get_cookie_accounts()),
-                            "enabled": sum(r["enabled"] for r in app_state.get_cookie_accounts())},
+        "cookie_accounts": {"total": len(accounts),
+                            "enabled": sum(r["enabled"] for r in accounts)},
         "proxy": {
             "enabled": classify_proxy_uri(proxy_url) != "direct",
             "url": mask_proxy_url(proxy_url),  # 脱敏：绝不回传认证凭据

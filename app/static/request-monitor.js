@@ -137,6 +137,9 @@
     detail();
   }
   document.addEventListener('click',e=>{
+    // 与列表/详情刷新处的选区守卫同口径：行内拖选复制 trace-ID、模型名时
+    // 松开鼠标的 click 不应触发弹窗抢焦点、破坏选区。
+    if(!window.getSelection().isCollapsed) return;
     const target=e.target.closest('[data-request]');
     if(target) open(target.dataset.request);
   });
@@ -155,5 +158,6 @@
   window.requestMonitor={refresh,summary,open};
   setInterval(()=>{refresh(false);detail(false);},2000);
   document.addEventListener('visibilitychange',()=>{if(!document.hidden){refresh();detail();}});
-  fetchStats();
+  // 首次 stats 已由 dashboard.js 末尾的 fetchStats() 发起（并通过
+  // window.requestMonitor.summary 回填这里），再拉一次是冗余往返。
 })();

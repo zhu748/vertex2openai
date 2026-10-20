@@ -2,9 +2,10 @@ from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 from models import OpenAIRequest
-from auth import get_api_key
+from auth import get_api_key, get_api_key_flexible
 
 import asyncio
+import hashlib
 import json
 import time
 
@@ -120,6 +121,10 @@ async def _call_upstream(request_obj: OpenAIRequest, fastapi_request: Request):
             except Exception as exc:
                 stats.add_error()
                 code, message = extract_upstream_error(exc)
+                # 裸 TimeoutError 的 str() 是空串，客户端会收到不可排障的空
+                # message 错误帧；对齐 resumable 路径的固定文案。
+                if not message and isinstance(exc, TimeoutError):
+                    message = "本轮请求超过总执行期限。"
                 print(f"❌ [流式转发] {request_obj.model} | HTTP {code} | {message[:200]}")
                 error = create_openai_error_response(code, message[:1024], "upstream_error")
                 yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
@@ -211,13 +216,19 @@ async def _resumable_stream(fastapi_request: Request, request_obj: OpenAIRequest
             await _abort_placeholder(buf, stream_id, f"上游返回非流式响应（HTTP {status}）。", status)
             return resp
         if buf.done:
-            close = getattr(resp.body_iterator, "aclose", None)
+            close = getattr(resp, "aclose", None) or getattr(resp.body_iterator, "aclose", None)
             if close:
                 await close()
             return JSONResponse(status_code=buf.status_code, content=buf.payload or
                                 create_openai_error_response(503, "响应缓冲已释放。", "buffer_evicted"))
         pump_task = asyncio.create_task(within_request_deadline(buf, lambda: pump_stream(buf, resp.body_iterator)))
-        pump_task.add_done_callback(lambda _task: resumable_store.schedule_cleanup(resp.body_iterator.aclose))
+        # 泵结束的收尾必须走 resp.aclose（若可用）而不是只关 body_iterator：
+        # resp 是 ManagedStreamingResponse，只有 aclose 才会执行 cleanup 链
+        # （case B 下会取消 setup 任务并关闭内层上游流；只关 body_iterator 会让
+        # 慢 prepare 后被取消的泵泄漏孤儿 setup 任务与在飞上游连接，2026-10 修复）。
+        # 正常耗尽路径下 aclose 幂等无害。
+        pump_task.add_done_callback(lambda _task: resumable_store.schedule_cleanup(
+            getattr(resp, "aclose", resp.body_iterator.aclose)))
         resumable_store.register_pump(stream_id, pump_task, buffer=buf)
         print(f"📦 [续传缓冲] {stream_id}（{id_src}）：后台泵已启动，上游读取与前端连接解绑。")
         return resp
@@ -347,7 +358,7 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
 
 @router.get("/v1/resumable/{stream_id}")
 async def resumable_poll(stream_id: str, fastapi_request: Request,
-                         api_key: str = Depends(get_api_key),
+                         api_key: str = Depends(get_api_key_flexible),
                          from_: int = Query(0, alias="from"),
                          limit: int = Query(200),
                          wait: float = Query(0.0)):
@@ -357,9 +368,25 @@ async def resumable_poll(stream_id: str, fastapi_request: Request,
     短连接天生抗抖动；返回带序号的事件分片、next 游标与 done 标志，
     客户端按 seq 去重、按 done 判定本轮完整结束。wait>0 时为长轮询（最多等 25 秒）。
     响应头 X-Resume-Id 即为这里的 {id}。
+
+    鉴权与原生端点同口径（Bearer / x-goog-api-key / ?key=），并校验缓冲
+    归属：rid 只能被创建它的那把 Key 轮询（rid 本身混入 Key+指纹，跨 Key
+    读取意味着拿到了他人的生成 ID，2026-10 收紧）。
     """
+    if from_ < 0:
+        # 与续传主路径（resume_cursor 对负数返回 400）保持同一口径：
+        # 静默锐 0 会把客户端的游标 bug 掩盖成「从头全量重放」。
+        return JSONResponse(status_code=400, content=create_openai_error_response(
+            400, "轮询游标 from 必须是非负整数。", "invalid_resume_cursor"))
     buf = await resumable_store.get_exact(stream_id)
     if buf is None:
+        return JSONResponse(
+            status_code=404,
+            content=create_openai_error_response(
+                404, f"未找到响应缓冲 {stream_id}（可能已过期被清理）。", "not_found"))
+    owner_digest = hashlib.sha256((api_key or "").encode("utf-8")).hexdigest() if api_key else ""
+    if getattr(buf, "owner_key_digest", "") and owner_digest and buf.owner_key_digest != owner_digest:
+        # 404 而非 403：不向持有他人 rid 的调用者确认该缓冲存在。
         return JSONResponse(
             status_code=404,
             content=create_openai_error_response(
@@ -367,7 +394,7 @@ async def resumable_poll(stream_id: str, fastapi_request: Request,
     limit = max(1, min(limit, 500))
     if wait > 0 and not buf.done:
         await buf.wait_for(max(0, from_), min(wait, 25.0))
-    start = max(0, from_)
+    start = from_
     if start > buf.next_seq:
         return JSONResponse(status_code=409, content=create_openai_error_response(
             409, "轮询游标超过缓冲末尾。", "invalid_resume_cursor"))

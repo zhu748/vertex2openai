@@ -3,13 +3,35 @@
 import re
 from typing import List, Optional, Tuple
 
-from models import OpenAIMessage, message_text
+from models import OpenAIMessage, message_text, normalize_content_part
 
 
 def _is_empty_message(msg: OpenAIMessage) -> bool:
+    """判空口径：只把「无任何实质内容」的消息当空。
+
+    message_text 只提取文本段，因此绝不能直接用它判空——否则「无文字
+    说明、纯图片」的用户轮会被当成空消息，末尾图片轮随后被预填充兼容
+    逻辑整条删除，上一条 assistant 历史回复被误当预填充（2026-10 修复）。
+    """
     if getattr(msg, "tool_calls", None):
         return False
-    return not message_text(msg.content).strip()
+    content = msg.content
+    if content is None:
+        return True
+    if isinstance(content, str):
+        return not content.strip()
+    if isinstance(content, list):
+        for part in content:
+            p = normalize_content_part(part)
+            if isinstance(p, dict):
+                if p.get("type") == "text":
+                    if str(p.get("text", "")).strip():
+                        return False
+                elif p.get("type") or any(p.values()):
+                    # 任何非文本载体（图片/音频/未知类型/带内容 dict）都不是空消息
+                    return False
+        return True
+    return True
 
 
 DEFAULT_PREFILL_INSTRUCTION = (

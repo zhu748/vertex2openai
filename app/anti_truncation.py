@@ -109,7 +109,9 @@ def prepare_transport(request, base_model: str, settings: dict, *,
         reason = "本轮明确指定了 tool_choice，保留客户端工具选择"
     elif request.response_format and request.response_format.get("type") not in (None, "text"):
         reason = "本轮使用结构化输出"
-    elif (request.n not in (None, 1) or extra.get("best_of", 1) != 1):
+    elif (request.n not in (None, 1) or extra.get("best_of") not in (None, 1)):
+        # best_of 用 not in (None, 1)：JSON "best_of": null 会以 None 落进
+        # model_extra，旧写法 extra.get("best_of", 1) != 1 把它误判成多候选。
         reason = "本轮请求多个候选"
     elif extra.get("functions") or extra.get("function_call") or any(
             m.role == "function" or (m.model_extra or {}).get("function_call") for m in request.messages):

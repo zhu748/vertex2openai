@@ -432,6 +432,10 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
 
             async for obj in iter_json_objects(TextSource(response.text)):
                 sampler.add(obj)
+                # 一旦拿到错误事件就停止解析剩余响应：生图响应可达数 MB base64，
+                # 错误分支的返回值不依赖后续对象，继续拼接是纯浪费。
+                if api_error:
+                    break
                 for et, data in extract_events(obj):
                     if et == "text":
                         full_text += data

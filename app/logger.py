@@ -75,7 +75,8 @@ class SSELogger:
     def __init__(self, max_history: int = 100, queue_size: int = 500):
         self.max_history = max_history
         self.queue_size = queue_size
-        self.history: List[str] = []
+        self.history: List[tuple] = []   # [(seq, formatted_msg)]，seq 全局递增
+        self._seq = 0
         self._subscribers: List[tuple] = []       # [(queue, loop)]
         self._lock = threading.Lock()
 
@@ -92,14 +93,15 @@ class SSELogger:
         with self._lock:
             self._subscribers = [(sq, sl) for (sq, sl) in self._subscribers if sq is not q]
 
-    def snapshot_history(self) -> List[str]:
+    def snapshot_history(self) -> List[tuple]:
+        """返回 [(seq, msg)]；seq 供 SSE id 字段与 Last-Event-ID 增量重放使用。"""
         with self._lock:
             return list(self.history)
 
     # ---- 推送 ----
 
     @staticmethod
-    def _offer(q: asyncio.Queue, msg: str) -> None:
+    def _offer(q: asyncio.Queue, msg: tuple) -> None:
         """在事件循环线程里执行：队列满时丢最旧的一条，保证新日志能进来。"""
         try:
             q.put_nowait(msg)
@@ -115,7 +117,12 @@ class SSELogger:
         formatted_msg = f"[{timestamp}] {plain_text}"
 
         with self._lock:
-            self.history.append(formatted_msg)
+            # 每条日志带全局递增 seq：SSE 下发 id 字段后，浏览器断线重连会
+            # 自动回传 Last-Event-ID，服务端据此只重放缺失部分（旧实现重连
+            # 后全量重放 100 条历史，前端无条件 append 导致日志成片重复）。
+            self._seq += 1
+            seq = self._seq
+            self.history.append((seq, formatted_msg))
             if len(self.history) > self.max_history:
                 self.history.pop(0)
             subscribers = list(self._subscribers)
@@ -124,7 +131,7 @@ class SSELogger:
             try:
                 if loop.is_closed():
                     continue
-                loop.call_soon_threadsafe(self._offer, q, formatted_msg)
+                loop.call_soon_threadsafe(self._offer, q, (seq, formatted_msg))
             except RuntimeError:
                 # 事件循环已停止，忽略即可
                 pass

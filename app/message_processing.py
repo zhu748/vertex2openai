@@ -33,6 +33,53 @@ from usage import map_usage
 SUPPORTED_ROLES = ["user", "model", "function"]
 
 
+def logprobs_payload_from_candidate(candidate: Any) -> Optional[Dict[str, Any]]:
+    """把 SDK Candidate 的 logprobs_result 转成 OpenAI choices[].logprobs 结构。
+
+    旧实现写的是 hasattr(candidate, "logprobs")，但 google-genai 的字段名
+    是 logprobs_result——该分支恒为 False，客户端请求 logprobs:true 时
+    上游真的返回了概率数据却在转换层被整体丢弃（2026-10 修复）。
+    Cookie 通道不下发 logprobs 参数，此函数仅服务 Express/SDK 路径。
+    """
+    result = getattr(candidate, "logprobs_result", None)
+    if result is None:
+        return None
+    chosen = list(getattr(result, "chosen_candidates", None) or [])
+    if not chosen:
+        return None
+    tops = list(getattr(result, "top_candidates", None) or [])
+
+    def _entry(item: Any) -> Dict[str, Any]:
+        token = getattr(item, "token", None)
+        logprob = getattr(item, "log_probability", None)
+        if token is None and logprob is None:
+            return {}
+        entry: Dict[str, Any] = {"token": token or ""}
+        if logprob is not None:
+            entry["logprob"] = float(logprob)
+        try:
+            entry["bytes"] = list((token or "").encode("utf-8"))
+        except (UnicodeError, ValueError):
+            pass
+        return entry
+
+    content = []
+    for i, item in enumerate(chosen):
+        entry = _entry(item)
+        if not entry:
+            continue
+        top_list = None
+        if i < len(tops):
+            top_list = [_entry(c) for c in (getattr(tops[i], "candidates", None) or [])]
+            top_list = [t for t in top_list if t]
+        if top_list:
+            entry["top_logprobs"] = top_list
+        content.append(entry)
+    if not content:
+        return None
+    return {"content": content}
+
+
 def _extract_markdown_images_to_parts(text: str) -> Tuple[List[types.Part], str]:
     parts = []
     remaining_text = text
@@ -109,7 +156,10 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
 
     for idx, message in enumerate(messages):
         role = message.role
-        if role == "system":
+        # OpenAI 新约定（o 系列/Responses 风格）用 developer 表达最高优先级指令，
+        # 语义等同 system：统一跳过 contents，由 system_instruction 单独承载，
+        # 避免被降级成 user 轮混进对话（2026-10 修复）。
+        if role in ("system", "developer"):
             continue
 
         parts = []
@@ -673,7 +723,9 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
                 google["part_order"] = order_descriptors
             
             choice_item = {"index": i, "message": message_payload, "finish_reason": openai_finish_reason}
-            if hasattr(candidate, "logprobs") and candidate.logprobs is not None: choice_item["logprobs"] = candidate.logprobs
+            logprobs_payload = logprobs_payload_from_candidate(candidate)
+            if logprobs_payload is not None:
+                choice_item["logprobs"] = logprobs_payload
             choices.append(choice_item)
             
     elif hasattr(gemini_response_obj, "text") and gemini_response_obj.text is not None:

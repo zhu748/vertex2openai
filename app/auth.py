@@ -1,6 +1,6 @@
 import secrets
 
-from fastapi import HTTPException, Header
+from fastapi import HTTPException, Header, Request
 from typing import Optional
 from config import API_KEY
 
@@ -40,3 +40,28 @@ async def get_api_key(authorization: Optional[str] = Header(None)):
         raise HTTPException(status_code=401, detail="API Key 无效。")
 
     return api_key
+
+
+async def get_api_key_flexible(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+    x_goog_api_key: Optional[str] = Header(None),
+):
+    """鉴权依赖：兼容 Bearer / x-goog-api-key / ?key= 三种写法。
+
+    与原生 Gemini 端点的取 Key 口径一致，便于同一客户端用同一套凭据
+    发起生成与轮询 /v1/resumable/{id}（旧实现只认 Bearer，原生客户端
+    用 x-goog-api-key 轮询分片会被 401，2026-10 修复）。
+    """
+    bearer = ""
+    if authorization and authorization.startswith("Bearer "):
+        bearer = authorization[len("Bearer "):]
+    candidate = x_goog_api_key or bearer or request.query_params.get("key", "")
+    if not candidate:
+        raise HTTPException(
+            status_code=401,
+            detail="缺少 API Key（支持 Authorization: Bearer / x-goog-api-key / ?key= 三种写法）。",
+        )
+    if not validate_api_key(candidate):
+        raise HTTPException(status_code=401, detail="API Key 无效。")
+    return candidate
