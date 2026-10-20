@@ -312,10 +312,34 @@ async function main() {
     const legacySsPayload=Buffer.from('chacha20-ietf-poly1305:private-password@9.9.9.9:9999').toString('base64');
     await page.fill('#proxy-paste','ss://'+legacySsPayload);
     await page.click('.proxy-recognize');
-    await page.waitForFunction(()=>document.querySelector('#proxy-type').value==='share' && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    await page.waitForFunction(()=>document.querySelector('#proxy-type').value==='singbox' && !document.querySelector('#proxy-form-add').matches(':disabled'));
     await page.click('#proxy-form-add');
     await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===3 && !document.querySelector('#proxy-form-add').matches(':disabled'));
     assert.ok(!(await page.locator('[data-proxy-index="2"] strong').textContent()).includes(legacySsPayload));
+    await page.locator('[data-proxy-index="2"]').getByRole('button',{name:'删除第 3 条代理',exact:true}).click();
+    // 分享链接协议：下拉统一归入 sing-box 节点选项，列表行显示协议://端点 与节点名。
+    await page.fill('#proxy-paste','vless://12345678-90ab-4cde-8f90-1234567890ab@203.0.113.10:2096?security=tls&type=ws&path=%2F#NL%20Node');
+    await page.click('.proxy-recognize');
+    await page.waitForFunction(()=>document.querySelector('#proxy-type').value==='singbox' && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    // 选中 sing-box 节点后：结构化字段隐藏，粘贴框切换为节点链接输入。
+    assert.equal(await page.locator('#proxy-structured-fields').evaluate(el=>el.classList.contains('hidden')),true);
+    assert.equal(await page.textContent('#proxy-paste-label'),'节点链接');
+    assert.equal(await page.inputValue('#proxy-paste'),'vless://12345678-90ab-4cde-8f90-1234567890ab@203.0.113.10:2096?security=tls&type=ws&path=%2F#NL%20Node');
+    await screenshot('proxy-editor-singbox-node');
+    await page.click('#proxy-form-add');
+    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===3 && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    const vlessLabel=await page.locator('[data-proxy-index="2"] strong').textContent();
+    assert.ok(vlessLabel.includes('vless://203.0.113.10:2096') && vlessLabel.includes('NL Node'),vlessLabel);
+    const vmessPayload=Buffer.from(JSON.stringify({v:'2',ps:'东京 01',add:'vm.example.com',port:'443',id:'11111111-2222-3333-4444-555555555555',aid:'0',scy:'auto',net:'ws',type:'none',host:'',path:'/ws',tls:'tls',sni:'',alpn:'',fp:''})).toString('base64');
+    await page.fill('#proxy-paste','vmess://'+vmessPayload);
+    await page.click('.proxy-recognize');
+    await page.waitForFunction(()=>document.querySelector('#proxy-type').value==='singbox' && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    await page.click('#proxy-form-add');
+    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===4 && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    const vmessLabel=await page.locator('[data-proxy-index="3"] strong').textContent();
+    assert.ok(vmessLabel.includes('vmess://vm.example.com:443') && vmessLabel.includes('东京 01'),vmessLabel);
+    assert.ok(!vmessLabel.includes(vmessPayload));
+    await page.locator('[data-proxy-index="3"]').getByRole('button',{name:'删除第 4 条代理',exact:true}).click();
     await page.locator('[data-proxy-index="2"]').getByRole('button',{name:'删除第 3 条代理',exact:true}).click();
     await page.fill('#proxy-paste',JSON.stringify(Array.from({length:30},(_,index)=>`http://draft-${index}.invalid:8080`)));
     await page.click('.proxy-recognize');

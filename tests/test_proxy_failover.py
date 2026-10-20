@@ -67,6 +67,32 @@ class FormatTests(unittest.TestCase):
         with self.assertRaises(ProxyFormatError):
             parse_proxy_list([{}])
 
+    def test_share_links_report_their_protocol_for_the_editor(self):
+        """proxy_fields 回传分享链接的实际协议，前端代理编辑器据此选中类型。"""
+        import base64 as _b64
+        import json as _json
+        vmess = "vmess://" + _b64.b64encode(_json.dumps(
+            {"add": "vm.example.com", "port": "443", "id": "u", "ps": "node"}).encode()).decode()
+        cases = {
+            "vless://12345678-90ab-4cde-8f90-1234567890ab@203.0.113.10:2096?security=tls&type=ws&path=%2F#NL": "vless",
+            vmess: "vmess",
+            "trojan://secret@203.0.113.12:443?sni=example.com#TJ": "trojan",
+            "ss://YWVzLTI1Ni1nY206cGFzcw==@5.6.7.8:8388#S": "ss",
+            "hysteria2://auth@203.0.113.11:443?sni=example.com#HY2": "hysteria2",
+            "hy2://auth@203.0.113.11:443?sni=example.com#HY2": "hy2",
+            "tuic://11111111-2222-3333-4444-555555555555:pwd@203.0.113.13:443?congestion_control=bbr#TU": "tuic",
+        }
+        for uri, scheme in cases.items():
+            with self.subTest(scheme=scheme):
+                fields = proxy_fields(uri)
+                self.assertEqual(fields["type"], scheme)
+                self.assertEqual(fields["url"], uri)
+                self.assertNotIn("host", fields)      # 分享链接不拆结构化字段
+        # 未知协议回落通用 share；原生协议仍是结构化字段
+        self.assertEqual(proxy_fields("mystery://a:1")["type"], "share")
+        fields = proxy_fields("socks5://u:p@1.2.3.4:1080")
+        self.assertEqual((fields["type"], fields["host"], fields["port"]), ("socks5", "1.2.3.4", 1080))
+
 
 class ChainTests(unittest.IsolatedAsyncioTestCase):
     async def test_resolution_failures_skip_to_next_proxy_and_never_add_direct(self):

@@ -76,6 +76,8 @@ async function saveCookieAccounts(){
 }
 
 /* Proxy editor stores a draft until Apply; account list/global Save persists it. */
+// 可拆字段填写的原生代理协议；其余类型（sing-box 节点链接 / 直连）只走粘贴框。
+const STRUCTURED_PROXY_TYPES=['socks5','socks5h','http','https','socks4','socks4a'];
 function openProxyEditor(scope='global',index=0){
   if((scope==='key'&&!keysLoaded)||(scope==='cookie'&&!cookiesLoaded)||(scope==='global'&&!settingsLoaded)){
     toast('配置尚未加载，请先重新加载');return;
@@ -97,9 +99,24 @@ function proxyLabel(uri){
   if(['direct','none','off','直连'].includes(uri.toLowerCase())) return '强制直连';
   try{
     const url=new URL(uri);
-    if(url.protocol==='vmess:') return 'vmess://（分享链接）';
-    if(url.protocol==='ss:'&&!url.username&&!url.password) return 'ss://（分享链接）';
-    return url.protocol+'//'+(url.username||url.password?'***@':'')+url.host;
+    const proto=url.protocol.replace(/:$/,'');
+    if(proto==='vmess'){
+      // vmess:// 整体是 base64(JSON)：解出地址与备注才能区分多条同类节点。
+      try{
+        const b64=uri.slice('vmess://'.length).replace(/-/g,'+').replace(/_/g,'/');
+        const bytes=Uint8Array.from(atob(b64),c=>c.charCodeAt(0));
+        const payload=JSON.parse(new TextDecoder().decode(bytes));
+        const host=String(payload.add||'')+(payload.port?':'+payload.port:'');
+        return 'vmess://'+(host||'（分享链接）')+(payload.ps?' · '+payload.ps:'');
+      }catch(_){return 'vmess://（分享链接）';}
+    }
+    if(proto==='ss'&&!url.username&&!url.password) return 'ss://（分享链接）';
+    if(STRUCTURED_PROXY_TYPES.includes(proto))
+      return proto+'://'+((url.username||url.password)?'***@':'')+url.host;
+    // 其余分享链接（vless/trojan/hy2/tuic 等）：显示端点与节点备注。
+    let name='';
+    try{name=decodeURIComponent(url.hash.replace(/^#/,'')).trim();}catch(_){name=url.hash.replace(/^#/,'').trim();}
+    return proto+'://'+url.host+(name?' · '+name:'');
   }catch(_){return '待识别的代理地址';}
 }
 function renderProxyEditor(){
@@ -138,7 +155,12 @@ function resetProxyForm(){
 }
 function proxyTypeChanged(){
   const type=$('proxy-type').value;
-  $('proxy-structured-fields').classList.toggle('hidden',['share','direct'].includes(type));
+  const structured=STRUCTURED_PROXY_TYPES.includes(type);
+  $('proxy-structured-fields').classList.toggle('hidden',!structured);
+  // 选中 sing-box 节点时，粘贴框即节点链接输入框。
+  const nodeLink=type==='singbox';
+  $('proxy-paste-label').textContent=nodeLink?'节点链接':'粘贴代理 · 自动识别';
+  $('proxy-paste').placeholder=nodeLink?'vless:// vmess:// trojan:// ss:// hysteria2:// tuic:// …（每行一条，可批量）':'粘贴一条自动填入字段，粘贴多条可批量导入';
 }
 async function parseProxyInput(payload){
   const response=await fetch('/api/proxy/parse',{method:'POST',signal:AbortSignal.timeout(15000),headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
@@ -147,10 +169,12 @@ async function parseProxyInput(payload){
   return result.proxies;
 }
 function fillProxyFields(proxy){
-  const type=proxy.url==='direct'?'direct':proxy.type;
+  let type=proxy.url==='direct'?'direct':proxy.type;
+  // 分享链接系（vless/vmess/trojan/ss/hysteria2/tuic 及未知协议）统一归入 sing-box 节点。
+  if(type!=='direct'&&!STRUCTURED_PROXY_TYPES.includes(type)) type='singbox';
   $('proxy-type').value=type;
   for(const field of ['host','port','username','password']) $('proxy-'+field).value=proxy[field]??'';
-  if(type==='share'||type==='direct') $('proxy-paste').value=proxy.url;
+  if(!STRUCTURED_PROXY_TYPES.includes(type)) $('proxy-paste').value=proxy.url;
   proxyTypeChanged();
 }
 async function recognizeProxyPaste(){
@@ -163,7 +187,9 @@ async function recognizeProxyPaste(){
     $('proxy-editor-error').textContent='';
     if(proxies.length===1){
       fillProxyFields(proxies[0]);
-      $('proxy-paste-hint').textContent='已识别 '+(proxies[0].url==='direct'?'强制直连':proxies[0].type==='share'?'分享链接':proxies[0].type.toUpperCase())+'，检查字段后加入列表。';
+      const t=proxies[0].type;
+      const identified=proxies[0].url==='direct'?'强制直连':(t==='share'?'分享链接':t.toUpperCase());
+      $('proxy-paste-hint').textContent='已识别 '+identified+'，检查后加入列表。';
     }else{
       const merged=[...new Set([...proxyEditor.proxies,...proxies.map(p=>p.url)])];
       if(merged.length>32) throw new Error('每个列表最多 32 条代理');
@@ -179,16 +205,19 @@ async function editProxy(index){
     if(proxyEditor!==editor) return;
     resetProxyForm();proxyEditor.editing=index;fillProxyFields(proxies[0]);
     renderProxyEditor();
-    const target=$(['share','direct'].includes($('proxy-type').value)?'proxy-paste':'proxy-host');
+    const target=$(STRUCTURED_PROXY_TYPES.includes($('proxy-type').value)?'proxy-host':'proxy-paste');
     target.focus({preventScroll:true});target.scrollIntoView({block:'center',behavior:'smooth'});
   }catch(error){if(proxyEditor===editor) $('proxy-editor-error').textContent=error.message;}
 }
 async function addProxyDraft(){
   const editor=proxyEditor;
   const type=$('proxy-type').value;
+  const structured=STRUCTURED_PROXY_TYPES.includes(type);
   try{
-    const payload=['share','direct'].includes(type)?{text:type==='direct'?'direct':$('proxy-paste').value.trim()}:
-      {type,host:$('proxy-host').value.trim(),port:$('proxy-port').value.trim(),username:$('proxy-username').value,password:$('proxy-password').value};
+    if(type==='singbox'&&!$('proxy-paste').value.trim())
+      throw new Error('请先在上方粘贴节点链接（vless://、vmess:// 等）');
+    const payload=structured?{type,host:$('proxy-host').value.trim(),port:$('proxy-port').value.trim(),username:$('proxy-username').value,password:$('proxy-password').value}
+      :{text:type==='direct'?'direct':$('proxy-paste').value.trim()};
     const proxies=await parseProxyInput(payload);
     if(proxyEditor!==editor) return false;
     if(proxyEditor.editing!==null){proxyEditor.proxies.splice(proxyEditor.editing,1,proxies[0].url);}

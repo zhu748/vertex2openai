@@ -10,6 +10,11 @@ DIRECT_TOKENS = {"direct", "none", "off", "直连", "无代理"}
 FORM_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h", "socks4", "socks4a"}
 _ALIASES = {"socks": "socks5", "socks5-hostname": "socks5h", "socks4-hostname": "socks4a"}
 
+# sing-box 转换的分享链接协议（见 proxy_resolver.SINGBOX_PROXY_SCHEMES）。
+# proxy_fields 对这些协议回传实际 scheme：前端代理编辑器据此在识别提示里
+# 显示协议名，并把它们统一归入「sing-box 节点」下拉选项（整条链接编辑）。
+SHARE_PROXY_SCHEMES = {"vless", "vmess", "trojan", "ss", "hysteria2", "hy2", "tuic"}
+
 
 class ProxyFormatError(ValueError):
     pass
@@ -173,7 +178,10 @@ def proxy_fields(uri):
     value = normalize_proxy_uri(uri)
     parts = urlsplit(value)
     if parts.scheme not in FORM_PROXY_SCHEMES:
-        return {"url": value, "type": "share"}
+        # 分享链接回传实际协议（vless/vmess/...），前端选中对应类型；
+        # 未知协议保持通用 share（仅整条 URI 编辑）。
+        scheme = parts.scheme if parts.scheme in SHARE_PROXY_SCHEMES else "share"
+        return {"url": value, "type": scheme}
     return {"url": value, "type": parts.scheme, "host": parts.hostname,
             "port": parts.port, "username": unquote(parts.username or ""),
             "password": unquote(parts.password or "")}
