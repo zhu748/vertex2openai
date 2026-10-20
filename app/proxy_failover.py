@@ -57,12 +57,10 @@ class ProxyChain:
         stats.add_retry()
         from first_reply import FirstReplyTimeout
         if isinstance(error, FirstReplyTimeout):
-            # 首回复超时既可能是出口“半死”（连上但不透传），也可能是模型
-            # 思考本身较慢；不武断归因为代理故障，提示两种可能。
+            # 超时详情（“超过 N 秒”与调参提示）由 first_reply 的 trace 事件
+            # 说明；切换日志只保留简短原因，不输出英文类名。
             seconds = getattr(error, "seconds", None)
-            window = f" {seconds:g} 秒" if seconds else ""
-            reason = (f"首回复超时{window}（模型思考较慢或出口不畅均可能；"
-                      f"慢思考模型可在模型参数调大 first_reply_timeout_seconds）")
+            reason = f"首回复超时 {seconds:g} 秒" if seconds else "首回复超时"
         else:
             reason = f"HTTP {status}" if status is not None else type(error).__name__
         print(f"🔀 [代理切换] {mask_proxy_uri(previous) or '直连'} 失败（{reason}），"

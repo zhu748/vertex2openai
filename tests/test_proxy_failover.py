@@ -236,7 +236,7 @@ class ChainTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(multi.exception.seconds, 0.01)
 
     async def test_proxy_switch_log_explains_timeout_fairly(self):
-        """首回复超时切换时不再输出英文类名，改为提示“模型慢或出口不畅均可能”。"""
+        """首回复超时切换时输出秒数而非英文类名；详情由 trace 事件单独说明。"""
         token = request_tracking._attempt_started.set(None)
         try:
             async def operation(raw, resolved):
@@ -250,10 +250,35 @@ class ChainTests(unittest.IsolatedAsyncioTestCase):
                         ProxyChain(candidates=["http://first:80", "http://second:80"]).run(operation))
             text = output.getvalue()
             self.assertIn("🔀 [代理切换]", text)
-            self.assertIn("首回复超时", text)
-            self.assertIn("模型思考较慢或出口不畅均可能", text)
+            self.assertIn("首回复超时 0.015 秒", text)
             self.assertNotIn("FirstReplyTimeout", text)
         finally:
+            request_tracking._attempt_started.reset(token)
+
+    async def test_proxy_attempt_timeout_emits_trace_event(self):
+        """多出口每出口窗口超时都发 first_reply_timeout trace 事件，
+        对齐单出口路径既有的“超过 N 秒”说明，不再只剩切换英文类名。"""
+        token = request_tracking._attempt_started.set(None)
+        trace_token = None
+        try:
+            trace = request_tracking.RequestTrace("/v1/chat/completions")
+            trace_token = request_tracking.current_trace.set(trace)
+            async def operation(raw, resolved):
+                await asyncio.Event().wait()
+            with mock.patch("first_reply.timeout_seconds", return_value=0.015):
+                with self.assertRaises(FirstReplyTimeout):
+                    await timed_call(
+                        "gemini-test",
+                        ProxyChain(candidates=["http://first:80", "http://second:80"]).run(operation))
+            events = [e for e in trace.events if e["kind"] == "first_reply_timeout"]
+            self.assertEqual(len(events), 2)  # 每个出口各一条
+            for item in events:
+                self.assertIn("等待模型首回复超过 0.015 秒", item["message"])
+                self.assertIn("本次上游读取已中断", item["message"])
+                self.assertIn("当前出口窗口", item["message"])
+        finally:
+            if trace_token is not None:
+                request_tracking.current_trace.reset(trace_token)
             request_tracking._attempt_started.reset(token)
 
     async def test_sdk_switches_before_first_chunk_but_does_not_replay_partial_stream(self):
