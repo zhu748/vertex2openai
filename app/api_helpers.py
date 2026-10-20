@@ -51,7 +51,8 @@ from upstream_errors import (
     extract_upstream_error,
 )
 from usage import make_usage_chunk, map_usage, wants_usage
-from request_tracking import configure as track_configure, upstream_attempt, upstream_chunk, record_usage
+from request_tracking import (attempt_started_at, configure as track_configure,
+                              upstream_attempt, upstream_chunk, record_usage)
 from first_reply import FirstReplyGuard, sdk_has_reply, timed_call
 
 
@@ -759,7 +760,11 @@ async def execute_gemini_call(
                             upstream_chunk()
                             received_chunks += 1
                             if received_chunks == 1:
-                                elapsed = time.monotonic() - attempt_started
+                                # 归因到当前出口的尝试起点：多出口切换后
+                                # attempt_started_at() 会重置，不把已失败出口
+                                # 的等待时间累加进来（外层 attempt_started 只随
+                                # 换 key 重试重置，口径是整次尝试总耗时）。
+                                elapsed = time.monotonic() - (attempt_started_at() or attempt_started)
                                 print(f"📥 [首个上游分片] {request_obj.model}：第 {attempt + 1} 次尝试等待 {elapsed:.1f} 秒收到分片；分片可能仅含思考或用量。")
                             if getattr(chunk_item_call, "usage_metadata", None):
                                 final_p_tk, final_c_tk, final_t_tk = _extract_usage(chunk_item_call)
@@ -786,7 +791,7 @@ async def execute_gemini_call(
                                 delta = choice.get("delta") or {}
                                 if delta.get("content"):
                                     if not content_chars:
-                                        elapsed = time.monotonic() - attempt_started
+                                        elapsed = time.monotonic() - (attempt_started_at() or attempt_started)
                                         print(f"✍️ [首段正文] {request_obj.model}：第 {attempt + 1} 次尝试等待 {elapsed:.1f} 秒开始输出正文。")
                                     content_chars += len(delta["content"])
                                 reasoning_chars += len(delta.get("reasoning_content") or "")

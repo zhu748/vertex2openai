@@ -1,7 +1,8 @@
 """Ordered proxy failover with real loopback HTTP proxies and offline SDK doubles."""
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, redirect_stdout
+import io
 import json
 import os
 from pathlib import Path
@@ -27,6 +28,8 @@ from proxy_config import (ProxyFormatError, build_proxy_uri, normalize_proxy_uri
 from proxy_failover import FailoverHTTPClient, FailoverSDKClient, ProxyChain
 from proxy_resolver import ProxyResolveError, mask_proxy_uri
 from runtime_state import app_state
+import request_tracking
+from request_tracking import attempt_started_at, upstream_attempt
 from express_key_manager import ExpressKeyManager
 from routes import gemini_native
 from upstreams import cookie_proxy
@@ -184,6 +187,74 @@ class ChainTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch("first_reply.timeout_seconds", return_value=0.01):
             with self.assertRaises(FirstReplyTimeout):
                 await timed_call("gemini-test", ProxyChain(candidates=["http://first:80"]).run(operation))
+
+    async def test_attempt_started_resets_when_switching_exits(self):
+        """出口切换后“第 N 次尝试等待 X 秒”必须归因到新出口，不累加已失败出口的等待。"""
+        token = request_tracking._attempt_started.set(None)
+        try:
+            observed = []
+            async def operation(raw, resolved):
+                observed.append((raw, attempt_started_at()))
+                if raw.endswith("first:80"):
+                    await asyncio.Event().wait()
+                return httpx.Response(200)
+            upstream_attempt()  # 模拟 api_helpers 外层在首次调用前的记录
+            with mock.patch("first_reply.timeout_seconds", return_value=0.015):
+                result = await timed_call(
+                    "gemini-test",
+                    ProxyChain(candidates=["http://first:80", "http://second:80"]).run(operation))
+            self.assertEqual(result.status_code, 200)
+            self.assertEqual([raw for raw, _ in observed], ["http://first:80", "http://second:80"])
+            first_started, second_started = observed[0][1], observed[1][1]
+            self.assertIsNotNone(first_started)
+            self.assertIsNotNone(second_started)
+            # 第二次出口尝试的起点被刷新（中间隔了超时窗口，必大于第一次）。
+            self.assertGreater(second_started, first_started)
+        finally:
+            request_tracking._attempt_started.reset(token)
+
+    async def test_first_reply_timeout_carries_window_seconds(self):
+        """FirstReplyTimeout 携带触发超时的窗口秒数，供切换日志归类原因。"""
+        with mock.patch("first_reply.timeout_seconds", return_value=0.01):
+            guard = FirstReplyGuard("gemini-test")
+            async def hang():
+                await asyncio.Event().wait()
+            with self.assertRaises(FirstReplyTimeout) as ctx:
+                await guard.wait(hang())
+            self.assertEqual(ctx.exception.seconds, 0.01)
+            # 多出口路径：proxy_attempt 触发的超时同样携带窗口秒数。
+            token = request_tracking._attempt_started.set(None)
+            try:
+                async def blocked(raw, resolved):
+                    await asyncio.Event().wait()
+                with self.assertRaises(FirstReplyTimeout) as multi:
+                    await timed_call(
+                        "gemini-test",
+                        ProxyChain(candidates=["http://first:80", "http://second:80"]).run(blocked))
+            finally:
+                request_tracking._attempt_started.reset(token)
+            self.assertEqual(multi.exception.seconds, 0.01)
+
+    async def test_proxy_switch_log_explains_timeout_fairly(self):
+        """首回复超时切换时不再输出英文类名，改为提示“模型慢或出口不畅均可能”。"""
+        token = request_tracking._attempt_started.set(None)
+        try:
+            async def operation(raw, resolved):
+                await asyncio.Event().wait()
+            output = io.StringIO()
+            with mock.patch("first_reply.timeout_seconds", return_value=0.015), \
+                    redirect_stdout(output):
+                with self.assertRaises(FirstReplyTimeout):
+                    await timed_call(
+                        "gemini-test",
+                        ProxyChain(candidates=["http://first:80", "http://second:80"]).run(operation))
+            text = output.getvalue()
+            self.assertIn("🔀 [代理切换]", text)
+            self.assertIn("首回复超时", text)
+            self.assertIn("模型思考较慢或出口不畅均可能", text)
+            self.assertNotIn("FirstReplyTimeout", text)
+        finally:
+            request_tracking._attempt_started.reset(token)
 
     async def test_sdk_switches_before_first_chunk_but_does_not_replay_partial_stream(self):
         partial_chunk = types.GenerateContentResponse(candidates=[types.Candidate(

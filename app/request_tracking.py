@@ -15,6 +15,7 @@ import time
 
 
 current_trace = ContextVar("request_trace", default=None)
+_attempt_started = ContextVar("attempt_started", default=None)
 MAX_INSPECTION_BYTES = 2 * 1024 * 1024
 
 
@@ -350,8 +351,17 @@ def configure(**values):
 
 
 def upstream_attempt():
+    # 每次真实发起上游调用（含同 key 换出口）都刷新起点：日志里的
+    # “第 N 次尝试等待 X 秒”应归因到当前出口，而不是把已失败出口的
+    # 等待时间累加进来。
+    _attempt_started.set(time.monotonic())
     if trace := current_trace.get():
         trace.attempt()
+
+
+def attempt_started_at():
+    """最近一次上游尝试（当前出口）的单调钟起点；尚未发起过则为 None。"""
+    return _attempt_started.get()
 
 
 def upstream_chunk():

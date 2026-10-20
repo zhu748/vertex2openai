@@ -55,7 +55,16 @@ class ProxyChain:
         self.index += 1
         from logger import stats
         stats.add_retry()
-        reason = f"HTTP {status}" if status is not None else type(error).__name__
+        from first_reply import FirstReplyTimeout
+        if isinstance(error, FirstReplyTimeout):
+            # 首回复超时既可能是出口“半死”（连上但不透传），也可能是模型
+            # 思考本身较慢；不武断归因为代理故障，提示两种可能。
+            seconds = getattr(error, "seconds", None)
+            window = f" {seconds:g} 秒" if seconds else ""
+            reason = (f"首回复超时{window}（模型思考较慢或出口不畅均可能；"
+                      f"慢思考模型可在模型参数调大 first_reply_timeout_seconds）")
+        else:
+            reason = f"HTTP {status}" if status is not None else type(error).__name__
         print(f"🔀 [代理切换] {mask_proxy_uri(previous) or '直连'} 失败（{reason}），"
               f"按顺序尝试 {self.index + 1}/{len(self.candidates)}："
               f"{mask_proxy_uri(self.current) or '直连'}")

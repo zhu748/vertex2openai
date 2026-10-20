@@ -34,13 +34,19 @@ async def proxy_attempt(enabled):
     except TimeoutError as exc:
         if not attempt.expired():
             raise
-        raise FirstReplyTimeout(f"当前出口等待模型首回复超过 {guard.seconds:g} 秒。") from exc
+        raise FirstReplyTimeout(
+            f"当前出口等待模型首回复超过 {guard.seconds:g} 秒。", seconds=guard.seconds) from exc
     finally:
         parent.reschedule(guard.deadline if completed else None)
 
 
 class FirstReplyTimeout(TimeoutError):
     code = 504
+
+    def __init__(self, message, *, seconds=None):
+        super().__init__(message)
+        # 携带触发超时的窗口秒数，供代理切换日志区分“模型慢”与“出口故障”。
+        self.seconds = seconds
 
 
 def timeout_seconds(model):
@@ -76,7 +82,9 @@ class FirstReplyGuard:
                 raise
             if self.trace:
                 self.trace.event("first_reply_timeout", f"等待模型首回复超过 {self.seconds:g} 秒，本次上游读取已中断。")
-            raise FirstReplyTimeout(f"等待模型首回复超过 {self.seconds:g} 秒（思考、正文、工具调用或图片均算回复）。") from exc
+            raise FirstReplyTimeout(
+                f"等待模型首回复超过 {self.seconds:g} 秒（思考、正文、工具调用或图片均算回复）。",
+                seconds=self.seconds) from exc
         finally:
             _active_wait.reset(token)
 
