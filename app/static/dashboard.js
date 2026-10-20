@@ -121,6 +121,30 @@ async function fetchStats(){
 /* ---------- 通用转义（XSS 防护）：所有拼进 innerHTML 的服务端数据必须先过这里 ---------- */
 function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
 
+/* ---------- Shared credential forms (available even if the editor fails to load) ---------- */
+function proxyDraft(value){
+  if(Array.isArray(value)) return value.map(v=>typeof v==='string'?v:JSON.stringify(v));
+  const text=String(value||'').trim();
+  if(!text) return [];
+  if(text.startsWith('[')){
+    try{const list=JSON.parse(text);if(Array.isArray(list)) return proxyDraft(list);}catch(_){}
+  }
+  return text.split(/\r?\n/).map(v=>v.trim()).filter(Boolean);
+}
+function credentialCopy(record){return {...record,proxies:proxyDraft(record.proxies??record.proxy)};}
+function projectFromInput(value){
+  const text=value.trim(), match=text.match(/[?&]project=([^&#]+)/)||text.match(/\/projects\/([^/?#]+)/);
+  if(!match) return text;
+  try{return decodeURIComponent(match[1]);}catch(_){return match[1];}
+}
+function accountProxyFields(scope,index,record){
+  const prefix=scope==='key'?'k':'c', proxies=proxyDraft(record.proxies??record.proxy);
+  return `<div class="account-proxy-field"><div class="field-heading"><label for="${scope}-proxy-${index}">专属代理（按顺序尝试）</label>
+    <button type="button" class="btn-ghost" onclick="manageProxies('${scope}',${index})">管理代理 · ${proxies.length} 条</button></div>
+    <textarea id="${scope}-proxy-${index}" class="inp log ${prefix}-proxy" rows="2" spellcheck="false" autocomplete="off" placeholder="每行一条；留空跟随全局；direct 强制直连">${esc(proxies.join('\n'))}</textarea>
+    <label class="fallback-option"><input type="checkbox" class="${prefix}-fallback" ${record.proxy_fallback===false?'':'checked'}>专属代理全部失效后，使用全局代理</label></div>`;
+}
+
 /* ---------- Channel ---------- */
 let currentMode='api_key';
 function renderMode(mode){
@@ -701,9 +725,60 @@ try{
 $('image_aspect_ratio').addEventListener('change', e=>{ curAR=e.target.value; });
 
 /* init */
+let channelConfigLoading=null;
+function channelAssetNotice(message){
+  let box=$('console-assets-error');
+  if(!box){
+    box=document.createElement('div');box.id='console-assets-error';box.className='inline-notice hidden';box.setAttribute('role','alert');
+    box.innerHTML='<span></span><button type="button" class="btn-ghost" onclick="location.reload()">刷新面板</button>';
+    document.querySelector('main').prepend(box);
+  }
+  box.classList.toggle('hidden',!message);box.querySelector('span').textContent=message;
+}
+async function ensureChannelConfig(){
+  if(window.consoleChannels) return window.consoleChannels;
+  if(!channelConfigLoading){
+    channelConfigLoading=new Promise((resolve,reject)=>{
+      const script=document.createElement('script');
+      const source=document.querySelector('script[src^="/static/channel-config.js"]')?.src || '/static/channel-config.js';
+      const url=new URL(source,location.href);url.searchParams.set('retry',Date.now());
+      script.src=url.href;script.async=false;script.dataset.cfasync='false';
+      const timer=setTimeout(()=>finish(new Error('账号与代理编辑器加载超时')),10000);
+      function finish(error){
+        clearTimeout(timer);script.onload=script.onerror=null;
+        if(error){script.remove();reject(error);}else resolve(window.consoleChannels);
+      }
+      script.onload=()=>finish(window.consoleChannels?null:new Error('账号与代理编辑器版本不一致'));
+      script.onerror=()=>finish(new Error('账号与代理编辑器加载失败'));
+      document.head.append(script);
+    });
+  }
+  try{return await channelConfigLoading;}finally{channelConfigLoading=null;}
+}
+async function loadChannelFeatures(){
+  try{
+    const channels=await ensureChannelConfig();
+    await channels.load();
+    channels.init();
+    channelAssetNotice('');
+  }catch(error){channelAssetNotice(error.message+'。已保存的 Key、代理和模型参数仍可查看与修改，请刷新或重新加载配置以重试编辑器。');}
+}
+async function manageProxies(scope='global',index=0){
+  try{
+    const channels=await ensureChannelConfig();channels.init();channels.open(scope,index);
+  }catch(error){channelAssetNotice(error.message+'，请重新加载配置或刷新面板。');toast(error.message);}
+}
+// Keep buttons in a cached previous HTML document usable during an upgrade.
+function openProxyEditor(scope='global',index=0){return manageProxies(scope,index);}
+function reloadConfiguration(){
+  loadNotice('channel','');
+  return Promise.allSettled([loadRuntime(),loadParams(),loadExpressKeys(),loadChannelFeatures()]);
+}
+// Read local state before initializing optional dialogs. An asset failure must
+// never hide the saved proxy or prevent the user from correcting it.
 navigateHash();
-initProxyEditor();
-fetchStats(); setInterval(()=>{ if(!document.hidden) fetchStats(); },3000); loadRuntime(); loadParams(); loadExpressKeys(); loadCookieAccounts();
+fetchStats(); setInterval(()=>{ if(!document.hidden) fetchStats(); },3000);
+loadRuntime(); loadParams(); loadExpressKeys(); loadChannelFeatures();
 
 async function runAction(button,action){
   if(button.matches(':disabled')) return;

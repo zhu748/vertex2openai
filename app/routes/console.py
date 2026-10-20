@@ -22,6 +22,7 @@ from console_auth import (
     revoke_session,
     require_auth,
 )
+from console_assets import versioned_assets
 from logger import rt_logger, stats
 from request_tracking import request_registry
 
@@ -33,13 +34,13 @@ _TEMPLATE_DIR = Path(__file__).resolve().parents[1] / "templates"
 @lru_cache(maxsize=2)
 def _load_template(name: str) -> str:
     """页面只从随应用分发的模板读取，缓存到进程结束。"""
-    return (_TEMPLATE_DIR / name).read_text(encoding="utf-8")
+    return versioned_assets((_TEMPLATE_DIR / name).read_text(encoding="utf-8"))
 
 
 @router.get("/", response_class=HTMLResponse)
 async def dashboard_ui(request: Request):
     name = "dashboard.html" if is_authenticated(request) else "login.html"
-    return HTMLResponse(_load_template(name))
+    return HTMLResponse(_load_template(name), headers={"Cache-Control": "no-store", "Vary": "Cookie"})
 
 
 class LoginBody(BaseModel):

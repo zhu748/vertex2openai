@@ -1,6 +1,7 @@
 """控制台跨路由会话、模板加载与凭证热更新的离线集成回归。"""
 
 import os
+import re
 from html.parser import HTMLParser
 from pathlib import Path
 import sys
@@ -16,6 +17,7 @@ from fastapi.testclient import TestClient
 
 import config
 import console_auth
+import console_assets
 import main
 from routes import console, credentials_api, settings_api
 from runtime_state import AppState
@@ -117,6 +119,38 @@ class ConsoleRoutesTests(unittest.TestCase):
                     response = self.client.get(url)
                     self.assertEqual(response.status_code, 200)
                     self.assertGreater(len(response.content), 0)
+
+    def test_console_documents_and_assets_cannot_reuse_a_previous_deployment(self):
+        for authenticated in (False, True):
+            if authenticated:
+                self.login()
+            response = self.client.get("/")
+            self.assertEqual(response.headers["cache-control"], "no-store")
+            self.assertIn("Cookie", response.headers["vary"])
+            urls = re.findall(r'(?:src|href)="(/static/[^"?]+\.(?:js|css)\?v=[a-f0-9]{16})"', response.text)
+            self.assertGreaterEqual(len(urls), 3)
+            self.assertEqual(len({url.split("?v=")[1] for url in urls}), 1)
+            for url in urls:
+                asset = self.client.get(url)
+                self.assertEqual(asset.status_code, 200)
+                self.assertIn("must-revalidate", asset.headers["cache-control"])
+                cached = self.client.get(url, headers={"If-None-Match": asset.headers["etag"]})
+                self.assertEqual(cached.status_code, 304)
+                self.assertIn("must-revalidate", cached.headers["cache-control"])
+            # Browsers that still have old HTML also revalidate bare URLs.
+            self.assertIn("must-revalidate", self.client.get('/static/dashboard.js').headers["cache-control"])
+
+    def test_changing_any_console_module_changes_the_shared_asset_version(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(console_assets, "STATIC_DIR", Path(directory)):
+            module = Path(directory) / "channel-config.js"
+            module.write_text("old component", encoding="utf-8")
+            template = '<script src="/static/channel-config.js"></script><script src="/static/dashboard.js"></script>'
+            before = console_assets.versioned_assets(template)
+            module.write_text("new component", encoding="utf-8")
+            after = console_assets.versioned_assets(template)
+            self.assertNotEqual(before, after)
+            versions = re.findall(r'\?v=([a-f0-9]{16})', after)
+            self.assertEqual(versions[0], versions[1])
 
     def test_key_save_refreshes_the_registered_manager(self):
         self.login()

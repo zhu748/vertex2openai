@@ -4,7 +4,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
+from console_assets import ConsoleStaticFiles
 
 from express_key_manager import ExpressKeyManager
 from lifecycle import lifespan
@@ -24,7 +24,7 @@ from runtime_state import StatePersistenceError
 
 app = FastAPI(title="agentplatform2api", lifespan=lifespan)
 app.state.express_key_manager = ExpressKeyManager()
-app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
+app.mount("/static", ConsoleStaticFiles(directory=Path(__file__).parent / "static"), name="static")
 
 app.add_middleware(
     CORSMiddleware,

@@ -1,5 +1,8 @@
-/* Cookie accounts and the shared, ordered proxy editor. Loaded before dashboard.js. */
-let COOKIE_ACCOUNTS=[], cookiesLoaded=false, proxyEditor=null;
+/* Cookie accounts and the ordered proxy editor. Shared form helpers live in dashboard.js.
+ * Keep state local so a failed/cached script can be retried without redeclaration errors. */
+(() => {
+if(window.consoleChannels) return;
+let COOKIE_ACCOUNTS=[], cookiesLoaded=false, proxyEditor=null, proxyEditorInitialized=false;
 
 async function updateCredentialStrategy(select){
   if(!settingsLoaded){toast('设置尚未加载，请先重新加载配置');return;}
@@ -14,28 +17,6 @@ async function updateCredentialStrategy(select){
   finally{select.disabled=false;}
 }
 
-function proxyDraft(value){
-  if(Array.isArray(value)) return value.map(v=>typeof v==='string'?v:JSON.stringify(v));
-  const text=String(value||'').trim();
-  if(!text) return [];
-  if(text.startsWith('[')){
-    try{const list=JSON.parse(text);if(Array.isArray(list)) return proxyDraft(list);}catch(_){}
-  }
-  return text.split(/\r?\n/).map(v=>v.trim()).filter(Boolean);
-}
-function credentialCopy(record){return {...record,proxies:proxyDraft(record.proxies??record.proxy)};}
-function projectFromInput(value){
-  const text=value.trim(), match=text.match(/[?&]project=([^&#]+)/)||text.match(/\/projects\/([^/?#]+)/);
-  if(!match) return text;
-  try{return decodeURIComponent(match[1]);}catch(_){return match[1];}
-}
-function accountProxyFields(scope,index,record){
-  const prefix=scope==='key'?'k':'c', proxies=proxyDraft(record.proxies??record.proxy);
-  return `<div class="account-proxy-field"><div class="field-heading"><label for="${scope}-proxy-${index}">专属代理（按顺序尝试）</label>
-    <button type="button" class="btn-ghost" onclick="openProxyEditor('${scope}',${index})">管理代理 · ${proxies.length} 条</button></div>
-    <textarea id="${scope}-proxy-${index}" class="inp log ${prefix}-proxy" rows="2" spellcheck="false" autocomplete="off" placeholder="每行一条；留空跟随全局；direct 强制直连">${esc(proxies.join('\n'))}</textarea>
-    <label class="fallback-option"><input type="checkbox" class="${prefix}-fallback" ${record.proxy_fallback===false?'':'checked'}>专属代理全部失效后，使用全局代理</label></div>`;
-}
 function renderCookieAccounts(){
   $('cookies-list').innerHTML=COOKIE_ACCOUNTS.map((rec,index)=>`
     <div class="key-card cookie-card" data-cookie-index="${index}">
@@ -247,8 +228,17 @@ async function testEditorProxy(index){
   }catch(error){if(target.isConnected) target.textContent='测试失败：'+error.message;}
 }
 function initProxyEditor(){
+  if(proxyEditorInitialized) return;
+  if(!['proxy-dialog-close','proxy-dialog-cancel','proxy-dialog','proxy-paste'].every(id=>$(id))) throw new Error('代理编辑器页面版本不一致，请刷新面板');
   $('proxy-dialog-close').addEventListener('click',closeProxyEditor);
   $('proxy-dialog-cancel').addEventListener('click',closeProxyEditor);
   $('proxy-dialog').addEventListener('cancel',event=>{event.preventDefault();closeProxyEditor();});
   $('proxy-paste').addEventListener('paste',()=>setTimeout(()=>{if(proxyEditor) runAction(document.querySelector('.proxy-recognize'),recognizeProxyPaste);},0));
+  proxyEditorInitialized=true;
 }
+
+window.consoleChannels={load:loadCookieAccounts,init:initProxyEditor,open:openProxyEditor};
+Object.assign(window,{updateCredentialStrategy,loadCookieAccounts,addCookieAccount,removeCookieAccount,saveCookieAccounts,
+  closeProxyEditor,moveProxy,deleteProxy,resetProxyForm,proxyTypeChanged,recognizeProxyPaste,editProxy,addProxyDraft,
+  applyProxyEditor,testEditorProxy,renderProxyEditor});
+})();

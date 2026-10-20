@@ -500,6 +500,67 @@ async function main() {
     assert.equal(await page.evaluate(() => document.querySelector('#prompt-bar').style.width), '0%');
     check('零请求与零 Token 正确显示，避免 NaN 或虚假比例');
 
+    const cachedComponentPage=await context.newPage();
+    let componentRequests=0;
+    await cachedComponentPage.route('**/static/channel-config.js*',route=>{
+      componentRequests++;
+      // A previous deployment used top-level names. Retrying the current
+      // component must not collide with those cached declarations.
+      return componentRequests===1?route.fulfill({contentType:'application/javascript',body:'let COOKIE_ACCOUNTS=[], cookiesLoaded=false, proxyEditor=null;'}):route.continue();
+    });
+    await cachedComponentPage.goto(origin+'/#channel');
+    await cachedComponentPage.waitForFunction(()=>window.consoleChannels && document.querySelectorAll('[data-cookie-index]').length===2 && document.querySelectorAll('.k-key').length===2);
+    assert.equal(componentRequests,2);
+    assert.equal(await cachedComponentPage.inputValue('#first_reply_timeout_seconds'),'35');
+    await cachedComponentPage.getByRole('button',{name:'管理 / 添加代理',exact:true}).click();
+    await cachedComponentPage.waitForSelector('#proxy-dialog[open]');
+    await cachedComponentPage.keyboard.press('Escape');
+    await cachedComponentPage.close();
+    check('旧版缓存脚本自动重新加载，账号与代理组件重试不发生全局变量冲突');
+
+    const originalSettings=await (await page.request.get(origin+'/api/settings')).json();
+    const offlineProxy='socks5://invalid-user:invalid-pass@127.0.0.1:9';
+    assert.equal((await page.request.post(origin+'/api/settings',{data:{proxy_urls:[offlineProxy]}})).status(),200);
+    const offlinePage=await context.newPage();
+    await offlinePage.route('**/static/channel-config.js*',route=>route.abort());
+    await offlinePage.goto(origin+'/#channel');
+    await offlinePage.waitForSelector('#console-assets-error:not(.hidden)');
+    await offlinePage.waitForFunction(()=>settingsLoaded && keysLoaded && runtimeLoaded && capabilitiesLoaded);
+    assert.equal(await offlinePage.locator('.k-key').count(),2);
+    assert.ok(await offlinePage.locator('#model-sel option').count()>1);
+    assert.equal(await offlinePage.inputValue('#proxy-input'),offlineProxy);
+    await offlinePage.fill('#proxy-input','http://replacement.invalid:8080');
+    pending=offlinePage.waitForResponse(r=>new URL(r.url()).pathname==='/api/settings' && r.request().method()==='POST');
+    await offlinePage.locator('button[onclick*="saveProxy()"]').click();
+    response=await pending;
+    assert.equal(response.status(),200);
+    assert.deepEqual((await response.json()).proxy_urls,['http://replacement.invalid:8080']);
+    await offlinePage.unroute('**/static/channel-config.js*');
+    await offlinePage.evaluate(()=>reloadConfiguration());
+    await offlinePage.waitForFunction(()=>window.consoleChannels && document.querySelectorAll('[data-cookie-index]').length===2);
+    assert.equal(await offlinePage.locator('#console-assets-error').isHidden(),true);
+    await offlinePage.getByRole('button',{name:'管理 / 添加代理',exact:true}).click();
+    await offlinePage.waitForSelector('#proxy-dialog[open]');
+    await offlinePage.keyboard.press('Escape');
+    await offlinePage.close();
+    assert.equal((await page.request.post(origin+'/api/settings',{data:{proxy_urls:originalSettings.proxy_urls}})).status(),200);
+    check('代理离线且编辑器脚本不可用时，Key、模型与参数仍加载，原代理可修改保存，组件可重新加载恢复');
+
+    const mismatchedPage=await context.newPage();
+    await mismatchedPage.route(origin+'/',async route=>{
+      const response=await route.fetch();
+      await route.fulfill({response,body:(await response.text()).replace('id="proxy-dialog-close"','id="old-proxy-dialog-close"')});
+    });
+    await mismatchedPage.goto(origin+'/#channel');
+    await mismatchedPage.waitForSelector('#console-assets-error:not(.hidden)');
+    await mismatchedPage.waitForFunction(()=>settingsLoaded && keysLoaded && capabilitiesLoaded && document.querySelectorAll('[data-cookie-index]').length===2);
+    assert.ok(await mismatchedPage.locator('#model-sel option').count()>1);
+    assert.equal(await mismatchedPage.inputValue('#proxy-input'),originalSettings.proxy_urls.join('\n'));
+    assert.ok((await mismatchedPage.textContent('#console-assets-error')).includes('版本不一致'));
+    await mismatchedPage.close();
+    await page.bringToFront();
+    check('弹窗初始化异常不阻断 Cookie、Key、代理和本地模型目录加载');
+
     const failedPage = await context.newPage();
     await failedPage.route('**/api/settings', route => route.fulfill({status: 503, json: {error: 'test'}}));
     await failedPage.goto(origin + '/#params');

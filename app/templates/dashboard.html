@@ -7,10 +7,10 @@
   <meta content="#f6f7fb" name="theme-color"/>
   <link href="/static/dashboard.css" rel="stylesheet"/>
   <link href="/static/console.css" rel="stylesheet"/>
-  <script defer="" src="/static/channel-config.js"></script>
-  <script defer="" src="/static/dashboard.js">
+  <script data-cfasync="false" defer="" src="/static/channel-config.js"></script>
+  <script data-cfasync="false" defer="" src="/static/dashboard.js">
   </script>
-  <script defer="" src="/static/request-monitor.js">
+  <script data-cfasync="false" defer="" src="/static/request-monitor.js">
   </script>
  </head>
  <body class="min-h-screen console-page">
@@ -238,7 +238,7 @@
      <div class="inline-notice hidden" id="channel-load-error" role="alert">
       <span>
       </span>
-      <button class="btn-ghost" onclick="runAction(this,async()=&gt;{loadNotice('channel','');await Promise.all([loadRuntime(),loadExpressKeys(),loadCookieAccounts(),loadParams()]);})">重新加载配置</button>
+      <button class="btn-ghost" onclick="runAction(this,reloadConfiguration)">重新加载配置</button>
      </div>
      <div class="channel-grid">
       <fieldset class="card settings-card channel-wide">
@@ -278,7 +278,7 @@
          <div class="text-xs text-neutral-500 mt-0.5">多个 Key 可同时启用，每个 Key 可设置自己的项目、代理列表与回退策略</div>
         </div>
         <div class="toolbar-actions">
-         <span class="pill" id="keys-count" style="text-transform:none">0 个</span>
+         <span class="pill" id="keys-count" style="text-transform:none">加载中…</span>
          <button class="px-3 py-1.5 text-sm rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="runAction(this,()=&gt;probeAllKeys())">探测已保存 Key</button>
          <button class="px-3 py-1.5 text-sm rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="addKeyRow()">＋ 添加 Key</button>
          <button class="btn px-4 py-1.5 text-sm" onclick="runAction(this,()=&gt;saveExpressKeys())">保存 Key 列表</button>
@@ -351,7 +351,7 @@
       <fieldset class="card settings-card channel-wide" id="cookie-box">
        <legend class="visually-hidden">Cookie 账号列表</legend>
        <div class="card-toolbar"><div><div class="text-sm font-semibold">Cookie 账号列表</div><div class="text-xs text-neutral-500 mt-0.5">每个账号独立绑定 Cookie、Project ID 和代理；已保存的 Cookie 留空即可保留</div></div>
-        <div class="toolbar-actions"><span class="pill" id="cookies-count">0 个</span><button type="button" onclick="addCookieAccount()">＋ 添加 Cookie</button><button type="button" class="btn px-4 py-1.5 text-sm" onclick="runAction(this,()=>saveCookieAccounts())">保存 Cookie 列表</button></div>
+        <div class="toolbar-actions"><span class="pill" id="cookies-count">加载中…</span><button type="button" onclick="addCookieAccount()">＋ 添加 Cookie</button><button type="button" class="btn px-4 py-1.5 text-sm" onclick="runAction(this,()=>saveCookieAccounts())">保存 Cookie 列表</button></div>
        </div>
        <div id="cookies-list"></div>
        <p class="empty-state hidden" id="cookies-empty">尚未配置 Cookie 账号。添加一个或多个账号，并填写各自的 Project ID。</p>
@@ -360,7 +360,7 @@
       <fieldset class="card settings-card channel-wide">
        <legend class="visually-hidden">全局代理列表</legend>
        <div class="card-toolbar"><div><div class="text-sm font-semibold">全局代理列表 <button aria-controls="h_proxy" aria-expanded="false" aria-label="展开说明" class="helpq" onclick="hlp(this,'h_proxy')" type="button">?</button></div><div class="text-xs text-neutral-500 mt-0.5">从第一条开始使用，失败后依次切换。账号专属代理优先于此列表</div></div>
-        <div class="toolbar-actions"><span class="pill" id="proxy-status">未启用（直连）</span><button type="button" onclick="openProxyEditor('global')">管理 / 添加代理</button><button type="button" onclick="runAction(this,()=>testProxy())">测试首条</button><button type="button" class="btn px-4 py-1.5 text-sm" onclick="runAction(this,()=>saveProxy())">保存代理</button></div>
+        <div class="toolbar-actions"><span class="pill" id="proxy-status">加载中…</span><button type="button" onclick="manageProxies('global')">管理 / 添加代理</button><button type="button" onclick="runAction(this,()=>testProxy())">测试首条</button><button type="button" class="btn px-4 py-1.5 text-sm" onclick="runAction(this,()=>saveProxy())">保存代理</button></div>
        </div>
        <div class="helpbox" id="h_proxy">每行一条，或用「管理 / 添加代理」填写类型、IP、端口、账号、密码，也可粘贴后自动识别。支持 HTTP / HTTPS / SOCKS5 / SOCKS5H，以及由 sing-box 转换的 SOCKS4、VLESS、VMess、Trojan、SS、Hysteria2、TUIC。<br>连接异常、代理超时或 HTTP 407 / 502 / 503 / 504 时尝试下一条；账号鉴权、配额与参数错误沿用模型重试策略。<br>账号专属代理全部失败后，默认继续尝试全局列表；可在每个账号下取消此回退。清空全局列表并保存即可直连；已配置代理全部失败时，不会额外增加直连出口。账号填写 <code>direct</code> 可强制直连。</div>
        <textarea aria-label="全局出站代理" class="inp log" id="proxy-input" rows="3" spellcheck="false" autocomplete="off" placeholder="每行一条，第一条为首选；留空 = 直连。点击「管理 / 添加代理」填写或识别代理"></textarea>
