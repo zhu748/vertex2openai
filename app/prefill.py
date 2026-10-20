@@ -245,17 +245,24 @@ def apply_prefill_compat(
     return new_msgs, prefill, True
 
 
+# 重叠搜索窗口上限：预填充复述发生在输出开头几百字符内，真实用例不会
+# 超过几千字符。无上限时长预填充（角色扮演预设可达数十 KB）的循环比对
+# 是 O(n²) 字符操作且在事件循环上（实测 100KB 预填充 ~237ms 纯 CPU）。
+_OVERLAP_SEARCH_CAP = 4096
+
+
 def strip_prefill_overlap(prefill: str, output: str, min_overlap: int = 8) -> str:
     """预填充去重：若模型无视指令、把预填充的结尾复述在输出开头，裁掉重叠部分。
 
     - 输出以整段预填充开头（完整复述）→ 裁掉整段；
-    - 否则找 预填充结尾 与 输出开头 的最长重叠（≥ min_overlap 字符，避免误伤）。
+    - 否则找 预填充结尾 与 输出开头 的最长重叠（≥ min_overlap 字符，避免误伤），
+      搜索窗口受 _OVERLAP_SEARCH_CAP 钳位（超长预填充不再平方级膨胀）。
     """
     if not prefill or not output:
         return output
     if output.startswith(prefill):
         return output[len(prefill) :]
-    kmax = min(len(prefill), len(output))
+    kmax = min(len(prefill), len(output), _OVERLAP_SEARCH_CAP)
     for k in range(kmax, min_overlap - 1, -1):
         if prefill[-k:] == output[:k]:
             return output[k:]

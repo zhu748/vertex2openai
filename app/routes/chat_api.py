@@ -76,7 +76,8 @@ async def _call_upstream(request_obj: OpenAIRequest, fastapi_request: Request):
                 setup.cancel()
             result = (await asyncio.gather(setup, return_exceptions=True))[0]
             if isinstance(result, StreamingResponse):
-                close = getattr(result, "aclose", result.body_iterator.aclose)
+                # getattr 默认值不能急切求值：非 StreamingResponse 形态会先抛 AttributeError。
+                close = getattr(result, "aclose", None) or result.body_iterator.aclose
                 await close()
 
         try:

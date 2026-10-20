@@ -38,6 +38,7 @@ cachedContent / responseSchema 等字段保持原请求体，兼容性取决于�
 import json
 import asyncio
 import codecs
+import hashlib
 import time
 from typing import Any, Optional
 from urllib.parse import parse_qs, quote
@@ -167,9 +168,15 @@ def _split_model_action(model_action: str) -> tuple[str, str]:
     return name.strip(), ""
 
 
-def _resolve_upstream_model_path(model: str, key_project_id: str) -> str:
-    """复用 Express 通道的 location 钉定规则。"""
-    settings = app_state.get_settings()
+def _resolve_upstream_model_path(model: str, key_project_id: str,
+                                 settings: dict | None = None) -> str:
+    """复用 Express 通道的 location 钉定规则。
+
+    settings 可由调用方传入请求级快照：重试循环里逐次调用时免掉
+    get_settings() 的全量深拷贝（retry_max 上限 50，最坏一次请求 51 次）。
+    """
+    if settings is None:
+        settings = app_state.get_settings()
     return resolve_express_model_path(model, settings, key_project_id=key_project_id)
 
 
@@ -295,6 +302,10 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
 
     is_stream = action == "streamGenerateContent"
     retry_max, backoff_seconds, jitter_seconds = get_retry_settings()
+    # 请求级设置快照：重试循环内 _resolve_upstream_model_path 每次都
+    # get_settings()（锁内全量深拷贝），最多 51 次；拍一次快照复用，
+    # 与 models_api/settings_api 已有 base= 模式一致。
+    base_settings = app_state.get_settings()
     record = None
     previous_key = None
     key_attempts = 0           # 上游错误已重试次数（不含首次）
@@ -339,7 +350,8 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
             # 钉定兜底轮：复用同一把 Key（换的是模型路径，不是 Key）
             model_path = model
         else:
-            model_path = _resolve_upstream_model_path(model, record.get("project_id", ""))
+            model_path = _resolve_upstream_model_path(model, record.get("project_id", ""),
+                                                     settings=base_settings)
 
         upstream = None
         prefetched = None
@@ -410,13 +422,16 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
               + (f" ← {upstream.request.url}"
                  if app_state.get_setting("debug_outbound", False) else ""))
         if (is_stream and upstream.status_code < 400
+                and "sse" in parse_qs(query).get("alt", [])
                 and "text/event-stream" not in _ct.lower()):
+            # 仅 alt=sse 的请求才要求 SSE 形态：不带 alt=sse 的 streamGenerateContent
+            # 返回分块 JSON 数组是合法形态（上方 _native_json_chunks 专门支持），
+            # 旧实现对每个此类正常请求都打「等不到 data: 行」的误导性严重告警。
             print("⚠️ [Gemini 透传] 流式请求的上游响应不是 text/event-stream——"
                   "客户端若按 SSE 解析将等不到 data: 行（v1 端点曾出现此形态，"
                   "现已钉 v1beta1；若复现请把 debug_outbound 打开后上报 URL）。")
-            if "sse" in parse_qs(query).get("alt", []):
-                await _close_upstream(upstream)
-                return _native_error(502, "上游未返回 SSE 流，无法完成 alt=sse 请求。", "UNAVAILABLE")
+            await _close_upstream(upstream)
+            return _native_error(502, "上游未返回 SSE 流，无法完成 alt=sse 请求。", "UNAVAILABLE")
 
         # 429/5xx：按控制台预算重选 Key，不能因单 Key / 池已用遍而提前退出。
         retryable_status = is_retryable_status(upstream.status_code)
@@ -664,8 +679,13 @@ async def _relay_stream(upstream: httpx.Response, *, keepalive=False, deadline=N
 # 端点：generateContent / streamGenerateContent / countTokens / embedContent
 # ============================================================
 async def _resumable_native(request, api_key, model, action, query, payload, parsed):
+    # 指纹用原始请求体的 sha256：旧实现把已解析的 payload（可达 32MiB，
+    # 含 base64 图片）重新 json.dumps 一遍，大请求数百毫秒纯 CPU。
+    # 语义同步收窄为「原样重发命中同一缓冲」（与 chat_api 指纹的注释口径
+    # 一致）；同一客户端重发的字节序列相同，命中行为不变。
     fingerprint = "native:" + json.dumps(
-        [model, action, sorted(parse_qs(query).items()), parsed], sort_keys=True,
+        [model, action, sorted(parse_qs(query).items()),
+         hashlib.sha256(payload).hexdigest()], sort_keys=True,
         ensure_ascii=False, separators=(",", ":"))
     try:
         buf, new, start, _source = await resolve_buffer(
@@ -674,7 +694,9 @@ async def _resumable_native(request, api_key, model, action, query, payload, par
         return _native_error(exc.code, str(exc))
 
     async def close_response(response):
-        close = getattr(response, "aclose", response.body_iterator.aclose)
+        # getattr 默认值不能急切求值：传入无 body_iterator 的 Response 时
+        # 会在判定前就抛 AttributeError（同类代码 streaming.py 已有保护）。
+        close = getattr(response, "aclose", None) or response.body_iterator.aclose
         with anyio.CancelScope(shield=True):
             await close()
 

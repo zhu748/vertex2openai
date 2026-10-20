@@ -323,7 +323,9 @@ def _convert_messages_to_contents(messages: list, model_name: str = "", native_t
                 for p in content or []:
                     p = normalize_content_part(p)
                     if isinstance(p, dict) and p.get("type") == "text":
-                        system_parts.append(p.get("text", ""))
+                        # or 兑底：text:null 的分段以原始 dict 留存，
+                        # get("text", "") 返回 None 会污染 system 文本拼接。
+                        system_parts.append(p.get("text") or "")
             continue
 
         # 旧版 functions 协议的结果消息是 role="function"（与 Express 通道的

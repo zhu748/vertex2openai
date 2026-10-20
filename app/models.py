@@ -85,7 +85,10 @@ def message_text(content: Any) -> str:
         parts = []
         for p in content:
             if isinstance(p, dict) and p.get("type") == "text":
-                parts.append(p.get("text", ""))
+                # `or ""`：{"type":"text","text":null} 过不了 pydantic 的
+                # text:str 校验，会以原始 dict 留在 union 里；键存在但值为 None
+                # 时 .get("text", "") 返回 None，拼进 "".join 直接 TypeError → 500。
+                parts.append(p.get("text") or "")
             elif hasattr(p, "text") and isinstance(getattr(p, "text", None), str):
                 parts.append(p.text)
         return "".join(parts)

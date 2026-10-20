@@ -37,7 +37,9 @@ def _system_instruction(request: OpenAIRequest) -> str | None:
             for part in message.content:
                 part = normalize_content_part(part)
                 if isinstance(part, dict) and part.get("type") == "text":
-                    texts.append(part.get("text", ""))
+                    # text:null 的分段过不了 ContentPartText 校验、以原始 dict 留存；
+                    # 键存在但值为 None 时 get("text", "") 返回 None，拼进 join 即 TypeError。
+                    texts.append(part.get("text") or "")
     return "\n".join(texts) if texts else None
 
 

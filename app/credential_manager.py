@@ -25,8 +25,16 @@ class CredentialManager:
         return dict(records[index])
 
     def get_cookie_record(self):
+        # 优先选 project_id 完整的账号：凭证接口允许保存空 project_id 的启用账号
+        # （与 get_mixed_record 的 `r["project_id"]` 过滤口径一致）。旧实现不过滤，
+        # 多账号池里选中缺 project 的账号会在 cookie 通道给出 400，其余账号正常，
+        # 表现为按比例间歇失败（2026-10 修复）。
+        # 全部都缺 project 时保留旧行为（选中后由通道给出明确的 400 配置提示）。
         records = [dict(r, channel="cookie") for r in app_state.get_cookie_accounts() if r["enabled"]]
-        return self._select(records, "cookie")
+        if not records:
+            return None
+        complete = [r for r in records if r["project_id"]]
+        return self._select(complete or records, "cookie")
 
     def get_mixed_record(self, key_manager, *, express_only=False):
         records = [dict(r, channel="express") for r in key_manager.get_records()]

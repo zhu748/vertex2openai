@@ -1,18 +1,40 @@
 """ASGI middleware which does not buffer or acknowledge streaming responses."""
 import asyncio
+
 import anyio
+from request_connection import BodyTooLargeError, ClientConnection, ConnectionReceiver
+from request_tracking import PayloadObserver, current_trace, request_registry
 from starlette.requests import ClientDisconnect
 from starlette.responses import JSONResponse
-
-from request_tracking import PayloadObserver, current_trace, request_registry
-from request_connection import ClientConnection, ConnectionReceiver
 
 # 请求体体积上限：与原生透传通道（gemini_native.MAX_NATIVE_BODY_BYTES）的
 # 32MiB 防护对齐。/v1/chat/completions 的 body 由 FastAPI/Pydantic 全量读入
 # 解析（含巨型 messages / base64 图片），不设限等于允许认证后的内存放大。
-# 此处在进入 FastAPI 前只看 content-length；chunked 无长度头的场景由 native
-# 通道自身的两段式检查覆盖，chat 通道极罕见（主流客户端对 JSON body 必带长度头）。
+# content-length 头在此预检；chunked 无长度头的场景由 ConnectionReceiver
+# 在 receive 层边读边计数，超限抛 BodyTooLargeError → 此处统一回 413
+# （旧实现依赖 native 通道「读完后检查」，据不住 chunked，2026-10 修复）。
 MAX_CHAT_BODY_BYTES = 32 * 1024 * 1024
+
+# 未认证端点（/api/login）的请求体上限：Pydantic 全量解析巨型 JSON 同样
+# 是内存放大面，而这里无需鉴权即可触达。口令本身就是短字符串，256KB 绰绰有余。
+LOGIN_BODY_BYTES = 256 * 1024
+
+
+class _LoginBodyLimitReceive:
+    """给 /api/login 包一层计数 receive（不建 trace、不计入大盘统计）。"""
+
+    def __init__(self, receive, max_bytes: int):
+        self._receive = receive
+        self._max_bytes = max_bytes
+        self._seen = 0
+
+    async def __call__(self):
+        message = await self._receive()
+        if message.get("type") == "http.request":
+            self._seen += len(message.get("body") or b"")
+            if self._seen > self._max_bytes:
+                raise BodyTooLargeError(self._max_bytes)
+        return message
 
 
 class StatsMiddleware:
@@ -23,8 +45,24 @@ class StatsMiddleware:
     async def __call__(self, scope, receive, send):
         stats = self.stats() if callable(self.stats) else self.stats
         path = scope.get("path", "")
-        tracked = scope["type"] == "http" and scope.get("method") == "POST" and (
+        method = scope.get("method", "")
+        tracked = scope["type"] == "http" and method == "POST" and (
             path == "/v1/chat/completions" or path.startswith(("/v1/models/", "/v1beta/models/")))
+        # 登录端点单独限流：不计入请求统计（避免大盘被登录轮询污染），
+        # 也不建 trace；只做体积防护。
+        if (not tracked and scope["type"] == "http" and method == "POST"
+                and path == "/api/login"):
+            limited = _LoginBodyLimitReceive(receive, LOGIN_BODY_BYTES)
+            try:
+                await self.app(scope, limited, send)
+            except BodyTooLargeError:
+                response = JSONResponse(
+                    status_code=413,
+                    content={"error": {"message": f"登录请求体超过 {LOGIN_BODY_BYTES // 1024}KiB 上限。",
+                                      "type": "invalid_request_error", "code": 413}},
+                )
+                await response(scope, receive, send)
+            return
         if not tracked:
             return await self.app(scope, receive, send)
         stats.increment_total()
@@ -51,7 +89,7 @@ class StatsMiddleware:
         connection = ClientConnection()
         scope.setdefault("state", {})["client_connection"] = connection
         receiver = ConnectionReceiver(receive, connection, lambda: trace.end_connection(disconnected=True),
-                                      lambda: completed)
+                                      lambda: completed, max_body_bytes=MAX_CHAT_BODY_BYTES)
 
         async def relay(message):
             nonlocal started, observer, completed, send_failed
@@ -88,6 +126,20 @@ class StatsMiddleware:
 
         try:
             await self.app(scope, receiver, relay)
+        except BodyTooLargeError as exc:
+            # chunked 请求体在 receive 层超限：响应尚未开始，统一回 413。
+            # 旧实现只能在应用层全量读完后检查，拦不住无长度头的流式上传。
+            # 错误计数交给 relay（status >= 400 时统一计），不在此重复计。
+            if started or send_failed:
+                raise
+            print(f"⚠️ [体积限制] {path}：{exc}")
+            response = JSONResponse(
+                status_code=413,
+                content={"error": {"message": f"请求体超过 {MAX_CHAT_BODY_BYTES // (1024 * 1024)}MiB 上限。",
+                                  "type": "invalid_request_error", "code": 413}},
+            )
+            await response(scope, receive, relay)
+            return
         except (asyncio.CancelledError, ClientDisconnect):
             raise
         except Exception as exc:

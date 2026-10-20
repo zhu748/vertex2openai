@@ -116,11 +116,20 @@ def _coerce_tool_response(content: Any) -> Dict[str, Any]:
 
     修复：旧实现用 `isinstance(str) and (...) or (...)` 的错误优先级，
     当 content 为 list 时会对其调用 .strip() 抛 AttributeError。
+    2026-10：dict 与 str-JSON 形态对齐——旧实现 dict {"temp":20} 被二次
+    序列化成 {"result":'{"temp": 20}'}，而等价的 str '{"temp":20}' 却得到
+    结构化 {"temp":20}，同一份数据两种输入形状深生出不同的模型可见形状。
     """
     if content is None:
         return {"result": ""}
+    if isinstance(content, dict):
+        # 已是对象：直接作为 response（与 str-JSON 路径解析后的形状一致）。
+        return content
     if not isinstance(content, str):
-        # content 可能是 OpenAI 的分段 list / dict
+        # content 可能是 OpenAI 的分段 list 等结构：数组包 result（与
+        # str '[1,2]' 的解析路径同形），其余无法结构化的再退化成文本。
+        if isinstance(content, list):
+            return {"result": content}
         try:
             return {"result": json.dumps(content, ensure_ascii=False)}
         except Exception:
@@ -220,6 +229,14 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
                 except json.JSONDecodeError as e:
                     print(f"⚠️ [工具调用] 历史 tool_call 的 arguments 不是合法 JSON（{e}），"
                           f"已按空参数下发：{str(arguments_str)[:120]}")
+                    parsed_arguments = {}
+                # FunctionCall.args 必须是 dict：合法 JSON 但非对象（如 "[1,2]"、"\"x\""）
+                # 会让主分支与 from_function_call 回退分支**同样**抛 ValidationError
+                # （旧实现两处都未兑底，异常直达客户端变 500）。与 Cookie 通道
+                # _parse_function_args 的防御口径对齐：非 dict 一律归一为 {}。
+                if not isinstance(parsed_arguments, dict):
+                    print(f"⚠️ [工具调用] 历史 tool_call 的 arguments 不是 JSON 对象，已按空参数下发："
+                          f"{str(arguments_str)[:120]}")
                     parsed_arguments = {}
 
                 explicit_sig, _ = signature_from_extra(tool_call)
@@ -338,7 +355,10 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
                         continue
 
                     if part_item.get("type") == "text":
-                        text_content = part_item.get("text", "\n")
+                        # or 兑底：{"type":"text","text":null} 会以原始 dict 留在
+                        # union 里，get("text", "\n") 此时返回 None，下游 re.finditer
+                        # 直接 TypeError（2026-10 修复，与 message_text 同口径）。
+                        text_content = part_item.get("text") or ""
                         image_parts, clean_text = _extract_markdown_images_to_parts(text_content)
                         if clean_text: parts.append(types.Part.from_text(text=clean_text))
                         parts.extend(image_parts)

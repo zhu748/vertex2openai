@@ -148,4 +148,10 @@ async def stream_logs_endpoint(request: Request, _auth: bool = Depends(require_a
         finally:
             rt_logger.unsubscribe(q)
 
-    return StreamingResponse(log_generator(), media_type="text/event-stream")
+    return StreamingResponse(
+        log_generator(),
+        media_type="text/event-stream",
+        # 与聊天/原生 SSE 端点同口径：默认开启响应缓冲的反代（nginx 等）
+        # 会攒住日志与心跳，控制台「运行日志」长时间不更新（2026-10 修复）。
+        headers={"Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no"},
+    )

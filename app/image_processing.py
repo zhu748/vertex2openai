@@ -22,27 +22,37 @@ def optimize_image_bytes(
     if Image is None:
         return image_data, original_mime
 
-    settings = app_state.get_settings()
-    if not settings.get("img_compress_enabled", True):
+    # 逐键读取（无深拷贝）：旧实现每张图都 get_settings() 锁内深拷贝整个
+    # 设置树（含全部 model_overrides），多图消息按图数放大（2026-10 优化）。
+    if not app_state.get_setting("img_compress_enabled", True):
         return image_data, original_mime
 
     if max_size_bytes is None:
         try:
-            max_size_bytes = int(float(settings.get("img_compress_max_mb", 1.5)) * 1024 * 1024)
+            max_size_bytes = int(float(app_state.get_setting("img_compress_max_mb", 1.5)) * 1024 * 1024)
         except (TypeError, ValueError, OverflowError):
             max_size_bytes = int(1.5 * 1024 * 1024)
     try:
-        max_dim = int(settings.get("img_compress_max_dim", 1536) or 1536)
+        max_dim = int(app_state.get_setting("img_compress_max_dim", 1536) or 1536)
     except (TypeError, ValueError, OverflowError):
         max_dim = 1536
     try:
-        quality = int(settings.get("img_compress_quality", 85) or 85)
+        quality = int(app_state.get_setting("img_compress_quality", 85) or 85)
     except (TypeError, ValueError, OverflowError):
         quality = 85
 
-    # 在安全体积内的图片，原样发送，不损耗画质
+    # 在安全体积内的图片，原样发送，不损耗画质。
+    # 像素炸弹守卫：低熵 PNG（如 258KB 的 9000×9000）字节数达标但像素数巨大，
+    # 会绕过最长边限制原样透传，后续任何解码方部按 ~25× 解压放大。
+    # 只读 header 判定（不解压全图），超过 _MAX_INPUT_PIXELS 才进入压缩路径。
     if len(image_data) <= max_size_bytes:
-        return image_data, original_mime
+        try:
+            with Image.open(io.BytesIO(image_data)) as img:
+                if img.width * img.height <= _MAX_INPUT_PIXELS:
+                    return image_data, original_mime
+        except Exception:
+            # 无法解析的图维持既有行为：原样透传（压缩路径同样会失败并回退）。
+            return image_data, original_mime
 
     try:
         with Image.open(io.BytesIO(image_data)) as img:
@@ -77,6 +87,10 @@ def optimize_image_bytes(
 
 
 MAX_REMOTE_IMAGE_BYTES = 20 * 1024 * 1024  # 单张图上限，防止超大响应打爆内存
+
+# 像素炸弹守卫阈值：字节数达标但像素数巨大的图（低熵 PNG）在此强制进入
+# 压缩路径（最长边限制）。40MP 只拦真炸弹，常规照片/全景均不受影响。
+_MAX_INPUT_PIXELS = 40_000_000
 
 
 MAX_REMOTE_IMAGE_REDIRECTS = 3

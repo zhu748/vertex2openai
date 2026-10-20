@@ -23,6 +23,12 @@ SUPPORTED_PROFILES = ("off", "chrome", "edge", "safari", "firefox", "safari_ios"
 # “两块数据之间的间隔”），长思考流可能持续数分钟，这里放宽到 30 分钟。
 _CURL_TOTAL_TIMEOUT_SECONDS = 1800.0
 _CURL_BUFFER_LIMIT_BYTES = 64 * 1024 * 1024
+# 流式响应的自缓冲上限：aiter_text 为 aread 幂等语义自留一份副本，
+# 但 200 响应实际只会被 aiter 消费（非 200 才先 aread）——旧实现把整个
+# 流式响应（生图可达数十 MB base64 × 并发数）全额驻留内存，且超过
+# 64MiB 时流中途抛 ValueError 把能正常分块交付的大响应判死。改为：
+# 超出 1MiB 即放弃缓冲（错误诊断体远小于此），继续纯透传。
+_CURL_SELF_BUFFER_LIMIT_BYTES = 1024 * 1024
 
 
 def get_impersonate_profile() -> str:
@@ -68,9 +74,13 @@ class _CurlRespShim:
     已缓冲内容）。cookie_proxy 的错误分支存在“先 aiter_text 再 aread”
     的用法，因此 shim 在 aiter 时自缓冲，aread 优先回缓冲，绝不二次
     消费 curl 流。
+
+    自缓冲有 1MiB 上限（_CURL_SELF_BUFFER_LIMIT_BYTES）：超过即放弃
+    缓冲纯透传，避免把整个流式响应（生图 base64 数 MB × 并发）驻留
+    内存；放弃后再调 aread 返回空字节（当前调用图无此路径，防御性兑底）。
     """
 
-    __slots__ = ("_r", "status_code", "_buffered", "_from_stream", "_consumed")
+    __slots__ = ("_r", "status_code", "_buffered", "_from_stream", "_consumed", "_dropped")
 
     def __init__(self, resp, from_stream: bool = False):
         self._r = resp
@@ -80,6 +90,7 @@ class _CurlRespShim:
         # 不能拿“content 是否为空”判断是否已缓冲，必须显式标记来源。
         self._from_stream = from_stream
         self._consumed = False
+        self._dropped = False
 
     @property
     def text(self) -> str:
@@ -112,7 +123,8 @@ class _CurlRespShim:
         """与 httpx 调用约定一致：普通方法返回异步生成器（不需要 await）。
 
         cookie_proxy 的用法是 `async for chunk in response.aiter_text():`，
-        shim 必须保持同一形态。每块顺带写入自缓冲（供 aread 幂等语义使用）。
+        shim 必须保持同一形态。每块顺带写入自缓冲（供 aread 幂等语义使用），
+        缓冲超过 _CURL_SELF_BUFFER_LIMIT_BYTES 后放弃缓冲纯透传。
         """
         async def _gen():
             decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
@@ -122,9 +134,14 @@ class _CurlRespShim:
             async for chunk in self._r.aiter_content():
                 if not chunk:
                     continue
-                if len(self._buffered) + len(chunk) > _CURL_BUFFER_LIMIT_BYTES:
-                    raise ValueError("上游响应超过 64MiB 读取上限。")
-                self._buffered.extend(chunk)
+                if not self._dropped:
+                    if len(self._buffered) + len(chunk) > _CURL_SELF_BUFFER_LIMIT_BYTES:
+                        # 大流式响应：放弃幂等缓冲（错误诊断体远小于此限额），
+                        # 不再让整个响应驻留内存、也不再中途判死。
+                        self._dropped = True
+                        self._buffered.clear()
+                    else:
+                        self._buffered.extend(chunk)
                 text = decoder.decode(chunk)
                 if text:
                     yield text
@@ -251,11 +268,15 @@ def _create_upstream_client(client_kwargs: dict):
 # ============================================================
 # Cookie 通道客户端池：签名 → 客户端，跨请求复用
 # ============================================================
-_UPSTREAM_POOL_MAX = 4   # 实际组合 ≤ 2（代理 × 伪装档案），4 已冗余
+# 上限 16：签名含（伪装档案 × 解析后代理 URL × 超时形态）。多 Cookie 账号
+# 各挂账号级代理 + 全局兑底时活跃组合轻松超过旧上限 4——每请求 LRU 淘汰
+# 意味着新建 + 重新 TCP/TLS 握手（池化核心收益被抵消），每个被淘汰客户端
+# 还要挂 7230s 延迟关闭任务。16 覆盖典型多账号部署且内存开销可忽略。
+_UPSTREAM_POOL_MAX = 16
 
 
 class _UpstreamClientPool:
-    """（伪装档案, 代理, 超时, 重定向, 证书）→ 客户端，LRU 上限 4。
+    """（伪装档案, 代理, 超时, 重定向, 证书）→ 客户端，LRU 上限 _UPSTREAM_POOL_MAX。
 
     客户端创建/登记在锁内完成（两个构造器都是纯内存操作，无 IO）；
     被淘汰的客户端交给延迟关闭器（护住飞行中的流）。签名覆盖

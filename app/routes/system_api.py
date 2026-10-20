@@ -22,9 +22,11 @@ PROXY_TEST_TIMEOUT_SECONDS = 8.0
 def _healthz_payload() -> dict:
     proxy_url = get_effective_proxy_url()
     express_keys = app_state.get_express_keys()
-    cookie_configured = bool(app_state.get_google_cookie())
     # healthz 是被监控高频轮询的公开端点：Cookie 账号列表取一次复用，
     # 不再每条各取一遍（每次调用都做全量记录归一化，全程持锁）。
+    # cookie_configured 也从同一份列表推导：旧实现额外调 get_google_cookie()，
+    # 其内部又做一遍 get_cookie_accounts() 全量归一化——秒级轮询下每次
+    # healthz 白做 2 次归一化 + 1 次 Key 归一化的锁竞争（2026-10 优化）。
     accounts = app_state.get_cookie_accounts()
     return {
         "status": "ok",
@@ -35,7 +37,7 @@ def _healthz_payload() -> dict:
             "total": len(express_keys),
             "enabled": sum(1 for r in express_keys if r.get("enabled", True)),
         },
-        "cookie_configured": cookie_configured,
+        "cookie_configured": any(r["enabled"] for r in accounts),
         "cookie_accounts": {"total": len(accounts),
                             "enabled": sum(r["enabled"] for r in accounts)},
         "proxy": {

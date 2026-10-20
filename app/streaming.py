@@ -132,7 +132,9 @@ async def prepare_sse(operation, request, error_body, on_error):
             setup.cancel()
         response = (await asyncio.gather(setup, return_exceptions=True))[0]
         if isinstance(response, StreamingResponse):
-            await getattr(response, "aclose", response.body_iterator.aclose)()
+            # getattr 默认值不能急切求值：非 StreamingResponse 形态会先抛 AttributeError。
+            close = getattr(response, "aclose", None) or response.body_iterator.aclose
+            await close()
 
     try:
         done, _ = await asyncio.wait({setup}, timeout=0.05)

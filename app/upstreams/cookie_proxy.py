@@ -595,7 +595,9 @@ class CookieProxyUpstream(BaseUpstream):
 
         # batchGraphql(Studio) 会忽略 includeThoughts=false（真机验证），因此当解析出的思考配置
         # 要求不回传思考时，由本通道在响应侧主动剥离思考块。生图无思考，strip 恒 False。
-        _eff_settings = app_state.get_effective_settings(base_model_name)
+        # 复用 3. 段已取的 _inj_settings：同参数同模型，两次 get_effective_settings
+        # 之间无任何设置写入点，旧实现白做一次全量深拷贝+合并（热路径，2026-10 优化）。
+        _eff_settings = _inj_settings
         _tk = mc.resolve_thinking(base_model_name, request_obj, _eff_settings, prefill_active=prefill_active)
         strip_thoughts = bool(_tk.get("mode") and not _tk.get("include_thoughts", True))
         if strip_thoughts and cookie_debug:
@@ -734,6 +736,7 @@ class CookieProxyUpstream(BaseUpstream):
                         blocked_msg = None
                         sampler = RawSampler()
                         deduper = PrefillDeduper(prefill_text)
+                        pending_safety_html = ""
 
                         # 消费实时生成器（原始事件 → 此处格式化为 OpenAI chunk）
                         events = _execute_stream_request_generator(
@@ -825,10 +828,11 @@ class CookieProxyUpstream(BaseUpstream):
                                 elif status == "finish":
                                     finish_raw = data
                                 elif status == "safety":
-                                    # 最后一块才到，作为一个独立 chunk 追加在正文之后
-                                    _sh = _safety_html_if_enabled(data)
-                                    if _sh:
-                                        yield make_openai_chunk(response_id, model_display, content=_sh)
+                                    # 安全分与 finish 同块到达（最后一块）：先暂存，
+                                    # 等去重器 flush 完尾段再输出。旧实现在循环内即时
+                                    # yield，预填充 + 短回复场景下会插在去重器攒住的
+                                    # 正文尾段**之前**，把安全块嵌进正文中间（2026-10 修复）。
+                                    pending_safety_html = _safety_html_if_enabled(data)
                                 elif status == "usage":
                                     usage_meta = data
                                 elif status == "blocked":
@@ -888,6 +892,11 @@ class CookieProxyUpstream(BaseUpstream):
                             stream_part_order.append({"type": "ordinary", "index": len(stream_ordinary_metadata)})
                             stream_ordinary_metadata.append(ordinary_part_metadata("text", tail, None))
                             yield make_openai_chunk(response_id, model_display, content=tail)
+
+                        # 安全分在正文（含去重尾段）之后、结束帧之前输出，
+                        # 与非流式路径 content_value = full_text + safety_html 的顺序一致。
+                        if pending_safety_html:
+                            yield make_openai_chunk(response_id, model_display, content=pending_safety_html)
 
                         if got_text or got_tool_call:
                             stats.add_success()
@@ -1049,6 +1058,11 @@ class CookieProxyUpstream(BaseUpstream):
                         text_decoder = text_transport.decoder() if text_transport else None
                         async for obj in iter_json_objects(fake_resp):
                             sampler.add(obj)
+                            # error 即停：后续对象不再解析（生图响应可达数 MB，
+                            # 白烧事件循环 CPU），且首个 error 不被后续 error 覆盖。
+                            # 生图路径（_collect_full_response）同构修复已验证。
+                            if api_error:
+                                break
                             events = extract_events(obj)
                             if text_decoder:
                                 events = text_decoder.cookie_events(events)

@@ -289,17 +289,27 @@ class CurlBudgetTests(unittest.IsolatedAsyncioTestCase):
                 reads.append(True)
                 yield b"x" * 10
         raw = SimpleNamespace(status_code=200, aiter_content=chunks)
-        for use_aread in (True, False):
-            reads.clear()
-            shim = impersonate._CurlRespShim(raw, from_stream=True)
-            with mock.patch.object(impersonate, "_CURL_BUFFER_LIMIT_BYTES", 15):
-                with self.assertRaisesRegex(ValueError, "读取上限"):
-                    if use_aread:
-                        await shim.aread()
-                    else:
-                        _ = [chunk async for chunk in shim.aiter_text()]
-            self.assertEqual(len(reads), 2)
-            self.assertLessEqual(len(shim._buffered), 15)
+        # aread（错误诊断体路径）：超限时抛 ValueError，读取停在限额处，
+        # 幂等缓冲的硬上限语义不变。
+        reads.clear()
+        shim = impersonate._CurlRespShim(raw, from_stream=True)
+        with mock.patch.object(impersonate, "_CURL_BUFFER_LIMIT_BYTES", 15):
+            with self.assertRaisesRegex(ValueError, "读取上限"):
+                await shim.aread()
+        self.assertEqual(len(reads), 2)
+        self.assertLessEqual(len(shim._buffered), 15)
+
+        # aiter（正常流式路径）：超过自缓冲上限后放弃缓冲纯透传，流完整
+        # 送达而非中途判死；缓冲不再随响应体无界增长（2026-10 修复：生图
+        # 等大响应之前要么全额驻留内存、要么超过硬上限被中断）。
+        reads.clear()
+        shim = impersonate._CurlRespShim(raw, from_stream=True)
+        with mock.patch.object(impersonate, "_CURL_SELF_BUFFER_LIMIT_BYTES", 15):
+            received = "".join([chunk async for chunk in shim.aiter_text()])
+        self.assertEqual(len(reads), 100)
+        self.assertEqual(received, "x" * 1000)
+        self.assertTrue(shim._dropped)
+        self.assertLessEqual(len(shim._buffered), 15)
 
 
 

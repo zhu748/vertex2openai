@@ -11,6 +11,10 @@ from fastapi import HTTPException, Request
 AUTH_COOKIE = "ap_session"
 DEFAULT_API_KEY = "123456"
 SESSION_TTL_SECONDS = 60 * 60 * 24 * 30
+# 会话总数上限：旧实现只在 issue_session 时顺带清理过期项、无数量上限，
+# 持正确口令的脚本可循环登录无限撑大 dict（30 天 TTL 的内存驻留）。
+# 超限时淘汰过期时间最早（最陈旧）的会话。
+SESSIONS_MAX_ENTRIES = 256
 
 # 随机会话 token 可单独撤销，过期时间以秒为单位。
 _sessions: dict[str, float] = {}
@@ -29,11 +33,19 @@ _TRUST_PROXY_HEADERS = os.environ.get("TRUST_PROXY_HEADERS", "").strip() not in 
 
 
 def client_ip(request: Request) -> str:
-    """登录限速用的客户端 IP（可选信任 X-Forwarded-For 首跳）。"""
+    """登录限速用的客户端 IP。
+
+    取 X-Forwarded-For 的**最右侧**一跳（需 TRUST_PROXY_HEADERS=1）：
+    该值由自家可信反代追加，不可被客户端伪造。旧实现取首跳——
+    nginx 默认的 $proxy_add_x_forwarded_for 是追加语义，客户端伪造
+    `X-Forwarded-For: 1.2.3.4` 后首跳仍是伪造值，攻击者每请求换一个
+    假 IP 即可绕过指数退避无限爆破控制台口令（2026-10 修复）。
+    多级可信反代链场景请由最外层反代覆盖（而非追加）XFF。
+    """
     if _TRUST_PROXY_HEADERS:
         xff = request.headers.get("x-forwarded-for", "")
         if xff:
-            return xff.split(",")[0].strip() or (request.client.host if request.client else "unknown")
+            return xff.split(",")[-1].strip() or (request.client.host if request.client else "unknown")
     return request.client.host if request.client else "unknown"
 
 
@@ -57,6 +69,10 @@ def issue_session() -> str:
         for t, exp in list(_sessions.items()):  # 顺手清理过期会话
             if exp < now:
                 _sessions.pop(t, None)
+        while len(_sessions) >= SESSIONS_MAX_ENTRIES:
+            # 满额：淘汰过期时间最早（最陈旧）的会话，保留限流主体功能。
+            oldest = min(_sessions, key=_sessions.get)
+            _sessions.pop(oldest, None)
         _sessions[token] = now + SESSION_TTL_SECONDS
     return token
 

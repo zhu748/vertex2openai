@@ -113,6 +113,10 @@ class SSELogger:
                 pass
 
     def push(self, plain_text: str) -> None:
+        # 超长打印截断后再推流：控制台日志面板不需要完整巨型文本，
+        # 保留原长度提示便于在 Docker stdout 侧定位完整内容。
+        if len(plain_text) > _MAX_PUSH_CHARS:
+            plain_text = plain_text[:_MAX_PUSH_CHARS] + f"…（已截断，原长度 {len(plain_text)} 字符）"
         timestamp = time.strftime("%H:%M:%S")
         formatted_msg = f"[{timestamp}] {plain_text}"
 
@@ -141,6 +145,11 @@ rt_logger = SSELogger()
 
 # 防止 print 钩子内部再触发 print 导致递归
 _in_hook = threading.local()
+
+# 推入 SSE 日志流的单条消息长度上限：trace.log 有 2000 字符截断，但
+# rt_logger.push 没有——一条带完整响应体/traceback 的巨型打印会同时驻留
+# history（100 条）与每个订阅者队列（500 槽），内存按订阅者数放大。
+_MAX_PUSH_CHARS = 8 * 1024
 
 
 def custom_print(*args, **kwargs):

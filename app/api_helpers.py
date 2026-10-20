@@ -830,7 +830,7 @@ async def execute_gemini_call(
                             tail = deduper.flush()
                             if tail:
                                 if prefill_text and not has_yielded:
-                                    yield f"data: {json.dumps(_pf)}\n\n"
+                                    yield f"data: {json.dumps(_pf, ensure_ascii=False)}\n\n"
                                 has_yielded = True
                                 content_chars += len(tail)
                                 _tail = {"id": response_id_for_stream, "object": "chat.completion.chunk", "created": int(time.time()), "model": request_obj.model, "choices": [{"index": 0, "delta": {"content": tail}, "finish_reason": None}]}
