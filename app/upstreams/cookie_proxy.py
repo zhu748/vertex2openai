@@ -187,7 +187,8 @@ def _native_tool_error_response(status_code: int, payload: str) -> bool:
 
 
 def _api_error_details(data) -> tuple[int, str]:
-    message = data.get("message", str(data)) if isinstance(data, dict) else str(data)
+    raw = data.get("message") if isinstance(data, dict) else data
+    message = raw if isinstance(raw, str) and raw.strip() else str(data)
     code = data.get("code") if isinstance(data, dict) else None
     if not isinstance(code, int) or not 400 <= code <= 599:
         code = 429 if _is_retryable_error(message) else 502

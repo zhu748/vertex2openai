@@ -126,6 +126,8 @@ function proxyDraft(value){
   if(Array.isArray(value)) return value.map(v=>typeof v==='string'?v:JSON.stringify(v));
   const text=String(value||'').trim();
   if(!text) return [];
+  // Preserve a whole ICE/node object until the shared backend parser expands it.
+  if(text.startsWith('{')) return [text];
   if(text.startsWith('[')){
     try{const list=JSON.parse(text);if(Array.isArray(list)) return proxyDraft(list);}catch(_){}
   }

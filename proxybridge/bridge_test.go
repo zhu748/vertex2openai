@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"io"
@@ -363,5 +364,70 @@ func TestSSTPRejectsUntrustedServerBeforePPP(t *testing.T) {
 	}
 	if err == nil || dial != nil {
 		t.Fatal("untrusted SSTP server was accepted")
+	}
+}
+
+type failedHalfClose struct{ net.Conn }
+
+func (c failedHalfClose) CloseWrite() error { return io.ErrClosedPipe }
+
+func TestRelayHalfCloseErrorStopsBothDirections(t *testing.T) {
+	left, leftPeer := net.Pipe()
+	right, rightPeer := net.Pipe()
+	defer left.Close()
+	defer leftPeer.Close()
+	defer right.Close()
+	defer rightPeer.Close()
+	done := make(chan struct{})
+	go func() {
+		relay(left, failedHalfClose{right})
+		close(done)
+	}()
+	leftPeer.Close() // EOF in the upload direction, followed by a failed FIN.
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("failed half-close left the opposite copy goroutine blocked")
+	}
+}
+
+func TestSSTPPortCollisionDoesNotStartVPNHandshake(t *testing.T) {
+	occupied, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+	cert, _ := testCertificate(t)
+	vpn, err := tls.Listen("tcp4", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer vpn.Close()
+	connected := make(chan struct{}, 1)
+	go func() {
+		conn, err := vpn.Accept()
+		if err == nil {
+			defer conn.Close()
+			connected <- struct{}{}
+			conn.(*tls.Conn).Handshake()
+		}
+	}()
+	cfg := config{Scheme: "sstp", Server: "127.0.0.1", Port: vpn.Addr().(*net.TCPAddr).Port,
+		ListenPort: occupied.Addr().(*net.TCPAddr).Port, Username: "fixture", Password: "password"}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(path); err == nil || err.Error() != "listen_failed" {
+		t.Fatalf("port collision reached the VPN handshake: %v", err)
+	}
+	select {
+	case <-connected:
+		t.Fatal("contacted VPN despite occupied SOCKS port")
+	default:
 	}
 }

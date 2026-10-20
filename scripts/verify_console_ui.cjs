@@ -336,7 +336,7 @@ async function main() {
     assert.equal(await page.inputValue('#proxy-mtu'),'1280');
     await screenshot('proxy-editor-sstp');
     await page.click('#proxy-form-add');
-    await page.waitForFunction(()=>document.querySelector('#proxy-type').value==='socks5' && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    await page.waitForFunction(()=>document.querySelector('#proxy-type').value==='sstp' && !document.querySelector('#proxy-form-add').matches(':disabled'));
     await page.fill('#proxy-paste','turn:relay.example.com:3478?transport=tcp&username=fixture&password=private-turn-password');
     await page.click('.proxy-recognize');
     await page.waitForFunction(()=>document.querySelector('#proxy-type').value==='turn' && !document.querySelector('#proxy-form-add').matches(':disabled'));
@@ -350,8 +350,89 @@ async function main() {
     await page.fill('#proxy-password','private-turns-password');
     await page.click('#proxy-form-add');
     await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===5 && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    await page.selectOption('#proxy-type','sstp');
+    await page.fill('#proxy-paste','vpn-supplier.example|443|domain\\fixture|private@password');
+    // Add also recognizes fresh paste without clicking Recognize first.
+    await page.click('#proxy-form-add');
+    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===6 && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    assert.match(await page.locator('[data-proxy-index="5"] strong').textContent(),/sstp:\/\/\*\*\*@vpn-supplier.example:443/);
+    await page.fill('#proxy-paste',JSON.stringify({iceServers:[{urls:'stun:discovery.example'},{
+      urls:['turn:ice.example:3478?transport=tcp','turns:ice.example:5349?transport=tcp'],username:'fixture',credential:'private+ice%password'}]}));
+    await page.click('.proxy-recognize');
+    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===8 && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    const node={type:'sstp',server:'json-vpn.example',username:'fixture',password:'private-json-password',name:'办公 VPN',options:{sni:'cert.example',mtu:1280}};
+    await page.fill('#proxy-paste',JSON.stringify(node));
+    await page.click('.proxy-recognize');
+    await page.waitForFunction(()=>document.querySelector('#proxy-name').value==='办公 VPN' && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    // A changed paste takes precedence over the previous recognized fields.
+    node.server='updated-json-vpn.example';node.name='备用 VPN';
+    await page.fill('#proxy-paste',JSON.stringify(node));
+    await page.click('#proxy-form-add');
+    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===9 && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    assert.match(await page.locator('[data-proxy-index="8"] strong').textContent(),/updated-json-vpn.example:443 · 备用 VPN/);
+    assert.ok(!(await page.textContent('#proxy-editor-list')).includes('private'));
+    await page.locator('[data-proxy-index="8"]').getByRole('button',{name:'编辑',exact:true}).click();
+    await page.waitForFunction(()=>document.querySelector('#proxy-name').value==='备用 VPN' && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    assert.equal(await page.inputValue('#proxy-sni'),'cert.example');
+    assert.equal(await page.inputValue('#proxy-mtu'),'1280');
+    await page.fill('#proxy-name','VPN 备份');
+    await page.click('#proxy-form-add');
+    await page.waitForFunction(()=>document.querySelector('[data-proxy-index="8"] strong').textContent.includes('VPN 备份') && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    await screenshot('proxy-editor-import-formats');
     await page.click('#proxy-dialog-cancel');
-    check('TURN / TURNS / SSTP 字段填写、默认端口、TLS 高级设置、标准 TURN URI 识别与凭据脱敏');
+    check('TURN / TURNS / SSTP 多格式识别、ICE / 节点 JSON、直接添加粘贴、备注编辑与凭据脱敏');
+
+    const originalProxyDraft=await page.inputValue('#proxy-input');
+    await page.fill('#proxy-input',JSON.stringify({urls:['turn:raw-ice.example?transport=tcp','turns:raw-ice.example?transport=tcp'],username:'fixture',credential:'private-raw-ice'}));
+    await page.getByRole('button',{name:'管理 / 添加代理',exact:true}).click();
+    await page.locator('[data-proxy-index="0"]').getByRole('button',{name:'编辑',exact:true}).click();
+    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===2 && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    assert.match(await page.locator('[data-proxy-index="0"] strong').textContent(),/turn:\/\//);
+    assert.match(await page.locator('[data-proxy-index="1"] strong').textContent(),/turns:\/\//);
+    await page.click('#proxy-dialog-cancel');
+    await page.fill('#proxy-input',originalProxyDraft);
+    check('原始 ICE JSON 编辑先展开全部节点，取消保留配置草稿');
+
+    await page.getByRole('button',{name:'管理 / 添加代理',exact:true}).click();
+    await page.selectOption('#proxy-type','turn');
+    const pasteProxy=async value=>{
+      await page.evaluate(text=>{
+        const input=document.querySelector('#proxy-paste');
+        input.value=text;input.dispatchEvent(new Event('paste',{bubbles:true}));
+      },value);
+    };
+    await pasteProxy('test:1234@192.0.2.10:3478');
+    await page.waitForFunction(()=>document.querySelector('#proxy-password').value==='1234' && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    assert.equal(await page.inputValue('#proxy-type'),'turn');
+    assert.equal(await page.inputValue('#proxy-host'),'192.0.2.10');
+    await page.click('#proxy-form-add');
+    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===3 && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    assert.equal(await page.inputValue('#proxy-type'),'turn');
+    await pasteProxy('192.0.2.20:5349');
+    await page.waitForFunction(()=>document.querySelector('#proxy-host').value==='192.0.2.20' && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    assert.equal(await page.inputValue('#proxy-type'),'turn'); // Port does not choose TLS.
+    assert.equal(await page.inputValue('#proxy-port'),'5349');
+    assert.equal(await page.inputValue('#proxy-username'),'');
+    assert.match(await page.textContent('#proxy-paste-hint'),/补齐账号.*密码/);
+    await page.fill('#proxy-username','test');await page.fill('#proxy-password','test');
+    await page.click('#proxy-form-add');
+    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===4 && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    await pasteProxy('test:1234@192.0.2.30:3478\n192.0.2.40:3479');
+    await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===6 && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    assert.match(await page.locator('[data-proxy-index="5"] small').textContent(),/待补齐账号.*密码/);
+    assert.equal(await page.locator('[data-proxy-index="5"]').getByRole('button',{name:'测试',exact:true}).isDisabled(),true);
+    await page.click('#proxy-dialog-apply');
+    await page.waitForFunction(()=>document.querySelector('#proxy-editor-error').textContent.includes('第 6 条代理待补齐'));
+    await page.locator('[data-proxy-index="5"]').getByRole('button',{name:'编辑',exact:true}).click();
+    await page.waitForFunction(()=>document.querySelector('#proxy-host').value==='192.0.2.40' && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    await page.fill('#proxy-username','test');await page.fill('#proxy-password','test');
+    await page.click('#proxy-form-add');
+    await page.waitForFunction(()=>!document.querySelector('[data-proxy-index="5"] small').textContent.includes('待补齐') && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    await page.click('#proxy-dialog-apply');
+    await page.waitForFunction(()=>!document.querySelector('#proxy-dialog').open);
+    assert.equal((await page.inputValue('#proxy-input')).split('\n').length,6);
+    await page.fill('#proxy-input',originalProxyDraft);
+    check('所选协议下粘贴即填字段，纯地址先补凭据，混合批量保留待完成节点并阻止遗漏保存');
 
     await page.getByRole('button',{name:'管理 / 添加代理',exact:true}).click();
     const legacySsPayload=Buffer.from('chacha20-ietf-poly1305:private-password@9.9.9.9:9999').toString('base64');

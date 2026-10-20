@@ -107,9 +107,9 @@ class FormatTests(unittest.TestCase):
         # 正常凭据 + 无关 query 值含 @：凭据/端点不受污染。
         self.assertEqual(normalize_proxy_uri("socks5://user:pass@host:1080?peer=a@b"),
                          "socks5://user:pass@host:1080")
-        # fragment 里含 @ 的分享链接形态也不受影响（FORM 代理 URL 的 fragment 丢弃）。
+        # fragment 里的 @ 是节点备注，不影响凭据；保留并编码供编辑器回填。
         self.assertEqual(normalize_proxy_uri("http://user:pass@host:8080#frag@ment"),
-                         "http://user:pass@host:8080")
+                         "http://user:pass@host:8080#frag%40ment")
 
     def test_ambiguous_supplier_shapes_and_precise_errors(self):
         """回归：裸主机名四段式不再静默错位；报错信息精确到具体原因。"""

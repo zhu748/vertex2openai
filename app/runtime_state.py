@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import json
+import math
 import os
 import tempfile
 import threading
@@ -212,11 +213,15 @@ class AppState:
         source = str(item.get("project_source", "") or "").strip().lower()
         if source not in ("auto", "manual"):
             source = ""
+        detected = item.get("detected_at", 0)
+        if (isinstance(detected, bool) or not isinstance(detected, (int, float))
+                or detected < 0 or (isinstance(detected, float) and not math.isfinite(detected))):
+            detected = 0
         return {
             "key": key,
             "project_id": str(item.get("project_id", "") or "").strip(),
             "project_source": source,
-            "detected_at": item.get("detected_at") or 0,
+            "detected_at": detected,
             "note": str(item.get("note", "") or "").strip(),
             "enabled": bool(item.get("enabled", True)),
             # Key 级出站代理：支持 http/https/socks5/socks4/vless/vmess/trojan/ss/

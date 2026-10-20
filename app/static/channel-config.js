@@ -103,6 +103,8 @@ function proxyLabel(uri){
   try{
     const url=new URL(uri.replace(/^(turns?):(?!\/\/)/i,'$1://'));
     const proto=url.protocol.replace(/:$/,'');
+    let name='';
+    try{name=decodeURIComponent(url.hash.replace(/^#/,'')).trim();}catch(_){name=url.hash.replace(/^#/,'').trim();}
     if(proto==='vmess'){
       // vmess:// 整体是 base64(JSON)：解出地址与备注才能区分多条同类节点。
       try{
@@ -114,21 +116,29 @@ function proxyLabel(uri){
       }catch(_){return 'vmess://（分享链接）';}
     }
     if(proto==='ss'&&!url.username&&!url.password) return 'ss://（分享链接）';
-    if(STRUCTURED_PROXY_TYPES.includes(proto))
-      return proto+'://'+((url.username||url.password||url.searchParams.has('username')||url.searchParams.has('password'))?'***@':'')+url.host;
+    if(STRUCTURED_PROXY_TYPES.includes(proto)){
+      const port=url.port||({turn:'3478',turns:'5349',sstp:'443',http:'80',https:'443'})[proto];
+      const endpoint=url.hostname+(port?':'+port:'');
+      return proto+'://'+((url.username||url.password||url.searchParams.has('username')||url.searchParams.has('password'))?'***@':'')+endpoint+(name?' · '+name:'');
+    }
     // 其余分享链接（vless/trojan/hy2/tuic 等）：显示端点与节点备注。
-    let name='';
-    try{name=decodeURIComponent(url.hash.replace(/^#/,'')).trim();}catch(_){name=url.hash.replace(/^#/,'').trim();}
     return proto+'://'+url.host+(name?' · '+name:'');
   }catch(_){return '待识别的代理地址';}
 }
+function proxyMissingFields(uri){
+  try{
+    const url=new URL(uri.replace(/^(turns?):(?!\/\/)/i,'$1://'));
+    if(!BRIDGE_PROXY_TYPES.includes(url.protocol.slice(0,-1))) return [];
+    return [['username','账号'],['password','密码']].filter(([key])=>!(url[key]||url.searchParams.get(key))).map(([,label])=>label);
+  }catch(_){return [];}
+}
 function renderProxyEditor(){
   $('proxy-editor-list').innerHTML=proxyEditor.proxies.map((uri,index)=>`
-    <div class="proxy-row${proxyEditor.editing===index?' is-editing':''}" data-proxy-index="${index}"><div class="proxy-row-title"><span class="proxy-order">${index+1}</span><div><strong>${esc(proxyLabel(uri))}</strong><small>${proxyEditor.editing===index?'正在编辑 · ':''}${index===0?'首选出口':'第 '+(index+1)+' 顺位'}</small></div></div>
+    <div class="proxy-row${proxyEditor.editing===index?' is-editing':''}" data-proxy-index="${index}"><div class="proxy-row-title"><span class="proxy-order">${index+1}</span><div><strong>${esc(proxyLabel(uri))}</strong><small>${proxyMissingFields(uri).length?'待补齐'+proxyMissingFields(uri).join(' / ')+' · ':''}${proxyEditor.editing===index?'正在编辑 · ':''}${index===0?'首选出口':'第 '+(index+1)+' 顺位'}</small></div></div>
       <div class="proxy-row-actions">
         ${index>0?`<button type="button" onclick="moveProxy(${index},0)" aria-label="将第 ${index+1} 条设为首选">设为首选</button><button type="button" onclick="moveProxy(${index},${index-1})" aria-label="上移第 ${index+1} 条">↑</button>`:''}
         ${index<proxyEditor.proxies.length-1?`<button type="button" onclick="moveProxy(${index},${index+1})" aria-label="下移第 ${index+1} 条">↓</button>`:''}
-        <button type="button" onclick="runAction(this,()=>testEditorProxy(${index}))">测试</button>
+        <button type="button" ${proxyMissingFields(uri).length?'disabled title="请先编辑并补齐账号密码"':''} onclick="runAction(this,()=>testEditorProxy(${index}))">测试</button>
         <button type="button" onclick="runAction(this,()=>editProxy(${index}))">编辑</button>
         <button type="button" class="danger" onclick="deleteProxy(${index})" aria-label="删除第 ${index+1} 条代理">删除</button></div>
       <div class="proxy-row-result" id="proxy-result-${index}" role="status"></div></div>`).join('')||'<p class="empty-state">尚无代理。填写表单添加，或粘贴多条地址批量导入。<br>清空专属列表后跟随全局；清空全局列表后直连。</p>';
@@ -149,13 +159,14 @@ function deleteProxy(index){
   else if(proxyEditor.editing!==null && proxyEditor.editing>index) proxyEditor.editing--;
   renderProxyEditor();
 }
-function resetProxyForm(){
-  if(proxyEditor) proxyEditor.editing=null;
-  ['proxy-paste','proxy-host','proxy-port','proxy-username','proxy-password','proxy-sni','proxy-ca','proxy-realm','proxy-mtu'].forEach(id=>$(id).value='');
+function resetProxyForm({keepType=false}={}){
+  const type=keepType?$('proxy-type').value:'socks5';
+  if(proxyEditor){proxyEditor.editing=null;proxyEditor.recognizedSource='';}
+  ['proxy-paste','proxy-host','proxy-port','proxy-username','proxy-password','proxy-name','proxy-sni','proxy-ca','proxy-realm','proxy-mtu'].forEach(id=>$(id).value='');
   $('proxy-insecure').checked=false;
   $('proxy-advanced').open=false;
-  $('proxy-type').value='socks5';$('proxy-form-add').textContent='加入列表';
-  $('proxy-editor-error').textContent='';$('proxy-paste-hint').textContent='支持标准 URL、主机:端口:用户:密码、用户:密码:主机:端口及分享链接。';
+  $('proxy-type').value=type;$('proxy-form-add').textContent='加入列表';
+  $('proxy-editor-error').textContent='';$('proxy-paste-hint').textContent='支持 用户:密码@主机:端口、主机:端口、标准链接及 JSON；无协议的简写按所选类型识别。';
   proxyTypeChanged();
 }
 function proxyTypeChanged(){
@@ -167,10 +178,10 @@ function proxyTypeChanged(){
   $('proxy-tls-fields').classList.toggle('hidden',!tls);
   $('proxy-turn-fields').classList.toggle('hidden',type!=='turn'&&type!=='turns');
   $('proxy-sstp-fields').classList.toggle('hidden',type!=='sstp');
-  $('proxy-port').placeholder=({turn:'3478',turns:'5349',sstp:'443'})[type]||'1080';
+  $('proxy-port').placeholder=({turn:'3478',turns:'5349',sstp:'443',http:'80',https:'443'})[type]||'1080';
   document.querySelector('label[for="proxy-username"]').textContent=bridge?'账号（必填）':'账号（可选）';
   document.querySelector('label[for="proxy-password"]').textContent=bridge?'密码（必填）':'密码（可选）';
-  $('proxy-protocol-hint').textContent=type==='sstp'?'SSTP 使用 MS-CHAPv2 认证，支持 IPv4 出口；默认校验服务器证书。':(type==='turn'||type==='turns'?'TURN 服务器必须支持 RFC 6062 TCP 中继；用户名和密码由服务器提供。':'');
+  $('proxy-protocol-hint').textContent=type==='sstp'?'SSTP：MS-CHAPv2、IPv4 出口、本机 DNS；默认校验证书。可粘贴 用户:密码@主机:端口 或 主机:端口，再补齐凭据。':(type==='turn'||type==='turns'?'TURN：需要 RFC 6062 TCP 中继，使用本机 DNS。可粘贴 用户:密码@主机:端口 或 主机:端口，再补齐凭据；无前缀时沿用所选类型。':'');
   // 选中 sing-box 节点时，粘贴框即节点链接输入框。
   const nodeLink=type==='singbox';
   $('proxy-paste-label').textContent=nodeLink?'节点链接':'粘贴代理 · 自动识别';
@@ -187,7 +198,7 @@ function fillProxyFields(proxy){
   // 分享链接系（vless/vmess/trojan/ss/hysteria2/tuic 及未知协议）统一归入 sing-box 节点。
   if(type!=='direct'&&!STRUCTURED_PROXY_TYPES.includes(type)) type='singbox';
   $('proxy-type').value=type;
-  for(const field of ['host','port','username','password']) $('proxy-'+field).value=proxy[field]??'';
+  for(const field of ['host','port','username','password','name']) $('proxy-'+field).value=proxy[field]??'';
   const options=proxy.options||{};
   for(const field of ['sni','ca','realm','mtu']) $('proxy-'+field).value=options[field]??'';
   $('proxy-insecure').checked=['true','1'].includes(String(options.insecure||'').toLowerCase());
@@ -200,27 +211,38 @@ async function recognizeProxyPaste(){
   if(!source) return;
   const editor=proxyEditor;
   try{
-    const proxies=await parseProxyInput({text:source,type:$('proxy-type').value});
+    const proxies=await parseProxyInput({text:source,type:$('proxy-type').value,draft:true});
     if(proxyEditor!==editor || $('proxy-paste').value.trim()!==source) return;
     $('proxy-editor-error').textContent='';
     if(proxies.length===1){
       fillProxyFields(proxies[0]);
+      editor.recognizedSource=$('proxy-paste').value.trim();
       const t=proxies[0].type;
       const identified=proxies[0].url==='direct'?'强制直连':(t==='share'?'分享链接':t.toUpperCase());
-      $('proxy-paste-hint').textContent='已识别 '+identified+'，检查后加入列表。';
+      const missing=(proxies[0].missing_fields||[]).map(field=>field==='username'?'账号':'密码');
+      $('proxy-paste-hint').textContent='已识别 '+identified+'，'+(missing.length?'请补齐'+missing.join(' / ')+'后加入列表。':'检查后加入列表。');
     }else{
       const merged=[...new Set([...proxyEditor.proxies,...proxies.map(p=>p.url)])];
       if(merged.length>32) throw new Error('每个列表最多 32 条代理');
       proxyEditor.proxies=merged;
-      resetProxyForm();renderProxyEditor();toast('已识别并加入 '+proxies.length+' 条代理，请应用配置');
+      const pending=proxies.filter(proxy=>proxy.missing_fields?.length).length;
+      resetProxyForm({keepType:true});renderProxyEditor();
+      toast('已识别并加入 '+proxies.length+' 条代理'+(pending?'，其中 '+pending+' 条待编辑补齐凭据':'，请应用配置'));
     }
   }catch(error){if(proxyEditor===editor) $('proxy-editor-error').textContent=error.message;}
 }
 async function editProxy(index){
   const editor=proxyEditor;
   try{
-    const proxies=await parseProxyInput({text:editor.proxies[index]});
+    const proxies=await parseProxyInput({text:editor.proxies[index],draft:true});
     if(proxyEditor!==editor) return;
+    if(proxies.length>1){
+      const expanded=[...editor.proxies];expanded.splice(index,1,...proxies.map(proxy=>proxy.url));
+      const merged=[...new Set(expanded)];
+      if(merged.length>32) throw new Error('每个列表最多 32 条代理');
+      editor.proxies=merged;resetProxyForm();renderProxyEditor();
+      toast('已展开 '+proxies.length+' 条代理，请选择需要编辑的节点');return;
+    }
     resetProxyForm();proxyEditor.editing=index;fillProxyFields(proxies[0]);
     renderProxyEditor();
     const target=$(STRUCTURED_PROXY_TYPES.includes($('proxy-type').value)?'proxy-host':'proxy-paste');
@@ -234,7 +256,15 @@ async function addProxyDraft(){
   try{
     if(type==='singbox'&&!$('proxy-paste').value.trim())
       throw new Error('请先在上方粘贴节点链接（vless://、vmess:// 等）');
-    const payload=structured?{type,host:$('proxy-host').value.trim(),port:$('proxy-port').value.trim(),username:$('proxy-username').value,password:$('proxy-password').value}
+    // Directly adding newly pasted text must recognize it too; otherwise the
+    // visible input could be ignored in favour of fields from the previous node.
+    if(structured && $('proxy-paste').value.trim() && $('proxy-paste').value.trim()!==editor.recognizedSource){
+      await recognizeProxyPaste();
+      if(proxyEditor!==editor || $('proxy-editor-error').textContent) return false;
+      if(!$('proxy-paste').value.trim()) return true; // Batch import already added.
+      return addProxyDraft();
+    }
+    const payload=structured?{type,host:$('proxy-host').value.trim(),port:$('proxy-port').value.trim(),username:$('proxy-username').value,password:$('proxy-password').value,name:$('proxy-name').value.trim()}
       :{text:type==='direct'?'direct':$('proxy-paste').value.trim()};
     if(BRIDGE_PROXY_TYPES.includes(type)){
       payload.options={};
@@ -250,15 +280,18 @@ async function addProxyDraft(){
       if(merged.length>32) throw new Error('每个列表最多 32 条代理');
       proxyEditor.proxies=merged;
     }
-    resetProxyForm();renderProxyEditor();return true;
+    resetProxyForm({keepType:true});renderProxyEditor();return true;
   }catch(error){if(proxyEditor===editor) $('proxy-editor-error').textContent=error.message;return false;}
 }
 async function applyProxyEditor(){
   const editor=proxyEditor;
-  if($('proxy-host').value.trim()||$('proxy-paste').value.trim()||$('proxy-type').value==='direct'){
+  const structured=STRUCTURED_PROXY_TYPES.includes($('proxy-type').value);
+  if((structured&&['host','port','username','password','name'].some(field=>$('proxy-'+field).value.trim()))||$('proxy-paste').value.trim()||$('proxy-type').value==='direct'){
     if(!await addProxyDraft()) return;
   }
   try{
+    const pending=editor.proxies.findIndex(uri=>proxyMissingFields(uri).length);
+    if(pending!==-1) throw new Error('第 '+(pending+1)+' 条代理待补齐'+proxyMissingFields(editor.proxies[pending]).join(' / ')+'，请编辑后再应用。');
     const normalized=editor.proxies.length?(await parseProxyInput({text:JSON.stringify(editor.proxies)})).map(p=>p.url):[];
     if(proxyEditor!==editor) return;
     if(editor.scope==='global') $('proxy-input').value=normalized.join('\n');

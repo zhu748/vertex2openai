@@ -74,22 +74,32 @@ class ProxyParseBody(BaseModel):
     username: str = ""
     password: str = ""
     options: dict[str, str | int | bool] = Field(default_factory=dict)
+    name: str = ""
+    draft: bool = False
 
 
 @router.post("/api/proxy/parse")
 async def parse_proxy(body: ProxyParseBody, _auth: bool = Depends(require_auth)):
     try:
         value = body.text.strip() or build_proxy_uri(body.type, body.host, body.port, body.username,
-                                                   body.password, options=body.options)
+                                                   body.password, options=body.options, name=body.name)
         protocols = FORM_PROXY_SCHEMES | BRIDGE_PROXY_SCHEMES
-        proxies = parse_proxy_list(value, default_scheme=body.type if body.type in protocols else "socks5")
+        proxies = parse_proxy_list(value, default_scheme=body.type if body.type in protocols else "socks5",
+                                   allow_incomplete=body.draft)
         if not proxies or len(proxies) > 32:
             raise ProxyFormatError("请填写 1–32 条代理。")
+        fields = []
         for index, uri in enumerate(proxies):
+            if body.draft and uri.split(":", 1)[0] in BRIDGE_PROXY_SCHEMES:
+                # Draft parsing has already validated the endpoint and options.
+                # Saving, testing and connecting still require full credentials.
+                fields.append(proxy_fields(uri, allow_incomplete=True))
+                continue
             error = validate_proxy_uri(uri)
             if error:
                 raise ProxyFormatError(f"第 {index + 1} 条代理：{error}")
-        return JSONResponse(content={"proxies": [proxy_fields(uri) for uri in proxies]},
+            fields.append(proxy_fields(uri))
+        return JSONResponse(content={"proxies": fields},
                             headers={"Cache-Control": "no-store"})
     except ProxyFormatError as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})

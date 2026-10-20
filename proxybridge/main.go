@@ -90,6 +90,14 @@ func run(path string) error {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer cancel()
+	// Reserve the SOCKS port before an expensive SSTP handshake. Otherwise a
+	// different process can claim it during TLS/PPP negotiation, wasting a VPN
+	// session and up to 30 seconds before we discover the bind failure.
+	listener, err := net.Listen("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(cfg.ListenPort)))
+	if err != nil {
+		return errors.New("listen_failed")
+	}
+	defer listener.Close()
 	var dial dialFunc
 	var closeTunnel func()
 	switch cfg.Scheme {
@@ -113,10 +121,6 @@ func run(path string) error {
 		return errors.New("unsupported_protocol")
 	}
 	defer closeTunnel()
-	listener, err := net.Listen("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(cfg.ListenPort)))
-	if err != nil {
-		return errors.New("listen_failed")
-	}
 	if cfg.ReadyFile != "" {
 		if err := os.WriteFile(cfg.ReadyFile, []byte("ready\n"), 0600); err != nil {
 			listener.Close()
@@ -285,7 +289,9 @@ func relay(a, b net.Conn) {
 	copyTo := func(dst, src net.Conn) {
 		_, err := io.Copy(dst, src)
 		if closer, ok := dst.(interface{ CloseWrite() error }); ok {
-			closer.CloseWrite()
+			if closeErr := closer.CloseWrite(); err == nil {
+				err = closeErr
+			}
 		} else {
 			dst.Close()
 		}

@@ -21,7 +21,8 @@ def validate_json_schema(schema: Any, *, label: str = "schema") -> None:
     if not isinstance(schema, dict):
         raise SchemaValidationError(f"{label} must be a JSON object")
     try:
-        serialized = json.dumps(schema, ensure_ascii=False, separators=(",", ":"), check_circular=True)
+        serialized = json.dumps(schema, ensure_ascii=False, separators=(",", ":"),
+                                check_circular=True, allow_nan=False)
     except (TypeError, ValueError, RecursionError) as exc:
         raise SchemaValidationError(f"{label} is not a valid JSON Schema object: {exc}") from None
     if len(serialized.encode("utf-8")) > MAX_SCHEMA_SERIALIZED_BYTES:

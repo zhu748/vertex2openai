@@ -79,7 +79,7 @@ def _complete_json_objects(text: str, limit: int):
     while (start := text.find("{", position)) >= 0:
         try:
             obj, position = decoder.raw_decode(text, start)
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, RecursionError) as exc:
             raise IncompleteResponseError("上游返回无效或不完整的 JSON 对象。") from exc
         if len(text[start:position].encode("utf-8")) > limit:
             raise IncompleteResponseError("上游单个 JSON 对象超过字节上限。")
@@ -158,7 +158,24 @@ class RawSampler:
         return "\n".join(lines)
 
 
+def _wire_object(value, label, *, allow_null=True):
+    if value is None and allow_null:
+        return {}
+    if not isinstance(value, dict):
+        raise IncompleteResponseError(f"上游 {label} 必须是 JSON 对象。")
+    return value
+
+
+def _wire_list(value, label):
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise IncompleteResponseError(f"上游 {label} 必须是数组。")
+    return value
+
+
 def extract_events(obj: dict):
+    obj = _wire_object(obj, "响应", allow_null=False)
     # 真值判断而非 "error" in obj：该端点的 Proto JSON 会序列化默认空值
     # （同文件 thoughtSignature/functionCall 的空值过滤同理），若某个块
     # 带出 "error": null / {}，旧实现会把它当真实错误，整个回合以 502
@@ -168,14 +185,16 @@ def extract_events(obj: dict):
         yield ("error", err)
         return
 
-    results = obj.get("results", [])
+    results = _wire_list(obj.get("results"), "results")
     for result in results:
-        if "errors" in result:
-            for err in result["errors"]:
+        result = _wire_object(result, "result", allow_null=False)
+        errors = _wire_list(result.get("errors"), "errors")
+        if errors:
+            for err in errors:
                 yield ("error", err)
             continue
 
-        data = result.get("data")
+        data = _wire_object(result.get("data"), "data")
         if not data:
             continue
 
@@ -191,13 +210,17 @@ def extract_events(obj: dict):
                     msg += f"（{pf['blockReasonMessage']}）"
                 yield ("blocked", msg)
 
-        candidates = data.get("candidates", [])
+        candidates = _wire_list(data.get("candidates"), "candidates")
         for candidate in candidates:
-            content_obj = candidate.get("content") or {}
-            parts = content_obj.get("parts") or []
+            candidate = _wire_object(candidate, "candidate", allow_null=False)
+            content_obj = _wire_object(candidate.get("content"), "content")
+            parts = _wire_list(content_obj.get("parts"), "parts")
 
             for part in parts:
+                part = _wire_object(part, "part", allow_null=False)
                 text = part.get("text", "")
+                if text is not None and not isinstance(text, str):
+                    raise IncompleteResponseError("上游 part.text 必须是字符串。")
                 if text:
                     if is_thought_part(part):
                         yield ("thought", text)
@@ -207,15 +230,17 @@ def extract_events(obj: dict):
                 # Proto JSON includes empty defaults for functionCall,
                 # functionResponse and thoughtSignature on ordinary Parts.  Only
                 # a named call and a non-empty signature are semantically real.
-                function_call = part.get("functionCall")
-                if isinstance(function_call, dict) and str(function_call.get("name") or "").strip():
+                function_call = _wire_object(part.get("functionCall"), "functionCall")
+                name = function_call.get("name")
+                if name is not None and not isinstance(name, str):
+                    raise IncompleteResponseError("上游 functionCall.name 必须是字符串。")
+                if name and name.strip():
                     args = function_call.get("args")
-                    if not isinstance(args, dict):
-                        args = {}
+                    args = _wire_object(args, "functionCall.args")
                     yield (
                         "function_call",
                         {
-                            "name": str(function_call["name"]),
+                            "name": name,
                             "args": args,
                             "thought_signature": part.get("thoughtSignature") or None,
                         },
@@ -231,10 +256,12 @@ def extract_events(obj: dict):
                         },
                     )
 
-                inline_data = part.get("inlineData")
+                inline_data = _wire_object(part.get("inlineData"), "inlineData")
                 if inline_data:
                     mime_type = inline_data.get("mimeType", "")
                     b64 = inline_data.get("data", "")
+                    if not isinstance(mime_type, str) or not isinstance(b64, str):
+                        raise IncompleteResponseError("上游 inlineData 的 mimeType / data 必须是字符串。")
                     if mime_type and b64:
                         image_md = f"![Generated Image](data:{mime_type};base64,{b64})"
                         yield ("image", image_md)

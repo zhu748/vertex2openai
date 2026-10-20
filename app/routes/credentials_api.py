@@ -1,6 +1,7 @@
 """Express Key 列表、项目探测与 Cookie 凭证管理。"""
 
 import asyncio
+import math
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
@@ -82,6 +83,13 @@ async def save_express_keys(body: ExpressKeysBody, request: Request, _auth: bool
     for idx, item in enumerate(body.keys):
         if not isinstance(item, dict):
             return JSONResponse(status_code=400, content={"error": "每条 Key 记录必须是对象。"})
+        for field in ("key", "project_id", "project_source", "note"):
+            if field in item and not isinstance(item[field], str):
+                return JSONResponse(status_code=400, content={"error": f"第 {idx + 1} 个 Key 的 {field} 必须是字符串。"})
+        detected = item.get("detected_at", 0)
+        if (isinstance(detected, bool) or not isinstance(detected, (int, float))
+                or detected < 0 or (isinstance(detected, float) and not math.isfinite(detected))):
+            return JSONResponse(status_code=400, content={"error": f"第 {idx + 1} 个 Key 的 detected_at 必须是有限的非负时间戳。"})
         err = _validate_account_proxies(item, f"第 {idx + 1} 个 Key")
         if err:
             masked = express_key_probe.mask_key(str(item.get("key", "") or ""))
@@ -132,6 +140,8 @@ async def save_cookie_accounts(body: CookieAccountsBody, _auth: bool = Depends(r
         record_id = record.get("id", "")
         if not isinstance(record_id, str) or len(record_id) > 100:
             return JSONResponse(status_code=400, content={"error": f"{label}的 ID 无效。"})
+        record_id = record_id.strip()
+        record["id"] = record_id
         cookie = record.get("cookie", "")
         if not isinstance(cookie, str):
             return JSONResponse(status_code=400, content={"error": f"{label}的 Cookie 必须是字符串。"})
@@ -145,7 +155,10 @@ async def save_cookie_accounts(body: CookieAccountsBody, _auth: bool = Depends(r
         validation = validate_cookie(cookie)
         if not validation["valid"]:
             return JSONResponse(status_code=400, content={"error": f"{label}：{validation['message']}"})
-        project = str(record.get("project_id", "") or "").strip()
+        for field in ("project_id", "note"):
+            if field in record and not isinstance(record[field], str):
+                return JSONResponse(status_code=400, content={"error": f"{label}的 {field} 必须是字符串。"})
+        project = record.get("project_id", "").strip()
         if record.get("enabled", True) and not project:
             return JSONResponse(status_code=400, content={"error": f"{label}启用前需要填写 Project ID。"})
         error = _validate_account_proxies(record, label)

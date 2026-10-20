@@ -49,11 +49,12 @@ import subprocess
 import threading
 import time
 import atexit
+import weakref
 from contextvars import ContextVar
 from typing import Any, Optional
 from urllib.parse import unquote, parse_qs, urlsplit, urlunsplit
 from proxy_config import (BRIDGE_PROXY_SCHEMES, DIRECT_TOKENS, ProxyFormatError,
-                          normalize_proxy_uri, parse_bridge_proxy_uri)
+                          build_proxy_uri, normalize_proxy_uri, parse_bridge_proxy_uri)
 
 
 class ProxyResolveError(Exception):
@@ -74,6 +75,11 @@ class ProxyUsage:
         self._entries = set()
         self._closed = False
         self._lock = threading.Lock()
+
+    @property
+    def closed(self):
+        with self._lock:
+            return self._closed
 
     def include(self, manager, uri):
         with self._lock:
@@ -642,7 +648,7 @@ def _find_free_port() -> int:
         return s.getsockname()[1]
 
 
-def _wait_socks5_ready(port: int, timeout: float = 10.0, process=None) -> bool:
+def _wait_socks5_ready(port: int, timeout: float = 10.0, process=None, cancelled=None) -> bool:
     """轮询本地端口直到 sing-box 的 socks5 入站完成握手应答。
 
     只 TCP connect 成功不算就绪——端口可能被其他进程占着（崩溃复活场景：
@@ -651,15 +657,23 @@ def _wait_socks5_ready(port: int, timeout: float = 10.0, process=None) -> bool:
     服务端回 \x05 开头两字节）才认。
     process 传入时，子进程一退出立即返回（不等满超时）。
     """
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if cancelled is not None and cancelled():
+            return False
         if process is not None and process.poll() is not None:
             return False                      # 进程已退出，不用再等
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.4) as s:
                 s.settimeout(0.5)
                 s.sendall(b"\x05\x01\x00")    # SOCKS5 greeting：支持无认证
-                reply = s.recv(2)
+                # TCP may split even a two-byte greeting across packets.
+                reply = bytearray()
+                while len(reply) < 2:
+                    chunk = s.recv(2 - len(reply))
+                    if not chunk:
+                        break
+                    reply.extend(chunk)
                 if reply == b"\x05\x00":
                     return True
         except OSError:
@@ -690,9 +704,9 @@ class ProxyProcessManager:
     engine_name = "代理转换器"
 
     def __init__(self):
-        self._lock = threading.Lock()          # 只保护下面两个 dict 的存取
+        self._lock = threading.Lock()          # 保护实例、启动锁和使用计数
         self._instances: dict[str, _SingboxInstance] = {}
-        self._uri_locks: dict[str, threading.Lock] = {}
+        self._uri_locks = weakref.WeakValueDictionary()
         self._active_uses: dict[str, int] = {}
         self._closed = False
 
@@ -720,25 +734,26 @@ class ProxyProcessManager:
         sing-box 最多等待 10s；SSTP 另含最多 30s 的握手）。异步上下文请先用 resolve_proxy_uri_async()
         预热，避免卡住事件循环。
         """
-        uri = str(uri or "").strip()
+        uri = self._cache_uri(str(uri or "").strip())
         if not uri:
             raise ProxyResolveError("get_local_socks5 收到空 URI。")
         usage = current_proxy_usage.get()
         if usage is not None:
             usage.include(self, uri)
-        inst = self._instances.get(uri)     # CPython dict.get 原子，快路径免锁
-        if inst is not None and inst.alive():
-            inst.last_used = time.time()
-            return f"socks5://127.0.0.1:{inst.port}"
+        if self._startup_cancelled(uri):
+            raise ProxyResolveError("请求已结束或服务正在退出，已取消代理启动。", retry_new_port=False)
+        cached = self._cached_local_socks5(uri)
+        if cached is not None:
+            return cached
 
         with self._uri_lock(uri):           # 按 URI 串行：不同代理的启动互不阻塞
-            inst = self._instances.get(uri)
-            if inst is not None and inst.alive():
-                inst.last_used = time.time()
-                return f"socks5://127.0.0.1:{inst.port}"
+            if self._startup_cancelled(uri):
+                raise ProxyResolveError("请求已结束或服务正在退出，已取消代理启动。", retry_new_port=False)
+            cached = self._cached_local_socks5(uri)
+            if cached is not None:
+                return cached
             with self._lock:
-                if self._closed:
-                    raise ProxyResolveError(f"进程正在退出，{self.engine_name} 已停。")
+                inst = self._instances.get(uri)
             stale_port = inst.port if inst is not None else None
             try:
                 inst = self._launch(uri, stale_port if stale_port else _find_free_port())
@@ -755,16 +770,39 @@ class ProxyProcessManager:
                     with self._lock:
                         self._instances.pop(uri, None)
                     raise
+            request_closed = usage is not None and usage.closed
             with self._lock:
-                if self._closed:            # 与停机竞态：刚起的进程立即回收
-                    self._terminate(inst)
-                    raise ProxyResolveError(f"进程正在退出，{self.engine_name} 已停。")
-                self._instances[uri] = inst
+                closed = self._closed or (request_closed and not self._active_uses.get(uri))
+                if not closed:
+                    self._instances[uri] = inst
+            if closed:  # Do not hold the shared lock while waiting for a process.
+                self._terminate(inst)
+                raise ProxyResolveError("请求已结束或服务正在退出，已取消代理启动。", retry_new_port=False)
             return f"socks5://127.0.0.1:{inst.port}"
 
+    def _cached_local_socks5(self, uri):
+        # Lookup and touch must be atomic with eviction. An unlocked dict.get
+        # could hand out a socket whose process the reaper had already removed.
+        with self._lock:
+            if self._closed:
+                raise ProxyResolveError(f"进程正在退出，{self.engine_name} 已停。")
+            inst = self._instances.get(uri)
+            if inst is not None and inst.alive():
+                inst.last_used = time.time()
+                return f"socks5://127.0.0.1:{inst.port}"
+
+        return None
+
+    def _startup_cancelled(self, uri):
+        usage = current_proxy_usage.get()
+        request_closed = usage is not None and usage.closed
+        with self._lock:
+            # Another generation waiting for this node can take ownership of
+            # startup, even if the original request's thread was cancelled.
+            return self._closed or (request_closed and not self._active_uses.get(uri))
+
     def _uri_lock(self, uri: str) -> threading.Lock:
-        """取（或建）该 URI 专属的启动锁。锁对象只增不减（数量以
-        进程生命周期内出现过的不同代理 URI 为上界，可忽略）。"""
+        """Share a startup lock among current waiters; discard it when unused."""
         with self._lock:
             lk = self._uri_locks.get(uri)
             if lk is None:
@@ -799,18 +837,26 @@ class ProxyProcessManager:
         idle_seconds = self._idle_minutes() * 60.0
         now = time.time()
         with self._lock:
-            dead = {k for k, v in self._instances.items()
-                    if not self._active_uses.get(k) and not v.alive()}
-            stale = []
-            if idle_seconds > 0:
-                stale = [k for k, v in self._instances.items()
-                         if k not in dead and not self._active_uses.get(k)
-                         and now - v.last_used > idle_seconds]
-            keys = sorted(dead) + [k for k in stale if k not in dead]
-            victims = [self._instances.pop(k) for k in keys]
-        for inst in victims:
-            self._terminate(inst)           # 锁外终止，不阻塞正在取用的请求
-        return len(keys)
+            keys = list(self._instances)
+        removed = 0
+        for uri in keys:
+            lock = self._uri_lock(uri)
+            if not lock.acquire(blocking=False):
+                continue  # A restart owns this URI; do not discard its port.
+            try:
+                with self._lock:
+                    inst = self._instances.get(uri)
+                    if inst is None or self._active_uses.get(uri):
+                        continue
+                    if inst.alive() and (idle_seconds <= 0 or now - inst.last_used <= idle_seconds):
+                        continue
+                    self._instances.pop(uri)
+                # Keep the per-URI lock until the old listener has gone away.
+                self._terminate(inst)
+                removed += 1
+            finally:
+                lock.release()
+        return removed
 
     def stats(self) -> dict:
         """运行概览（供日志 / 控制台展示）。"""
@@ -827,6 +873,9 @@ class ProxyProcessManager:
 
     def _runtime_info(self):
         raise NotImplementedError
+
+    def _cache_uri(self, uri):
+        return uri
 
     def _idle_minutes(self):
         return _idle_minutes()
@@ -936,11 +985,14 @@ class SingboxManager(ProxyProcessManager):
 
         inst = _SingboxInstance(uri, port, process, config_path, log_path)
         # 协议级就绪检查：SOCKS5 握手应答 + 进程存活双条件（见函数 docstring）
-        ready = _wait_socks5_ready(port, timeout=10.0, process=process)
+        ready = _wait_socks5_ready(port, timeout=10.0, process=process,
+                                   cancelled=lambda: self._startup_cancelled(uri))
         alive = process.poll() is None
         if not (ready and alive):
             tail = inst.log_tail()
             self._terminate(inst)
+            if self._startup_cancelled(uri):
+                raise ProxyResolveError("请求已结束或服务正在退出，已取消代理启动。", retry_new_port=False)
             if not alive:
                 detail = f"sing-box 启动后即退出（配置或节点参数大概率有误）。日志尾部：{tail or '（无输出）'}"
             else:
@@ -959,7 +1011,7 @@ def find_bridge_binary() -> Optional[str]:
                  if path and os.path.isfile(path) and os.access(path, os.X_OK)), None)
 
 
-def _wait_bridge_ready(instance, ready_file, timeout):
+def _wait_bridge_ready(instance, ready_file, timeout, cancelled=None):
     """Require the child's own bind acknowledgment before checking SOCKS5.
 
     A foreign SOCKS5 process can take a released dynamic port while SSTP is
@@ -967,6 +1019,8 @@ def _wait_bridge_ready(instance, ready_file, timeout):
     """
     deadline = time.monotonic() + timeout
     while instance.alive() and time.monotonic() < deadline:
+        if cancelled is not None and cancelled():
+            return False
         try:
             with open(ready_file, encoding="ascii") as marker:
                 ready = marker.read(16) == "ready\n"
@@ -974,7 +1028,7 @@ def _wait_bridge_ready(instance, ready_file, timeout):
             ready = False
         if ready:
             return _wait_socks5_ready(instance.port, timeout=max(0.1, deadline - time.monotonic()),
-                                      process=instance.process)
+                                      process=instance.process, cancelled=cancelled)
         time.sleep(0.05)
     return False
 
@@ -989,6 +1043,29 @@ class ProxyBridgeManager(ProxyProcessManager):
     def _runtime_info(self):
         binary = find_bridge_binary()
         return {"available": bool(binary), "binary": binary or "", "version": "1" if binary else ""}
+
+    def _cache_uri(self, uri):
+        # Remarks, query order and explicit defaults do not identify a different
+        # tunnel. Reuse one SSTP session even when the same node is imported in
+        # both RFC and URL forms or renamed in another account's list.
+        try:
+            cfg = parse_bridge_proxy_uri(uri)
+        except ProxyFormatError as exc:
+            raise ProxyResolveError(str(exc), retry_new_port=False) from None
+        options = {}
+        if cfg["scheme"] != "turn":
+            if cfg["tls_server_name"] != cfg["server"]:
+                options["sni"] = cfg["tls_server_name"]
+            if cfg["ca_file"]:
+                options["ca"] = cfg["ca_file"]
+            if cfg["insecure"]:
+                options["insecure"] = True
+        if cfg["scheme"] in {"turn", "turns"} and cfg["realm"]:
+            options["realm"] = cfg["realm"]
+        if cfg["scheme"] == "sstp" and cfg["mtu"] < 1400:
+            options["mtu"] = cfg["mtu"]
+        return build_proxy_uri(cfg["scheme"], cfg["server"], cfg["server_port"],
+                               cfg["username"], cfg["password"], options=options)
 
     def _idle_minutes(self):
         try:
@@ -1032,8 +1109,11 @@ class ProxyBridgeManager(ProxyProcessManager):
                                            stdin=subprocess.DEVNULL, start_new_session=True)
             inst = _SingboxInstance(uri, port, process, config_path, log_path)
             timeout = 35.0 if config["scheme"] == "sstp" else 10.0
-            if not _wait_bridge_ready(inst, ready_path, timeout) or not inst.alive():
+            if not _wait_bridge_ready(inst, ready_path, timeout,
+                                      cancelled=lambda: self._startup_cancelled(uri)) or not inst.alive():
                 self._terminate(inst)
+                if self._startup_cancelled(uri):
+                    raise ProxyResolveError("请求已结束或服务正在退出，已取消代理启动。", retry_new_port=False)
                 # Never forward arbitrary child-process output: custom helpers or
                 # malformed peers could echo credentials in an error message.
                 known = {
@@ -1042,6 +1122,9 @@ class ProxyBridgeManager(ProxyProcessManager):
                     "sstp_custom_ca_requires_linux": "SSTP 自定义 CA 当前需要 Linux",
                     "sstp_auth_failed_requires_mschapv2": "SSTP 认证失败，需正确的 MS-CHAPv2 账号密码",
                     "sstp_handshake_failed_check_tls_credentials_and_mschapv2": "SSTP TLS / PPP 握手失败",
+                    "sstp_handshake_timeout": "SSTP 握手超时（包含 TCP / TLS / PPP 的 30 秒总预算）",
+                    "sstp_ipv4_address_missing": "SSTP 服务器未分配可用的 IPv4 地址",
+                    "sstp_network_stack_failed": "SSTP 用户态网络栈初始化失败",
                     "listen_failed": "本地端口绑定失败",
                     "ready_write_failed": "无法写入转换器就绪标记",
                     "invalid_config": "转换器配置无效",
@@ -1118,8 +1201,8 @@ def resolve_proxy_uri(uri: Optional[str]) -> str:
       （首次使用时惰性启动 sing-box；之后纯缓存查找，开销≈0）；
     - 其他 → 抛 ProxyResolveError（含可操作指引，绝不静默直连）。
 
-    结果稳定：同一 URI 在进程生命周期内永远映射到同一端口，
-    客户端池签名不会因重复 resolve 而抖动。
+    正常复用期间端口稳定，客户端池签名不会因重复 resolve 而抖动；
+    回收、崩溃或端口冲突后可能重新分配。
     """
     try:
         value = normalize_proxy_uri(str(uri or ""))
@@ -1152,7 +1235,20 @@ async def resolve_proxy_uri_async(uri: Optional[str]) -> str:
     预热、再调用内部会同步 resolve 的池化代码（池签名命中缓存，零阻塞）。
     结果与同步版完全一致（同 URI 端口映射进程内稳定）。
     """
-    return await asyncio.to_thread(resolve_proxy_uri, uri)
+    kind = classify_proxy_uri(uri)
+    if kind not in {"singbox", "bridge"}:
+        return resolve_proxy_uri(uri)  # Native proxies never need a worker thread.
+    manager = bridge_manager if kind == "bridge" else singbox_manager
+    value = manager._cache_uri(normalize_proxy_uri(uri))
+    usage = current_proxy_usage.get()
+    if usage is not None:
+        usage.include(manager, value)
+    if manager._startup_cancelled(value):
+        raise ProxyResolveError("请求已结束或服务正在退出，已取消代理启动。", retry_new_port=False)
+    cached = manager._cached_local_socks5(value)
+    if cached is not None:
+        return cached
+    return await asyncio.to_thread(resolve_proxy_uri, value)
 
 
 def validate_proxy_uri(uri: str) -> str:

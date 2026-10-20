@@ -55,7 +55,11 @@ func (c config) startSSTP(ctx context.Context, cancel context.CancelFunc) (dialF
 		if err != nil {
 			return nil, err
 		}
-		raw.SetDeadline(time.Now().Add(30 * time.Second))
+		// The timeout covers DNS/TCP/TLS/HTTP/PPP together, rather than giving
+		// HTTP a fresh 30 seconds after a slow TCP connection. The library's
+		// HTTP handshake does not itself watch the context.
+		deadline, _ := handshakeCtx.Deadline()
+		raw.SetDeadline(deadline)
 		stop := context.AfterFunc(ctx, func() { raw.Close() })
 		carrier = &managedConn{Conn: raw, cleanup: func() { stop() }}
 		return carrier, nil
@@ -66,11 +70,23 @@ func (c config) startSSTP(ctx context.Context, cancel context.CancelFunc) (dialF
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err != nil {
+		if carrier != nil {
+			carrier.Close()
+		}
 		packets.Close()
+		var timeout net.Error
+		if handshakeCtx.Err() != nil || (errors.As(err, &timeout) && timeout.Timeout()) {
+			return nil, nil, errors.New("sstp_handshake_timeout")
+		}
 		if errors.Is(err, client.ErrAuth) {
 			return nil, nil, errors.New("sstp_auth_failed_requires_mschapv2")
 		}
 		return nil, nil, errors.New("sstp_handshake_failed_check_tls_credentials_and_mschapv2")
+	}
+	if handshakeCtx.Err() != nil {
+		session.Close()
+		packets.Close()
+		return nil, nil, errors.New("sstp_handshake_timeout")
 	}
 	carrier.SetDeadline(time.Time{})
 	ip, valid := netip.AddrFromSlice(result.AssignedIP)

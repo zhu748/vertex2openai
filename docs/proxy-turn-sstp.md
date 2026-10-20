@@ -16,6 +16,8 @@ SSTP 客户端不创建系统 TUN / PPP 设备，不修改宿主机路由，也�
 
 「高级连接设置」可填写证书名称（SNI）、自定义 CA 文件、TURN Realm 或 SSTP MTU。默认校验 TLS 证书，只有明确勾选「允许未受信任的服务器证书」才会跳过校验。
 
+节点备注会显示在列表中；链接中的 `#备注` 会自动填入备注字段，编辑端口或 TLS 参数后仍保留。列表标题只显示端点和备注，不展示账号密码。
+
 加入列表、应用草稿后，点击对应的「保存代理」「保存 Key 列表」或「保存 Cookie 列表」生效。配置解析与保存不连接远端服务器，转换器未安装或代理离线时仍能编辑已有配置。
 
 ## 链接与环境变量
@@ -34,6 +36,52 @@ turns:turn.example.com:5349?transport=tcp&username=username&password=password
 ```
 
 用户名和密码中的 `@`、`:`、`#`、`&` 等保留字符须进行 URL 编码，例如密码 `p@ss:word` 应写成 `p%40ss%3Aword`。面板字段方式无需手动编码。标准 TURN URI 本身不定义凭据参数，这里的 `username` / `password` 是本项目用于传入凭据的扩展。
+
+### 智能识别与批量导入
+
+省略协议时，先在面板选择 TURN、TURNS 或 SSTP，再粘贴下列格式（下例按 SSTP 识别）：
+
+```text
+vpn.example.com:443:username:password
+username:password:vpn.example.com:443
+username:password@vpn.example.com:443
+vpn.example.com:443@username:password
+vpn.example.com|443|username|password
+vpn.example.com 443 username password
+vpn.example.com:443
+```
+
+URL 中的账号密码需要进行 URL 编码；空格和 `|` 四字段格式中的凭据按原文读取。也支持 `协议://Base64(用户名:密码)@主机:端口`。IPv6 地址使用方括号。省略协议的记录使用当前选择的类型；环境变量中请写明协议。
+
+在面板先选择协议，再粘贴到「粘贴代理 · 自动识别」框，会自动填入字段。单独的 `主机:端口` 也可以先识别，TURN / TURNS / SSTP 随后补齐账号密码。批量粘贴可混合完整凭据和纯地址，纯地址会在草稿列表标记「待补齐账号 / 密码」，点击编辑补齐后才能应用配置。添加后会保留当前协议类型，方便继续粘贴同类节点。HTTP / SOCKS 等可拆字段类型采用同样的粘贴方式。
+
+端口不会改变所选协议：例如选择 TURN 后粘贴 `主机:5349` 仍按 TURN 填入；需要 TLS 时请选择 TURNS，或粘贴明确的 `turns://` 链接。
+
+可直接粘贴 WebRTC ICE JSON，包括单节点、节点数组及 `iceServers` 包装：
+
+```json
+{"iceServers":[
+  {"urls":"stun:discovery.example.com"},
+  {"urls":["turn:relay.example.com:3478?transport=tcp","turns:relay.example.com:5349?transport=tcp"],
+   "username":"user","credential":"password"}
+]}
+```
+
+STUN 条目会跳过；只有 STUN 的配置会报错，不能作为代理。明确指定 `transport=udp` 的 TURN 节点仍然拒绝导入，本组件需要 RFC 6062 TCP 中继。ICE 的 `credential` 按原文读取，无需额外 URL 编码；不支持 OAuth 凭据。
+
+也支持字段形式的节点 JSON，以及混合链接和节点对象的 JSON 数组：
+
+```json
+{"type":"sstp","server":"vpn.example.com","server_port":443,
+ "username":"domain\\user","password":"password","name":"备用 VPN",
+ "options":{"sni":"vpn.example.com","mtu":1280}}
+```
+
+`scheme` / `host` / `port` 分别是 `type` / `server` / `server_port` 的替代写法；同一字段不要同时使用两种写法。也可用顶层的 `tls_server_name`、`ca_file`、`insecure`、`realm`、`mtu` 传入对应高级参数。未知字段、重复 JSON 字段和重复高级参数会拒绝导入。
+
+粘贴单条后点击「识别」会填入表单，多条会按顺序加入草稿；也可以直接点击「加入列表」或「应用到配置」，新粘贴的内容会先经过识别。相同连接配置会复用一个转换进程，备注、参数顺序和显式默认值不会额外建立 SSTP 会话。
+
+### 环境变量
 
 环境变量可混合不同类型并指定故障切换顺序：
 

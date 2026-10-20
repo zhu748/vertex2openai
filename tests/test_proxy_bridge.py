@@ -61,7 +61,8 @@ class BridgeConfigurationTests(unittest.TestCase):
     def test_ordered_lists_accept_standard_and_url_turn_forms(self):
         turn = "turn:host:3478?username=u&password=p&transport=tcp"
         sstp = "sstp://u:p@vpn.example.com:443"
-        self.assertEqual(parse_proxy_list(turn + ", " + sstp + "," + turn), [turn, sstp])
+        self.assertEqual(parse_proxy_list(turn + ", " + sstp + "," + turn),
+                         ["turn://u:p@host:3478?transport=tcp", sstp])
 
 
 class BridgeProcessTests(unittest.TestCase):
