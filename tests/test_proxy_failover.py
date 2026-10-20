@@ -233,7 +233,9 @@ class ChainTests(unittest.IsolatedAsyncioTestCase):
             request_tracking._attempt_started.reset(token)
 
     async def test_first_reply_timeout_carries_window_seconds(self):
-        """FirstReplyTimeout 携带触发超时的窗口秒数，供重试日志与诊断归类原因。"""
+        """FirstReplyTimeout 携带触发超时的窗口秒数，供重试日志与诊断展示窗口口径。
+        多出口与单出口的异常 message 必须逐字一致：它是外层重试日志、最终 504
+        错误响应与 cookie 通道共用的文案源，不能各说各话。"""
         with mock.patch("first_reply.timeout_seconds", return_value=0.01):
             guard = FirstReplyGuard("gemini-test")
             async def hang():
@@ -241,7 +243,8 @@ class ChainTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(FirstReplyTimeout) as ctx:
                 await guard.wait(hang())
             self.assertEqual(ctx.exception.seconds, 0.01)
-            # 多出口路径：proxy_attempt 触发的超时同样携带窗口秒数。
+            self.assertIn("（思考、正文、工具调用或图片均算回复）", str(ctx.exception))
+            # 多出口路径：proxy_attempt 触发的超时同样携带窗口秒数与相同文案。
             token = request_tracking._attempt_started.set(None)
             try:
                 async def blocked(raw, resolved):
@@ -253,6 +256,7 @@ class ChainTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 request_tracking._attempt_started.reset(token)
             self.assertEqual(multi.exception.seconds, 0.01)
+            self.assertEqual(str(multi.exception), str(ctx.exception))  # 文案逐字一致
 
     async def test_first_reply_timeout_does_not_print_proxy_switch(self):
         """首回复超时不触发代理切换：日志里不应出现 🔀 [代理切换]。"""
@@ -272,8 +276,10 @@ class ChainTests(unittest.IsolatedAsyncioTestCase):
             request_tracking._attempt_started.reset(token)
 
     async def test_proxy_attempt_timeout_emits_trace_event(self):
-        """多出口窗口超时同样发 first_reply_timeout trace 事件，
-        对齐单出口路径既有的“超过 N 秒”说明，并标明稍后自动重试。"""
+        """多出口窗口超时同样发 first_reply_timeout trace 事件：
+        旧版单出口的“超过 N 秒 / 本次上游读取已中断”说明 + 完整判活口径
+        （思考、正文、工具调用或图片均算回复）+ 自动重试预告，且不再提
+        “当前出口”——超时与出口无关，不能误导用户去怀疑代理。"""
         token = request_tracking._attempt_started.set(None)
         trace_token = None
         try:
@@ -290,8 +296,10 @@ class ChainTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(events), 1)  # 超时后不切换出口，仅当前出口一条
             for item in events:
                 self.assertIn("等待模型首回复超过 0.015 秒", item["message"])
+                self.assertIn("思考、正文、工具调用或图片均算回复", item["message"])
                 self.assertIn("本次上游读取已中断", item["message"])
                 self.assertIn("自动重试", item["message"])
+                self.assertNotIn("当前出口", item["message"])
         finally:
             if trace_token is not None:
                 request_tracking.current_trace.reset(trace_token)

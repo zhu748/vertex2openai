@@ -8,7 +8,9 @@
 1. 首回复超时不再触发 🔀 代理切换（出口没有故障证据，不能冤枉）；
 2. 超时说明已恢复：trace 事件「等待模型首回复超过 N 秒…」；
 3. 外层捕获 FirstReplyTimeout 后退避重试（与 429 同路径），重试成功；
-4. 「第 N 次尝试等待 X 秒」归因到当前尝试，不累加已失败尝试的等待。
+4. 重试日志展示的中文说明与旧版单出口文案逐字一致
+   （等待模型首回复超过 N 秒，思考、正文、工具调用或图片均算回复）；
+5. 「第 N 次尝试等待 X 秒」归因到当前尝试，不累加已失败尝试的等待。
 """
 import asyncio
 import os
@@ -47,7 +49,7 @@ async def main():
     chain = ProxyChain(candidates=["socks5://u:p@1.1.1.1:6370", "socks5://u:p@2.2.2.2:6361"])
     trace = request_tracking.RequestTrace("/v1/chat/completions")
     trace_token = request_tracking.current_trace.set(trace)
-    result, attempt = None, 0
+    result, attempt, last_exc = None, 0, None
     try:
         while attempt <= 2:
             upstream_attempt()  # 对应 api_helpers 外层 attempt 循环
@@ -59,6 +61,7 @@ async def main():
                         chain.run(operation))
                 break
             except FirstReplyTimeout as exc:
+                last_exc = exc
                 elapsed = time.monotonic() - request_started
                 print(f"⚠️ [自动重试] 流式请求失败（HTTP 504，{str(exc).rstrip('。')}，"
                       f"本次已等待 {elapsed:.1f} 秒）。第 {attempt + 1} 次退避重试，"
@@ -73,8 +76,11 @@ async def main():
     assert attempt == 1, "应恰好自动重试一次后成功"
     assert len(timeout_events) == 1, "超时应发出一条 first_reply_timeout 请求跟踪事件"
     assert chain.index == 0, "超时不得切换出口（chain.index 应保持 0）"
+    assert last_exc is not None and "思考、正文、工具调用或图片均算回复" in str(last_exc), \
+        "重试日志展示的说明必须与旧版单出口文案一致（含判活口径）"
     print()
-    print(f"✅ 超时说明已恢复：{timeout_events[0]['message'][:52]}...")
+    print(f"✅ 超时说明已恢复（与旧版一致）：{timeout_events[0]['message'][:56]}...")
+    print(f"✅ 重试日志文案：{str(last_exc).rstrip('。')}")
     print("✅ 未发生代理切换（全程无 🔀 日志，chain.index=0）——出口没有故障证据")
     print(f"✅ 自动重试 1 次后成功（与 429 同路径），「第 {attempt + 1} 次尝试等待 "
           f"{time.monotonic() - (attempt_started_at() or request_started):.1f} 秒」归因当前尝试")

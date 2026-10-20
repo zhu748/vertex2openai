@@ -34,15 +34,17 @@ async def proxy_attempt(enabled):
     except TimeoutError as exc:
         if not attempt.expired():
             raise
-        # 与 FirstReplyGuard.wait 的超时分支对齐：多出口路径同样要发 trace 事件，
-        # 否则监控面板与日志里只剩英文类名，丢失“超过 N 秒”的说明。
+        # 与 FirstReplyGuard.wait 的超时分支逐字对齐：异常 message 是外层重试
+        # 日志、最终 504 错误响应与 cookie 通道共用的文案源，多出口路径不能
+        # 另造一套说法；trace 事件补回旧版"超过 N 秒"说明并预告自动重试。
         if guard.trace:
             guard.trace.event(
                 "first_reply_timeout",
-                f"等待模型首回复超过 {guard.seconds:g} 秒（当前出口窗口；思考、正文、"
-                "工具调用或图片均算回复），本次上游读取已中断，稍后自动重试。")
+                f"等待模型首回复超过 {guard.seconds:g} 秒（思考、正文、工具调用"
+                "或图片均算回复），本次上游读取已中断，稍后自动重试。")
         raise FirstReplyTimeout(
-            f"当前出口等待模型首回复超过 {guard.seconds:g} 秒。", seconds=guard.seconds) from exc
+            f"等待模型首回复超过 {guard.seconds:g} 秒（思考、正文、工具调用或图片均算回复）。",
+            seconds=guard.seconds) from exc
     finally:
         parent.reschedule(guard.deadline if completed else None)
 
@@ -52,7 +54,7 @@ class FirstReplyTimeout(TimeoutError):
 
     def __init__(self, message, *, seconds=None):
         super().__init__(message)
-        # 携带触发超时的窗口秒数，供代理切换日志区分“模型慢”与“出口故障”。
+        # 携带触发超时的窗口秒数，供重试日志与请求监控面板展示窗口口径。
         self.seconds = seconds
 
 
