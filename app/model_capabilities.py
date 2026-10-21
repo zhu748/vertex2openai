@@ -354,7 +354,10 @@ def apply_sampling_policy(profile: Dict[str, Any], settings: Dict[str, Any]) -> 
     """
     policy = str(settings.get("sampling_policy", "auto") or "auto").lower()
     if policy not in ("deprecated", "allowed") or profile.get("is_image"):
-        return profile          # 生图本来就剥离全部采样，不受该开关影响
+        # 生图本来就剥离全部采样，不受该开关影响。返回副本而非缓存本体：
+        # get_profile 的文档承诺“返回已浅拷贝不修改入参”，直接共享缓存
+        # dict 的话首个未来调用方一旦原地修改就污染所有后续请求（2026-10 修复）。
+        return dict(profile)
     prof = dict(profile)
     allowed = set(prof.get("allowed_sampling", set()))
     if policy == "deprecated":
@@ -394,7 +397,10 @@ def resolve_image_size(model_name: str, request: Any, settings: Dict[str, Any]) 
     # 旧实现写成 `for cand in (...): if cand in sizes: return "1K" if "1K" in sizes else cand`，
     # 因为 1K 在所有白名单里，任何非法值都返回 1K，注释里的“优先给相近的高档”从未生效。
     ladder = ["512", "1K", "2K", "4K"]
-    idx = ladder.index(size) if size in ladder else len(ladder) - 1
+    # 未知值回落到默认档 1K：旧实现落 idx=len-1（4K，最高档），一个越界
+    # 的 extra.image_size（如 "1024x1024"/"high"）就能买到 16× 像素成本
+    # （2026-10 修复；客户端可控输入不得放大成最高档）。
+    idx = ladder.index(size) if size in ladder else ladder.index("1K")
     for i in range(idx, -1, -1):
         if ladder[i] in sizes:
             return ladder[i]

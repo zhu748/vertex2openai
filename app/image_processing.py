@@ -56,6 +56,14 @@ def optimize_image_bytes(
 
     try:
         with Image.open(io.BytesIO(image_data)) as img:
+            # 头部像素预检（不触发解码）：超过 2×_MAX_INPUT_PIXELS 的超大图
+            # 直接拒绝。旧实现会一路解码到 PIL 的 DecompressionBombError，
+            # 再被下方兜底 except 捕获后**原样回传**——像素炸弹守卫恰好对
+            # 最大的炸弹失效（低熵 900MP PNG 以 258KB 透传上游，2026-10 修复）。
+            if img.width * img.height > 2 * _MAX_INPUT_PIXELS:
+                raise ValueError(
+                    f"输入图片像素数 {img.width}x{img.height} 超过安全上限"
+                    f"（{2 * _MAX_INPUT_PIXELS // 1_000_000}MP），已拒绝处理")
             # Compression drops EXIF metadata. Apply camera orientation first
             # so portrait photos do not silently turn sideways upstream.
             img = ImageOps.exif_transpose(img)
@@ -82,6 +90,12 @@ def optimize_image_bytes(
                 opt_data = output.getvalue()
 
             return opt_data, "image/jpeg"
+    except ValueError:
+        # 明确的安全拒绝（像素超限）：不落入"原图回传"兜底。
+        raise
+    except Image.DecompressionBombError as e:
+        # PIL 自身的像素炸弹拦截：同样拒绝而非回传（belt and suspenders）。
+        raise ValueError(f"输入图片像素数超过 PIL 安全上限：{e}")
     except Exception as e:
         print(f"⚠️ [图片处理] 输入图片压缩失败，已回退为原图传输：{e}")
         return image_data, original_mime

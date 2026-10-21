@@ -225,6 +225,10 @@ DEFAULT_SETTINGS = {
     "upstream_max_concurrency": 32,     # 后台任务也占用生成名额；满时明确返回 503
     # 按模型单独保存的参数覆盖：{ "模型ID": { 键: 值, ... } }
     # 仅覆盖“与模型相关”的参数（见 PER_MODEL_KEYS）；优先级 请求 > 模型专属 > 全局 > 内置。
+    # 下面两个是**内置模型默认**（非演示条目）：这两款模型官方流式实现会
+    # 截断长文本，抗截断默认开启；有专门测试断言该行为（test_anti_truncation）
+    # 与控制台“重置回内置默认”的回退语义（用户可按模型覆盖为 off，清空
+    # 保存值后回落到这里的内置默认，属预期设计）。
     "model_overrides": {
         "gemini-4-argon": {"anti_truncation_mode": "both"},
         "gemini-3.8-flash": {"anti_truncation_mode": "both"},

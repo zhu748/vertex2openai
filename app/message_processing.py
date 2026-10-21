@@ -105,7 +105,16 @@ def _extract_markdown_images_to_parts(text: str) -> Tuple[List[types.Part], str]
                 extracted += 1
             except Exception as e:
                 print(f"⚠️ [图片处理] 提取 Markdown 图片失败，已跳过该图片：{e}")
-        parts.reverse()
+                # 失败也必须推进游标：旧实现只打日志不推进，整段 data URL
+                # （数 MB base64）会残留在文本里原样发给上游——日志说"已
+                # 跳过"但实际没跳过，25MB 图变成 ~33MB 提示词（2026-10 修复）。
+                kept.append(text[cursor:match.start()])
+                kept.append("[图片无法处理，已省略]")
+                cursor = match.end()
+        # 注：不可 reverse。旧实现（逐图倒序拼接防下标失效）需要 reverse
+        # 恢复文档顺序；2026-10 改为正序游标重组后 parts 本就按文档序追加，
+        # 残留的 reverse 会把多图消息整体倒序发给 Gemini（多图编辑时第一张
+        # 图是编辑目标，顺序错乱直接改错图）。
         # 仅在**确实抽走了图片**时才压平空白：抠掉 data URL 会留下成片空格。
         # 旧实现无条件执行，导致所有纯文本消息的缩进/多空格（代码块、ASCII 图、
         # 酒馆预设的排版）都被悄悄改写；全部提取失败时同样不该改写文本。
@@ -715,8 +724,11 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
                 is_thought = getattr(part, "thought", None) is True
                 text_value = getattr(part, "text", None)
                 if text_value is None and getattr(part, "inline_data", None) is not None:
-                    inline = part.inline_data
-                    text_value = _convert_image_to_markdown(inline.data, inline.mime_type)
+                    # ordinary_parts 的唯一消费端（round-trip 重建）会拒绝含
+                    # data: 图片的列表——这里再编码一遍 base64 只会让每个生图
+                    # 回合的响应体积翻倍且无人使用（正文 content 已有同一张图
+                    # 的 markdown，2026-10 修复）。file_data 的 URI 很短，保留。
+                    text_value = "[image]"
                 elif text_value is None and getattr(part, "file_data", None) is not None:
                     text_value = f"![Image]({part.file_data.file_uri})"
                 text_value = "" if text_value is None else str(text_value)

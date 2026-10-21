@@ -11,7 +11,9 @@ class BodyTooLargeError(HTTPException):
 
     content-length 头只能拦「谎报长度」的请求；Transfer-Encoding: chunked
     无长度头，旧实现要在应用层全量读完后才检查——超大甚至永不终止的
-    chunked 流会在 413 生效前耗尽内存。此异常由 StatsMiddleware 统一转成 413。
+    chunked 流会在 413 生效前耗尽内存。此异常统一转成 413（main.py 注册
+    的显式处理器渲染 OpenAI 错误形状；StatsMiddleware 的 except 分支仅作
+    处理器缺失时的兜底）。
 
     继承 HTTPException 的原因：FastAPI 路由层会把 body 读取抛出的普通
     Exception 吞成 400「There was an error parsing the body」，但显式
@@ -19,8 +21,14 @@ class BodyTooLargeError(HTTPException):
     """
 
     def __init__(self, limit: int):
-        mib = max(1, round(limit / (1024 * 1024)))
-        super().__init__(status_code=413, detail=f"请求体超过体积上限（约 {mib}MiB）。")
+        # 尺寸提示用准确单位：<1MiB 显示 KiB（登录上限 256KB 旧文案被
+        # max(1, round(...)) 误标成“约 1MiB”）。此 detail 只是 HTTPException
+        # 兼容文案；正式响应由 main.py 的 BodyTooLargeError 处理器渲染。
+        if limit >= 1024 * 1024:
+            size = f"{limit // (1024 * 1024)}MiB"
+        else:
+            size = f"{max(1, limit // 1024)}KiB"
+        super().__init__(status_code=413, detail=f"请求体超过体积上限（{size}）。")
         self.limit = limit
 
 class ClientConnection:

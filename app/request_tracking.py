@@ -263,17 +263,49 @@ class PayloadObserver:
         raw = chunk.encode("utf-8") if isinstance(chunk, str) else bytes(chunk)
         with self.trace._lock:
             self.trace.data["sent_bytes" if self.sent else "generated_bytes"] += len(raw)
+        if self.skipping:
+            # 跳过期间到达的块整块计入跳过字节（分隔符后残余被回灌检查，
+            # 计数轻微高估属于保守方向，不影响投递）。
+            with self.trace._lock:
+                self.trace.data["inspection_skipped_bytes"] += len(raw)
+            self._skip_step(raw, final=final)
+            return
         if len(self.buffer) + len(raw) > MAX_INSPECTION_BYTES:
             with self.trace._lock:
                 self.trace.data["inspection_skipped_bytes"] += len(raw)
             self.buffer.clear()
             self._scan = 0
             self.skipping = True
-        if self.skipping:
-            # Resume only after the oversized frame has ended; never decode its tail.
-            if self.sse and (b"\n\n" in raw or b"\r\n\r\n" in raw):
-                self.skipping = False
+            # 触发块自身可能已含超限帧的终结分隔符（帧在本块内结束）：
+            # 走同一检测路径，块内分隔符之后的残余是新的正常帧
+            # （旧实现在此直接 return，块尾带分隔符时下一块被误吞）。
+            self._skip_step(raw, final=final)
             return
+        self._ingest(raw, final=final)
+
+    def _skip_step(self, raw, final=False):
+        """跳过模式处理一块：定位超限帧的终结分隔符（支持横跨块与 \\r\\r），
+        找到则复位跳过并回灌分隔符之后的残余。"""
+        if not self.sse:
+            return
+        # 上一块的 3 字节尾与本块拼接检测（分隔符可能横跨块）。
+        joined = bytes(self.buffer) + raw
+        pos, mlen = -1, 0
+        for marker in (b"\r\n\r\n", b"\n\n", b"\r\r"):
+            p = joined.find(marker)
+            if p != -1 and (pos == -1 or p < pos):
+                pos, mlen = p, len(marker)
+        self.buffer.clear()
+        self.buffer.extend(raw[-3:])
+        if pos == -1:
+            return
+        self.skipping = False
+        self.buffer.clear()
+        self._scan = 0
+        # 分隔符之后是新的正常帧：回灌（不得整块丢弃）。
+        self._ingest(joined[pos + mlen:], final=final)
+
+    def _ingest(self, raw, final=False):
         self.buffer.extend(raw)
         if not self.sse:
             if final:
@@ -319,7 +351,12 @@ class RequestRegistry:
         for index, (key, trace) in enumerate(finished):
             if index < excess or time.monotonic() - trace.ended > self.ttl_seconds:
                 self._records.pop(key, None)
-        used = sum(trace.retained_bytes for trace in self._records.values())
+        # 字节预算只统计**已结束**的 trace：活动请求的跟踪数据无法回收，
+        # 计入预算的话活动集合一旦超限，会把全部历史记录一次性清空（控制台
+        # 历史被破坏）而注册表仍在增长——两头落空。活动集合由并发上限与
+        # per-trace 事件/日志上限自然约束。
+        used = sum(trace.retained_bytes for trace in self._records.values()
+                   if trace.ended is not None)
         for key, trace in finished:
             if used <= self.max_bytes:
                 break

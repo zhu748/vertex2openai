@@ -104,7 +104,10 @@ class _CurlRespShim:
         return self._r.json()
 
     async def aread(self) -> bytes:
-        if self._consumed or self._buffered:
+        # _dropped：流式读取中已丢弃超限缓冲——旧实现漏了此态，半消费的
+        # curl 流上再调 aread 会重新进入 aiter_content 永久死等到 60s 超时
+        # （文档承诺“放弃后再调 aread 返回空字节”，2026-10 修复）。
+        if self._consumed or self._dropped or self._buffered:
             return bytes(self._buffered)
         if not self._from_stream:     # 非流式响应：curl 已缓冲完整 body
             return self._r.content or b""
@@ -295,7 +298,10 @@ class _UpstreamClientPool:
             str(client_kwargs.get("proxy") or ""),
             repr(timeout),
             bool(client_kwargs.get("follow_redirects", False)),
-            str(client_kwargs.get("verify") or ""),
+            # verify 用可区分的规范形态：旧写法 str(False or "") == ""，
+            # 与“未传 verify”（工厂默认 True）同签名——先到者决定池化客户端
+            # 的 TLS 校验行为，后续调用方可能拿到与请求相反的校验配置。
+            repr(client_kwargs.get("verify", True)),
         )
 
     def get(self, client_kwargs: dict, factory: Callable[[dict], Any]) -> Any:

@@ -4,6 +4,7 @@ import asyncio
 from email.utils import parsedate_to_datetime
 import math
 import random
+import re
 import time
 from typing import Optional, TypeVar
 
@@ -17,6 +18,9 @@ from upstream_errors import error_status
 from request_tracking import retry_wait
 
 Number = TypeVar("Number", int, float)
+
+# 文本里的状态码标记：左右数字边界防止 "429" 误中 "4292" / "42912ms"。
+_STATUS_IN_TEXT_RE = re.compile(r"(?<![0-9])(429|500|502|503|504)(?![0-9])")
 
 
 def _retry_setting(key: str, number_type: type[Number], maximum: Number) -> Number:
@@ -67,11 +71,13 @@ def is_retryable_exception(e: Exception) -> bool:
         return True
     if isinstance(e, (ValueError, TypeError, AttributeError, httpx.LocalProtocolError)):
         return False
+    # 数字标记用有界正则匹配：裸子串 "429" 会误中 "port 4292"/"elapsed
+    # 42912ms"，把不可重试错误判成可重试 → 白白重试烧配额（2026-10 修复）。
+    if _STATUS_IN_TEXT_RE.search(error_str):
+        return True
     if any(
         marker in error_str
         for marker in (
-            "429",
-            "503",
             "too many requests",
             "quota",
             "resource exhausted",

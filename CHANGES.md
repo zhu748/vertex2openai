@@ -816,3 +816,30 @@ https://aiplatform.googleapis.com/v1/publishers/google/models/projects/…/model
 - 新签名由用户从 Cloud Console 前端 `batchGraphql` 请求（`operationName=StreamGenerateContent`
   的 Payload）抓取：`2/Hc4FpJfYmM+gO5TB0hcjYY0Iwj0rqLIVDZOhurBbu/I=`，已替换旧值；
   旧签名在全代码中零残留。部署后需重启服务生效。
+
+## 全项目四路深度审查（API/流式、投递恢复、内容模型、基础设施）
+
+- 修复多图消息图片倒序：`_extract_markdown_images_to_parts` 在改为正序游标重组后仍残留旧实现的 `parts.reverse()`，多图消息整体倒序发给 Gemini（多图编辑时第一张图是编辑目标，顺序错乱直接改错图）。
+- 修复生图/非流式请求被首回复窗口封顶永不成功：生图请求被服务强制走假流式/整取路径（用户无法规避），默认 15s 首回复窗口把整个生成封顶，FirstReplyTimeout 可重试导致空烧全部重试后 504。现在生图模型的整调用预算抬到 max(窗口, 300s)（文本模型维持配置窗口语义，测试契约不变）；首回复窗口每请求只读一次设置（重试不再重复深拷贝整棵设置树）；多代理出口不再把首回复窗口放大成 N×（钳制到原始剩余预算）。
+- 修复 TRUST_PROXY_HEADERS 解析反转：黑名单只认 `""/"0"/"false"/"False"`，`FALSE/OFF/no` 等自然写法全被当成启用 XFF 信任——管理员明确关闭反而打开，客户端可伪造 X-Forwarded-For 逐请求换 IP 绕过登录限速。改为显式白名单（1/true/yes/on）。
+- 修复像素炸弹守卫对最大的炸弹失效：低熵超大图（如 258KB 的 900MP PNG）解码到 PIL 的 DecompressionBombError 后被兜底 except 捕获**原样回传**，恰好绕过守卫。现在头部像素预检（2×上限直接拒绝）+ 炸弹异常单独拒绝（不落入原图回退）。
+- 修复提取失败的图片残留整段 data URL：失败路径只打日志不推进游标，数 MB base64 留在文本里原样发给上游（日志却说"已跳过"）。现在失败也推进游标并留占位符。
+- 修复控制台 413 响应形状分裂：BodyTooLargeError 继承 HTTPException 被内层 ExceptionMiddleware 先行转成 Starlette 默认 `{"detail":...}` 形状，StatsMiddleware 的 except 分支永不命中。注册显式处理器渲染 OpenAI 错误形状；256KB 登录上限的"约 1MiB"误标文案改为准确 KiB 单位。
+- 修复重试标记数字误匹配：裸子串 `"429" in msg` 会命中 "port 4292"/"elapsed 42912ms"，把不可重试错误判成可重试（最多空烧 50 次重试）。改用带数字边界的正则。
+- 修复状态落盘全程握状态锁：json.dump+fsync+replace 在 Docker overlay/网络卷上单次可达数百毫秒，事件循环上所有请求路径的 get_setting() 全部停摆。重构为「状态锁内快照（微秒级）+ 专用 IO 锁内落盘」，写入序号防旧盖新，并消除锁序倒置死锁风险；12 处调用点全部移出锁块。
+- 修复 SDK 客户端池同签名竞态：冷启动并发时败者把胜者刚登记的客户端退役进 7230s 延迟回收池，N 路并发平白多建 N-1 个 SDK 客户端。对齐姊妹池的正确写法（复用胜者、退役自己）。
+- 修复跳帧诊断恢复丢失：超限帧跳过后的分隔符检测只查当前块且不认 `\r\r`，分隔符被拆开时 skipping 永不复位，后续所有帧的里程碑/用量统计静默丢失；触发块自带终结分隔符的场景同样漏检。重写为「3 字节尾拼接检测 + 分隔符后残余回灌」。
+- 修复 stdout 日志绕过脱敏：无 trace 上下文（启动期/线程池 worker）的 print 拷贝原样输出，Docker 日志/采集端恰在这里拿到明文凭据。与 SSE 流同口径 redact。
+- 修复预填充流式去重 600 字符窗口截断：酒馆预填充普遍超 600 字符，复述进行中被强制判定导致整段复述漏裁（与非流式路径行为分叉）。复述状态（缓冲仍是前缀）时窗口放宽到 min(len(prefill), 4096)。
+- 修复生图分辨率非法值放大到最高档：未知 image_size（客户端可控 extra 字段，如 "1024x1024"）回落到 4K 而非默认档 1K，一个越界值买到 16× 像素成本。
+- 修复两条通道安全设置漂移：Express 恒发 BLOCK_NONE（评分返回后被丢弃），Cookie 跟随 safety_score 开关（OFF=关分类器）。现统一跟随开关。
+- 修复 thought_signature 两侧解码策略不一致：入口宽松解码（非 base64 值变成乱码字节回传 Google → 400），出口严格校验。统一 validate=True + UTF-8 回退。
+- 修复 stop 序列成员级空串下发：stop=[""] 的空串成员对 Gemini 是非法入参（整体 truthiness 检查挡不住），上游 400。补成员级过滤。
+- 修复 curl 流式响应丢弃后再读死等：aread 漏检 _dropped 状态，半消费流上重新进入 aiter_content 永久死等到 60s 超时。
+- 修复 impersonate 客户端池 verify 签名塌缩：verify=False 与未传（默认 True）同签名，先到者决定池化客户端的 TLS 校验行为。改用可区分的规范 repr。
+- 修复温度默认值无上界：default_temperature 保存任意非负值（如 22），此后每个注入默认值的请求上游 400（不可重试），报错点离保存点极远。补 [0,2] 边界。
+- 生图元数据不再重复编码整图 base64：ordinary_parts 的消费端拒绝 data: 图片条目，两处重复编码只让每个生图回合响应体积翻倍且无人使用。改留占位符。
+- 关机任务排空加固：关机窗口内新注册的后台任务立即取消（此前单次快照会漏掉收尾期间新注册的任务成为孤儿）；sing-box 版本子进程探测移出事件循环（此前挂起的 sing-box 可拖慢启动接收流量最长 10s）。
+- SSE 帧切分与错误包裹优化：帧缓冲改延迟压实（每帧 memmove 剩余字节的平方级搬运只在过半时发生一次）；prepare_sse 快窗扩到 250ms（立即拒绝的错误以真实状态码返回的比例更高），慢路径把上游状态码与 Retry-After 以 SSE 注释行透出（此前两者皆丢）；首个 SSE 帧前的元数据不再重复序列化（测量与下发共用一份）。
+- n>1 流式预填充先行帧补齐：此前只发 choice 0，与非流式的全 choice 行为分叉。
+- 其他：抗截断代理项筛查改 C 级正则快速路径（每 token 的逐字符 Python 循环只在异常输入触发）；续传全局预算读取加 1s TTL 缓存（每帧不再进状态锁）；请求注册表字节预算只统计已结束 trace（活动集合超限时不再清空全部控制台历史）；apply_sampling_policy 返回缓存副本防未来调用方污染；已死的 create_final_chunk 移除。

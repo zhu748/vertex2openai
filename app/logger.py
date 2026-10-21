@@ -185,6 +185,12 @@ def custom_print(*args, **kwargs):
             if trace and raw_msg and trace.id not in raw_msg:
                 original_print(f"[{trace.id}] {redact(raw_msg)}", end=kwargs.get("end", "\n"),
                                flush=kwargs.get("flush", False))
+            elif raw_msg:
+                # 无 trace 上下文（启动期/线程池 worker）的 stdout 拷贝同样脱敏：
+                # 旧实现此分支原样输出，Docker 日志/采集端恰在这里拿到明文凭据
+                # （与 SSE 流的 redact 口径不一致，2026-10 修复）。
+                original_print(redact(raw_msg), end=kwargs.get("end", "\n"),
+                               flush=kwargs.get("flush", False))
             else:
                 original_print(*args, **kwargs)
         except Exception:

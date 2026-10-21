@@ -29,7 +29,10 @@ LOGIN_LOCK_MAX_SECONDS = 300
 _LOGIN_FAILURES_TTL_SECONDS = 24 * 3600
 _LOGIN_FAILURES_MAX_ENTRIES = 10000
 # 仅在可信反代部署中启用 X-Forwarded-For，按真实客户端限速。
-_TRUST_PROXY_HEADERS = os.environ.get("TRUST_PROXY_HEADERS", "").strip() not in ("", "0", "false", "False")
+# 显式白名单解析：旧实现的黑名单只认 ""/"0"/"false"/"False"，自然写法
+# FALSE/OFF/Off/no 全被当成启用——管理员明确关闭反而打开 XFF 信任，
+# 客户端可伪造 X-Forwarded-For 逐请求换 IP 绕过登录限速（2026-10 修复）。
+_TRUST_PROXY_HEADERS = os.environ.get("TRUST_PROXY_HEADERS", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def client_ip(request: Request) -> str:

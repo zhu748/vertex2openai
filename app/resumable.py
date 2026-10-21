@@ -19,6 +19,7 @@ import hashlib
 import json
 import math
 import secrets
+import threading
 import time
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
@@ -148,11 +149,27 @@ def disconnect_grace_seconds() -> float:
         return 10.0
 
 
+# 限额 TTL 缓存：append 每个 SSE 帧都会走 _byte_limit 读全局预算（状态锁 +
+# 解析），控制台调整频率极低——1 秒内最多重读一次，放宽后至多 1 秒生效
+# （原先的"实时读"代价摊在每个帧上，2026-10 优化）。
+_limit_cache: dict = {}
+_limit_cache_lock = threading.Lock()
+_LIMIT_CACHE_TTL = 1.0
+
+
 def _byte_limit(key: str, default: int) -> int:
+    now = time.monotonic()
+    with _limit_cache_lock:
+        hit = _limit_cache.get(key)
+        if hit is not None and now - hit[0] < _LIMIT_CACHE_TTL:
+            return hit[1]
     try:
-        return max(1, int(float(_setting(key)) * 1024 * 1024))
+        value = max(1, int(float(_setting(key)) * 1024 * 1024))
     except (ValueError, TypeError, OverflowError):
-        return default * 1024 * 1024
+        value = default * 1024 * 1024
+    with _limit_cache_lock:
+        _limit_cache[key] = (now, value)
+    return value
 
 
 def _setting(key: str) -> Any:

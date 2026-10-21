@@ -10,6 +10,9 @@ import re
 import secrets
 import time
 
+# 代理项快速筛查（_unicode 的热路径短路用）。
+_SURROGATE_RE = re.compile("[\ud800-\udfff]")
+
 from fastapi.responses import StreamingResponse
 from google.genai import types
 
@@ -181,6 +184,11 @@ class TextDecoder:
         self.pending_size = 0
 
     def _unicode(self, text: str) -> str:
+        # 快速路径：无跨块挂起代理项且整段不含代理项时直接返回（C 级正则
+        # 扫描替代逐字符 Python 循环——每个流式增量都要跑，上游正常输出
+        # 永远不含代理项，慢路径只在异常输入时触发）。
+        if not self.pending_high and _SURROGATE_RE.search(text) is None:
+            return text
         out = []
         for char in text:
             code = ord(char)

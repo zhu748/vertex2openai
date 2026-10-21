@@ -206,9 +206,17 @@ class SdkClientPool:
         stale: list = []
         with self._lock:
             entry = self._clients.get(api_key)
-            if entry is not None:            # 同 Key 旧签名（或竞态里先建好的）
-                stale.append((("sdk", id(self), api_key, entry[0]), entry[1]))
-            self._clients[api_key] = (sig, client)
+            if entry is not None and entry[0] == sig:
+                # 同签名竞态败者：复用先到协程刚登记的客户端，退役自己的副本。
+                # 旧实现把胜者刚建好的客户端退役进延迟回收池（7230s 空驻留），
+                # N 路并发冷启动会平白多建 N-1 个 SDK 客户端（对齐
+                # HttpxClientPool/_UpstreamClientPool 的既有正确写法）。
+                stale.append((retired_key, client))
+                client = entry[1]
+            else:
+                if entry is not None:      # 同 Key 旧签名
+                    stale.append((("sdk", id(self), api_key, entry[0]), entry[1]))
+                self._clients[api_key] = (sig, client)
             while len(self._clients) > self._maxsize:
                 oldest = next(iter(self._clients))
                 if oldest == api_key:

@@ -18,7 +18,6 @@ from google.genai import types
 # 引入报错重试统计器
 from logger import stats
 from message_processing import (
-    _convert_image_to_markdown,
     _create_safety_ratings_html,
     convert_to_openai_format,
     logprobs_payload_from_candidate,
@@ -54,7 +53,7 @@ from upstream_errors import (
 from usage import make_usage_chunk, map_usage, wants_usage
 from request_tracking import (attempt_started_at, configure as track_configure,
                               upstream_attempt, upstream_chunk, record_usage)
-from first_reply import FirstReplyGuard, FirstReplyTimeout, sdk_has_reply, timed_call
+from first_reply import FirstReplyGuard, FirstReplyTimeout, sdk_has_reply, timed_call, timeout_seconds
 
 
 def _safety_score_enabled() -> bool:
@@ -189,8 +188,10 @@ def _build_chunk_payload(chunk: Any, model_name: str, response_id: str, candidat
                 if fc is None:
                     text_value = getattr(part, "text", None)
                     if text_value is None and getattr(part, "inline_data", None) is not None:
-                        inline = part.inline_data
-                        text_value = _convert_image_to_markdown(inline.data, inline.mime_type)
+                        # 同 message_processing 非流式路径：ordinary_parts 的
+                        # round-trip 消费端拒绝 data: 图片，再编码一遍 base64
+                        # 只会把每个生图回合的响应体积翻倍（2026-10 修复）。
+                        text_value = "[image]"
                     elif text_value is None and getattr(part, "file_data", None) is not None:
                         text_value = f"![Image]({part.file_data.file_uri})"
                     text_value = "" if text_value is None else str(text_value)
@@ -318,11 +319,6 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
                             indexer: Optional[ToolCallIndexer] = None) -> str:
     """单条 Gemini chunk → OpenAI SSE 帧（对外保持字符串返回，兼容既有调用方）。"""
     return f"data: {json.dumps(_build_chunk_payload(chunk, model_name, response_id, candidate_index, indexer), ensure_ascii=False)}\n\n"
-
-def create_final_chunk(model: str, response_id: str, candidate_count: int = 1) -> str:
-    choices = [{"index": i, "delta": {}, "finish_reason": "stop"} for i in range(candidate_count)]
-    final_chunk_data = {"id": response_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model, "choices": choices}
-    return f"data: {json.dumps(final_chunk_data, ensure_ascii=False)}\n\n"
 
 async def _chunk_openai_response_dict_for_sse(
     openai_response_dict: Dict[str, Any],
@@ -483,6 +479,9 @@ async def gemini_fake_stream_generator(
     # 读取控制台的 retry_max / retry_backoff_seconds / retry_jitter_seconds
     # （固定间隔 + 抖动，不随次数放大），并在等待期间检测客户端断开。
     max_retries, backoff_sec, jitter_sec = get_retry_settings()
+    # 首回复窗口每请求只读一次设置：重试循环里每次 timed_call 都重复
+    # 深拷贝整棵设置树（含全部 model_overrides），重试风暴下放大浪费。
+    fr_seconds = timeout_seconds(request_obj.model)
 
     async def _client_gone() -> bool:
         if fastapi_request is None:
@@ -526,7 +525,7 @@ async def gemini_fake_stream_generator(
                     model=model_for_api_call,
                     contents=prompt_for_api_call,
                     config=gen_config_dict_for_api_call,
-                ))
+                ), whole_call=True, seconds=fr_seconds)
             )
 
             # 等待期间持续吐 keep-alive，避免前端因长时间无字节而超时
@@ -710,6 +709,7 @@ async def execute_gemini_call(
                 # 钉定失败要在这里改写模型名与客户端，必须声明 nonlocal。
                 nonlocal model_to_call, current_client, fallback_model
                 max_retries, backoff_sec, jitter_sec = get_retry_settings()
+                fr_seconds = timeout_seconds(request_obj.model)
                 has_yielded = False  # 是否已向客户端输出过内容
                 thinking = gen_config_dict.get("thinking_config") or {}
                 print(f"🌊 [流式模式] {request_obj.model}：真流式，"
@@ -738,7 +738,7 @@ async def execute_gemini_call(
                             stats.add_retry()
                             retry_pending = False
                         upstream_attempt()
-                        first_reply = FirstReplyGuard(request_obj.model)
+                        first_reply = FirstReplyGuard(request_obj.model, seconds=fr_seconds)
                         stream_gen_obj = await first_reply.wait(current_client.aio.models.generate_content_stream(
                             model=model_to_call,
                             contents=actual_prompt_for_call,
@@ -752,7 +752,16 @@ async def execute_gemini_call(
                             keep_unsigned_parts=text_transport is None or len(request_obj.tools or []) > 1)
                         text_decoder = text_transport.decoder() if text_transport else None
                         deduper = PrefillDeduper(prefill_text) if (prefill_text and (request_obj.n or 1) == 1) else None
-                        _pf = {"id": response_id_for_stream, "object": "chat.completion.chunk", "created": int(time.time()), "model": request_obj.model, "choices": [{"index": 0, "delta": {"role": "assistant", "content": prefill_text}, "finish_reason": None}]}
+                        # 预填充先行帧：n>1 时为每个候选都发一份，与非流式
+                        # _prepend_prefill 的全 choice 行为一致（旧实现只发
+                        # choice 0，stream 与非 stream 同请求输出分叉）。
+                        _pf_frames = [
+                            {"id": response_id_for_stream, "object": "chat.completion.chunk",
+                             "created": int(time.time()), "model": request_obj.model,
+                             "choices": [{"index": ci, "delta": {"role": "assistant", "content": prefill_text},
+                                          "finish_reason": None}]}
+                            for ci in range(max(1, request_obj.n or 1))
+                        ]
 
                         final_p_tk, final_c_tk, final_t_tk = 0, 0, 0
                         seen_candidates, finished_candidates = set(), set()
@@ -815,16 +824,20 @@ async def execute_gemini_call(
                                     deferred_finishes.append(chunk_payload)
                                     continue
                                 if not first_reply.ready:
-                                    pending_metadata_bytes += len(json.dumps(chunk_payload, ensure_ascii=False).encode("utf-8"))
+                                    # 序列化一次复用：测量与最终下发共用同一份字符串
+                                    # （旧实现每个元数据 chunk 序列化两次）。
+                                    frame_text = json.dumps(chunk_payload, ensure_ascii=False)
+                                    pending_metadata_bytes += len(frame_text.encode("utf-8"))
                                     if pending_metadata_bytes > 2 * 1024 * 1024:
                                         raise IncompleteResponseError("首回复前的元数据缓冲超过 2 MiB。")
-                                    pending_metadata.append(chunk_payload)
+                                    pending_metadata.append(frame_text)
                                     continue
                                 for metadata in pending_metadata:
-                                    yield f"data: {json.dumps(metadata, ensure_ascii=False)}\n\n"
+                                    yield f"data: {metadata}\n\n"
                                 pending_metadata.clear()
                                 if prefill_text and not has_yielded:
-                                    yield f"data: {json.dumps(_pf, ensure_ascii=False)}\n\n"
+                                    for _pf_chunk in _pf_frames:
+                                        yield f"data: {json.dumps(_pf_chunk, ensure_ascii=False)}\n\n"
                                 has_yielded = True
                                 yield f"data: {json.dumps(chunk_payload, ensure_ascii=False)}\n\n"
 
@@ -837,7 +850,8 @@ async def execute_gemini_call(
                             tail = deduper.flush()
                             if tail:
                                 if prefill_text and not has_yielded:
-                                    yield f"data: {json.dumps(_pf, ensure_ascii=False)}\n\n"
+                                    for _pf_chunk in _pf_frames:
+                                        yield f"data: {json.dumps(_pf_chunk, ensure_ascii=False)}\n\n"
                                 has_yielded = True
                                 content_chars += len(tail)
                                 _tail = {"id": response_id_for_stream, "object": "chat.completion.chunk", "created": int(time.time()), "model": request_obj.model, "choices": [{"index": 0, "delta": {"content": tail}, "finish_reason": None}]}
@@ -962,6 +976,7 @@ async def execute_gemini_call(
         track_configure(mode="json", upstream_model=model_to_call)
         # 手动退避重试循环（替代 tenacity），以便在每次重试前检测客户端断开
         max_retries, backoff_sec, jitter_sec = get_retry_settings()
+        fr_seconds = timeout_seconds(request_obj.model)
         response_obj_call = None
         # 总尝试次数 = retry_max + 1，retry_max=0 时仍会请求一次
         attempt = 0
@@ -987,7 +1002,7 @@ async def execute_gemini_call(
                     model=model_to_call,
                     contents=actual_prompt_for_call,
                     config=gen_config_dict,
-                ))
+                ), whole_call=True, seconds=fr_seconds)
                 upstream_chunk()
                 break
             except asyncio.CancelledError:

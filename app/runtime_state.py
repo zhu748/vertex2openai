@@ -37,6 +37,11 @@ class AppState:
 
     def __init__(self):
         self._lock = threading.RLock()
+        # 磁盘 IO 专用锁：与状态锁分离，fsync 卡顿不再阻塞事件循环上的读设置。
+        self._io_lock = threading.Lock()
+        # 写入序号：并发 _save 时防止旧快照覆盖新快照（见 _save）。
+        self._save_seq = 0
+        self._persisted_seq = 0
         self._state = {}
         self._load_from_disk()
         self._committed = copy.deepcopy(self._state)
@@ -82,32 +87,59 @@ class AppState:
                       f"注意：下次成功保存将覆盖该文件。")
 
     def _save(self) -> None:
-        """原子写：先写同目录临时文件再 os.replace（同一文件系统内是原子操作）。"""
-        try:
-            target_dir = os.path.dirname(STATE_FILE) or "."
-            os.makedirs(target_dir, exist_ok=True)
-            fd, tmp_path = tempfile.mkstemp(prefix=".web_state-", suffix=".tmp", dir=target_dir)
+        """原子写：先写同目录临时文件再 os.replace（同一文件系统内是原子操作）。
+
+        调用方**不应持有 _lock**（本方法自行加锁）：快照在状态锁内完成（微秒级），
+        fsync/replace 在专用 IO 锁内、状态锁**外**执行。旧实现把
+        json.dump+fsync+replace 全程握在调用方的状态锁里——Docker overlay/
+        网络卷上单次 fsync 可达数百毫秒，事件循环上每个请求路径的
+        get_setting() 都会为此停摆（2026-10 修复）。
+        """
+        with self._lock:
+            self._save_seq += 1
+            seq = self._save_seq
+            snapshot = copy.deepcopy(self._state)
+        with self._io_lock:
+            if seq <= self._persisted_seq:
+                # 已有更新的快照落盘（本写者拿到 IO 锁前被更新者超越）：跳过，防旧盖新。
+                return
+            failure = None
             try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    json.dump(self._state, f, ensure_ascii=False, indent=2)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmp_path, STATE_FILE)
-            except Exception:
+                target_dir = os.path.dirname(STATE_FILE) or "."
+                os.makedirs(target_dir, exist_ok=True)
+                fd, tmp_path = tempfile.mkstemp(prefix=".web_state-", suffix=".tmp", dir=target_dir)
                 try:
-                    os.unlink(tmp_path)
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        json.dump(snapshot, f, ensure_ascii=False, indent=2)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp_path, STATE_FILE)
+                except Exception:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                    raise
+                try:
+                    os.chmod(STATE_FILE, 0o600)   # 里面有完整 Google Cookie
                 except OSError:
                     pass
-                raise
-            try:
-                os.chmod(STATE_FILE, 0o600)   # 里面有完整 Google Cookie
-            except OSError:
-                pass
-            self._committed = copy.deepcopy(self._state)
-        except Exception as e:
-            print(f"⚠️ [状态管理器] 无法保存状态到磁盘: {e}")
-            self._state = copy.deepcopy(self._committed)
-            raise StatePersistenceError("配置保存失败，请检查状态目录权限和磁盘空间；本次更新已回滚。") from e
+                self._persisted_seq = seq
+            except Exception as e:
+                failure = e
+        # 状态锁只在 IO 锁**之外**获取：锁序恒为 _lock → _io_lock。
+        # 反过来（持 _io_lock 再拿 _lock）会与「外层持 _lock 进 _save」的
+        # 调用者构成经典锁序倒置死锁。
+        if failure is not None:
+            print(f"⚠️ [状态管理器] 无法保存状态到磁盘: {failure}")
+            with self._lock:
+                # 仅当自己是最新写者时回滚（旧语义：本更新已回滚）；
+                # 已有更新写者在途时回滚会覆盖别人的待写状态。
+                if seq >= self._save_seq:
+                    self._state = copy.deepcopy(self._committed)
+            raise StatePersistenceError("配置保存失败，请检查状态目录权限和磁盘空间；本次更新已回滚。") from failure
+        with self._lock:
+            self._committed = snapshot
 
     def reload(self) -> None:
         """显式从磁盘重载（外部改了文件时用）。"""
@@ -132,7 +164,7 @@ class AppState:
                 elif cookie:
                     records = [self._normalize_cookie_record({"cookie": cookie, "project_id": project_id})]
                 self._state["cookie_accounts"] = records
-            self._save()
+        self._save()
 
     # ---------- 通道开关与凭证 ----------
 
@@ -145,8 +177,8 @@ class AppState:
         with self._lock:
             self._state["upstream_mode"] = mode
             self._state["use_web_proxy"] = mode == "web_proxy"
-            self._save()
-            print(f"🔄 [状态管理器] 上游调度模式已更新：{mode}")
+        self._save()
+        print(f"🔄 [状态管理器] 上游调度模式已更新：{mode}")
 
     def get_channel_mode(self) -> str:
         with self._lock:
@@ -159,8 +191,11 @@ class AppState:
 
     def initialize_channel_mode_once(self):
         with self._lock:
-            if "upstream_mode" not in self._state and "use_web_proxy" not in self._state:
-                self.set_channel_mode(app_config.UPSTREAM_MODE)
+            needed = ("upstream_mode" not in self._state and "use_web_proxy" not in self._state)
+        # 变更器（含 _save 的磁盘 IO）在状态锁外调用：嵌套在锁内会让
+        # IO 重新落回状态锁的临界区。
+        if needed:
+            self.set_channel_mode(app_config.UPSTREAM_MODE)
 
     def is_web_proxy_enabled(self) -> bool:
         with self._lock:
@@ -179,8 +214,8 @@ class AppState:
                 elif cookie_str:
                     records = [self._normalize_cookie_record({"cookie": cookie_str, "project_id": self.get_project_id()})]
                 self._state["cookie_accounts"] = records
-            self._save()
-            print("🔄 [状态管理器] 谷歌独立 Cookie 已保存到运行状态")
+        self._save()
+        print("🔄 [状态管理器] 谷歌独立 Cookie 已保存到运行状态")
 
     def get_google_cookie(self) -> str:
         with self._lock:
@@ -189,8 +224,8 @@ class AppState:
     def set_project_id(self, project_id: str):
         with self._lock:
             self._state["google_project_id"] = project_id
-            self._save()
-            print(f"🔄 [状态管理器] 项目 ID 已保存: {project_id}")
+        self._save()
+        print(f"🔄 [状态管理器] 项目 ID 已保存: {project_id}")
 
     def get_project_id(self) -> str:
         with self._lock:
@@ -266,8 +301,8 @@ class AppState:
         with self._lock:
             self._state["express_keys"] = clean
             self._state["express_keys_initialized"] = True
-            self._save()
-            print(f"🔑 [状态管理器] 已保存 {len(clean)} 个 Express API Key（明文存于 web_state.json，权限 0600）。")
+        self._save()
+        print(f"🔑 [状态管理器] 已保存 {len(clean)} 个 Express API Key（明文存于 web_state.json，权限 0600）。")
         return clean
 
     def update_express_key_project(self, key: str, project_id: str, source: str = "auto", *,
@@ -296,8 +331,9 @@ class AppState:
                 new_list.append(rec)
             if changed:
                 self._state["express_keys"] = new_list
-                self._save()
-            return changed
+        if changed:
+            self._save()
+        return changed
 
     def import_env_express_keys_once(self, env_keys: list) -> int:
         """把环境变量 VERTEX_EXPRESS_API_KEY 做**一次性**初始导入。
@@ -305,28 +341,30 @@ class AppState:
         只在从未保存过（没有 express_keys_initialized 标记）时执行，
         因此用户在控制台把 Key 全删光并保存后，重启也不会被环境变量重新灌回来。
         """
+        result = 0
         with self._lock:
             if self._state.get("express_keys_initialized"):
                 return 0
             existing = self._state.get("express_keys")
             if isinstance(existing, list) and existing:
                 self._state["express_keys_initialized"] = True
-                self._save()
-                return 0
-            clean, seen = [], set()
-            for item in (env_keys or []):
-                rec = self._normalize_express_record(item)
-                if not rec or rec["key"] in seen:
-                    continue
-                seen.add(rec["key"])
-                clean.append(rec)
-            self._state["express_keys"] = clean
-            self._state["express_keys_initialized"] = True
-            self._save()
-            if clean:
-                print(f"📥 [状态管理器] 已从环境变量 VERTEX_EXPRESS_API_KEY 一次性导入 {len(clean)} 个 Key，"
-                      "此后以控制台保存的列表为准。")
-            return len(clean)
+                result = 0
+            else:
+                clean, seen = [], set()
+                for item in (env_keys or []):
+                    rec = self._normalize_express_record(item)
+                    if not rec or rec["key"] in seen:
+                        continue
+                    seen.add(rec["key"])
+                    clean.append(rec)
+                self._state["express_keys"] = clean
+                self._state["express_keys_initialized"] = True
+                result = len(clean)
+                if clean:
+                    print(f"📥 [状态管理器] 已从环境变量 VERTEX_EXPRESS_API_KEY 一次性导入 {len(clean)} 个 Key，"
+                          "此后以控制台保存的列表为准。")
+        self._save()
+        return result
 
     # ---------- Cookie accounts (legacy singleton credentials are migrated once) ----------
 
@@ -376,7 +414,7 @@ class AppState:
             self._state["cookie_accounts_initialized"] = True
             # Old credentials must not resurrect after deleting every account.
             self._state.pop("google_cookie", None)
-            self._save()
+        self._save()
         return clean
 
     def import_env_cookie_accounts_once(self) -> int:
@@ -384,8 +422,9 @@ class AppState:
             if self._state.get("cookie_accounts_initialized"):
                 return 0
             records = self.get_cookie_accounts()
-            self.set_cookie_accounts(records)
-            return len(records)
+        # set_cookie_accounts（含 _save 的磁盘 IO）在状态锁外调用。
+        self.set_cookie_accounts(records)
+        return len(records)
 
     # ---------- 控制台可调设置 ----------
 
@@ -467,8 +506,8 @@ class AppState:
                 current["proxy_urls"] = proxies
                 current["proxy_url"] = proxies[0] if proxies else ""
             self._state["settings"] = current
-            self._save()
-            print(f"🔧 [状态管理器] 已更新 {accepted} 项运行时设置。")
+        self._save()
+        print(f"🔧 [状态管理器] 已更新 {accepted} 项运行时设置。")
         return self.get_settings()
 
     # ---------- 按模型参数覆盖 ----------
@@ -493,9 +532,9 @@ class AppState:
             overrides[model_name] = previous
             settings["model_overrides"] = overrides
             self._state["settings"] = settings
-            self._save()
-            print(f"🔧 [状态管理器] 已保存模型 {model_name} 的专属参数（{len(clean)} 项）。")
-            return self.get_model_overrides().get(model_name, {})
+        self._save()
+        print(f"🔧 [状态管理器] 已保存模型 {model_name} 的专属参数（{len(clean)} 项）。")
+        return self.get_model_overrides().get(model_name, {})
 
     def clear_model_override(self, model_name: str) -> bool:
         model_name = (model_name or "").strip()
@@ -509,9 +548,9 @@ class AppState:
             overrides.pop(model_name, None)
             settings["model_overrides"] = overrides
             self._state["settings"] = settings
-            self._save()
-            print(f"🔧 [状态管理器] 已清除模型 {model_name} 的专属参数。")
-            return True
+        self._save()
+        print(f"🔧 [状态管理器] 已清除模型 {model_name} 的专属参数。")
+        return True
 
     def get_effective_settings(self, model_name: str, base: Optional[dict] = None) -> dict:
         """该模型生效的设置：全局默认叠加该模型专属覆盖（仅 PER_MODEL_KEYS）。

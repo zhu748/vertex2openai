@@ -4,6 +4,7 @@ from typing import Any
 
 from google.genai import types
 
+import config as app_config
 import model_capabilities as mc
 from models import OpenAIRequest, normalize_content_part
 from runtime_state import app_state
@@ -60,9 +61,14 @@ def _request_parameters(request: OpenAIRequest) -> dict[str, Any]:
     if max_tokens is not None:
         result["max_output_tokens"] = max_tokens
     if request.stop:
-        # truthiness 判断：stop="" / [] 时不发（与 Cookie 通道一致；
-        # 空串停止词对 Gemini 是非法入参，旧实现会下发 [""]）。
-        result["stop_sequences"] = [request.stop] if isinstance(request.stop, str) else list(request.stop)
+        # 成员级过滤：stop=[""] / ["a", ""] 里的空串对 Gemini 是非法入参
+        # （注释早写明，旧实现只挡了整体空值，成员级空串仍下发 → 上游 400）。
+        if isinstance(request.stop, str):
+            result["stop_sequences"] = [request.stop]
+        else:
+            seqs = [s for s in request.stop if s]
+            if seqs:
+                result["stop_sequences"] = seqs
 
     if request.response_logprobs is not None:
         result["response_logprobs"] = request.response_logprobs
@@ -154,8 +160,13 @@ def create_generation_config(request: OpenAIRequest) -> dict[str, Any]:
     profile = mc.apply_sampling_policy(mc.get_profile(request.model), settings)
     config = _request_parameters(request)
     config.update(_response_format(request))
+    # 与 Cookie 通道同口径（OFF=关分类器不回评分；BLOCK_NONE=照常评分不拦截）：
+    # 跟着「输出附加安全分」开关走。旧实现 Express 恒发 BLOCK_NONE，评分
+    # 返回后又被设置开关丢弃——两通道行为漂移且白做上游评分（2026-10 修复）。
+    want_scores = bool(settings.get("safety_score", app_config.SAFETY_SCORE))
+    threshold = "BLOCK_NONE" if want_scores else "OFF"
     config["safety_settings"] = [
-        types.SafetySetting(category=f"HARM_CATEGORY_{name}", threshold="BLOCK_NONE")
+        types.SafetySetting(category=f"HARM_CATEGORY_{name}", threshold=threshold)
         for name in _TEXT_SAFETY_CATEGORIES
     ]
 

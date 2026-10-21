@@ -11,6 +11,22 @@ from response_validation import IncompleteResponseError
 
 _active_wait = ContextVar("first_reply_wait", default=None)
 
+# 生图模型的整调用最低预算：生图请求（两条通道都被强制走假流式/整取
+# 路径）常需 30-120s，首回复窗口（默认 15s）会把它们打成"每次尝试都超
+# 时→重试空烧→最终 504"（FirstReplyTimeout 是 TimeoutError 子类会被判
+# 可重试）。用户无法通过改请求规避（路径是服务强制选的），故对生图模型
+# 把整调用预算抬到 max(窗口, 300s)；文本模型维持配置窗口语义——用户与
+# 测试可以用小窗口约束挂起的非流式尝试（test_retry_windows 依赖此契约）。
+WHOLE_CALL_MIN_SECONDS = 300.0
+
+
+def _is_image_model(model: str) -> bool:
+    try:
+        from model_capabilities import get_profile
+        return bool(get_profile(model).get("is_image"))
+    except Exception:
+        return False
+
 
 @asynccontextmanager
 async def proxy_attempt(enabled):
@@ -21,10 +37,15 @@ async def proxy_attempt(enabled):
         return
     guard, parent = active
     parent.reschedule(None)
-    guard.deadline = time.monotonic() + guard.seconds
+    # 每个出口有自己的窗口，但总等待不得超出自首次等待起的原始预算：
+    # 旧实现每换一个出口就把 deadline 重置为满窗口，3 个慢出口 × 15s = 45s
+    # 才轮到换 Key 重试，且监控面板的截止时间一直在往后漂（2026-10 修复）。
+    remaining = guard.initial_deadline - time.monotonic()
+    window = guard.seconds if remaining <= 0 else max(0.001, min(guard.seconds, remaining))
+    guard.deadline = time.monotonic() + window
     if guard.trace:
         with guard.trace._lock:
-            guard.trace.data["first_reply_deadline"] = time.time() + guard.seconds
+            guard.trace.data["first_reply_deadline"] = time.time() + window
     attempt = asyncio.timeout_at(guard.deadline)
     completed = False
     try:
@@ -67,10 +88,16 @@ def timeout_seconds(model):
 
 
 class FirstReplyGuard:
-    def __init__(self, model):
-        self.seconds = timeout_seconds(model)
+    def __init__(self, model, *, seconds=None):
+        # seconds：调用方预先算好的窗口。同一请求的重试循环共享一次设置
+        # 读取——旧实现每次尝试都新建 Guard，每次都深拷贝整棵设置树
+        # （含全部 model_overrides），重试风暴下是纯浪费的热路径开销。
+        self.seconds = timeout_seconds(model) if seconds is None else max(0.0, float(seconds))
         self.started = time.monotonic()
         self.deadline = self.started + self.seconds
+        # 原始预算终点：proxy_attempt 每次换出口都会重置 deadline，不记
+        # 原始值的话 N 个出口可以把首回复窗口放大成 N×（见 proxy_attempt）。
+        self.initial_deadline = self.deadline
         self.ready = False
         self.trace = current_trace.get()
         if self.trace:
@@ -176,8 +203,20 @@ def native_has_reply(payload):
     return False
 
 
-async def timed_call(model, operation):
-    guard = FirstReplyGuard(model)
+async def timed_call(model, operation, *, whole_call=False, seconds=None):
+    """whole_call：该操作要等完整响应（非流式 generate_content / 整取 POST）。
+
+    生图模型在此路径把预算抬到 max(窗口, WHOLE_CALL_MIN_SECONDS)（见常量
+    注释）；文本模型严格用配置窗口（保留"小窗口约束挂起尝试"的既有契约）。"""
+    guard = FirstReplyGuard(model, seconds=seconds)
+    if whole_call and guard.seconds and _is_image_model(model):
+        guard.seconds = max(guard.seconds, WHOLE_CALL_MIN_SECONDS)
+        guard.deadline = guard.started + guard.seconds
+        guard.initial_deadline = guard.deadline
+        if guard.trace:
+            with guard.trace._lock:
+                guard.trace.data["first_reply_timeout_seconds"] = guard.seconds
+                guard.trace.data["first_reply_deadline"] = time.time() + guard.seconds
     result = await guard.wait(operation)
     if getattr(result, "status_code", 200) < 400:
         guard.accept()

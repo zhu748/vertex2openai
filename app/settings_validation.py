@@ -74,8 +74,10 @@ def _check_setting_value(key: str, v) -> str | None:
             return f"{key} 必须是数字或 null（null=不注入默认值），收到的是「{v!r}」"
         if key == "default_max_tokens" and (not isinstance(v, int) or v <= 0):
             return f"{key} 必须是正整数或 null。"
-        if key == "default_temperature" and v < 0:
-            return f"{key} 必须是非负数字或 null。"
+        if key == "default_temperature" and not 0 <= v <= 2.0:
+            # Gemini 上限 2.0：超界值保存时静默通过，之后每个请求注入默认值
+            # 都会 400（不可重试），报错点离保存点十万八千里（2026-10 修复）。
+            return f"{key} 必须在 [0, 2] 范围内，或为 null。"
         if key == "default_top_p" and not 0 <= v <= 1:
             return f"{key} 必须在 [0, 1] 范围内，或为 null。"
         return None

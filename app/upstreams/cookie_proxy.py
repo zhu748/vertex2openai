@@ -68,7 +68,7 @@ from upstreams.cookie_response import (
 from upstreams.request_preparation import prepare_messages
 from usage import make_usage_chunk, map_usage, wants_usage
 from request_tracking import configure as track_configure, upstream_attempt, upstream_chunk
-from first_reply import FirstReplyGuard, FirstReplyTimeout, timed_call
+from first_reply import FirstReplyGuard, FirstReplyTimeout, timed_call, timeout_seconds
 
 RETRYABLE_KEYWORDS = [
     "resource exhausted",
@@ -353,9 +353,11 @@ async def _execute_stream_request_generator_raw(
 
 async def _execute_stream_request_generator(client, headers, body, sampler=None, fallback_body=None, *, model=""):
     chain = getattr(client, "chain", None)
+    # 首回复窗口每请求只读一次设置（while 循环里换出口/重试会反复新建 Guard）。
+    fr_seconds = timeout_seconds(model)
     while True:
         source = _execute_stream_request_generator_raw(client, headers, body, sampler, fallback_body)
-        guard = FirstReplyGuard(model)
+        guard = FirstReplyGuard(model, seconds=fr_seconds)
         pending, pending_bytes = [], 0
         switch_proxy = False
         try:
@@ -406,6 +408,7 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
         return {"kind": "error", "message": "客户端已断开连接。"}
     body = await build_request_body_async(project_id, base_model_name, request_obj,
                                           prefill_active=prefill_active, force_search=force_search)
+    fr_seconds = timeout_seconds(base_model_name)
     for attempt in range(retry_max + 1):
         if await fastapi_request.is_disconnected():
             return {"kind": "error", "message": "客户端已断开连接。"}
@@ -415,7 +418,10 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
             req_headers = build_headers(headers.get("cookie", "")) or headers
             async with open_upstream_client(client_kwargs) as client:
                 upstream_attempt()
-                response = await timed_call(base_model_name, client.post(BATCH_GRAPHQL_URL, headers=req_headers, json=body))
+                # 整取响应（生图假流式路径）：首回复窗口按整调用预算放宽，
+                # 否则生图 30-120s 会在默认 15s 窗口下永远超时。
+                response = await timed_call(base_model_name, client.post(BATCH_GRAPHQL_URL, headers=req_headers, json=body),
+                                            whole_call=True, seconds=fr_seconds)
                 upstream_chunk()
 
             if is_retryable_status(response.status_code) and attempt < retry_max:
@@ -986,6 +992,8 @@ class CookieProxyUpstream(BaseUpstream):
                             force_search=force_builtin_search, native_tools=native)
                     return _body_cache[key]
 
+                # 非流式整取：首回复窗口按整调用预算放宽（生图/长思考）。
+                fr_seconds = timeout_seconds(base_model_name)
                 for attempt in range(retry_max + 1):
                     # 客户端已断开则立即停止，避免无谓的上游调用与重试
                     if await fastapi_request.is_disconnected():
@@ -1014,7 +1022,7 @@ class CookieProxyUpstream(BaseUpstream):
                             upstream_attempt()
                             response = await timed_call(base_model_name, client.post(
                                 BATCH_GRAPHQL_URL, headers=req_headers, json=body
-                            ))
+                            ), whole_call=True, seconds=fr_seconds)
                             upstream_chunk()
                             if fallback_body is not None and _native_tool_error_response(
                                     response.status_code, response.text):
@@ -1026,7 +1034,7 @@ class CookieProxyUpstream(BaseUpstream):
                                 upstream_attempt()
                                 response = await timed_call(base_model_name, client.post(
                                     BATCH_GRAPHQL_URL, headers=req_headers, json=resolved_fallback
-                                ))
+                                ), whole_call=True, seconds=fr_seconds)
                                 upstream_chunk()
                                 fallback_body = None
 

@@ -249,6 +249,9 @@ def apply_prefill_compat(
 # 超过几千字符。无上限时长预填充（角色扮演预设可达数十 KB）的循环比对
 # 是 O(n²) 字符操作且在事件循环上（实测 100KB 预填充 ~237ms 纯 CPU）。
 _OVERLAP_SEARCH_CAP = 4096
+# 复述检测窗口上限：与重叠搜索同帽（完整复述由 startswith 全长判定，
+# 不受此帽影响；超长预填充的尾部重叠本就不做平方级搜索）。
+_RESTATE_CAP = _OVERLAP_SEARCH_CAP
 
 
 def strip_prefill_overlap(prefill: str, output: str, min_overlap: int = 8) -> str:
@@ -294,7 +297,13 @@ class PrefillDeduper:
         # P2-4：只要已经能判定「不可能是预填充的重复」，立刻放行，不必攒满窗口。
         # 旧实现固定攒到 min(len(prefill)+32, 600) 字符才放行，首 token 延迟明显，
         # 与注释里的“零额外延迟”不符。
-        if len(self.buffer) >= self.window or not self._still_ambiguous():
+        # 复述进行中（buffer 仍是 prefill 的前缀）时窗口放宽到
+        # min(len(prefill), _RESTATE_CAP)：酒馆预填充普遍 >600 字符，固定
+        # 600 上限会在复述未完时强制判定，整段复述漏裁（与非流式路径行为
+        # 分叉，2026-10 修复）；未在复述状态则维持 600 快窗口（延迟优先）。
+        ambiguous = self._still_ambiguous()
+        if not ambiguous or len(self.buffer) >= (
+                min(len(self.prefill), _RESTATE_CAP) if ambiguous else self.window):
             return self._resolve()
         return ""
 

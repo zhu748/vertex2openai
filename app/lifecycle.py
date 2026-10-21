@@ -18,12 +18,17 @@ from runtime_state import app_state, get_effective_proxy_url, mask_proxy_url
 
 
 _background_tasks: set[asyncio.Task] = set()
+# 关机窗口标记：置位后新注册的后台任务立即取消，防止收尾期间的任务
+# 躳过排空循环泄漏成孤儿（ asyncio.run 结束后仍在运行/未 await）。
+_shutting_down = False
 
 
 def start_background_task(coro) -> asyncio.Task:
     """持有后台任务，报告异常，并在应用关闭时统一取消和等待。"""
     task = asyncio.create_task(coro)
     _background_tasks.add(task)
+    if _shutting_down:
+        task.cancel()
 
     def finished(completed: asyncio.Task) -> None:
         _background_tasks.discard(completed)
@@ -54,6 +59,8 @@ async def _probe_express_projects_on_startup() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _shutting_down
+    _shutting_down = False
     singbox_manager.reopen()
     bridge_manager.reopen()
     print("🚀 [服务启动] agentplatform2api 适配器已启动（Express API Key / Cookie 直连 双通道）。")
@@ -111,8 +118,11 @@ async def lifespan(app: FastAPI):
     # 能在启动日志里直接看到原因（请求时也会明确报错，绝不静默直连）。
     try:
         if singbox_available():
+            # 子进程探测放线程：singbox_version 内部是 subprocess.run（超时
+            # 10s），在事件循环上直跑会拖慢启动接收流量（结果有缓存，仅首次）。
+            version = await asyncio.to_thread(singbox_version)
             print(
-                f"🛰️ [多协议代理] sing-box 就绪（{singbox_version() or '版本未知'}）："
+                f"🛰️ [多协议代理] sing-box 就绪（{version or '版本未知'}）："
                 "vless/vmess/trojan/ss/socks4/hysteria2/tuic 分享链接可直接作为代理使用，"
                 "首个请求时自动转换成本地 socks5。"
             )
@@ -170,12 +180,18 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        tasks = list(_background_tasks)
-        for _t in tasks:
-            if not _t.done():
-                _t.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        _shutting_down = True
+        # 排空循环：单次快照会漏掉收尾期间新注册的任务（如正在断开的控制台
+        # 请求触发的 Key 探测），逐轮取消直至集合清空（上限 5 轮防病态自续）。
+        for _round in range(5):
+            tasks = [t for t in list(_background_tasks) if not t.done()]
+            for _t in tasks:
+                if not _t.done():
+                    _t.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            if not any(not t.done() for t in _background_tasks):
+                break
         await resumable_store.aclose()
         await close_models_refresh()
         await close_all_clients()

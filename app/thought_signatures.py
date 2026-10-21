@@ -25,7 +25,10 @@ def signature_bytes(part: Any, fc: Any) -> Optional[bytes]:
         return sig or None
     if isinstance(sig, str) and sig:
         try:
-            return base64.b64decode(sig)
+            # validate=True 与 signature_from_extra 同口径：非 base64 字符串
+            # （占位符/被截断的值）直接走 UTF-8 回退，而不是被宽松解码成
+            # 乱码字节回传 Google 导致上游 400（两侧解码策略必须一致）。
+            return base64.b64decode(sig, validate=True)
         except Exception:
             return sig.encode("utf-8")
     return None
