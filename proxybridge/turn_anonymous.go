@@ -41,28 +41,45 @@ func (s peerAddrSetter) AddTo(m *stun.Message) error {
 	return stun.XORMappedAddress(s).AddToAs(m, stun.AttrXORPeerAddress)
 }
 
-// rawSTUNTransaction writes one request and reads exactly one response.
-// STUN-over-TCP framing: 20-byte header, then the announced length.
+// rawSTUNTransaction writes one request and reads the response carrying the
+// same transaction ID. STUN-over-TCP framing: 20-byte header, then the
+// announced length.
+//
+// The control connection is not request/response exclusive: any peer that
+// hits the relayed transport address makes the server emit an unsolicited
+// ConnectionAttempt indication (RFC 6062 section 6.2.2), and retransmitted
+// responses to earlier transactions can still arrive. Reading exactly one
+// message used to consume such traffic as the reply, failing the Refresh,
+// killing the allocation and desynchronizing the stream. Unsolicited
+// messages are therefore read past; the connection deadline bounds the loop.
 func rawSTUNTransaction(conn net.Conn, request *stun.Message) (*stun.Message, error) {
 	if _, err := conn.Write(request.Raw); err != nil {
 		return nil, err
 	}
 	head := make([]byte, stunHeaderSize)
-	if _, err := io.ReadFull(conn, head); err != nil {
-		return nil, err
+	for {
+		if _, err := io.ReadFull(conn, head); err != nil {
+			return nil, err
+		}
+		if !stun.IsMessage(head) {
+			return nil, errors.New("not a STUN message")
+		}
+		body := make([]byte, binary.BigEndian.Uint16(head[2:4]))
+		if _, err := io.ReadFull(conn, body); err != nil {
+			return nil, err
+		}
+		response := &stun.Message{Raw: append(head, body...)}
+		if err := response.Decode(); err != nil {
+			return nil, err
+		}
+		if response.Type.Class == stun.ClassIndication {
+			continue
+		}
+		if response.TransactionID != request.TransactionID {
+			continue
+		}
+		return response, nil
 	}
-	if !stun.IsMessage(head) {
-		return nil, errors.New("not a STUN message")
-	}
-	body := make([]byte, binary.BigEndian.Uint16(head[2:4]))
-	if _, err := io.ReadFull(conn, body); err != nil {
-		return nil, err
-	}
-	response := &stun.Message{Raw: append(head, body...)}
-	if err := response.Decode(); err != nil {
-		return nil, err
-	}
-	return response, nil
 }
 
 func withTimeout(ctx context.Context, conn net.Conn) (func(), error) {
@@ -130,6 +147,18 @@ func detectTURNMode(ctx context.Context, c config, tlsConfig *tls.Config) (strin
 		return "", err
 	}
 	if response.Type.Class == stun.ClassSuccessResponse {
+		// The probe just created a real allocation. Closing the TCP control
+		// connection releases it on RFC-compliant servers; an explicit
+		// deallocation (RFC 5766 section 7.3: Refresh with LIFETIME 0) also
+		// covers servers that keep relayed ports reserved until expiry.
+		// Best effort: the mode decision does not depend on it.
+		release := stun.MustBuild(
+			stun.TransactionID,
+			stun.NewType(stun.MethodRefresh, stun.ClassRequest),
+			stun.RawAttribute{Type: stun.AttrLifetime, Value: make([]byte, 4)},
+			stun.Fingerprint,
+		)
+		_, _ = rawSTUNTransaction(control, release)
 		return "anonymous", nil
 	}
 	return "pion", nil
@@ -146,41 +175,75 @@ func (a *rawAllocation) stop() {
 	a.once.Do(func() { close(a.closed); a.control.Close() })
 }
 
+// refreshInterval schedules the next refresh inside the granted window:
+// half the granted lifetime with a small floor, and strictly before the
+// expiry. The old fixed floor of 5s delayed the first refresh past the
+// expiry of allocations granted less than 10 seconds.
+func refreshInterval(granted time.Duration) time.Duration {
+	if granted <= 0 {
+		return 0
+	}
+	interval := granted / 2
+	if interval < 250*time.Millisecond {
+		interval = 250 * time.Millisecond
+	}
+	if interval >= granted { // sub-second grants
+		interval = granted / 3
+	}
+	if interval <= 0 {
+		interval = time.Millisecond
+	}
+	return interval
+}
+
 // startRefresh keeps the allocation alive; a failed refresh fails closed by
 // closing the control connection and notifying the data side.
+//
+// RFC 5766 section 6.2 lets the server grant less time than requested, so
+// the next refresh follows the LIFETIME returned by each response. The old
+// loop kept the interval derived from the Allocate response: a server that
+// reduced the lifetime let the allocation expire between refreshes.
 func (a *rawAllocation) startRefresh(kill func()) {
-	interval := a.lifetime / 2
-	if interval < 5*time.Second {
-		interval = 5 * time.Second
-	}
 	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
+		timer := time.NewTimer(refreshInterval(a.lifetime))
+		defer timer.Stop()
+		granted := a.lifetime
 		for {
 			select {
 			case <-a.closed:
 				return
-			case <-ticker.C:
-				clear, err := withTimeout(context.Background(), a.control)
-				if err != nil {
-					a.stop()
-					kill()
-					return
-				}
-				refresh := stun.MustBuild(
-					stun.TransactionID,
-					stun.NewType(stun.MethodRefresh, stun.ClassRequest),
-					stun.RawAttribute{Type: stun.AttrLifetime,
-						Value: binary.BigEndian.AppendUint32(nil, uint32(a.lifetime/time.Second))},
-					stun.Fingerprint,
-				)
-				response, err := rawSTUNTransaction(a.control, refresh)
-				clear()
-				if err != nil || response.Type.Class != stun.ClassSuccessResponse {
-					a.stop()
-					kill()
-					return
-				}
+			case <-timer.C:
+			}
+			clear, err := withTimeout(context.Background(), a.control)
+			if err != nil {
+				a.stop()
+				kill()
+				return
+			}
+			refresh := stun.MustBuild(
+				stun.TransactionID,
+				stun.NewType(stun.MethodRefresh, stun.ClassRequest),
+				stun.RawAttribute{Type: stun.AttrLifetime,
+					Value: binary.BigEndian.AppendUint32(nil, uint32(a.lifetime/time.Second))},
+				stun.Fingerprint,
+			)
+			response, err := rawSTUNTransaction(a.control, refresh)
+			clear()
+			if err != nil || response.Type.Class != stun.ClassSuccessResponse {
+				a.stop()
+				kill()
+				return
+			}
+			if value, err := response.Get(stun.AttrLifetime); err == nil && len(value) == 4 {
+				granted = time.Duration(binary.BigEndian.Uint32(value)) * time.Second
+			}
+			if next := refreshInterval(granted); next <= 0 {
+				// The server granted a zero lifetime: the allocation is gone.
+				a.stop()
+				kill()
+				return
+			} else {
+				timer.Reset(next)
 			}
 		}
 	}()

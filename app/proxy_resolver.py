@@ -1039,10 +1039,49 @@ class ProxyBridgeManager(ProxyProcessManager):
     def __init__(self):
         super().__init__()
         self._file_namespace = os.urandom(6).hex()
+        self._swept = False
 
     def _runtime_info(self):
         binary = find_bridge_binary()
         return {"available": bool(binary), "binary": binary or "", "version": "1" if binary else ""}
+
+    def _sweep_orphan_files(self, directory: str) -> None:
+        """Delete bridge state files whose owning process is gone.
+
+        同前缀清理只覆盖本进程实例的重启；SIGKILL / OOM 后残留的
+        bridge-{pid}-…-*.log 属于已死进程，永远不会被前缀匹配到，长跑
+        部署会无限积累。文件名内嵌 pid：pid 已死且超过宽限期才删除，
+        pid 复用只会导致少删（安全方向）。
+        """
+        if self._swept:
+            return
+        self._swept = True
+        now = time.time()
+        try:
+            entries = os.listdir(directory)
+        except OSError:
+            return
+        for name in entries:
+            parts = name.split("-")
+            # bridge-{pid}-{ns}-{digest}-{port}.{json|log|ready}
+            if len(parts) < 5 or not parts[0] == "bridge" or not parts[1].isdigit():
+                continue
+            pid = int(parts[1])
+            if pid == os.getpid():
+                continue
+            try:
+                os.kill(pid, 0)
+                continue  # 属主仍存活（含僵尸）：保留
+            except ProcessLookupError:
+                pass  # 已死：孤儿
+            except OSError:
+                continue  # 无法判定（权限 / 平台差异）：保守保留
+            path = os.path.join(directory, name)
+            try:
+                if now - os.path.getmtime(path) > 3600:  # 1 小时宽限期
+                    os.unlink(path)
+            except OSError:
+                pass
 
     def _cache_uri(self, uri):
         # Remarks, query order and explicit defaults do not identify a different
@@ -1097,6 +1136,7 @@ class ProxyBridgeManager(ProxyProcessManager):
         try:
             os.makedirs(directory, mode=0o700, exist_ok=True)
             os.chmod(directory, 0o700)
+            self._sweep_orphan_files(directory)
             for stale in glob.glob(os.path.join(directory, prefix + "*")):
                 os.unlink(stale)
             fd = os.open(config_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)

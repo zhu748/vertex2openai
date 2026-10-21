@@ -41,7 +41,15 @@ type protocolError struct {
 	cause error
 }
 
-func (e protocolError) Error() string { return e.code }
+func (e protocolError) Error() string {
+	// The SSTP wrapper only carries its own diagnostics (assigned IP, packet
+	// counters, dial error text); nothing peer-supplied flows in here, so the
+	// cause is safe to surface. Returning the bare code discarded it.
+	if e.cause == nil {
+		return e.code
+	}
+	return e.code + ": " + e.cause.Error()
+}
 func (e protocolError) Unwrap() error { return e.cause }
 
 var diagnostics atomic.Uint32
@@ -212,6 +220,13 @@ func serveSOCKS(ctx context.Context, listener net.Listener, dial dialFunc) error
 	stop := context.AfterFunc(ctx, func() { listener.Close() })
 	defer stop()
 	slots := make(chan struct{}, 128)
+	// Refusals run on their own bounded pool: answering inline in the
+	// accept loop let one slow client stall the loop (and thus every
+	// other incoming connection) for the full 5-second refusal deadline.
+	// Beyond the pool, saturated connections are dropped without a reply.
+	refusals := make(chan struct{}, 64)
+	var refusers sync.WaitGroup
+	defer refusers.Wait()
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -236,8 +251,18 @@ func serveSOCKS(ctx context.Context, listener net.Listener, dial dialFunc) error
 			// reply with a real failure code instead of a bare
 			// reset, so the Python side can tell proxy saturation
 			// apart from a network error and fail over correctly.
-			refuseOverloaded(conn)
-			conn.Close()
+			select {
+			case refusals <- struct{}{}:
+				refusers.Add(1)
+				go func() {
+					defer refusers.Done()
+					defer func() { <-refusals }()
+					defer conn.Close()
+					refuseOverloaded(conn)
+				}()
+			default:
+				conn.Close()
+			}
 		}
 	}
 }

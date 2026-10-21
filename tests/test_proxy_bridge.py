@@ -182,6 +182,45 @@ class BridgeProcessTests(unittest.TestCase):
         self.assertTrue(all(not path.exists() for path in paths))
         self.assertFalse(manager._instances)
 
+    def test_orphan_files_from_dead_processes_are_swept(self):
+        # SIGKILL / OOM 残留的 bridge-{pid}-… 文件不属于任何存活进程，
+        # 启动新实例时按 pid 存活 + 1 小时宽限清理；活进程与新鲜残留保留。
+        directory = Path(pr._state_dir()).parent / "proxy-bridge"
+        directory.mkdir(parents=True, exist_ok=True)
+        dead_pid = self._unused_pid()
+        old = directory / f"bridge-{dead_pid}-abcdef012345-0123456789abcdef-4400.log"
+        recent = directory / f"bridge-{dead_pid}-abcdef012345-0123456789abcdef-4401.log"
+        live = directory / f"bridge-{os.getpid()}-abcdef012345-0123456789abcdef-4402.log"
+        old.write_text("old orphan")
+        recent.write_text("recent orphan")
+        live.write_text("live owner")
+        old_time = time.time() - 7200
+        os.utime(old, (old_time, old_time))
+
+        manager = pr.ProxyBridgeManager()
+        manager._sweep_orphan_files(str(directory))
+
+        self.assertFalse(old.exists())      # 死 pid + 超宽限期 → 删除
+        self.assertTrue(recent.exists())    # 死 pid + 宽限期内 → 保留
+        self.assertTrue(live.exists())      # 活 pid → 永不删除
+        # 只执行一次（惰性），重复调用不重复扫描。
+        manager._sweep_orphan_files(str(directory))
+        self.assertTrue(recent.exists())
+        recent.unlink()
+        live.unlink()
+
+    @staticmethod
+    def _unused_pid():
+        # 找一个当前不存在且不太可能立即被复用的 pid（跳过 1 和低段）。
+        for pid in range(40000, 32000, -1):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return pid
+            except OSError:
+                continue
+        raise AssertionError("no unused pid found")
+
 
 if __name__ == "__main__":
     unittest.main()
