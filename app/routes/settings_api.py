@@ -48,7 +48,8 @@ async def get_runtime_settings(_auth: bool = Depends(require_auth)):
             "google_cookie": mask_cookie(cookie),
             "google_cookie_configured": bool(cookie),
             "google_project_id": app_state.get_project_id(),
-        }
+        },
+        headers={"Cache-Control": "no-store"},
     )
 
 
@@ -60,7 +61,7 @@ async def set_settings_mode(setting: ModeSetting, _auth: bool = Depends(require_
 
 @router.get("/api/settings")
 async def get_settings_api(_auth: bool = Depends(require_auth)):
-    return JSONResponse(content=app_state.get_settings())
+    return JSONResponse(content=app_state.get_settings(), headers={"Cache-Control": "no-store"})
 
 
 @router.post("/api/settings")
@@ -75,7 +76,7 @@ async def update_settings_api(request: Request, _auth: bool = Depends(require_au
     if error:
         return JSONResponse(status_code=400, content=error)
     updated = await asyncio.to_thread(app_state.update_settings, patch)
-    return JSONResponse(content=updated)
+    return JSONResponse(content=updated, headers={"Cache-Control": "no-store"})
 
 
 @router.get("/api/capabilities")
@@ -92,12 +93,13 @@ async def get_capabilities_api(_auth: bool = Depends(require_auth)):
     }
     # 附带各模型是否已有专属参数覆盖，供前端标示
     overrides = app_state.get_model_overrides()
-    return JSONResponse(content={"models": models, "capabilities": caps, "overrides": overrides})
+    return JSONResponse(content={"models": models, "capabilities": caps, "overrides": overrides},
+                        headers={"Cache-Control": "no-store"})
 
 
 @router.get("/api/model-overrides")
 async def list_model_overrides(_auth: bool = Depends(require_auth)):
-    return JSONResponse(content=app_state.get_model_overrides())
+    return JSONResponse(content=app_state.get_model_overrides(), headers={"Cache-Control": "no-store"})
 
 
 @router.post("/api/model-overrides/{model_name}")

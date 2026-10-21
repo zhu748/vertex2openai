@@ -96,7 +96,7 @@ def classify_tool_traffic(messages: list, tools: Any = None) -> dict:
 
     history = False
     for m in messages or []:
-        if getattr(m, "role", None) == "tool" or getattr(m, "tool_calls", None):
+        if getattr(m, "role", None) in ("tool", "function") or getattr(m, "tool_calls", None):
             history = True
             break
 
@@ -233,7 +233,7 @@ def _plain_text_of(content: Any) -> str:
     for p in content or []:
         p = normalize_content_part(p)
         if isinstance(p, dict) and p.get("type") == "text":
-            out.append(p.get("text", ""))
+            out.append(p.get("text") or "")
     if out:
         return "\n".join(out)
     try:

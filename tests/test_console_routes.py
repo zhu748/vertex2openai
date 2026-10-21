@@ -94,6 +94,20 @@ class ConsoleRoutesTests(unittest.TestCase):
             os.chdir(previous)
             console._load_template.cache_clear()
 
+    def test_credential_and_configuration_responses_are_not_cacheable(self):
+        self.login()
+        with mock.patch.object(settings_api, "get_express_models", mock.AsyncMock(return_value=[])):
+            for path in ("/api/express-keys", "/api/cookie-accounts", "/api/settings",
+                         "/api/settings/runtime", "/api/model-overrides", "/api/capabilities"):
+                with self.subTest(path=path):
+                    response = self.client.get(path)
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.headers.get("cache-control"), "no-store")
+        response = self.client.post("/api/settings", json={"proxy_urls": []})
+        self.assertEqual(response.headers.get("cache-control"), "no-store")
+        response = self.client.post("/api/express-keys", json={"keys": []})
+        self.assertEqual(response.headers.get("cache-control"), "no-store")
+
     def test_login_and_dashboard_serve_all_assets_locally(self):
         class Assets(HTMLParser):
             def __init__(self):

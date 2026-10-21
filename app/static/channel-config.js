@@ -301,7 +301,7 @@ async function applyProxyEditor(){
     if(pending!==-1) throw new Error('第 '+(pending+1)+' 条代理待补齐'+proxyMissingFields(editor.proxies[pending]).join(' / ')+'，请编辑后再应用。');
     const normalized=editor.proxies.length?(await parseProxyInput({text:JSON.stringify(editor.proxies)})).map(p=>p.url):[];
     if(proxyEditor!==editor) return;
-    if(editor.scope==='global') $('proxy-input').value=normalized.join('\n');
+    if(editor.scope==='global'){$('proxy-input').value=normalized.join('\n');updateProxyDraft();}
     else{
       const record=(editor.scope==='key'?KEYS:COOKIE_ACCOUNTS)[editor.index];
       record.proxies=normalized;record.proxy=normalized[0]||'';

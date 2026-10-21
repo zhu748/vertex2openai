@@ -83,11 +83,12 @@ def logprobs_payload_from_candidate(candidate: Any) -> Optional[Dict[str, Any]]:
 def _extract_markdown_images_to_parts(text: str) -> Tuple[List[types.Part], str]:
     parts = []
     remaining_text = text
-    pattern = r"!\[[^\]]*\]\(data:(image/[a-zA-Z0-9+.-]+);base64,([a-zA-Z0-9+/=]+)\)"
+    # 先按 Markdown 边界取出 data URL，再由有界解码器校验编码；只匹配
+    # Base64 字符会漏掉折行和坏编码，令整段图片数据残留成提示词。
+    pattern = r"!\[[^\]]*\]\(data:(image/[a-zA-Z0-9+.-]+);base64,([^)]*)\)"
     matches = list(re.finditer(pattern, text))
     
     if matches:
-        extracted = 0
         # 一次重组替代逐图「前缀+后缀」重建：多图场景下旧写法每张图都
         # 复制一遍全量剩余文本（O(n²)），数 MB 的 base64 历史会被放大成
         # 数十 MB 的 memcpy。
@@ -102,7 +103,6 @@ def _extract_markdown_images_to_parts(text: str) -> Tuple[List[types.Part], str]
                 parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
                 kept.append(text[cursor:match.start()])
                 cursor = match.end()
-                extracted += 1
             except Exception as e:
                 print(f"⚠️ [图片处理] 提取 Markdown 图片失败，已跳过该图片：{e}")
                 # 失败也必须推进游标：旧实现只打日志不推进，整段 data URL
@@ -115,13 +115,11 @@ def _extract_markdown_images_to_parts(text: str) -> Tuple[List[types.Part], str]
         # 恢复文档顺序；2026-10 改为正序游标重组后 parts 本就按文档序追加，
         # 残留的 reverse 会把多图消息整体倒序发给 Gemini（多图编辑时第一张
         # 图是编辑目标，顺序错乱直接改错图）。
-        # 仅在**确实抽走了图片**时才压平空白：抠掉 data URL 会留下成片空格。
-        # 旧实现无条件执行，导致所有纯文本消息的缩进/多空格（代码块、ASCII 图、
-        # 酒馆预设的排版）都被悄悄改写；全部提取失败时同样不该改写文本。
-        # 文本保真优先。
-        if extracted:
-            kept.append(text[cursor:])
-            remaining_text = re.sub(r"[ \t]+", " ", "".join(kept)).strip()
+        # 无论提取成功还是失败，都应用已重组的文本，避免全部失败时把
+        # 原始 Base64 当成提示词发送。保留周围空白，代码缩进和预设排版
+        # 不应因为同一消息带了图片而改变。
+        kept.append(text[cursor:])
+        remaining_text = "".join(kept)
 
     return parts, remaining_text
 
@@ -406,8 +404,11 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
                             fetched = fetch_remote_image(image_url)
                             if fetched:
                                 img_bytes, mime_type = fetched
-                                opt_bytes, opt_mime = optimize_image_bytes(img_bytes, mime_type)
-                                parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
+                                try:
+                                    opt_bytes, opt_mime = optimize_image_bytes(img_bytes, mime_type)
+                                    parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
+                                except ValueError as e:
+                                    print(f"⚠️ [图片处理] 远程图片超出处理限制，已跳过：{e}")
 
             if message_sig and exact_ordinary_parts is None:
                 target = None
@@ -553,7 +554,10 @@ def openai_content_to_wire_parts(content: Any) -> List[Dict[str, Any]]:
                 elif url.startswith("http"):
                     fetched = fetch_remote_image(url)
                     if fetched:
-                        parts.append(_wire_image_part(*fetched))
+                        try:
+                            parts.append(_wire_image_part(*fetched))
+                        except ValueError as e:
+                            print(f"⚠️ [图片处理] 远程图片超出处理限制，已跳过：{e}")
     return parts
 
 

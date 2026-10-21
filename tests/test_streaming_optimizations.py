@@ -312,6 +312,11 @@ class CookieStreamTests(unittest.IsolatedAsyncioTestCase):
                 frames = result.body_iterator
                 body = await anext(frames)
                 body += await asyncio.wait_for(anext(frames), 1)
+                # 在线程中准备请求体时，第二个心跳仍可能早于 POST 开始。
+                # 持续读取直到 mock 上游实际启动，避免把调度时序当作协议契约。
+                async with asyncio.timeout(2):
+                    while not started.is_set():
+                        body += await anext(frames)
                 self.assertTrue(started.is_set())
                 self.assertEqual(text_in(body), "")
                 release.set()

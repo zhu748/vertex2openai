@@ -528,6 +528,7 @@ class _NativeStreamState:
         self.reply_guard = reply_guard
         self.seen, self.finished = set(), set()
         self.received = False
+        self.blocked = False
 
     def inspect(self, payload):
         for obj in payload if isinstance(payload, list) else [payload]:
@@ -536,6 +537,9 @@ class _NativeStreamState:
             self.received = True
             if obj.get("error"):
                 raise NativeStreamError(obj)
+            feedback = obj.get("promptFeedback")
+            if isinstance(feedback, dict) and has_finish_reason(feedback.get("blockReason")):
+                self.blocked = True
             if not isinstance(obj.get("candidates", []), list):
                 raise IncompleteResponseError("上游 candidates 格式错误。")
             for index, candidate in enumerate(obj.get("candidates") or []):
@@ -562,6 +566,8 @@ class _NativeStreamState:
             raise IncompleteResponseError("上游流已结束，但未收到响应数据。")
         if self.seen - self.finished:
             raise IncompleteResponseError("上游连接已结束，但候选回复缺少结束标记。")
+        if not self.finished and not self.blocked:
+            raise IncompleteResponseError("上游流已结束，但未收到模型结束标记或请求拦截结果。")
 
 
 async def _native_json_chunks(upstream, reply_guard=None):

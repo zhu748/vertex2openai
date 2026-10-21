@@ -125,11 +125,14 @@ class AppState:
                 except OSError:
                     pass
                 self._persisted_seq = seq
+                # 发布落盘快照必须与写文件处于同一 IO 临界区。若在释放锁后
+                # 发布，较慢的旧写者会覆盖新写者的回滚基准；下一次保存失败
+                # 就会把内存中的 Key / Cookie / 设置退回已经过时的版本。
+                self._committed = snapshot
             except Exception as e:
                 failure = e
-        # 状态锁只在 IO 锁**之外**获取：锁序恒为 _lock → _io_lock。
-        # 反过来（持 _io_lock 再拿 _lock）会与「外层持 _lock 进 _save」的
-        # 调用者构成经典锁序倒置死锁。
+        # _save 的状态快照和失败回滚均在 IO 临界区外获取状态锁，磁盘写入
+        # 不阻塞 getter。变更器也必须在退出状态锁之后调用 _save。
         if failure is not None:
             print(f"⚠️ [状态管理器] 无法保存状态到磁盘: {failure}")
             with self._lock:
@@ -138,14 +141,16 @@ class AppState:
                 if seq >= self._save_seq:
                     self._state = copy.deepcopy(self._committed)
             raise StatePersistenceError("配置保存失败，请检查状态目录权限和磁盘空间；本次更新已回滚。") from failure
-        with self._lock:
-            self._committed = snapshot
 
     def reload(self) -> None:
         """显式从磁盘重载（外部改了文件时用）。"""
-        with self._lock:
-            self._load_from_disk()
-            self._committed = copy.deepcopy(self._state)
+        with self._io_lock:
+            with self._lock:
+                self._load_from_disk()
+                self._committed = copy.deepcopy(self._state)
+                # 作废重载前已拍下、尚未落盘的快照，避免旧保存覆盖外部编辑。
+                self._save_seq += 1
+                self._persisted_seq = self._save_seq
 
     def set_cookie_credentials(self, cookie: str = "", project_id: str = "") -> None:
         """Commit both credential fields together, so partial updates cannot leak."""

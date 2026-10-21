@@ -68,7 +68,7 @@ def _validate_account_proxies(item, label):
 
 @router.get("/api/express-keys")
 async def list_express_keys(_auth: bool = Depends(require_auth)):
-    return JSONResponse(content=_express_keys_payload())
+    return JSONResponse(content=_express_keys_payload(), headers={"Cache-Control": "no-store"})
 
 
 @router.post("/api/express-keys")
@@ -107,7 +107,7 @@ async def save_express_keys(body: ExpressKeysBody, request: Request, _auth: bool
         start_background_task(express_key_probe.probe_all(keys=pending))
     payload = _express_keys_payload()
     payload["status"] = "success"
-    return JSONResponse(content=payload)
+    return JSONResponse(content=payload, headers={"Cache-Control": "no-store"})
 
 
 class CookieAccountsBody(BaseModel):
@@ -187,7 +187,7 @@ async def probe_express_keys(body: ProbeBody, _auth: bool = Depends(require_auth
         results = [await express_key_probe.probe_and_store(key, force=body.force)]
     payload = _express_keys_payload()
     payload["results"] = results
-    return JSONResponse(content=payload)
+    return JSONResponse(content=payload, headers={"Cache-Control": "no-store"})
 
 
 @router.post("/api/express-keys/project")
@@ -203,7 +203,7 @@ async def set_express_key_project(body: KeyProjectBody, _auth: bool = Depends(re
         return JSONResponse(status_code=404, content={"error": "该 Key 不在列表中。"})
     payload = _express_keys_payload()
     payload["status"] = "success"
-    return JSONResponse(content=payload)
+    return JSONResponse(content=payload, headers={"Cache-Control": "no-store"})
 
 
 class CookieSetting(BaseModel):

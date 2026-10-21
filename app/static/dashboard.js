@@ -313,26 +313,30 @@ function updateProxyPill(on){
   p.style.background = on ? '#ecfdf5' : '#f5f5f5';
   p.style.color = on ? '#047857' : '#737373';
 }
+function updateProxyDraft(){
+  const saved=proxyDraft(GLOBAL_SETTINGS.proxy_urls??GLOBAL_SETTINGS.proxy_url);
+  const draft=proxyDraft($('proxy-input').value);
+  $('proxy-draft-state')?.classList.toggle('hidden',!settingsLoaded||JSON.stringify(saved)===JSON.stringify(draft));
+  // 旧节点的测试结果不能作为新草稿的连通性结论。
+  $('proxy-test-result').classList.add('hidden');
+}
 async function saveProxy(){
   if(!settingsLoaded){toast('设置尚未加载，请先在模型参数页重新加载配置');return;}
   const proxies=proxyDraft($('proxy-input').value);
   try{
     const r=await fetch('/api/settings',{signal:AbortSignal.timeout(30000),method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxy_urls:proxies})});
-    if(r.ok){ const saved=await r.json(); GLOBAL_SETTINGS.proxy_urls=saved.proxy_urls;GLOBAL_SETTINGS.proxy_url=saved.proxy_url;$('proxy-input').value=saved.proxy_urls.join('\n');updateProxyPill(saved.proxy_urls.length); toast(proxies.length?'✅ 已保存 '+saved.proxy_urls.length+' 条代理（按顺序故障切换）':'已清空代理，恢复直连'); }
-    else{
-      let msg='保存失败';
-      try{ const d=await r.json(); if(d && d.error) msg=d.error; }catch(_){}
-      toast('❌ '+msg);
-    }
+    if(r.ok){ const saved=await r.json(); GLOBAL_SETTINGS.proxy_urls=saved.proxy_urls;GLOBAL_SETTINGS.proxy_url=saved.proxy_url;$('proxy-input').value=saved.proxy_urls.join('\n');updateProxyPill(saved.proxy_urls.length);updateProxyDraft(); toast(proxies.length?'✅ 已保存 '+saved.proxy_urls.length+' 条代理（按顺序故障切换）':'已清空代理，恢复直连'); }
+    else toast('❌ '+await responseError(r));
   }catch(e){ toast('❌ 网络请求失败'); }
 }
 async function testProxy(){
   const v=proxyDraft($('proxy-input').value)[0]||'direct';
   const box=$('proxy-test-result'); box.classList.remove('hidden');
-  box.innerHTML='<span class="text-neutral-500">🛰️ 正在测试（最长 8 秒）…</span>';
+  box.innerHTML='<span class="text-neutral-500">🛰️ 正在测试，首次启动协议转换可能需要较长时间…</span>';
   try{
     const r=await fetch('/api/proxy/test',{signal:AbortSignal.timeout(60000),method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxy_url:v})});
     const d=await r.json();
+    if(!r.ok) throw new Error(await responseError(r,'测试失败',d));
     if(d.ok){
       box.innerHTML=`<span style="color:#047857">✅ ${esc(d.message)} · 延迟 ${d.latency_ms} ms${d.via_proxy?(' · 经 '+esc(d.proxy)):''}</span>`;
       toast('✅ 连通成功（'+d.latency_ms+' ms）');
@@ -341,7 +345,7 @@ async function testProxy(){
       toast('❌ 连通失败');
     }
   }catch(e){
-    box.innerHTML='<span style="color:#be123c">❌ 请求测试端点失败（服务异常或代理地址格式非法）</span>';
+    box.innerHTML='<span style="color:#be123c">❌ '+esc(e.name==='TimeoutError'?'代理测试超时，请重试或检查节点状态':e.message)+'</span>';
   }
 }
 
@@ -359,7 +363,7 @@ async function saveFingerprint(){
   const v=$('cookie-impersonate').value;
   try{
     const r=await fetch('/api/settings',{signal:AbortSignal.timeout(30000),method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cookie_impersonate:v})});
-    if(r.ok){ updateFpPill(v); toast(v==='off'?'✅ 已关闭伪装（下一个请求生效）':'✅ 伪装已保存并热生效：'+(FP_LABELS[v]||v)); }
+    if(r.ok){ GLOBAL_SETTINGS.cookie_impersonate=v;updateFpPill(v); toast(v==='off'?'✅ 已关闭伪装（下一个请求生效）':'✅ 伪装已保存并热生效：'+(FP_LABELS[v]||v)); }
     else{
       let msg='保存失败';
       try{ const d=await r.json(); if(d && d.error) msg=d.error; }catch(_){}
@@ -388,7 +392,7 @@ async function saveExpressUa(){
   const c=$('express-ua-custom').value.trim();
   try{
     const r=await fetch('/api/settings',{signal:AbortSignal.timeout(30000),method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({express_ua_profile:v,express_ua_custom:c})});
-    if(r.ok){ updateExpressPill(v,c); updateExpressCustomVis();
+    if(r.ok){ GLOBAL_SETTINGS.express_ua_profile=v;GLOBAL_SETTINGS.express_ua_custom=c;updateExpressPill(v,c); updateExpressCustomVis();
       toast(v==='sdk'||(v==='custom'&&!c)?'✅ 已恢复官方 SDK 原生形态（下一个请求生效）':'✅ 请求头指纹已保存并热生效：'+(FP2_LABELS[v]||v)); }
     else{
       let msg='保存失败';
@@ -417,6 +421,7 @@ async function loadParams(){
     // 出站代理：回填输入框并刷新状态徽标
     setV('proxy-input', proxyDraft(s.proxy_urls??s.proxy_url).join('\n'));
     updateProxyPill(proxyDraft(s.proxy_urls??s.proxy_url).length);
+    updateProxyDraft();
     // Cookie 通道指纹伪装：回填下拉框并刷新徽标
     setV('cookie-impersonate', s.cookie_impersonate || 'chrome');
     updateFpPill(s.cookie_impersonate || 'chrome');
@@ -667,6 +672,7 @@ async function saveSettings(){
       // Another section may have saved model defaults while this response was in flight.
       // Only merge the fields owned by this form, never an older full-state snapshot.
       Object.keys(patch).forEach(key=>GLOBAL_SETTINGS[key]=saved[key]);
+      setV('credential-strategy',saved.roundrobin?'roundrobin':'random');
       toast(overriding?'全局运行设置已保存；模型专属参数保持不变':'全局运行设置已保存');
     }
     else toast(await responseError(r));
@@ -810,5 +816,6 @@ async function runAction(button,action){
 }
 document.addEventListener('input',event=>{
   event.target.removeAttribute('aria-invalid');
+  if(event.target.id==='proxy-input') updateProxyDraft();
   if(PER_MODEL_KEYS.includes(event.target.id)){captureModelDraft();if(event.target.id==='sampling_policy') updateSamplingDisplay();}
 });

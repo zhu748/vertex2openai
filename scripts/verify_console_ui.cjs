@@ -313,7 +313,28 @@ async function main() {
     response=await pending;
     assert.equal(response.status(),200);
     assert.equal(response.request().postDataJSON().proxy_urls.length,2);
+    await page.waitForFunction(()=>document.querySelector('#proxy-draft-state').classList.contains('hidden') && !document.querySelector('#proxy-input').matches(':disabled'));
     check('代理弹窗识别供应商格式、字段填写、特殊字符、排序、编辑、测试与持久化');
+
+    const savedProxyText=await page.inputValue('#proxy-input');
+    await page.locator('button[onclick*="testProxy()"]').click();
+    await page.waitForFunction(()=>document.querySelector('#proxy-test-result').textContent.includes('75 ms') && !document.querySelector('#proxy-input').matches(':disabled'));
+    await page.fill('#proxy-input','socks5://invalid.example:0');
+    assert.equal(await page.locator('#proxy-draft-state').isVisible(),true);
+    assert.equal(await page.locator('#proxy-test-result').isVisible(),false);
+    pending=responseFor('/api/settings');
+    await page.locator('button[onclick*="saveProxy()"]').click();
+    assert.equal((await pending).status(),400);
+    await page.waitForFunction(()=>document.activeElement.id==='proxy-input' && document.querySelector('#proxy-input').getAttribute('aria-invalid')==='true');
+    await page.fill('#proxy-input',savedProxyText);
+    assert.equal(await page.locator('#proxy-draft-state').isVisible(),false);
+    const expiredProxyTest=route=>route.fulfill({status:401,json:{detail:'未登录'}});
+    await page.route('**/api/proxy/test',expiredProxyTest);
+    await page.locator('button[onclick*="testProxy()"]').click();
+    await page.waitForFunction(()=>document.querySelector('#proxy-test-result').textContent.includes('登录已过期') && !document.querySelector('#proxy-input').matches(':disabled'));
+    await page.unroute('**/api/proxy/test',expiredProxyTest);
+    await page.fill('#proxy-input',savedProxyText);
+    check('代理草稿提示、编辑后清除旧测试结果、错误定位与会话过期反馈');
 
     await page.getByRole('button',{name:'管理 / 添加代理',exact:true}).click();
     await page.selectOption('#proxy-type','sstp');
@@ -538,6 +559,14 @@ async function main() {
     await page.selectOption('#credential-strategy','roundrobin');
     await page.waitForFunction(()=>!document.querySelector('#credential-strategy').disabled && document.querySelector('#roundrobin').checked);
     check('混合模式、多 Cookie 项目与代理绑定、空值保留凭证、独立启停和轮询');
+
+    await openTab('params');
+    await page.uncheck('#roundrobin');
+    pending=responseFor('/api/settings');
+    await page.locator('button[onclick*="saveSettings"]').click();
+    assert.equal((await pending).status(),200);
+    await page.waitForFunction(()=>!document.querySelector('#roundrobin').matches(':disabled') && document.querySelector('#credential-strategy').value==='random');
+    check('全局设置保存后同步通道页账号调度状态');
 
     await openTab('requests');
     await page.waitForSelector('#request-rows tr[data-request]');

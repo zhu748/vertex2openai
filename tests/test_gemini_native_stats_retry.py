@@ -26,6 +26,8 @@ from logger import ProxyStats
 from routes import gemini_native
 import retry_policy
 
+COMPLETE_SSE = b'data: {"candidates": [{"content": {"parts": [{"text": "ok"}]}, "finishReason": "STOP"}]}\n\n'
+
 
 class KeyManager:
     def __init__(self, keys=("key-1",)):
@@ -92,7 +94,7 @@ class NativeStatsRetryTests(unittest.TestCase):
     def test_native_actions_and_prefixes_count_once(self):
         def responder(request):
             if ":streamGenerateContent" in str(request.url):
-                return httpx.Response(200, content=b'data: {"candidates": []}\n\n',
+                return httpx.Response(200, content=COMPLETE_SSE,
                                       headers={"content-type": "text/event-stream"})
             return httpx.Response(200, json={"candidates": []})
 
@@ -112,7 +114,7 @@ class NativeStatsRetryTests(unittest.TestCase):
                 self.responder = lambda request: (
                     httpx.Response(429, json={"error": {"code": 429}})
                     if len(self.requests) == 1 else
-                    httpx.Response(200, content=b'data: {"candidates": []}\n\n',
+                    httpx.Response(200, content=COMPLETE_SSE,
                                    headers={"content-type": "text/event-stream"}))
                 response = self.post(action)
                 self.assertEqual(response.status_code, 200)
@@ -134,7 +136,7 @@ class NativeStatsRetryTests(unittest.TestCase):
                     bare_attempts += 1
                     if bare_attempts <= 10:
                         return httpx.Response(429, json={"error": {"code": 429}})
-                    return httpx.Response(200, content=b'data: {"candidates": []}\n\n',
+                    return httpx.Response(200, content=COMPLETE_SSE,
                                           headers={"content-type": "text/event-stream"})
 
                 self.responder = responder
@@ -305,12 +307,22 @@ class NativeStatsRetryTests(unittest.TestCase):
             if len(self.requests) == 1:
                 return httpx.Response(429, stream=ErrorStream())
             self.assertEqual(closed, [True])
-            return httpx.Response(200, content=b'data: {"candidates": []}\n\n',
+            return httpx.Response(200, content=COMPLETE_SSE,
                                   headers={"content-type": "text/event-stream"})
         self.responder = responder
         response = self.post("streamGenerateContent")
-        self.assertEqual(response.content, b'data: {"candidates": []}\n\n')
+        self.assertEqual(response.content, COMPLETE_SSE)
         self.assert_stats(retries=1)
+
+    def test_metadata_only_stream_is_never_counted_as_success(self):
+        self.responder = lambda request: httpx.Response(
+            200, content=b'data: {"usageMetadata": {"totalTokenCount": 42}}\n\n',
+            headers={"content-type": "text/event-stream"})
+        response = self.post("streamGenerateContent")
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["error"]["code"], 502)
+        self.assertEqual(len(self.requests), 1)
+        self.assert_stats(success=0, error=1)
 
     def test_explicit_sse_request_rejects_non_sse_upstream(self):
         response = self.client.post("/v1beta/models/gemini-test:streamGenerateContent?alt=sse",

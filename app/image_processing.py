@@ -2,6 +2,7 @@
 
 import base64
 import io
+import re
 from typing import Optional, Tuple
 
 import config as app_config
@@ -21,6 +22,22 @@ def optimize_image_bytes(
     超过阈值的图会限制最长边并重采样，避免多轮修图卡死。"""
     if Image is None:
         return image_data, original_mime
+
+    # 安全预检独立于压缩开关和压缩体积阈值。PIL 在打开极大图片时就会
+    # 抛 DecompressionBombError；不能让普通解析失败的「回传原图」兜底
+    # 把它吞掉，否则数百 MP 的低熵小文件会绕过后续像素检查。
+    try:
+        with Image.open(io.BytesIO(image_data)) as img:
+            pixel_count = img.width * img.height
+            dimensions = f"{img.width}x{img.height}"
+    except Image.DecompressionBombError as exc:
+        raise ValueError("输入图片像素数超过 PIL 安全上限，已拒绝处理。") from exc
+    except Exception:
+        return image_data, original_mime
+    if pixel_count > 2 * _MAX_INPUT_PIXELS:
+        raise ValueError(
+            f"输入图片像素数 {dimensions} 超过安全上限"
+            f"（{2 * _MAX_INPUT_PIXELS // 1_000_000}MP），已拒绝处理")
 
     # 逐键读取（无深拷贝）：旧实现每张图都 get_settings() 锁内深拷贝整个
     # 设置树（含全部 model_overrides），多图消息按图数放大（2026-10 优化）。
@@ -45,25 +62,11 @@ def optimize_image_bytes(
     # 像素炸弹守卫：低熵 PNG（如 258KB 的 9000×9000）字节数达标但像素数巨大，
     # 会绕过最长边限制原样透传，后续任何解码方部按 ~25× 解压放大。
     # 只读 header 判定（不解压全图），超过 _MAX_INPUT_PIXELS 才进入压缩路径。
-    if len(image_data) <= max_size_bytes:
-        try:
-            with Image.open(io.BytesIO(image_data)) as img:
-                if img.width * img.height <= _MAX_INPUT_PIXELS:
-                    return image_data, original_mime
-        except Exception:
-            # 无法解析的图维持既有行为：原样透传（压缩路径同样会失败并回退）。
-            return image_data, original_mime
+    if len(image_data) <= max_size_bytes and pixel_count <= _MAX_INPUT_PIXELS:
+        return image_data, original_mime
 
     try:
         with Image.open(io.BytesIO(image_data)) as img:
-            # 头部像素预检（不触发解码）：超过 2×_MAX_INPUT_PIXELS 的超大图
-            # 直接拒绝。旧实现会一路解码到 PIL 的 DecompressionBombError，
-            # 再被下方兜底 except 捕获后**原样回传**——像素炸弹守卫恰好对
-            # 最大的炸弹失效（低熵 900MP PNG 以 258KB 透传上游，2026-10 修复）。
-            if img.width * img.height > 2 * _MAX_INPUT_PIXELS:
-                raise ValueError(
-                    f"输入图片像素数 {img.width}x{img.height} 超过安全上限"
-                    f"（{2 * _MAX_INPUT_PIXELS // 1_000_000}MP），已拒绝处理")
             # Compression drops EXIF metadata. Apply camera orientation first
             # so portrait photos do not silently turn sideways upstream.
             img = ImageOps.exif_transpose(img)
@@ -121,7 +124,10 @@ def decode_data_url_image(b64_data: str) -> bytes:
             f"内联图片 base64 超过 {MAX_REMOTE_IMAGE_BYTES // (1024 * 1024)}MiB 上限（收到 "
             f"{len(b64_data) // (1024 * 1024)}MiB 级字符）"
         )
-    raw = base64.b64decode(b64_data)
+    # RFC 2045 折行仍可接受；其它非 Base64 字符不能被解码器静默丢弃。
+    raw = base64.b64decode(re.sub(r"[ \t\r\n]+", "", b64_data), validate=True)
+    if not raw:
+        raise ValueError("内联图片内容为空。")
     if len(raw) > MAX_REMOTE_IMAGE_BYTES:
         raise ValueError(f"内联图片解码后超过 {MAX_REMOTE_IMAGE_BYTES // (1024 * 1024)}MiB 上限")
     return raw

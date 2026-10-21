@@ -42,21 +42,20 @@ def _normalize_models_config(data: object) -> Optional[Dict[str, List[str]]]:
 
 
 def _load_local_models_config() -> Dict[str, List[str]]:
-    try:
-        local_file = next((path for path in _LOCAL_MODEL_FILE_CANDIDATES if path.exists()), None)
-        if local_file is None:
-            searched = ", ".join(str(path) for path in _LOCAL_MODEL_FILE_CANDIDATES)
-            print(f"❌ [模型配置] 未找到本地 vertexModels.json，已检查：{searched}")
-            return {"models": []}
-
-        data = json.loads(local_file.read_text(encoding="utf-8"))
-        normalized = _normalize_models_config(data)
-        if normalized is not None:
-            print(f"📦 [模型配置] 已使用本地模型配置文件：{local_file}。")
-            return normalized
-        print(f"❌ [模型配置] 本地模型配置结构无效：{local_file}。")
-    except Exception as exc:
-        print(f"❌ [模型配置] 读取本地模型配置失败：{exc}")
+    for local_file in dict.fromkeys(_LOCAL_MODEL_FILE_CANDIDATES):
+        try:
+            if not local_file.exists():
+                continue
+            data = json.loads(local_file.read_text(encoding="utf-8"))
+            normalized = _normalize_models_config(data)
+            if normalized and normalized["models"]:
+                print(f"📦 [模型配置] 已使用本地模型配置文件：{local_file}。")
+                return normalized
+            print(f"⚠️ [模型配置] 本地模型配置为空或结构无效，尝试下一份：{local_file}。")
+        except Exception as exc:
+            print(f"⚠️ [模型配置] 读取本地模型配置失败，尝试下一份 {local_file}：{exc}")
+    searched = ", ".join(str(path) for path in _LOCAL_MODEL_FILE_CANDIDATES)
+    print(f"❌ [模型配置] 没有可用的本地 vertexModels.json，已检查：{searched}")
     return {"models": []}
 
 
