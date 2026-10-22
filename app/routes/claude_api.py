@@ -165,68 +165,16 @@ def _json_response_payload(response) -> Optional[dict]:
         return None
 
 
-# ============================================================
-# 主端点：POST /v1/messages
-# ============================================================
+def _claude_stream_response(response: StreamingResponse, display_model: str, *,
+                           omit_thinking: bool) -> ManagedStreamingResponse:
+    """把上游 OpenAI SSE 流翻译成 Anthropic 事件流（claude_messages 的流式段）。
 
-@router.post("/v1/messages")
-async def claude_messages(fastapi_request: Request, api_key: str = Depends(get_claude_auth)):
-    """Anthropic Messages 端点：Anthropic 请求 → 内部管线 → Anthropic 响应。
-
-    并发闸（limit_generation）内置于 _call_upstream，不在此重复装饰，
-    避免同一请求占用两份并发配额。
-    上游错误（404 模型不可用 / 403 权限 / 429 拥堵等）如实透传状态码，
-    仅把错误体改写为 Anthropic 形状；流式已开始后错误以 SSE error 事件表达。
+    职责与保活策略（详见模块 docstring 与 IDLE_PING_SECONDS 注释）：
+    - message_start 先行（不等上游首字节）；
+    - 10s 空闲补 ping、上游心跳注释帧转 ping；
+    - 有界帧队列背压防慢客户端堆内存；生产者/消费者生命周期与上游
+      关闭均在 finally 中收尾，客户端断开不泄漏任务与连接。
     """
-    try:
-        body = await _parse_json_body(fastapi_request)
-    except ClaudeRequestError as exc:
-        return claude_error(400, exc.err_type, str(exc))
-
-    raw_model = body.get("model")
-    if not isinstance(raw_model, str) or not raw_model.strip():
-        return claude_error(400, "invalid_request_error", "model is required")
-    if "max_tokens" not in body:
-        return claude_error(400, "invalid_request_error", "max_tokens is required")
-
-    display_model, internal_model = resolve_claude_model(raw_model, await _available_models())
-    try:
-        request_obj = anthropic_to_openai_request(body, internal_model)
-    except ClaudeRequestError as exc:
-        return claude_error(exc.status, exc.err_type, str(exc))
-
-    # thinking.display=omitted：响应侧不回传思考块（对齐 vertex-master
-    # includeThoughts 口径；模型照常思考，reasoning_tokens 照计 usage）。
-    omit_thinking = anthropic_omit_thinking(body)
-
-    track_configure(model=display_model, protocol="claude",
-                    stream=bool(request_obj.stream), channel=_track_channel())
-    print(f"🔵 [Claude] 模型 {display_model} → {internal_model} | "
-          f"{'流式' if request_obj.stream else '非流式'} | max_tokens={request_obj.max_tokens}")
-
-    try:
-        response = await _call_upstream(request_obj, fastapi_request)
-    except GenerationCapacityError:
-        return claude_error(529, "overloaded_error", "服务并发已达上限，请稍后重试。")
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        code, message = extract_upstream_error(exc)
-        print(f"❌ [Claude] 模型 {display_model} 调用失败 | HTTP {code} | {message[:200]}")
-        return claude_error(code, anthropic_error_type(code), message[:1024])
-
-    if not isinstance(response, StreamingResponse):
-        # 非流式 / 流式快速失败：真实 HTTP 状态码 + Anthropic 错误体
-        status = getattr(response, "status_code", 200) or 200
-        payload = _json_response_payload(response)
-        if status >= 400 or (isinstance(payload, dict) and payload.get("error")):
-            message = _openai_error_message(payload, f"上游请求失败（HTTP {status}）。")
-            err_status = status if status >= 400 else 502
-            return claude_error(err_status, anthropic_error_type(err_status), message)
-        return JSONResponse(content=openai_completion_to_anthropic(
-            payload or {}, display_model, new_message_id(), omit_thinking=omit_thinking))
-
-    # ---- 流式：OpenAI SSE 帧 → Anthropic SSE 事件 ----
     state = ClaudeStreamState(display_model, omit_thinking=omit_thinking)
     upstream_iterator = response.body_iterator
 
@@ -237,9 +185,6 @@ async def claude_messages(fastapi_request: Request, api_key: str = Depends(get_c
             else:
                 yield chunk
 
-    # 空闲 ping 保活：见模块级 IDLE_PING_SECONDS 注释（vertex-master 用
-    # 无条件 10s ticker；这里 10s 无帧才补 ping，活跃期不产生冗余事件，
-    # 最长静默间隔同样 <= IDLE_PING_SECONDS，效果等价且更省）。
     _END = object()  # 生产者结束哨兵
     # 有界队列：慢客户端（网络拥塞）不会让上游读帧无限堆内存——
     # 队满时生产者阻塞在 put 上，形成自然背压；正常生成速率远低于消费
@@ -344,6 +289,71 @@ async def claude_messages(fastapi_request: Request, api_key: str = Depends(get_c
         headers={"Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no"},
         cleanup=cleanup,
     )
+
+
+# ============================================================
+# 主端点：POST /v1/messages
+# ============================================================
+
+@router.post("/v1/messages")
+async def claude_messages(fastapi_request: Request, api_key: str = Depends(get_claude_auth)):
+    """Anthropic Messages 端点：Anthropic 请求 → 内部管线 → Anthropic 响应。
+
+    并发闸（limit_generation）内置于 _call_upstream，不在此重复装饰，
+    避免同一请求占用两份并发配额。
+    上游错误（404 模型不可用 / 403 权限 / 429 拥堵等）如实透传状态码，
+    仅把错误体改写为 Anthropic 形状；流式已开始后错误以 SSE error 事件表达。
+    """
+    try:
+        body = await _parse_json_body(fastapi_request)
+    except ClaudeRequestError as exc:
+        return claude_error(400, exc.err_type, str(exc))
+
+    raw_model = body.get("model")
+    if not isinstance(raw_model, str) or not raw_model.strip():
+        return claude_error(400, "invalid_request_error", "model is required")
+    if "max_tokens" not in body:
+        return claude_error(400, "invalid_request_error", "max_tokens is required")
+
+    display_model, internal_model = resolve_claude_model(raw_model, await _available_models())
+    try:
+        request_obj = anthropic_to_openai_request(body, internal_model)
+    except ClaudeRequestError as exc:
+        return claude_error(exc.status, exc.err_type, str(exc))
+
+    # thinking.display=omitted：响应侧不回传思考块（对齐 vertex-master
+    # includeThoughts 口径；模型照常思考，reasoning_tokens 照计 usage）。
+    omit_thinking = anthropic_omit_thinking(body)
+
+    track_configure(model=display_model, protocol="claude",
+                    stream=bool(request_obj.stream), channel=_track_channel())
+    print(f"🔵 [Claude] 模型 {display_model} → {internal_model} | "
+          f"{'流式' if request_obj.stream else '非流式'} | max_tokens={request_obj.max_tokens}")
+
+    try:
+        response = await _call_upstream(request_obj, fastapi_request)
+    except GenerationCapacityError:
+        return claude_error(529, "overloaded_error", "服务并发已达上限，请稍后重试。")
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        code, message = extract_upstream_error(exc)
+        print(f"❌ [Claude] 模型 {display_model} 调用失败 | HTTP {code} | {message[:200]}")
+        return claude_error(code, anthropic_error_type(code), message[:1024])
+
+    if not isinstance(response, StreamingResponse):
+        # 非流式 / 流式快速失败：真实 HTTP 状态码 + Anthropic 错误体
+        status = getattr(response, "status_code", 200) or 200
+        payload = _json_response_payload(response)
+        if status >= 400 or (isinstance(payload, dict) and payload.get("error")):
+            message = _openai_error_message(payload, f"上游请求失败（HTTP {status}）。")
+            err_status = status if status >= 400 else 502
+            return claude_error(err_status, anthropic_error_type(err_status), message)
+        return JSONResponse(content=openai_completion_to_anthropic(
+            payload or {}, display_model, new_message_id(), omit_thinking=omit_thinking))
+
+    # ---- 流式：OpenAI SSE 帧 → Anthropic SSE 事件 ----
+    return _claude_stream_response(response, display_model, omit_thinking=omit_thinking)
 
 
 def _sse_data_lines(frame_text: str):
