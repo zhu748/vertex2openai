@@ -28,6 +28,7 @@ from prefill import PrefillDeduper, strip_prefill_overlap
 from response_validation import (
     IncompleteResponseError,
     has_finish_reason,
+    map_finish_reason_to_openai,
     require_complete_response,
     require_unblocked_response,
 )
@@ -51,6 +52,7 @@ from upstream_errors import (
     extract_upstream_error,
 )
 from usage import make_usage_chunk, map_usage, wants_usage
+from streaming import disconnected as _request_disconnected
 from request_tracking import (attempt_started_at, configure as track_configure,
                               upstream_attempt, upstream_chunk, record_usage)
 from first_reply import FirstReplyGuard, FirstReplyTimeout, sdk_has_reply, timed_call, timeout_seconds
@@ -172,14 +174,7 @@ def _build_chunk_payload(chunk: Any, model_name: str, response_id: str, candidat
         if getattr(candidate, "index", None) is not None:
             output_index = candidate.index
         raw_gemini_finish_reason = getattr(candidate, "finish_reason", None)
-        if raw_gemini_finish_reason:
-            if hasattr(raw_gemini_finish_reason, "name"): raw_gemini_finish_reason_str = raw_gemini_finish_reason.name.upper()
-            else: raw_gemini_finish_reason_str = str(raw_gemini_finish_reason).upper()
-
-            if raw_gemini_finish_reason_str == "STOP": openai_finish_reason = "stop"
-            elif raw_gemini_finish_reason_str == "MAX_TOKENS": openai_finish_reason = "length"
-            elif raw_gemini_finish_reason_str in ("SAFETY", "PROHIBITED_CONTENT", "RECITATION", "BLOCKLIST", "SPII", "IMAGE_SAFETY"): openai_finish_reason = "content_filter"
-            elif raw_gemini_finish_reason_str in ["TOOL_CODE", "FUNCTION_CALL"]: openai_finish_reason = "tool_calls"
+        openai_finish_reason = map_finish_reason_to_openai(raw_gemini_finish_reason, default=None)
 
         # Collect every parallel call and keep signatures on their exact tool-call
         # deltas. Message-level signatures cover ordinary/signature-only Parts.
@@ -490,14 +485,6 @@ async def gemini_fake_stream_generator(
     # 深拷贝整棵设置树（含全部 model_overrides），重试风暴下放大浪费。
     fr_seconds = timeout_seconds(request_obj.model)
 
-    async def _client_gone() -> bool:
-        if fastapi_request is None:
-            return False
-        try:
-            return await fastapi_request.is_disconnected()
-        except Exception:
-            return False
-
     outer_keep_alive_interval = app_state.get_setting(
         "fake_streaming_interval", app_config.FAKE_STREAMING_INTERVAL_SECONDS)
 
@@ -510,7 +497,7 @@ async def gemini_fake_stream_generator(
     try:
         attempt = 0
         while attempt <= max_retries:
-            if await _client_gone():
+            if await _request_disconnected(fastapi_request):
                 print(f"ℹ️ [客户端断开] 假流式请求前检测到客户端已断开，停止调用模型 {model_for_api_call}。")
                 return
 
@@ -544,7 +531,7 @@ async def gemini_fake_stream_generator(
                     yield f"data: {json.dumps(keep_alive_data)}\n\n"
                     heartbeat_due = time.monotonic() + outer_keep_alive_interval
                 await asyncio.wait({api_call_task}, timeout=0.5)
-                if await _client_gone():
+                if await _request_disconnected(fastapi_request):
                     print("ℹ️ [客户端断开] 假流式等待期间客户端已断开，正在取消上游任务。")
                     api_call_task.cancel()
                     return
@@ -573,7 +560,7 @@ async def gemini_fake_stream_generator(
                         step = min(0.5, wait_time - waited)
                         await asyncio.sleep(step)
                         waited += step
-                        if await _client_gone():
+                        if await _request_disconnected(fastapi_request):
                             print("ℹ️ [客户端断开] 假流式退避期间客户端已断开，停止重试。")
                             return
                         if outer_keep_alive_interval > 0 and time.monotonic() >= heartbeat_due:
@@ -674,15 +661,6 @@ async def execute_gemini_call(
     actual_prompt_for_call = await asyncio.to_thread(prompt_func, request_obj.messages)
     print(f"🚀 [上游请求] 正在调用 Agent Platform Express Mode 模型 {model_to_call}，客户端请求模型名为 {request_obj.model}。")
 
-    async def _client_gone() -> bool:
-        """检测客户端是否已断开连接（用于在重试前及时止损）。"""
-        if fastapi_request is None:
-            return False
-        try:
-            return await fastapi_request.is_disconnected()
-        except Exception:
-            return False
-
     if request_obj.stream:
         # 生图判定统一走能力档案（nano-banana-2.1 名字里不带 image，裸 "image" in 会漏判，
         # 漏判会绕开下面的生图假流式保护，走真流式）
@@ -731,7 +709,7 @@ async def execute_gemini_call(
                 last_error = None
                 while attempt <= max_retries:
                     # 客户端断开则停止重试，避免无谓的上游调用
-                    if await _client_gone():
+                    if await _request_disconnected(fastapi_request):
                         print(f"ℹ️ [客户端断开] 真流式请求前检测到客户端已断开，停止调用模型 {model_to_call}。")
                         return
                     stream_gen_obj = None
@@ -942,7 +920,7 @@ async def execute_gemini_call(
                             print(f"⚠️ [自动重试] Agent Platform Express Mode 流式请求失败（HTTP {code}，"
                                   f"{detail}，本次已等待 {elapsed:.1f} 秒）。"
                                   f"第 {attempt + 1} 次退避重试，等待 {wait_time:.1f} 秒。")
-                            if await _client_gone():
+                            if await _request_disconnected(fastapi_request):
                                 print(f"ℹ️ [客户端断开] 重试前检测到客户端已断开，停止调用模型 {model_to_call}。")
                                 return
                             # 退避等待期间持续吐 SSE 心跳，保活前端连接
@@ -990,7 +968,7 @@ async def execute_gemini_call(
         retry_pending = False
         last_error = None
         while attempt <= max_retries:
-            if await _client_gone():
+            if await _request_disconnected(fastapi_request):
                 print(f"ℹ️ [客户端断开] 非流式请求前检测到客户端已断开，停止调用模型 {model_to_call}。")
                 return JSONResponse(
                     status_code=499,

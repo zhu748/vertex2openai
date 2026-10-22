@@ -22,6 +22,20 @@ Number = TypeVar("Number", int, float)
 # 文本里的状态码标记：左右数字边界防止 "429" 误中 "4292" / "42912ms"。
 _STATUS_IN_TEXT_RE = re.compile(r"(?<![0-9])(429|500|502|503|504)(?![0-9])")
 
+# 可重试错误的文本关键词（Express / Cookie 两条通道共用一套口径，防两份列表漂移；
+# Cookie 通道的 _is_retryable_error 直接引用，不再自带一份）。
+RETRYABLE_MARKERS = (
+    "too many requests",
+    "quota",
+    "resource exhausted",
+    "resource_exhausted",
+    "try again later",
+    "rate limit",
+    "overloaded",
+    "temporarily unavailable",
+    "internal error",
+)
+
 
 def _retry_setting(key: str, number_type: type[Number], maximum: Number) -> Number:
     default = app_config.DEFAULT_SETTINGS[key]
@@ -50,6 +64,14 @@ def is_retryable_status(code: int) -> bool:
     return code == 429 or 500 <= code <= 599
 
 
+def is_retryable_message(error_msg: str) -> bool:
+    """纯文本可重试性判断：状态码标记（带数字边界）或关键词任一命中。"""
+    lower = (error_msg or "").lower()
+    if _STATUS_IN_TEXT_RE.search(lower):
+        return True
+    return any(marker in lower for marker in RETRYABLE_MARKERS)
+
+
 def is_retryable_exception(e: Exception) -> bool:
     if isinstance(e, (AntiTruncationError, IncompleteResponseError)):
         return False
@@ -73,24 +95,7 @@ def is_retryable_exception(e: Exception) -> bool:
         return False
     # 数字标记用有界正则匹配：裸子串 "429" 会误中 "port 4292"/"elapsed
     # 42912ms"，把不可重试错误判成可重试 → 白白重试烧配额（2026-10 修复）。
-    if _STATUS_IN_TEXT_RE.search(error_str):
-        return True
-    if any(
-        marker in error_str
-        for marker in (
-            "too many requests",
-            "quota",
-            "resource exhausted",
-            "resource_exhausted",
-            "try again later",
-            "rate limit",
-            "overloaded",
-            "temporarily unavailable",
-            "internal error",
-        )
-    ):
-        return True
-    return False
+    return is_retryable_message(error_str)
 
 
 def _retry_delay_value(retry_after: Optional[str], default: float, attempt: int = 0, jitter: float = 1.0) -> float:

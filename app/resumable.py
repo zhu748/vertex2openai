@@ -27,6 +27,7 @@ import config as app_config
 from runtime_state import app_state
 from streaming import with_heartbeats, HEARTBEAT, HEARTBEAT_FRAME
 from request_tracking import current_trace
+from upstream_errors import google_status_detail
 
 # 终止帧：与 OpenAI 流一致，客户端见到它即可判定「本轮完整结束」
 DONE_FRAME = "data: [DONE]\n\n"
@@ -321,9 +322,8 @@ class ResumableBuffer:
                     current_trace.reset(token)
             payload = {"error": {"message": message[:1024], "type": error_type, "code": code}}
             if self.kind == "native":
-                detail = {400: "INVALID_ARGUMENT", 401: "UNAUTHENTICATED", 403: "PERMISSION_DENIED",
-                          404: "NOT_FOUND", 429: "RESOURCE_EXHAUSTED", 504: "DEADLINE_EXCEEDED"}.get(code, "UNAVAILABLE")
-                payload = {"error": {"message": message[:1024], "status": detail, "code": code}}
+                payload = {"error": {"message": message[:1024],
+                                     "status": google_status_detail(code), "code": code}}
             frames = ([self.event_frame(f"data: {json.dumps(payload, ensure_ascii=False)}\n\n")]
                       if self.kind != "json" else [])
             if self.kind != "json":

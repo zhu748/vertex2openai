@@ -14,6 +14,7 @@ from image_processing import (
     optimize_image_bytes,
 )
 from models import OpenAIMessage, message_text, normalize_content_part
+from response_validation import map_finish_reason_to_openai
 from runtime_state import app_state
 from signature_store import SignatureState
 from thought_signatures import (
@@ -681,15 +682,7 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
             message_payload = {"role": "assistant"}
             
             raw_finish_reason = getattr(candidate, "finish_reason", None)
-            openai_finish_reason = "stop" 
-            if raw_finish_reason:
-                if hasattr(raw_finish_reason, "name"): raw_gemini_finish_reason_str = raw_finish_reason.name.upper()
-                else: raw_gemini_finish_reason_str = str(raw_finish_reason).upper()
-
-                if raw_gemini_finish_reason_str == "STOP": openai_finish_reason = "stop"
-                elif raw_gemini_finish_reason_str == "MAX_TOKENS": openai_finish_reason = "length"
-                elif raw_gemini_finish_reason_str in ("SAFETY", "PROHIBITED_CONTENT", "RECITATION", "BLOCKLIST", "SPII", "IMAGE_SAFETY"): openai_finish_reason = "content_filter"
-                elif raw_gemini_finish_reason_str in ["TOOL_CODE", "FUNCTION_CALL"]: openai_finish_reason = "tool_calls"
+            openai_finish_reason = map_finish_reason_to_openai(raw_finish_reason, default="stop")
             
             parts_in_order = list(getattr(getattr(candidate, "content", None), "parts", None) or [])
             reasoning_str, normal_content_str = parse_gemini_response_for_reasoning_and_content(candidate)

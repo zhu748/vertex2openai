@@ -19,6 +19,19 @@ def error_status(error: Exception) -> int | None:
     return None
 
 
+def google_status_detail(code: int) -> str:
+    """HTTP 状态码 → Google 风格 error.status（原生端点错误体共用）。
+
+    gemini_native 的 _native_error 与 resumable 缓冲的 native 错误帧共用
+    这一份映射，保证两条路径对同一状态码给出一致的 detail。
+    """
+    return {
+        400: "INVALID_ARGUMENT", 401: "UNAUTHENTICATED", 403: "PERMISSION_DENIED",
+        404: "NOT_FOUND", 429: "RESOURCE_EXHAUSTED", 500: "INTERNAL",
+        502: "UNAVAILABLE", 503: "UNAVAILABLE", 504: "DEADLINE_EXCEEDED",
+    }.get(code, "UNKNOWN")
+
+
 def create_openai_error_response(status_code: int, message: str, error_type: str) -> dict[str, Any]:
     safe_message = re.sub(r"([?&]key=)[^&\s'\"]+", r"\1***HIDDEN_API_KEY***", message)
     return {"error": {"message": safe_message, "type": error_type, "code": status_code, "param": None}}

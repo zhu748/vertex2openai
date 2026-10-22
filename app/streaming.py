@@ -54,7 +54,11 @@ async def sse_frames(source, max_frame_bytes=64 * 1024 * 1024):
             await close()
 
 
-async def _disconnected(request):
+async def disconnected(request):
+    """客户端是否已断开（request 为 None 或读取异常时按未断开处理）。
+
+    api_helpers 的重试循环与 with_heartbeats 共用这一个实现，
+    替代原先三份逐字相同的内嵌 _client_gone/_disconnected。"""
     if request is None:
         return False
     try:
@@ -76,7 +80,7 @@ async def with_heartbeats(source, request=None, interval=None):
     loop = asyncio.get_running_loop()
     try:
         while True:
-            if await _disconnected(request):
+            if await disconnected(request):
                 return
             pending = asyncio.ensure_future(anext(iterator))
             deadline = loop.time() + interval
@@ -91,7 +95,7 @@ async def with_heartbeats(source, request=None, interval=None):
                     pending = None
                     yield item
                     break
-                if await _disconnected(request):
+                if await disconnected(request):
                     return
                 if loop.time() >= deadline:
                     yield HEARTBEAT

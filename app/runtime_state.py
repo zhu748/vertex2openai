@@ -296,18 +296,23 @@ class AppState:
         同时打上 express_keys_initialized 标记：**用户保存空列表后，
         启动时不得再从环境变量把 Key 导回来**（否则删不掉）。
         """
-        clean, seen = [], set()
-        for item in (records or []):
-            rec = self._normalize_express_record(item)
-            if not rec or rec["key"] in seen:
-                continue
-            seen.add(rec["key"])
-            clean.append(rec)
+        clean = self._clean_express_records(records)
         with self._lock:
             self._state["express_keys"] = clean
             self._state["express_keys_initialized"] = True
         self._save()
         print(f"🔑 [状态管理器] 已保存 {len(clean)} 个 Express API Key（明文存于 web_state.json，权限 0600）。")
+        return clean
+
+    @staticmethod
+    def _clean_express_records(records: list) -> list:
+        """批量归一化 Express Key 记录并按 key 去重（保持顺序，空记录丢弃）。"""
+        clean, seen = [], set()
+        for item in (records or []):
+            rec = AppState._normalize_express_record(item)
+            if rec and rec["key"] not in seen:
+                seen.add(rec["key"])
+                clean.append(rec)
         return clean
 
     def update_express_key_project(self, key: str, project_id: str, source: str = "auto", *,
@@ -355,13 +360,7 @@ class AppState:
                 self._state["express_keys_initialized"] = True
                 result = 0
             else:
-                clean, seen = [], set()
-                for item in (env_keys or []):
-                    rec = self._normalize_express_record(item)
-                    if not rec or rec["key"] in seen:
-                        continue
-                    seen.add(rec["key"])
-                    clean.append(rec)
+                clean = self._clean_express_records(env_keys)
                 self._state["express_keys"] = clean
                 self._state["express_keys_initialized"] = True
                 result = len(clean)

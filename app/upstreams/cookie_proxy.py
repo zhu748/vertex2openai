@@ -26,13 +26,16 @@ from proxy_failover import ProxyChain
 from credential_manager import credential_manager
 from response_validation import (
     AntiTruncationError,
+    FINISH_CONTENT_FILTER,
     IncompleteResponseError,
     has_finish_reason,
+    map_finish_reason_to_openai,
     require_finish_reason,
 )
 from retry_policy import (
     get_retry_settings,
     is_retryable_exception,
+    is_retryable_message,
     is_retryable_status,
     retry_delay,
     wait_for_retry,
@@ -55,13 +58,11 @@ from upstreams.cookie_request import (
     normalized_tool_name,
 )
 from upstreams.cookie_response import (
-    FILTERED_FINISH_REASONS,
     RawSampler,
     TextSource,
     extract_events,
     iter_json_objects,
     make_openai_chunk,
-    map_finish_reason,
     openai_tool_call,
     signature_bytes_from_wire,
 )
@@ -69,18 +70,6 @@ from upstreams.request_preparation import prepare_messages
 from usage import make_usage_chunk, map_usage, wants_usage
 from request_tracking import configure as track_configure, upstream_attempt, upstream_chunk
 from first_reply import FirstReplyGuard, FirstReplyTimeout, timed_call, timeout_seconds
-
-RETRYABLE_KEYWORDS = [
-    "resource exhausted",
-    "try again later",
-    "429",
-    "quota",
-    "rate limit",
-    "overloaded",
-    "temporarily unavailable",
-    "internal error",
-]
-
 
 COOKIE_EXPIRED_KEYWORDS = [
     "permission",
@@ -157,9 +146,8 @@ def _safety_html_if_enabled(ratings: Any) -> str:
 
 
 def _is_retryable_error(error_msg: str) -> bool:
-    """判断错误是否可重试（429 限流类）"""
-    lower = error_msg.lower()
-    return any(kw in lower for kw in RETRYABLE_KEYWORDS)
+    """判断错误是否可重试（429 限流类）；与 Express 通道共用 retry_policy 的单一口径。"""
+    return is_retryable_message(error_msg)
 
 
 def _is_cookie_expired_error(error_msg: str) -> bool:
@@ -484,7 +472,7 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
 
             require_finish_reason(finish_raw)
             return {"kind": "ok", "full_text": full_text + safety_html, "reasoning_text": reasoning_text,
-                    "finish_reason": map_finish_reason(finish_raw), "usage_meta": usage_meta}
+                    "finish_reason": map_finish_reason_to_openai(finish_raw), "usage_meta": usage_meta}
         except Exception as e:
             em = str(e)
             if is_retryable_exception(e) and attempt < retry_max:
@@ -925,7 +913,7 @@ class CookieProxyUpstream(BaseUpstream):
                                     response_id, model_display, extra_content={"google": google})
                             yield make_openai_chunk(
                                 response_id, model_display,
-                                finish_reason="tool_calls" if got_tool_call else map_finish_reason(finish_raw))
+                                finish_reason="tool_calls" if got_tool_call else map_finish_reason_to_openai(finish_raw))
                         else:
                             # 无正文：明确告知客户端 + 落诊断日志（旧版此处一个字节都不发就关流）
                             detail = f"finishReason={finish_raw or '无'}"
@@ -939,7 +927,7 @@ class CookieProxyUpstream(BaseUpstream):
                             yield make_openai_chunk(
                                 response_id, model_display,
                                 content=f"\n[Studio 提示] 上游{desc}（{detail}）。{hint}")
-                            filtered = bool(blocked_msg) or ((finish_raw or "").upper() in FILTERED_FINISH_REASONS)
+                            filtered = bool(blocked_msg) or ((finish_raw or "").upper() in FINISH_CONTENT_FILTER)
                             yield make_openai_chunk(response_id, model_display,
                                                      finish_reason="content_filter" if filtered else "stop")
 
@@ -1138,7 +1126,7 @@ class CookieProxyUpstream(BaseUpstream):
                             # 预填充智能兼容：去重后把预填充文本拼回输出开头
                             if prefill_text and got_text:
                                 full_text = prefill_text + strip_prefill_overlap(prefill_text, full_text)
-                            finish_reason = "tool_calls" if tool_calls else map_finish_reason(finish_raw)
+                            finish_reason = "tool_calls" if tool_calls else map_finish_reason_to_openai(finish_raw)
                             stats.add_success()
                             print(f"✅ [Studio] {base_model_name} | {len(full_text)} 字符 | {elapsed:.1f}s")
                         else:
@@ -1152,7 +1140,7 @@ class CookieProxyUpstream(BaseUpstream):
                             print(f"❌ [Studio] {base_model_name} | 上游{desc}（{detail}）| {elapsed:.1f}s")
                             print(f"🔎 [Studio 诊断] 原始响应样本：\n{sampler.dump()}")
                             full_text = f"[Studio 提示] 上游{desc}（{detail}）。{hint}"
-                            filtered = bool(blocked_msg) or ((finish_raw or "").upper() in FILTERED_FINISH_REASONS)
+                            filtered = bool(blocked_msg) or ((finish_raw or "").upper() in FINISH_CONTENT_FILTER)
                             finish_reason = "content_filter" if filtered else "stop"
 
                         usage = map_usage(usage_meta)

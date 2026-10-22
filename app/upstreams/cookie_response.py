@@ -86,19 +86,6 @@ def _complete_json_objects(text: str, limit: int):
         yield obj
 
 
-FILTERED_FINISH_REASONS = {"SAFETY", "PROHIBITED_CONTENT", "RECITATION", "BLOCKLIST", "SPII", "IMAGE_SAFETY"}
-
-
-def map_finish_reason(raw: str | None) -> str:
-    """batchGraphql finishReason → OpenAI finish_reason。"""
-    r = (raw or "").upper()
-    if r == "MAX_TOKENS":
-        return "length"
-    if r in FILTERED_FINISH_REASONS:
-        return "content_filter"
-    return "stop"
-
-
 def _summ_obj(obj: dict, width: int = 700) -> str:
     """把一个响应对象压成截断的单行 JSON（诊断日志用，图片 base64 会掐掉）。"""
     try:

@@ -49,7 +49,7 @@ from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from retry_policy import get_retry_settings, is_retryable_exception, is_retryable_status
-from upstream_errors import extract_upstream_error
+from upstream_errors import extract_upstream_error, google_status_detail
 from response_validation import IncompleteResponseError, has_finish_reason
 from admission import limit_generation, GenerationCapacityError
 from retry_policy import retry_delay as _retry_delay, wait_for_retry as _wait_for_retry
@@ -141,14 +141,22 @@ class NativeAPIError(Exception):
 
 def _native_error(status: int, message: str, status_detail: Optional[str] = None) -> JSONResponse:
     """构造 Google 风格错误体（原生 SDK 会按 error.message 展示）。"""
-    detail = status_detail or {
-        400: "INVALID_ARGUMENT", 401: "UNAUTHENTICATED", 403: "PERMISSION_DENIED",
-        404: "NOT_FOUND", 429: "RESOURCE_EXHAUSTED", 500: "INTERNAL",
-        502: "UNAVAILABLE", 503: "UNAVAILABLE", 504: "DEADLINE_EXCEEDED",
-    }.get(status, "UNKNOWN")
+    detail = status_detail or google_status_detail(status)
     return JSONResponse(status_code=status, content={
         "error": {"code": status, "message": message, "status": detail}
     })
+
+
+def _native_model_entry(model_id: str) -> dict:
+    """Gemini 原生 models.list / models.get 共用的目录条目。"""
+    return {
+        "name": f"models/{model_id}",
+        "displayName": model_id,
+        "description": f"Vertex Express 模型（经 vertex2openai 透传）：{model_id}",
+        "inputTokenLimit": 1048576,
+        "outputTokenLimit": 65536,
+        "supportedGenerationMethods": ["generateContent", "streamGenerateContent", "countTokens"],
+    }
 
 
 # ============================================================
@@ -914,18 +922,7 @@ async def native_list_models(fastapi_request: Request,
     has_any = manager.get_total_keys() > 0 or app_state.get_channel_mode() in ("web_proxy", "mixed")
     raw = await get_express_models() if has_any else []
 
-    methods = ["generateContent", "streamGenerateContent", "countTokens"]
-    models = []
-    for mid in sorted(raw):
-        entry = {
-            "name": f"models/{mid}",
-            "displayName": mid,
-            "description": f"Vertex Express 模型（经 vertex2openai 透传）：{mid}",
-            "inputTokenLimit": 1048576,
-            "outputTokenLimit": 65536,
-            "supportedGenerationMethods": methods,
-        }
-        models.append(entry)
+    models = [_native_model_entry(mid) for mid in sorted(raw)]
     return {"models": models}
 
 
@@ -941,13 +938,5 @@ async def native_get_model(model_action: str, fastapi_request: Request,
         return _native_error(400, f"GET 不支持 :{action}，请用 POST。")
     raw = await get_express_models() if has_any else []
     if model and model in raw:
-        return {
-            "name": f"models/{model}",
-            "displayName": model,
-            "description": f"Vertex Express 模型（经 vertex2openai 透传）：{model}",
-            "inputTokenLimit": 1048576,
-            "outputTokenLimit": 65536,
-            "supportedGenerationMethods": [
-                "generateContent", "streamGenerateContent", "countTokens"],
-        }
+        return _native_model_entry(model)
     return _native_error(404, f"Model {model} not found.", status_detail="NOT_FOUND")
