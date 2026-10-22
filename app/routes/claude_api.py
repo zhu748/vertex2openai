@@ -33,7 +33,7 @@ Cherry Studio 等说 Claude 协议的客户端）说的是另一套协议：
 
 import asyncio
 import json
-from typing import Any, Optional
+from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse, StreamingResponse

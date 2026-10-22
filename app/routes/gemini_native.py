@@ -184,13 +184,6 @@ def _resolve_upstream_model_path(model: str, key_project_id: str,
 # ============================================================
 # 上游转发核心
 # ============================================================
-def _pick_express_key(fastapi_request: Request) -> Optional[dict]:
-    manager = fastapi_request.app.state.express_key_manager
-    if manager.get_total_keys() == 0:
-        return None
-    return manager.get_express_record()
-
-
 def _build_upstream_url(model_path: str, action: str) -> str:
     """把模型路径拼成上游 URL，规则对齐 google-genai SDK 的 t_model()：
 

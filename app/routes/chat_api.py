@@ -151,11 +151,6 @@ def _request_fingerprint(request_obj: OpenAIRequest) -> str:
         return json.dumps(request_obj.model_dump(), sort_keys=True, default=str)
 
 
-def _resume_start_seq(fastapi_request: Request) -> int:
-    """续传起点：优先 Last-Event-ID 请求头，其次 ?resume_from= 查询参数，缺省 0。"""
-    return resume_cursor(fastapi_request)[1]
-
-
 def _resume_headers(stream_id: str, replay: bool = False) -> dict:
     headers = {"X-Resume-Id": stream_id, "Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no"}
     if replay:

@@ -76,10 +76,6 @@ UPSTREAM_MODE = _settings.UPSTREAM_MODE or (
 if UPSTREAM_MODE not in ("api_key", "web_proxy", "mixed"):
     raise ValueError("UPSTREAM_MODE 必须是 api_key、web_proxy 或 mixed。")
 
-REASONING_TAG = "agent_platform_think_tag"
-# 向后兼容别名（历史代码引用 VERTEX_REASONING_TAG）
-VERTEX_REASONING_TAG = REASONING_TAG
-
 
 # ============================================================
 # 控制台可调的运行时默认值（可在大盘热更新，持久化到 web_state.json）

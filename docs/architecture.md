@@ -126,6 +126,9 @@ Cookie 执行器只编排认证、重试、协议降级与交付，不再承担�
 
 单组测试可以直接运行，例如 `python tests/test_console_routes.py`。
 `verify_round17.py` 和 `verify_singbox_e2e.py` 属于手动网络诊断，不属于离线回归。
+`smoke_final.py` 是离线全服务冒烟（TestClient 启动完整应用验证核心端点），
+`verify_first_reply_timing.py` 复现并验证首回复超时的重试归因行为；两者均为
+手动诊断脚本，可离线运行，不依赖真实凭据。
 新增离线回归请放在 `tests/test_*.py`，由统一入口自动发现。
 
 前端浏览器回归为 `node scripts/verify_console_ui.cjs`，需另装 Playwright 和 Chromium，配置见 README。

@@ -246,9 +246,9 @@ class ResumableTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_resume_header_advances_past_delivered_frame(self):
         request = SimpleNamespace(headers={"last-event-id": "2"}, query_params={"resume_from": "1"})
-        self.assertEqual(chat_api._resume_start_seq(request), 3)
+        self.assertEqual(resumable.resume_cursor(request)[1], 3)
         request.headers.clear()
-        self.assertEqual(chat_api._resume_start_seq(request), 1)
+        self.assertEqual(resumable.resume_cursor(request)[1], 1)
 
     async def test_buffered_json_preserves_upstream_error_code(self):
         error = Exception("Resource exhausted")

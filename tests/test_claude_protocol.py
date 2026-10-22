@@ -436,7 +436,6 @@ class StreamStateTests(unittest.TestCase):
         frames += state.feed_openai_chunk(self.chunk({"content": "answer"}))
         frames += state.finish_events()
         events = stream_events(frames)
-        names = [e[0] for e in events]
         starts = named(events, "content_block_start")
         self.assertEqual([s["content_block"]["type"] for s in starts],
                          ["thinking", "text"])
@@ -488,7 +487,6 @@ class StreamStateTests(unittest.TestCase):
             "tool_calls": [{"index": 0, "function": {"arguments": ": 1}"}}]}))
         frames += state.finish_events()
         events = stream_events(frames)
-        names = [e[0] for e in events]
         open_indexes = set()
         for name, data in events:
             if name == "content_block_start":

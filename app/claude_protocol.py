@@ -965,11 +965,6 @@ _CJK_RE = re.compile(
     "[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff\uff00-\uffef]")
 
 
-def _is_cjk(ch: str) -> bool:
-    """单字符判定（保留给旧调用方；批量统计请用 estimate_text_tokens）。"""
-    return bool(_CJK_RE.match(ch))
-
-
 def estimate_text_tokens(text: str) -> int:
     """CJK ≈ 1 token/字，其余 ≈ 4 字符/token 的启发式估算（正则批量计数）。"""
     if not text:
