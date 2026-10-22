@@ -27,6 +27,7 @@ from models import OpenAIMessage, OpenAIRequest
 from prefill import PrefillDeduper, strip_prefill_overlap
 from response_validation import (
     IncompleteResponseError,
+    PendingMetadataGate,
     has_finish_reason,
     map_finish_reason_to_openai,
     require_complete_response,
@@ -63,6 +64,27 @@ def _safety_score_enabled() -> bool:
         return bool(app_state.get_setting("safety_score", app_config.SAFETY_SCORE))
     except Exception:
         return bool(app_config.SAFETY_SCORE)
+
+
+def _keepalive_frame(model_name: str) -> str:
+    """假流式等待期间的心跳帧（空 delta chunk，前端按普通 chunk 忽略）。"""
+    payload = {"id": "chatcmpl-keepalive", "object": "chat.completion.chunk",
+               "created": int(time.time()), "model": model_name,
+               "choices": [{"delta": {"content": ""}, "index": 0, "finish_reason": None}]}
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+def _pin_failure_fallback(fallback_model: str, error: Exception, get_fallback_client):
+    """location 钉定路径失败的统一退回（真流式与非流式共用同一句提示）。
+
+    返回 (裸模型名, 普通客户端)；调用方需自行保证仅在尚未输出内容时才走到这里。
+    """
+    print(f"↩️ [上游端点] 钉定路径调用失败（{str(error)[:80]}），"
+          f"已退回默认路由 {fallback_model} 重试一次。"
+          "如持续出现，请确认「通道与凭证」里的 Project ID 属于该 API Key 且已开启计费，"
+          "或把「标准模式 location」设为“默认（后端自选）”。")
+    print("ℹ️ [流量等级] 回退默认路由已使用普通请求。")
+    return fallback_model, get_fallback_client()
 
 
 def _extract_usage(resp: Any) -> tuple[int, int, int]:
@@ -525,10 +547,7 @@ async def gemini_fake_stream_generator(
             # 等待期间持续吐 keep-alive，避免前端因长时间无字节而超时
             while not api_call_task.done():
                 if outer_keep_alive_interval > 0 and time.monotonic() >= heartbeat_due:
-                    keep_alive_data = {"id": "chatcmpl-keepalive", "object": "chat.completion.chunk",
-                                       "created": int(time.time()), "model": request_obj.model,
-                                       "choices": [{"delta": {"content": ""}, "index": 0, "finish_reason": None}]}
-                    yield f"data: {json.dumps(keep_alive_data)}\n\n"
+                    yield _keepalive_frame(request_obj.model)
                     heartbeat_due = time.monotonic() + outer_keep_alive_interval
                 await asyncio.wait({api_call_task}, timeout=0.5)
                 if await _request_disconnected(fastapi_request):
@@ -564,10 +583,7 @@ async def gemini_fake_stream_generator(
                             print("ℹ️ [客户端断开] 假流式退避期间客户端已断开，停止重试。")
                             return
                         if outer_keep_alive_interval > 0 and time.monotonic() >= heartbeat_due:
-                            keep_alive_data = {"id": "chatcmpl-keepalive", "object": "chat.completion.chunk",
-                                               "created": int(time.time()), "model": request_obj.model,
-                                               "choices": [{"delta": {"content": ""}, "index": 0, "finish_reason": None}]}
-                            yield f"data: {json.dumps(keep_alive_data)}\n\n"
+                            yield _keepalive_frame(request_obj.model)
                             heartbeat_due = time.monotonic() + outer_keep_alive_interval
                     attempt += 1
                     retry_pending = True
@@ -754,8 +770,7 @@ async def execute_gemini_call(
                         content_chars, reasoning_chars, tool_deltas = 0, 0, 0
                         finish_reasons = set()
                         deferred_finishes = []
-                        pending_metadata = []
-                        pending_metadata_bytes = 0
+                        pending_metadata = PendingMetadataGate()
 
                         async for chunk_item_call in first_reply.iterate(stream_gen_obj, sdk_has_reply):
                             upstream_chunk()
@@ -812,14 +827,10 @@ async def execute_gemini_call(
                                     # 序列化一次复用：测量与最终下发共用同一份字符串
                                     # （旧实现每个元数据 chunk 序列化两次）。
                                     frame_text = json.dumps(chunk_payload, ensure_ascii=False)
-                                    pending_metadata_bytes += len(frame_text.encode("utf-8"))
-                                    if pending_metadata_bytes > 2 * 1024 * 1024:
-                                        raise IncompleteResponseError("首回复前的元数据缓冲超过 2 MiB。")
-                                    pending_metadata.append(frame_text)
+                                    pending_metadata.add(frame_text, len(frame_text.encode("utf-8")))
                                     continue
-                                for metadata in pending_metadata:
+                                for metadata in pending_metadata.drain():
                                     yield f"data: {metadata}\n\n"
-                                pending_metadata.clear()
                                 if prefill_text and not has_yielded:
                                     for _pf_chunk in _pf_frames:
                                         yield f"data: {json.dumps(_pf_chunk, ensure_ascii=False)}\n\n"
@@ -896,13 +907,8 @@ async def execute_gemini_call(
                         # location 钉定路径不对 → 退回裸模型名再试一次（仅在还没输出内容时）
                         if (fallback_model and model_to_call != fallback_model
                                 and not has_yielded and is_location_pin_failure(e_stream_call)):
-                            print(f"↩️ [上游端点] 钉定路径调用失败（{str(e_stream_call)[:80]}），"
-                                  f"已退回默认路由 {fallback_model} 重试一次。"
-                                  "如持续出现，请确认「通道与凭证」里的 Project ID 属于该 API Key 且已开启计费，"
-                                  "或把「标准模式 location」设为“默认（后端自选）”。")
-                            model_to_call = fallback_model
-                            current_client = _get_fallback_client()
-                            print("ℹ️ [流量等级] 回退默认路由已使用普通请求。")
+                            model_to_call, current_client = _pin_failure_fallback(
+                                fallback_model, e_stream_call, _get_fallback_client)
                             continue
 
                         # 关键修复：只有在“尚未向客户端输出任何内容”时才重试；
@@ -997,13 +1003,8 @@ async def execute_gemini_call(
                 last_error = e_call
                 if (fallback_model and model_to_call != fallback_model
                         and is_location_pin_failure(e_call)):
-                    print(f"↩️ [上游端点] 钉定路径调用失败（{str(e_call)[:80]}），"
-                          f"已退回默认路由 {fallback_model} 重试一次。"
-                          "如持续出现，请确认「通道与凭证」里的 Project ID 属于该 API Key 且已开启计费，"
-                          "或把「标准模式 location」设为“默认（后端自选）”。")
-                    model_to_call = fallback_model
-                    current_client = _get_fallback_client()
-                    print("ℹ️ [流量等级] 回退默认路由已使用普通请求。")
+                    model_to_call, current_client = _pin_failure_fallback(
+                        fallback_model, e_call, _get_fallback_client)
                     continue
                 if is_retryable_exception(e_call) and not target_unavailable and attempt < max_retries:
                     wait_time = exception_retry_delay(e_call, backoff_sec, attempt, jitter_sec)

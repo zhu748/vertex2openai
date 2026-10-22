@@ -28,6 +28,7 @@ from response_validation import (
     AntiTruncationError,
     FINISH_CONTENT_FILTER,
     IncompleteResponseError,
+    PendingMetadataGate,
     has_finish_reason,
     map_finish_reason_to_openai,
     require_finish_reason,
@@ -134,6 +135,50 @@ _THINKING_RUNAWAY_HINT = (
 _NO_BODY_HINT = (
     "可能被安全策略拦截或接口行为变化；原始响应样本已写入运行日志，可到大盘“运行日志”页查看。"
 )
+
+
+def _no_body_detail(finish_raw, blocked_msg) -> str:
+    """无正文诊断前缀：结束原因 + promptFeedback 拦截说明（三条路径共用）。"""
+    detail = f"finishReason={finish_raw or '无'}"
+    if blocked_msg:
+        detail += f"；promptFeedback 拦截：{blocked_msg}"
+    return detail
+
+
+def _no_body_desc_hint(has_thought: bool, strip_thoughts: bool) -> tuple:
+    """无正文时的 (描述, 处置提示)：只有思考 → 跑飞提示，完全为空 → 通用提示。"""
+    desc = "只返回了思考、未返回正文" if has_thought else "未返回任何内容"
+    return desc, (_THINKING_RUNAWAY_HINT if (has_thought and not strip_thoughts) else _NO_BODY_HINT)
+
+
+class _RequestBodyCache:
+    """batchGraphql 请求体的「原生 / 降级」两形态缓存（流式与非流式共用）。
+
+    构建内部含远程图片下载 + PIL 压缩，旧实现每次重试都重建 = 反复下载
+    同一批图片；重试发同一个 body 本就是重试语义。降级形态惰性构建：
+    原生函数 Schema 首次被拒才建，同时把降级模式锁定到后续重试。
+    """
+
+    def __init__(self, project_id, base_model_name, request_obj, *,
+                 prefill_active: bool, force_search: bool):
+        self._args = (project_id, base_model_name, request_obj)
+        self._prefill_active = prefill_active
+        self._force_search = force_search
+        self._cache: Dict[str, dict] = {}
+        self.native_latched = False
+
+    async def get(self, native: bool) -> dict:
+        key = "native" if native else "degraded"
+        if key not in self._cache:
+            self._cache[key] = await build_request_body_async(
+                *self._args, prefill_active=self._prefill_active,
+                force_search=self._force_search, native_tools=native)
+        return self._cache[key]
+
+    async def degraded(self) -> dict:
+        """取降级 body，并把本次及后续重试锁定为降级模式。"""
+        self.native_latched = True
+        return await self.get(False)
 
 
 def _safety_html_if_enabled(ratings: Any) -> str:
@@ -346,7 +391,7 @@ async def _execute_stream_request_generator(client, headers, body, sampler=None,
     while True:
         source = _execute_stream_request_generator_raw(client, headers, body, sampler, fallback_body)
         guard = FirstReplyGuard(model, seconds=fr_seconds)
-        pending, pending_bytes = [], 0
+        pending = PendingMetadataGate()
         switch_proxy = False
         try:
             async for item in guard.iterate(source, lambda event: event[0] in ("text", "thought", "image", "function_call") and bool(event[1])):
@@ -358,23 +403,18 @@ async def _execute_stream_request_generator(client, headers, body, sampler=None,
                             break
                     # 错误前已缓冲的元数据（finish/usage/safety）先冲刷再报错，
                     # 与正常收尾路径一致，不静默丢弃上游给出的诊断线索。
-                    for prefix in pending:
+                    for prefix in pending.drain():
                         yield prefix
-                    pending.clear()
                     yield item
                     return
                 if not guard.ready:
-                    pending_bytes += len(str(data).encode("utf-8"))
-                    if pending_bytes > 2 * 1024 * 1024:
-                        raise IncompleteResponseError("首回复前的元数据缓冲超过 2 MiB。")
-                    pending.append(item)
+                    pending.add(item, len(str(data).encode("utf-8")))
                     continue
-                for prefix in pending:
+                for prefix in pending.drain():
                     yield prefix
-                pending.clear()
                 yield item
             if not switch_proxy:
-                for prefix in pending:
+                for prefix in pending.drain():
                     yield prefix
                 return
         except FirstReplyTimeout as exc:
@@ -464,9 +504,7 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
 
             if not full_text.strip():
                 # 无正文：给出可见的诊断信息，而不是静默空回复
-                detail = f"finishReason={finish_raw or '无'}"
-                if blocked_msg:
-                    detail += f"；promptFeedback 拦截：{blocked_msg}"
+                detail = _no_body_detail(finish_raw, blocked_msg)
                 print(f"🔎 [Studio 诊断] 生图无正文（{detail}）。原始响应样本：\n{sampler.dump()}")
                 return {"kind": "error", "message": f"上游未返回图片/正文（{detail}）。已在日志记录原始响应样本。"}
 
@@ -682,21 +720,9 @@ class CookieProxyUpstream(BaseUpstream):
             async def _stream_core():
                 nonlocal start_time
 
-                native_fallback_state = {"latched": False}
-
-                # 请求体按「原生 / 降级」两形态各自只构建一次：构建内部含
-                # 远程图片下载 + PIL 压缩，旧实现每次重试都重建 = 反复下载
-                # 同一批图片。重试发同一个 body 本就是重试语义。
-                _body_cache: Dict[str, Any] = {}
-
-                async def _cached_body(native: bool) -> dict:
-                    key = "native" if native else "degraded"
-                    if key not in _body_cache:
-                        _body_cache[key] = await build_request_body_async(
-                            project_id, base_model_name, request_obj,
-                            prefill_active=prefill_active,
-                            force_search=force_builtin_search, native_tools=native)
-                    return _body_cache[key]
+                body_cache = _RequestBodyCache(
+                    project_id, base_model_name, request_obj,
+                    prefill_active=prefill_active, force_search=force_builtin_search)
 
                 for attempt in range(retry_max + 1):
                     # 客户端已断开则立即停止，避免无谓的上游调用与重试
@@ -706,15 +732,13 @@ class CookieProxyUpstream(BaseUpstream):
                     if attempt:
                         stats.add_retry()
 
-                    use_native_tools = not native_fallback_state["latched"]
-                    body = await _cached_body(use_native_tools)
-                    fallback_body = None
-                    if native_custom_tools and use_native_tools and not text_transport:
-                        # 降级 body 惰性构建（原生 Schema 首次被拒才建），
-                        # 构建后进缓存；调用本工厂同时把降级模式锁定到后续重试。
-                        async def fallback_body():
-                            native_fallback_state["latched"] = True
-                            return await _cached_body(False)
+                    use_native_tools = not body_cache.native_latched
+                    body = await body_cache.get(use_native_tools)
+                    # 降级 body 惰性构建（原生 Schema 首次被拒才建）；
+                    # degraded() 会把降级模式锁定到后续重试。
+                    fallback_body = (body_cache.degraded
+                                     if native_custom_tools and use_native_tools and not text_transport
+                                     else None)
                     req_headers = build_headers(cookie_str) or headers
                     if cookie_debug:
                         print(f"🔎 [Studio 调试] 出站 generationConfig: "
@@ -916,11 +940,8 @@ class CookieProxyUpstream(BaseUpstream):
                                 finish_reason="tool_calls" if got_tool_call else map_finish_reason_to_openai(finish_raw))
                         else:
                             # 无正文：明确告知客户端 + 落诊断日志（旧版此处一个字节都不发就关流）
-                            detail = f"finishReason={finish_raw or '无'}"
-                            if blocked_msg:
-                                detail += f"；promptFeedback 拦截：{blocked_msg}"
-                            desc = "只返回了思考、未返回正文" if got_thought else "未返回任何内容"
-                            hint = (_THINKING_RUNAWAY_HINT if (got_thought and not strip_thoughts) else _NO_BODY_HINT)
+                            detail = _no_body_detail(finish_raw, blocked_msg)
+                            desc, hint = _no_body_desc_hint(got_thought, strip_thoughts)
                             stats.add_error()
                             print(f"❌ [Studio] {base_model_name} | 上游{desc}（{detail}）")
                             print(f"🔎 [Studio 诊断] 原始响应样本：\n{sampler.dump()}")
@@ -967,18 +988,10 @@ class CookieProxyUpstream(BaseUpstream):
         # ========== 非流式处理 ==========
         else:
             async def nonstream_response():
-                native_fallback_state = {"latched": False}
                 # 请求体两形态各自只构建一次（同流式路径：防重试反复下载图片）
-                _body_cache: Dict[str, Any] = {}
-
-                async def _cached_body(native: bool) -> dict:
-                    key = "native" if native else "degraded"
-                    if key not in _body_cache:
-                        _body_cache[key] = await build_request_body_async(
-                            project_id, base_model_name, request_obj,
-                            prefill_active=prefill_active,
-                            force_search=force_builtin_search, native_tools=native)
-                    return _body_cache[key]
+                body_cache = _RequestBodyCache(
+                    project_id, base_model_name, request_obj,
+                    prefill_active=prefill_active, force_search=force_builtin_search)
 
                 # 非流式整取：首回复窗口按整调用预算放宽（生图/长思考）。
                 fr_seconds = timeout_seconds(base_model_name)
@@ -992,15 +1005,13 @@ class CookieProxyUpstream(BaseUpstream):
                     if attempt:
                         stats.add_retry()
                     try:
-                        use_native_tools = not native_fallback_state["latched"]
-                        body = await _cached_body(use_native_tools)
-                        fallback_body = None
-                        if native_custom_tools and use_native_tools and not text_transport:
-                            # 降级 body 惰性构建（原生 Schema 首次被拒才建），
-                            # 构建后进缓存；调用本工厂同时把降级模式锁定到后续重试。
-                            async def fallback_body():
-                                native_fallback_state["latched"] = True
-                                return await _cached_body(False)
+                        use_native_tools = not body_cache.native_latched
+                        body = await body_cache.get(use_native_tools)
+                        # 降级 body 惰性构建（原生 Schema 首次被拒才建）；
+                        # degraded() 会把降级模式锁定到后续重试。
+                        fallback_body = (body_cache.degraded
+                                         if native_custom_tools and use_native_tools and not text_transport
+                                         else None)
                         req_headers = build_headers(cookie_str) or headers
                         if cookie_debug:
                             print(f"🔎 [Studio 调试] 出站 generationConfig: "
@@ -1014,10 +1025,7 @@ class CookieProxyUpstream(BaseUpstream):
                             upstream_chunk()
                             if fallback_body is not None and _native_tool_error_response(
                                     response.status_code, response.text):
-                                native_fallback_state["latched"] = True
-                                resolved_fallback = fallback_body()
-                                if hasattr(resolved_fallback, "__await__"):
-                                    resolved_fallback = await resolved_fallback
+                                resolved_fallback = await fallback_body()  # degraded() 同时锁定后续重试
                                 print("⚠️ [Studio] 当前模型/协议拒绝原生函数 Schema；本次及后续重试固定降级为文本工具观测。")
                                 upstream_attempt()
                                 response = await timed_call(base_model_name, client.post(
@@ -1131,11 +1139,8 @@ class CookieProxyUpstream(BaseUpstream):
                             print(f"✅ [Studio] {base_model_name} | {len(full_text)} 字符 | {elapsed:.1f}s")
                         else:
                             # 无正文（只有思考 / 完全空）：返回明确诊断而不是一个空格
-                            detail = f"finishReason={finish_raw or '无'}"
-                            if blocked_msg:
-                                detail += f"；promptFeedback 拦截：{blocked_msg}"
-                            desc = "只返回了思考、未返回正文" if reasoning_text else "未返回任何内容"
-                            hint = (_THINKING_RUNAWAY_HINT if (reasoning_text and not strip_thoughts) else _NO_BODY_HINT)
+                            detail = _no_body_detail(finish_raw, blocked_msg)
+                            desc, hint = _no_body_desc_hint(bool(reasoning_text), strip_thoughts)
                             stats.add_error()
                             print(f"❌ [Studio] {base_model_name} | 上游{desc}（{detail}）| {elapsed:.1f}s")
                             print(f"🔎 [Studio 诊断] 原始响应样本：\n{sampler.dump()}")

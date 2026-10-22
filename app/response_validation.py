@@ -39,6 +39,34 @@ def map_finish_reason_to_openai(raw: object, default: Optional[str] = "stop") ->
     return default
 
 
+class PendingMetadataGate:
+    """首回复前的元数据有界暂存（Express 与 Cookie 两通道共用）。
+
+    上游在首回复之前可能先发 finish/usage/安全分等元数据帧；这里攒着、
+    等首回复到达后按原顺序冲刷。超过 2 MiB 视为上游异常，立即抛
+    IncompleteResponseError——既不无界吃内存，也不静默丢弃诊断线索。
+    """
+
+    LIMIT_BYTES = 2 * 1024 * 1024
+
+    def __init__(self):
+        self.items: list = []
+        self._bytes = 0
+
+    def add(self, item, size: int) -> None:
+        """暂存一个元数据帧；size 为其编码字节数，超限即抛错（不入列）。"""
+        self._bytes += size
+        if self._bytes > self.LIMIT_BYTES:
+            raise IncompleteResponseError("首回复前的元数据缓冲超过 2 MiB。")
+        self.items.append(item)
+
+    def drain(self) -> list:
+        """取出并清空已缓冲的元数据（保持原顺序）。"""
+        items = self.items
+        self.items = []
+        return items
+
+
 class IncompleteResponseError(ValueError):
     code = 502
 
