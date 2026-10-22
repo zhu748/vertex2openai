@@ -11,10 +11,10 @@ from response_validation import IncompleteResponseError
 from json_stream import MAX_JSON_OBJECT_BYTES, JsonObjects as _JsonObjects
 from signature_store import SignatureRecord, SignatureState, signature_store
 from thought_signatures import (
+    attach_signature_extra,
     encode_thought_signature,
     is_thought_part,
     ordinary_part_metadata,
-    thought_signature_extra,
 )
 
 
@@ -69,9 +69,7 @@ def openai_tool_call(response_id: str, call_index: int, call: dict) -> dict:
         "type": "function",
         "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
     }
-    extra = thought_signature_extra(signature)
-    if extra:
-        payload["extra_content"] = extra
+    attach_signature_extra(payload, signature)
     return payload
 
 

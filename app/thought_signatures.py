@@ -54,6 +54,17 @@ def thought_signature_extra(signature: Optional[bytes], part_kind: Optional[str]
     return {"google": google}
 
 
+def attach_signature_extra(payload: dict, signature: Optional[bytes]) -> None:
+    """把思考签名扩展挂到工具调用载荷上（无签名时保持载荷不变）。
+
+    Express 流式/非流式与 Cookie 通道三处工具调用组包共用，
+    保证 extra_content 的挂载口径只有这一个实现点。
+    """
+    extra = thought_signature_extra(signature)
+    if extra:
+        payload["extra_content"] = extra
+
+
 def google_metadata(value: Any) -> dict:
     extra = value.get("extra_content") if isinstance(value, dict) else getattr(value, "extra_content", None)
     return (

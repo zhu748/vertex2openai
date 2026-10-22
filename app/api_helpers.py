@@ -42,6 +42,7 @@ from retry_policy import (
 from runtime_state import app_state
 from signature_store import SignatureState
 from thought_signatures import (
+    attach_signature_extra,
     build_tool_call_id,
     ordinary_part_metadata,
     signature_bytes,
@@ -254,9 +255,7 @@ def _build_chunk_payload(chunk: Any, model_name: str, response_id: str, candidat
                         "arguments": json.dumps(fc.args) if fc.args is not None else "",
                     },
                 }
-                extra = thought_signature_extra(sig)
-                if extra:
-                    tc["extra_content"] = extra
+                attach_signature_extra(tc, sig)
                 part_order.append({"type": "tool_call", "index": tc_index})
                 if indexer:
                     indexer.record_tool_call(output_index, tc_index)

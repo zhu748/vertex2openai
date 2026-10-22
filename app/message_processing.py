@@ -19,6 +19,7 @@ from runtime_state import app_state
 from signature_store import SignatureState
 from thought_signatures import (
     LEGACY_THOUGHT_SEP,
+    attach_signature_extra,
     build_tool_call_id,
     google_metadata,
     ordinary_part_metadata,
@@ -707,9 +708,7 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
                             "arguments": json.dumps(fc.args or {})
                         }
                     }
-                    extra = thought_signature_extra(sig)
-                    if extra:
-                        tool_payload["extra_content"] = extra
+                    attach_signature_extra(tool_payload, sig)
                     message_payload.setdefault("tool_calls", []).append(tool_payload)
                     order_descriptors.append({"type": "tool_call", "index": tool_index})
                     tool_index += 1
