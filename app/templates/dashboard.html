@@ -1190,6 +1190,21 @@
         </div>
         <p class="text-xs text-neutral-500 mt-2">最后一个客户端断开后，窗口内相同请求续接；超过窗口再发时取消旧任务并重新生成。0=断开后不再复用。有其他客户端连接时继续共享。</p>
        </div>
+       <!-- 保活 -->
+       <div class="card settings-card">
+        <div class="text-sm font-semibold mb-3">保活（Keep-Alive）</div>
+        <div class="grid grid-cols-3 gap-3">
+         <div style="grid-column:span 2">
+          <label class="lbl mb-1" for="keepalive_url">保活 URL</label>
+          <input class="inp" id="keepalive_url" placeholder="https://你的域名/healthz（留空关闭）" type="url"/>
+         </div>
+         <div>
+          <label class="lbl mb-1" for="keepalive_interval">间隔(秒)</label>
+          <input class="inp" id="keepalive_interval" max="86400" min="5" type="number"/>
+         </div>
+        </div>
+        <p class="text-xs text-neutral-500 mt-2">定期 GET 该 URL（默认 60 秒一次）：填自己的 <code>/healthz</code> 可防止免费托管平台冻结闲置实例，也可驱动外部监控。留空 = 关闭。请求直连出站、不走出站代理；保存后立即生效，无需重启。环境变量 <code>KEEPALIVE_URL</code> / <code>KEEPALIVE_INTERVAL</code> 仅作初始值。</p>
+       </div>
        <!-- 开关 -->
        <div class="card settings-card">
         <div class="text-sm font-semibold mb-3">交付与运行开关</div>

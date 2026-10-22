@@ -33,6 +33,7 @@ _SETTING_NUMERIC_RANGE = {
     "resumable_max_total_mb": (1, 8192),
     "request_timeout_seconds": (30, 7200),
     "upstream_max_concurrency": (1, 1000),
+    "keepalive_interval": (5, 86400),
 }
 # 已有专项校验的键（代理格式 / 指纹档案白名单），通用层跳过避免重复
 _SETTING_SPECIAL_KEYS = {"proxy_url", "proxy_urls", "express_ua_profile", "express_ua_custom", "model_overrides"}
@@ -141,4 +142,12 @@ def validate_global_settings_patch(patch: dict) -> dict | None:
                 "error": "express_ua_custom 必须为不含控制字符的 ASCII 请求头。",
                 "field": "express_ua_custom",
             }
+    if "keepalive_url" in patch:
+        v = patch["keepalive_url"]
+        if not isinstance(v, str):
+            return {"error": "keepalive_url 必须是字符串。", "field": "keepalive_url"}
+        v = v.strip()
+        if v and not (v.startswith("http://") or v.startswith("https://")):
+            return {"error": "keepalive_url 必须以 http:// 或 https:// 开头（例如 https://你的域名/healthz），或留空关闭保活。",
+                    "field": "keepalive_url"}
     return validate_settings_patch(patch)

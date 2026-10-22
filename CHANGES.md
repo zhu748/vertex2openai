@@ -2,6 +2,20 @@
 
 基于原版 `vertex2openai-main`（2026-09-01），持续完善兼容性、可靠性和代码组织。
 
+## 2026-10-22 出站保活服务（移植自 gcli2api）
+
+定期 GET 配置的 URL（默认 60 秒一次），防止免费托管平台冻结闲置实例，或驱动外部监控：
+
+- 新增 `app/keepalive.py`：后台任务式保活（`KeepAliveService`，启动即打第一发、
+  失败只记日志不重试、停机幂等）；未配置 URL 时不创建任何任务，零开销。
+- 环境变量 `KEEPALIVE_URL`（留空 = 关闭，须 http/https）与 `KEEPALIVE_INTERVAL`
+  （默认 60 秒，下限 5、上限 86400）仅作初始值；控制台「运行设置」页新增保活卡片，
+  保存立即热重启任务（清空 URL 即停止），无需重启服务。
+- 保活请求**直连**出站、不走出站代理（目标是公网监控端点或自身，跟随 Google
+  上游代理反而会在代理不可用时连带失效）；单请求超时 30 秒。
+- 保存时校验 URL scheme 与间隔范围；新增 13 个回归（含本地 HTTP 回路的真实 GET
+  命中、API 热重启钩子与环境变量初始值）。
+
 ## 2026-10-22 Claude（Anthropic）Messages API 兼容层
 
 对齐 vertex-master anthropic_handler 的完整协议兼容，Claude Code / Anthropic SDK /

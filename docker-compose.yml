@@ -41,6 +41,10 @@ services:
       # - SINGBOX_BIN=/usr/local/bin/sing-box
       # sing-box 空闲实例回收阈值（分钟，0 = 不回收，默认 30）：
       # - SINGBOX_IDLE_MINUTES=30
+      # 出站保活：定期 GET 该 URL（默认 60 秒一次），防止免费平台冻结闲置实例。
+      # 典型用法：填自己的 /healthz；留空 = 不启动（零开销）。控制台可热改。
+      # - KEEPALIVE_URL=https://你的域名/healthz
+      # - KEEPALIVE_INTERVAL=60
     # init: true 用 tini 兜底收尸：桥接子进程（vertex-proxy-bridge/sing-box）
     # 异常退出后不留僵尸进程，Python 侧的回收器只做兜底。
     init: true

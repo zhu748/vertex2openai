@@ -415,7 +415,7 @@ async function loadParams(){
     GLOBAL_SETTINGS=s;
     settingsLoaded=true;
     curAR = s.image_aspect_ratio || "";
-    ['resumable_disconnect_grace_seconds','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','retry_jitter_seconds','fake_streaming_interval','prefill_mode','express_location','resumable_ttl_seconds','resumable_max_streams','request_timeout_seconds','upstream_max_concurrency','resumable_max_buffer_mb','resumable_max_total_mb'].forEach(k=>setV(k,s[k]));
+    ['resumable_disconnect_grace_seconds','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','retry_jitter_seconds','fake_streaming_interval','prefill_mode','express_location','resumable_ttl_seconds','resumable_max_streams','request_timeout_seconds','upstream_max_concurrency','resumable_max_buffer_mb','resumable_max_total_mb','keepalive_url','keepalive_interval'].forEach(k=>setV(k,s[k]));
     ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','resumable_enabled'].forEach(k=>setV(k,s[k]));
     setV('credential-strategy',s.roundrobin?'roundrobin':'random');
     // 出站代理：回填输入框并刷新状态徽标
@@ -662,6 +662,8 @@ async function saveSettings(){
     upstream_max_concurrency:numOr('upstream_max_concurrency',32),
     resumable_max_buffer_mb:numOr('resumable_max_buffer_mb',64),
     resumable_max_total_mb:numOr('resumable_max_total_mb',256),
+    keepalive_url:$('keepalive_url').value.trim(),
+    keepalive_interval:numOr('keepalive_interval',60),
   };
   const m=$('model-sel').value;
   const overriding = !!(OVERRIDES[m] && Object.keys(OVERRIDES[m]).length>0);

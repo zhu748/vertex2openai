@@ -45,6 +45,7 @@ Express SDK 或 Cookie 上游；Gemini 原生请求通过 Express REST 透传。
 | `app/request_tracking.py` | 请求生命周期、分离连接/生成计数、首字时序、输出诊断与有界历史 |
 | `app/static/request-monitor.js` | 请求监控列表、筛选、分页、详情和关联日志交互 |
 | `app/usage.py` | SDK / REST 用量映射、用量开关与 OpenAI 用量尾块 |
+| `app/keepalive.py` | 出站保活：定期 GET 配置的 URL，配置校验、任务启停与热重启 |
 | `app/resumable.py`、`app/admission.py` | 有界响应缓冲、后台生成、期限与并发准入 |
 | `app/client_pool.py`、`app/impersonate.py`、`app/proxy_resolver.py` | 连接复用、传输适配和代理解析 |
 | `proxybridge/` | TURN RFC6062 / SSTP MS-CHAPv2 转本地 SOCKS5，独立进程与用户态网络栈 |

@@ -10,6 +10,7 @@ import config
 import express_key_probe
 from client_pool import close_all_clients
 from console_auth import DEFAULT_API_KEY
+from keepalive import keepalive_service
 from model_loader import close_models_refresh, get_models_config, schedule_models_refresh
 from proxy_resolver import (bridge_manager, find_bridge_binary, singbox_available,
                             singbox_manager, singbox_version)
@@ -169,6 +170,13 @@ async def lifespan(app: FastAPI):
         " / :streamGenerateContent / :countTokens（鉴权与 OpenAI 端点一致，三种原生 Key 写法均支持）。"
     )
 
+    # 出站保活（环境变量 KEEPALIVE_URL 仅初始值，控制台可热改；
+    # 未配置时不启动，零开销，见 keepalive.py）。
+    try:
+        await keepalive_service.start()
+    except Exception as e:
+        print(f"⚠️ [保活] 服务启动失败（不影响主服务）：{type(e).__name__} - {e}")
+
     # 默认口令告警已在 lifespan 开头的弱口令检查中输出（弱口令清单覆盖
     # "123456" 与 compose 占位口令 change-me-please），此处不再重复打印。
 
@@ -193,6 +201,7 @@ async def lifespan(app: FastAPI):
             if not any(not t.done() for t in _background_tasks):
                 break
         await resumable_store.aclose()
+        await keepalive_service.stop()
         await close_models_refresh()
         await close_all_clients()
         # 终止全部 sing-box 子进程（vless/vmess 等协议转换进程；

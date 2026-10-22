@@ -29,6 +29,10 @@ class AppSettings(BaseSettings):
     PROXY_URL: Optional[str] = None
     PROXY_URLS: Optional[str] = None  # ordered JSON array or one proxy per line
     SSL_CERT_FILE: Optional[str] = None
+    # 出站保活（见 keepalive.py）：定期 GET 该 URL，留空 = 不启动。
+    # 典型用法：填自己的 https://域名/healthz，防止免费托管平台冻结闲置实例。
+    KEEPALIVE_URL: str = ""
+    KEEPALIVE_INTERVAL: int = 60  # 秒，下限 5（见 keepalive._MIN_INTERVAL_SECONDS）
     # 标准（Express）模式的上游 base_url 覆盖。留空 = 用 SDK 默认（全局端点）。
     # 仅在确有需要时使用；要钉住 location 请用控制台的
     # express_location（见 DEFAULT_SETTINGS）+「通道与凭证」里的 Project ID，不要动这个。
@@ -62,6 +66,8 @@ PROXY_URLS = _settings.PROXY_URLS
 INITIAL_PROXY_URLS = parse_proxy_list(PROXY_URLS if PROXY_URLS is not None else PROXY_URL)
 SSL_CERT_FILE = _settings.SSL_CERT_FILE
 VERTEX_BASE_URL = _settings.VERTEX_BASE_URL
+KEEPALIVE_URL = _settings.KEEPALIVE_URL
+KEEPALIVE_INTERVAL_SECONDS = _settings.KEEPALIVE_INTERVAL
 
 GOOGLE_COOKIE = _settings.GOOGLE_COOKIE
 GOOGLE_COOKIES = _settings.GOOGLE_COOKIES
@@ -219,6 +225,11 @@ DEFAULT_SETTINGS = {
     "resumable_max_total_mb": 256,       # 全部已登记副本的编码字节预算
     "request_timeout_seconds": 1800,    # 一轮准备、重试及读取的总期限
     "upstream_max_concurrency": 32,     # 后台任务也占用生成名额；满时明确返回 503
+    # ===== 出站保活（见 keepalive.py）=====
+    # 定期 GET 这个 URL：保活自身部署（填自己的 /healthz）或驱动外部监控。
+    # 环境变量仅作初始值，控制台「运行设置」页可热改；留空 = 不启动。
+    "keepalive_url": KEEPALIVE_URL,
+    "keepalive_interval": KEEPALIVE_INTERVAL_SECONDS,
     # 按模型单独保存的参数覆盖：{ "模型ID": { 键: 值, ... } }
     # 仅覆盖“与模型相关”的参数（见 PER_MODEL_KEYS）；优先级 请求 > 模型专属 > 全局 > 内置。
     # 下面两个是**内置模型默认**（非演示条目）：这两款模型官方流式实现会

@@ -10,6 +10,7 @@ from pydantic import BaseModel
 import config
 import model_capabilities as mc
 from console_auth import require_auth
+from keepalive import keepalive_service
 from model_loader import get_express_models
 from runtime_state import app_state
 from settings_validation import validate_global_settings_patch, validate_settings_patch
@@ -76,6 +77,9 @@ async def update_settings_api(request: Request, _auth: bool = Depends(require_au
     if error:
         return JSONResponse(status_code=400, content=error)
     updated = await asyncio.to_thread(app_state.update_settings, patch)
+    if {"keepalive_url", "keepalive_interval"} & set(patch):
+        # 保活配置热更新：立即按新配置重启任务（清空 URL 即停止），无需重启服务。
+        await keepalive_service.restart()
     return JSONResponse(content=updated, headers={"Cache-Control": "no-store"})
 
 
