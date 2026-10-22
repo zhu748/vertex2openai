@@ -17,7 +17,7 @@ from upstreams.express_sdk import ExpressSDKUpstream
 from upstreams.cookie_proxy import CookieProxyUpstream
 from upstream_errors import extract_upstream_error, create_openai_error_response
 from logger import stats
-from streaming import keepalive_sse
+from streaming import keepalive_sse, close_setup_task
 from admission import limit_generation, ManagedStreamingResponse
 from response_validation import IncompleteResponseError
 from request_tracking import configure as track_configure
@@ -73,13 +73,7 @@ async def _call_upstream(request_obj: OpenAIRequest, fastapi_request: Request):
         setup = asyncio.create_task(prepare())
 
         async def close_setup():
-            if not setup.done() and not setup.cancelling():
-                setup.cancel()
-            result = (await asyncio.gather(setup, return_exceptions=True))[0]
-            if isinstance(result, StreamingResponse):
-                # getattr 默认值不能急切求值：非 StreamingResponse 形态会先抛 AttributeError。
-                close = getattr(result, "aclose", None) or result.body_iterator.aclose
-                await close()
+            await close_setup_task(setup)
 
         try:
             done, _ = await asyncio.wait({setup}, timeout=0.05)

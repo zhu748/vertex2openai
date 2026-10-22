@@ -386,30 +386,7 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
                         else:
                             image_url = getattr(img_url_data, "url", "") or ""
 
-                        if image_url.startswith("data:"):
-                            # re.DOTALL：RFC 2045 允许 base64 折行，含换行的
-                            # data URL 也必须能解出（与 Cookie 通道实现对齐；
-                            # 旧实现缺 DOTALL 会静默丢图）。解码失败不再炸整
-                            # 个请求（与 Cookie 通道一致：跳过该图并留日志）。
-                            mime_match = re.match(r"data:([^;]+);base64,(.+)", image_url, re.DOTALL)
-                            if mime_match:
-                                mime_type, b64_data = mime_match.groups()
-                                try:
-                                    raw_bytes = decode_data_url_image(b64_data)
-                                    opt_bytes, opt_mime = optimize_image_bytes(raw_bytes, mime_type)
-                                    parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
-                                except Exception as e:
-                                    print(f"⚠️ [图片处理] 解析内联图片失败，已跳过：{e}")
-                        elif image_url.startswith(("http://", "https://")):
-                            # 统一走加固后的 fetch_remote_image（SSRF 与体积防护都在那里，见 F-3）。
-                            fetched = fetch_remote_image(image_url)
-                            if fetched:
-                                img_bytes, mime_type = fetched
-                                try:
-                                    opt_bytes, opt_mime = optimize_image_bytes(img_bytes, mime_type)
-                                    parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
-                                except ValueError as e:
-                                    print(f"⚠️ [图片处理] 远程图片超出处理限制，已跳过：{e}")
+                        _ingest_image_part(image_url, lambda raw, mime: _append_sdk_image_part(parts, raw, mime))
 
             if message_sig and exact_ordinary_parts is None:
                 target = None
@@ -484,6 +461,41 @@ def _rindex_by_identity(seq: list, item: Any) -> int:
     raise ValueError("签名目标 part 不在列表中（不应发生）")
 
 
+def _ingest_image_part(image_url: str, append_part) -> None:
+    """摄取一张 image_url（data: 或 http(s):）并交给 append_part 构造通道专属 part。
+
+    Express（SDK Part）与 Cookie（wire dict）两条消息转换管线共用：
+      - data: URL 用 re.DOTALL 匹配 base64（RFC 2045 允许折行，
+        旧实现缺 DOTALL 会静默丢图）；
+      - 远程图片统一走加固后的 fetch_remote_image（SSRF 与体积防护都在那里）；
+      - 解码/压缩失败只打日志跳过该图，不炸整个请求（两通道行为一致）。
+    append_part(raw_bytes, mime_type) 负责压缩与目标形态构造，
+    其抛出的 ValueError 按「远程图片超出处理限制」处理。
+    """
+    if image_url.startswith("data:"):
+        mime_match = re.match(r"data:([^;]+);base64,(.+)", image_url, re.DOTALL)
+        if not mime_match:
+            return
+        mime_type, b64_data = mime_match.groups()
+        try:
+            append_part(decode_data_url_image(b64_data), mime_type)
+        except Exception as e:
+            print(f"⚠️ [图片处理] 解析内联图片失败，已跳过：{e}")
+    elif image_url.startswith(("http://", "https://")):
+        fetched = fetch_remote_image(image_url)
+        if fetched:
+            try:
+                append_part(*fetched)
+            except ValueError as e:
+                print(f"⚠️ [图片处理] 远程图片超出处理限制，已跳过：{e}")
+
+
+def _append_sdk_image_part(parts: list, raw_bytes: bytes, mime_type: str) -> None:
+    """压缩后构造 SDK types.Part（Express 通道的 append_part 实现）。"""
+    opt_bytes, opt_mime = optimize_image_bytes(raw_bytes, mime_type)
+    parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
+
+
 def _wire_image_part(raw_bytes: bytes, mime_type: str) -> Dict[str, Any]:
     """压缩后转成 batchGraphql 的 inlineData part（camelCase）。"""
     opt_bytes, opt_mime = optimize_image_bytes(raw_bytes, mime_type)
@@ -544,21 +556,7 @@ def openai_content_to_wire_parts(content: Any) -> List[Dict[str, Any]]:
                     url = url.get("url", "")
                 if not isinstance(url, str) or not url:
                     continue
-                if url.startswith("data:"):
-                    m = re.match(r"data:([^;]+);base64,(.+)", url, re.DOTALL)
-                    if m:
-                        mime_type, b64_data = m.groups()
-                        try:
-                            parts.append(_wire_image_part(decode_data_url_image(b64_data), mime_type))
-                        except Exception as e:
-                            print(f"⚠️ [图片处理] 解析内联图片失败，已跳过：{e}")
-                elif url.startswith("http"):
-                    fetched = fetch_remote_image(url)
-                    if fetched:
-                        try:
-                            parts.append(_wire_image_part(*fetched))
-                        except ValueError as e:
-                            print(f"⚠️ [图片处理] 远程图片超出处理限制，已跳过：{e}")
+                _ingest_image_part(url, lambda raw, mime: parts.append(_wire_image_part(raw, mime)))
     return parts
 
 

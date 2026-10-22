@@ -3,6 +3,24 @@ import asyncio
 import re
 from contextlib import suppress
 
+from fastapi.responses import StreamingResponse
+
+
+async def close_setup_task(setup):
+    """等待/取消快窗口 setup 任务，并关闭其持有的流式结果。
+
+    chat_api._call_upstream 与 prepare_sse 的快窗口包装共用：
+    - 未完成且未在取消中的任务先取消（cancelling 检查避免重复取消）；
+    - StreamingResponse 结果统一走 aclose（触发响应 cleanup 链）。
+    """
+    if not setup.done() and not setup.cancelling():
+        setup.cancel()
+    response = (await asyncio.gather(setup, return_exceptions=True))[0]
+    if isinstance(response, StreamingResponse):
+        # getattr 默认值不能急切求值：非 StreamingResponse 形态会先抛 AttributeError。
+        close = getattr(response, "aclose", None) or response.body_iterator.aclose
+        await close()
+
 
 HEARTBEAT = object()
 HEARTBEAT_INTERVAL = 10.0
@@ -139,7 +157,8 @@ async def prepare_sse(operation, request, error_body, on_error):
     200+SSE 包裹（状态头已提交）；此时把状态码与 Retry-After 以 SSE
     注释行带出，供排障/客户端旁路读取（2026-10 修复：旧实现两者皆丢）。
     """
-    from fastapi.responses import StreamingResponse
+    # ManagedStreamingResponse 依赖 admission → proxy_resolver 链，保持惰性
+    # 导入让 streaming 维持轻量（close_setup_task 只需要 fastapi 的类）。
     from admission import ManagedStreamingResponse
 
     _FAST_ERROR_WINDOW = 0.25
@@ -147,13 +166,7 @@ async def prepare_sse(operation, request, error_body, on_error):
     setup = asyncio.create_task(operation())
 
     async def cleanup():
-        if not setup.done():
-            setup.cancel()
-        response = (await asyncio.gather(setup, return_exceptions=True))[0]
-        if isinstance(response, StreamingResponse):
-            # getattr 默认值不能急切求值：非 StreamingResponse 形态会先抛 AttributeError。
-            close = getattr(response, "aclose", None) or response.body_iterator.aclose
-            await close()
+        await close_setup_task(setup)
 
     try:
         done, _ = await asyncio.wait({setup}, timeout=_FAST_ERROR_WINDOW)
