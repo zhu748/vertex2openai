@@ -10,7 +10,12 @@ from typing import Any, AsyncGenerator, Optional
 from response_validation import IncompleteResponseError
 from json_stream import MAX_JSON_OBJECT_BYTES, JsonObjects as _JsonObjects
 from signature_store import SignatureRecord, SignatureState, signature_store
-from thought_signatures import is_thought_part, thought_signature_extra
+from thought_signatures import (
+    encode_thought_signature,
+    is_thought_part,
+    ordinary_part_metadata,
+    thought_signature_extra,
+)
 
 
 def _stable_cookie_tool_call_id(response_id: str, call_index: int, name: str, args: Any) -> str:
@@ -29,6 +34,24 @@ def signature_bytes_from_wire(value: Any) -> Optional[bytes]:
         return base64.b64decode(value, validate=True) or None
     except Exception:
         return value.encode("utf-8")
+
+
+def apply_wire_signature(data: dict, ordinary_metadata: list, part_order: list) -> Optional[bytes]:
+    """把 batchGraphql 的 thoughtSignature 事件并入 ordinary 元数据（流式/非流式共用）。
+
+    已有普通块时签名挂到最后一块；尚无普通块且上游标注 signature_only 时
+    补一条零长度签名块；否则丢弃（无承载位置）。返回原始签名字节，
+    空签名返回 None 且不做任何修改。
+    """
+    signature = signature_bytes_from_wire(data.get("value"))
+    if not signature:
+        return None
+    if ordinary_metadata:
+        ordinary_metadata[-1]["thought_signature"] = encode_thought_signature(signature)
+    elif data.get("part_kind") == "signature_only":
+        part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
+        ordinary_metadata.append(ordinary_part_metadata("signature_only", "", signature))
+    return signature
 
 
 def openai_tool_call(response_id: str, call_index: int, call: dict) -> dict:

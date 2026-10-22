@@ -46,7 +46,6 @@ from schema_validation import SchemaValidationError
 from request_validation import validate_openai_request
 from streaming import HEARTBEAT, HEARTBEAT_FRAME, with_heartbeats
 from thought_signatures import (
-    encode_thought_signature,
     ordinary_part_metadata,
     thought_signature_extra,
 )
@@ -61,11 +60,11 @@ from upstreams.cookie_request import (
 from upstreams.cookie_response import (
     RawSampler,
     TextSource,
+    apply_wire_signature,
     extract_events,
     iter_json_objects,
     make_openai_chunk,
     openai_tool_call,
-    signature_bytes_from_wire,
 )
 from upstreams.request_preparation import prepare_messages
 from usage import make_usage_chunk, map_usage, wants_usage
@@ -149,6 +148,20 @@ def _no_body_desc_hint(has_thought: bool, strip_thoughts: bool) -> tuple:
     """无正文时的 (描述, 处置提示)：只有思考 → 跑飞提示，完全为空 → 通用提示。"""
     desc = "只返回了思考、未返回正文" if has_thought else "未返回任何内容"
     return desc, (_THINKING_RUNAWAY_HINT if (has_thought and not strip_thoughts) else _NO_BODY_HINT)
+
+
+def _no_body_outcome(finish_raw, blocked_msg, has_thought: bool, strip_thoughts: bool) -> tuple:
+    """无正文收尾的统一四元组（流式/非流式共用）：
+
+    (日志描述, 诊断detail, 客户端提示文案, finish_reason)。
+    content_filter 判定与提示文案在两条交付路径上必须一字不差。
+    """
+    detail = _no_body_detail(finish_raw, blocked_msg)
+    desc, hint = _no_body_desc_hint(has_thought, strip_thoughts)
+    filtered = bool(blocked_msg) or ((finish_raw or "").upper() in FINISH_CONTENT_FILTER)
+    finish = "content_filter" if filtered else "stop"
+    notice = f"[Studio 提示] 上游{desc}（{detail}）。{hint}"
+    return desc, detail, notice, finish
 
 
 class _RequestBodyCache:
@@ -796,15 +809,10 @@ class CookieProxyUpstream(BaseUpstream):
                                     got_tool_call = True
 
                                 elif status == "thought_signature":
-                                    signature = signature_bytes_from_wire(data.get("value"))
+                                    signature = apply_wire_signature(
+                                        data, stream_ordinary_metadata, stream_part_order)
                                     extra = thought_signature_extra(signature, data.get("part_kind"))
                                     if extra:
-                                        if stream_ordinary_metadata:
-                                            stream_ordinary_metadata[-1]["thought_signature"] = encode_thought_signature(signature)
-                                        elif data.get("part_kind") == "signature_only":
-                                            stream_part_order.append({"type": "ordinary", "index": 0})
-                                            stream_ordinary_metadata.append(
-                                                ordinary_part_metadata("signature_only", "", signature))
                                         google = extra.setdefault("google", {})
                                         if stream_ordinary_metadata:
                                             google["ordinary_parts"] = list(stream_ordinary_metadata)
@@ -940,17 +948,16 @@ class CookieProxyUpstream(BaseUpstream):
                                 finish_reason="tool_calls" if got_tool_call else map_finish_reason_to_openai(finish_raw))
                         else:
                             # 无正文：明确告知客户端 + 落诊断日志（旧版此处一个字节都不发就关流）
-                            detail = _no_body_detail(finish_raw, blocked_msg)
-                            desc, hint = _no_body_desc_hint(got_thought, strip_thoughts)
+                            desc, detail, notice, no_body_finish = _no_body_outcome(
+                                finish_raw, blocked_msg, got_thought, strip_thoughts)
                             stats.add_error()
                             print(f"❌ [Studio] {base_model_name} | 上游{desc}（{detail}）")
                             print(f"🔎 [Studio 诊断] 原始响应样本：\n{sampler.dump()}")
                             yield make_openai_chunk(
                                 response_id, model_display,
-                                content=f"\n[Studio 提示] 上游{desc}（{detail}）。{hint}")
-                            filtered = bool(blocked_msg) or ((finish_raw or "").upper() in FINISH_CONTENT_FILTER)
+                                content=f"\n{notice}")
                             yield make_openai_chunk(response_id, model_display,
-                                                     finish_reason="content_filter" if filtered else "stop")
+                                                     finish_reason=no_body_finish)
 
                         usage = map_usage(usage_meta)
                         if want_usage:
@@ -1092,14 +1099,9 @@ class CookieProxyUpstream(BaseUpstream):
                                     part_order.append({"type": "tool_call", "index": len(tool_calls)})
                                     tool_calls.append(openai_tool_call(response_id, len(tool_calls), data))
                                 elif event_type == "thought_signature":
-                                    sig = signature_bytes_from_wire(data.get("value"))
+                                    sig = apply_wire_signature(data, ordinary_metadata, part_order)
                                     if sig:
                                         message_extra = thought_signature_extra(sig, data.get("part_kind"))
-                                        if ordinary_metadata:
-                                            ordinary_metadata[-1]["thought_signature"] = encode_thought_signature(sig)
-                                        elif data.get("part_kind") == "signature_only":
-                                            part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
-                                            ordinary_metadata.append(ordinary_part_metadata("signature_only", "", sig))
                                 elif event_type == "finish":
                                     finish_raw = data
                                 elif event_type == "safety":
@@ -1139,14 +1141,12 @@ class CookieProxyUpstream(BaseUpstream):
                             print(f"✅ [Studio] {base_model_name} | {len(full_text)} 字符 | {elapsed:.1f}s")
                         else:
                             # 无正文（只有思考 / 完全空）：返回明确诊断而不是一个空格
-                            detail = _no_body_detail(finish_raw, blocked_msg)
-                            desc, hint = _no_body_desc_hint(bool(reasoning_text), strip_thoughts)
+                            desc, detail, notice, finish_reason = _no_body_outcome(
+                                finish_raw, blocked_msg, bool(reasoning_text), strip_thoughts)
                             stats.add_error()
                             print(f"❌ [Studio] {base_model_name} | 上游{desc}（{detail}）| {elapsed:.1f}s")
                             print(f"🔎 [Studio 诊断] 原始响应样本：\n{sampler.dump()}")
-                            full_text = f"[Studio 提示] 上游{desc}（{detail}）。{hint}"
-                            filtered = bool(blocked_msg) or ((finish_raw or "").upper() in FINISH_CONTENT_FILTER)
-                            finish_reason = "content_filter" if filtered else "stop"
+                            full_text = notice
 
                         usage = map_usage(usage_meta)
 
