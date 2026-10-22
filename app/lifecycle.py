@@ -208,3 +208,7 @@ async def lifespan(app: FastAPI):
         # atexit 里还有一道兑底，这里保证 FastAPI 优雅停机时先收掉）。
         await asyncio.gather(asyncio.to_thread(singbox_manager.shutdown_all),
                              asyncio.to_thread(bridge_manager.shutdown_all), return_exceptions=True)
+        # 排空 stdout 后台写线程（atexit 另有一道兜底；这里保证优雅停机
+        # 时已入队的日志全部落盘后再退出）。
+        from logger import shutdown_stdout_writer
+        await asyncio.to_thread(shutdown_stdout_writer)

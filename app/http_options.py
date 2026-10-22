@@ -59,7 +59,22 @@ def get_http_options(
         options["base_url"] = base_url
     if client_args:
         options["client_args"] = dict(client_args, event_hooks={"request": [_request_timeout]})
-        options["async_client_args"] = dict(client_args, event_hooks={"request": [_async_request_timeout]})
+        # 显式 transport 把 SDK 异步路径钉死在 httpx：运行环境一旦装有
+        # aiohttp，google-genai 会自动改走 aiohttp 传输层，并把整个
+        # async_client_args 原样展开传给 ClientSession.request(**kwargs)——
+        # 其中的 timeout 与 SDK 自己显式传递的 timeout 形参直接冲突抛
+        # TypeError；trust_env / event_hooks 也不是合法的 aiohttp request
+        # 参数。基础 transport 显式携带同一套证书与 trust_env 语义
+        # （client 级 verify 只作用于默认/代理 transport，显式 transport
+        # 存在时会被忽略），确保有无 aiohttp 行为完全一致。
+        async_transport = httpx.AsyncHTTPTransport(
+            verify=client_args.get("verify", True), trust_env=False
+        )
+        options["async_client_args"] = dict(
+            client_args,
+            transport=async_transport,
+            event_hooks={"request": [_async_request_timeout]},
+        )
 
     headers_override = build_sdk_channel_overrides()
     if headers_override:

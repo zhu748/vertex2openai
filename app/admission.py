@@ -28,8 +28,16 @@ class GenerationLimiter:
             if self.active >= limit:
                 raise GenerationCapacityError("上游生成并发已满，请稍后重试。")
             self.active += 1
-        if trace:
-            trace.start_generation()
+        try:
+            if trace:
+                trace.start_generation()
+        except BaseException:
+            # 锁外尾随动作抛异常（trace 是诊断层，不应拖垮准入）：Lease 尚未
+            # 创建，调用方拿不到 release 入口——不回滚的话该并发槽永久卡死
+            #（无 TTL 兑底，只能重启，2026-10 补齐）。
+            with self._lock:
+                self.active -= 1
+            raise
         limiter = self
 
         class Lease:

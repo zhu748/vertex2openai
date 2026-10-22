@@ -401,9 +401,23 @@ async def _execute_stream_request_generator(client, headers, body, sampler=None,
     chain = getattr(client, "chain", None)
     # 首回复窗口每请求只读一次设置（while 循环里换出口/重试会反复新建 Guard）。
     fr_seconds = timeout_seconds(model)
+    # Guard 在循环外创建一次：initial_deadline 记录原始预算终点。旧实现每轮
+    # 换出口都新建 Guard（initial_deadline 重置为满窗口），流式路径的首回复
+    # 总预算不变量失效——N 个候选出口 × 满窗口（默认 3×15s=45s）才轮到外层
+    # 重试，与非流式 timed_call+proxy_attempt 的钳制语义不一致（2026-10 修复）。
+    guard = FirstReplyGuard(model, seconds=fr_seconds)
     while True:
+        # 每轮把 deadline 钳到「满窗口 与 原始预算剩余」的较小值（首轮=满窗口），
+        # 与 proxy_attempt 对同一 Guard 的重写公式逐字一致；guard.ready 在换出口
+        # 前提下恒为 False（switch 分支要求 not guard.ready），复用无状态残留。
+        # seconds=0（禁用超时）时 wait 直接放行，deadline 不参与计时。
+        if guard.seconds:
+            window = max(0.001, min(guard.seconds, guard.initial_deadline - time.monotonic()))
+            guard.deadline = time.monotonic() + window
+            if guard.trace:
+                with guard.trace._lock:
+                    guard.trace.data["first_reply_deadline"] = time.time() + window
         source = _execute_stream_request_generator_raw(client, headers, body, sampler, fallback_body)
-        guard = FirstReplyGuard(model, seconds=fr_seconds)
         pending = PendingMetadataGate()
         switch_proxy = False
         try:

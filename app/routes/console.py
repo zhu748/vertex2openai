@@ -86,7 +86,10 @@ async def logout(request: Request):
 
 @router.get("/api/stats")
 async def get_stats_api(_auth: bool = Depends(require_auth)):
-    return JSONResponse(content={**stats.get_json_stats(), "requests": request_registry.list(limit=0)["summary"]})
+    # 概览面板只要 5 个计数：走轻量 summary()（零 snapshot 构造），
+    # 旧行为 list(limit=0) 会为每个 trace 拷一份完整快照再全部丢弃。
+    return JSONResponse(content={**stats.get_json_stats(), "requests": request_registry.summary()},
+                        headers={"Cache-Control": "no-store"})
 
 
 @router.get("/api/requests")

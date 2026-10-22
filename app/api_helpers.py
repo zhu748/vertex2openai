@@ -88,13 +88,6 @@ def _pin_failure_fallback(fallback_model: str, error: Exception, get_fallback_cl
     return fallback_model, get_fallback_client()
 
 
-def _extract_usage(resp: Any) -> tuple[int, int, int]:
-    """从 SDK 响应里取 (prompt, completion, total) token 数。"""
-    usage = map_usage(getattr(resp, "usage_metadata", None))
-    record_usage(usage)
-    return usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"]
-
-
 def _record_usage(resp: Any) -> dict:
     """记录 token 用量，并打印上游实际返回的流量等级。
 
@@ -613,7 +606,9 @@ async def gemini_fake_stream_generator(
 
     except asyncio.CancelledError:
         print(f"ℹ️ [客户端断开] 假流式响应期间客户端已断开，正在清理模型 {request_obj.model} 的后台任务。")
-        if "api_call_task" in locals() and not api_call_task.done():
+        # api_call_task 在循环前已无条件初始化为 None；真正完备的清理在
+        # finally（cancel + await），这里只做断连路径的快速取消。
+        if api_call_task is not None and not api_call_task.done():
             api_call_task.cancel()
         raise
     except Exception as e_outer_gemini:
@@ -764,6 +759,12 @@ async def execute_gemini_call(
                         ]
 
                         final_p_tk, final_c_tk, final_t_tk = 0, 0, 0
+                        # 完整 usage dict（含 prompt_tokens_details.cached_tokens /
+                        # completion_tokens_details.reasoning_tokens 细分）：尾块
+                        # 直接透传，与假流式/非流式口径一致；旧实现只传三个标量，
+                        # Claude 生态的 cache_read_input_tokens 与 thinking 细分
+                        # 在真流式下永远缺失（2026-10 修复）。
+                        final_usage: dict = {}
                         seen_candidates, finished_candidates = set(), set()
                         received_chunks = 0
                         content_chars, reasoning_chars, tool_deltas = 0, 0, 0
@@ -782,7 +783,11 @@ async def execute_gemini_call(
                                 elapsed = time.monotonic() - (attempt_started_at() or attempt_started)
                                 print(f"📥 [首个上游分片] {request_obj.model}：第 {attempt + 1} 次尝试等待 {elapsed:.1f} 秒收到分片；分片可能仅含思考或用量。")
                             if getattr(chunk_item_call, "usage_metadata", None):
-                                final_p_tk, final_c_tk, final_t_tk = _extract_usage(chunk_item_call)
+                                final_usage = map_usage(chunk_item_call.usage_metadata)
+                                record_usage(final_usage)  # 与旧 _extract_usage 一致：trace 用量口径
+                                final_p_tk, final_c_tk, final_t_tk = (
+                                    final_usage["prompt_tokens"], final_usage["completion_tokens"],
+                                    final_usage["total_tokens"])
 
                             # 支持 n>1：按候选序号逐个输出
                             require_unblocked_response(chunk_item_call)
@@ -869,9 +874,10 @@ async def execute_gemini_call(
                         for payload in deferred_finishes:
                             yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
-                        # P1-8：Express 真流式此前从不发 usage 块，客户端只能显示 0
+                        # P1-8：Express 真流式此前从不发 usage 块，客户端只能显示 0；
+                        # 上游没给 usage 时退三个标量（全 0）。
                         if wants_usage(request_obj):
-                            yield make_usage_chunk(response_id_for_stream, request_obj.model, {
+                            yield make_usage_chunk(response_id_for_stream, request_obj.model, final_usage or {
                                 "prompt_tokens": final_p_tk,
                                 "completion_tokens": final_c_tk,
                                 "total_tokens": final_t_tk,

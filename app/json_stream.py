@@ -32,7 +32,11 @@ class JsonObjects:
         self._state = "start"
 
     def _append(self, fragment):
-        self.size += len(fragment.encode("utf-8"))
+        # ASCII 快速路径：json_stream 消费的 fragment 来自 aiter_text()，
+        # 绝大多数是 ASCII（JSON 结构 + base64）；isascii() 是 O(1) 检查，
+        # 免去为计长把整个 fragment 再编码一遍的临时 bytes 分配。
+        # 非 ASCII（中文正文等）仍用精确字节长度维持字节上限语义。
+        self.size += len(fragment) if fragment.isascii() else len(fragment.encode("utf-8"))
         if self.size > self.limit:
             raise IncompleteResponseError("上游单个 JSON 对象超过字节上限。")
         self.buffer.write(fragment)

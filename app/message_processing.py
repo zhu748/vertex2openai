@@ -285,14 +285,45 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
                 reasoning = getattr(message, "reasoning_content", None)
                 if reasoning:
                     ordinary_parts.append(types.Part(text=reasoning, thought=True))
-                # content 为分段 list 时旧实现会静默丢弃全部文本（只处理 str），
-                # 与 Cookie 通道行为不一致；这里先归一成文本再走同一条抽取链。
-                content_text = message_text(message.content) if isinstance(message.content, list) else message.content
+                # content 为分段 list 时旧实现经 message_text 只提取文本，
+                # image_url 分段被静默丢弃：多轮修图 agent 把上一轮 assistant
+                # 的图片以分段形式回传（OpenAI 协议合法形态）时，带工具调用的
+                # 回合里图片无声消失，模型"看不到图"且无日志可查。与无
+                # tool_calls 分支对齐：文本仍按 "".join 归一（语义不变），
+                # image_url 分段逐个摄取（2026-10 修复）。
+                if isinstance(message.content, list):
+                    text_pieces: list = []
+                    image_parts_collected: list = []
+                    for part_item in message.content:
+                        part_item = normalize_content_part(part_item)
+                        if not isinstance(part_item, dict):
+                            text_attr = getattr(part_item, "text", None)
+                            if isinstance(text_attr, str):
+                                text_pieces.append(text_attr)
+                            continue
+                        if part_item.get("type") == "text":
+                            text_pieces.append(part_item.get("text") or "")
+                        elif part_item.get("type") == "image_url":
+                            img_url_data = part_item.get("image_url") or {}
+                            if isinstance(img_url_data, str):
+                                image_url = img_url_data
+                            elif isinstance(img_url_data, dict):
+                                image_url = img_url_data.get("url", "")
+                            else:
+                                image_url = getattr(img_url_data, "url", "") or ""
+                            _ingest_image_part(
+                                image_url,
+                                lambda raw, mime: _append_sdk_image_part(image_parts_collected, raw, mime))
+                    content_text = "".join(text_pieces)
+                else:
+                    content_text = message.content
+                    image_parts_collected = []
                 if isinstance(content_text, str) and content_text:
                     image_parts, clean_text = _extract_markdown_images_to_parts(content_text)
                     if clean_text:
                         ordinary_parts.append(types.Part.from_text(text=clean_text))
                     ordinary_parts.extend(image_parts)
+                ordinary_parts.extend(image_parts_collected)
 
                 message_sig, signature_kind = signature_from_extra(message)
                 if message_sig:

@@ -87,22 +87,37 @@ async def iter_json_objects(
             yield obj
         return
     parser = _JsonObjects(max_object_bytes)
-    async for chunk in response.aiter_text():
-        if chunk:
-            for obj in parser.feed(chunk):
-                yield obj
+    # 提前退出（消费方错误分支 return / 异常 / 取消）时显式关闭底层文本
+    # 迭代器：httpx 的 aiter_text 与 curl shim 的 _gen 均无内部 finally，
+    # 此前仅靠外层 async with client.stream 的 CM 与 asyncgen GC finalization
+    # 兜底，任何新调用点漏包 CM 就会漏连接（2026-10 补齐；aclose 幂等）。
+    aiter = response.aiter_text()
+    try:
+        async for chunk in aiter:
+            if chunk:
+                for obj in parser.feed(chunk):
+                    yield obj
+    finally:
+        close = getattr(aiter, "aclose", None)
+        if close is not None:
+            await close()
     parser.finish()
 
 
 def _complete_json_objects(text: str, limit: int):
     decoder = json.JSONDecoder()
+    # 整串 ASCII 标志是 O(1)（CPython 的 str 内部位标志）：纯 ASCII 响应
+    # （JSON 结构 + base64，最常见形态）下字符差即字节差，完全零拷贝；
+    # 非 ASCII 文本退回逐对象切片 + 精确编码，上限语义不变。
+    ascii_text = text.isascii()
     position = 0
     while (start := text.find("{", position)) >= 0:
         try:
             obj, position = decoder.raw_decode(text, start)
         except (json.JSONDecodeError, RecursionError) as exc:
             raise IncompleteResponseError("上游返回无效或不完整的 JSON 对象。") from exc
-        if len(text[start:position].encode("utf-8")) > limit:
+        span_bytes = (position - start) if ascii_text else len(text[start:position].encode("utf-8"))
+        if span_bytes > limit:
             raise IncompleteResponseError("上游单个 JSON 对象超过字节上限。")
         yield obj
 

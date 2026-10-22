@@ -40,8 +40,11 @@ async def proxy_attempt(enabled):
     # 每个出口有自己的窗口，但总等待不得超出自首次等待起的原始预算：
     # 旧实现每换一个出口就把 deadline 重置为满窗口，3 个慢出口 × 15s = 45s
     # 才轮到换 Key 重试，且监控面板的截止时间一直在往后漂（2026-10 修复）。
+    # remaining <= 0（前一出口的传输错误恰好落在 deadline 之后的事件循环计时
+    # 竞态）同样必须钳到极小窗口：漏掉这一分支会重新发放整个满窗口，
+    # 总预算不变量在最需要的路径上失效（2026-10 复核修复）。
     remaining = guard.initial_deadline - time.monotonic()
-    window = guard.seconds if remaining <= 0 else max(0.001, min(guard.seconds, remaining))
+    window = max(0.001, min(guard.seconds, remaining))
     guard.deadline = time.monotonic() + window
     if guard.trace:
         with guard.trace._lock:
@@ -58,6 +61,9 @@ async def proxy_attempt(enabled):
         # 与 FirstReplyGuard.wait 的超时分支逐字对齐：异常 message 是外层重试
         # 日志、最终 504 错误响应与 cookie 通道共用的文案源，多出口路径不能
         # 另造一套说法；trace 事件补回旧版"超过 N 秒"说明并预告自动重试。
+        # N 报配置窗口 guard.seconds（契约由 test_first_reply_timeout_carries_
+        # window_seconds 锚定：多/单出口文案与 seconds 字段逐字一致）；被总
+        # 预算裁剪的实际生效窗口通常与之相差毫秒级，不影响排障口径。
         if guard.trace:
             guard.trace.event(
                 "first_reply_timeout",
@@ -134,6 +140,11 @@ class FirstReplyGuard:
             self.trace.milestone("first_reply", "收到模型首个有效回复，首回复计时结束。")
 
     async def iterate(self, source, predicate):
+        # 注意：这里**不能**加 try/finally 去 aclose(iterator)——prefetch 在
+        # 首个回复帧后主动 break 并继续经 PrefetchedStream 消费同一 source，
+        # 迭代器被消费方提前 abandon 是预期路径（清理交给 prefetch 的
+        # except BaseException 分支与消费方自己的 finally，asyncgen GC
+        # finalization 作兜底）。
         iterator = source.__aiter__()
         while True:
             try:

@@ -57,6 +57,9 @@ from auth import constant_time_equal
 from config import API_KEY
 from logger import stats
 from request_tracking import configure as track_configure, upstream_attempt, upstream_chunk
+# 别名导入：_passthrough_request 内有同名局部变量 first_reply（guard 实例），
+# 直接 import first_reply 会被局部变量遮蔽成 UnboundLocalError。
+import first_reply as first_reply_module
 from first_reply import FirstReplyGuard, native_has_reply
 from json_stream import MAX_JSON_OBJECT_BYTES, JsonObjects
 from streaming import prepare_sse
@@ -311,6 +314,13 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
     # get_settings()（锁内全量深拷贝），最多 51 次；拍一次快照复用，
     # 与 models_api/settings_api 已有 base= 模式一致。
     base_settings = app_state.get_settings()
+    # 首回复窗口同样预读一次：FirstReplyGuard(model) 裸构造在每次换 Key
+    # 重试时都会走 timeout_seconds → get_effective_settings 的全量深拷贝
+    #（与 cookie_proxy/api_helpers 的 fr_seconds 预读模式对齐，2026-10 优化）。
+    # 注意经模块属性调用：测试用 mock.patch.object(first_reply, "timeout_seconds")
+    # 替换模块属性，直接 from-import 的函数绑定会绕过 patch，把窗口变成
+    # 真实默认 15 秒（本路由的外层限时较短，回归会直接暴露）。
+    fr_seconds = first_reply_module.timeout_seconds(model)
     record = None
     previous_key = None
     key_attempts = 0           # 上游错误已重试次数（不含首次）
@@ -362,7 +372,7 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
         prefetched = None
         try:
             upstream_attempt()
-            first_reply = FirstReplyGuard(model)
+            first_reply = FirstReplyGuard(model, seconds=fr_seconds)
             async def send(raw, resolved):
                 return await _passthrough_once(
                     client_for(raw, resolved), express_key, model_path, action, query, payload,

@@ -85,7 +85,11 @@ class RequestTrace:
 
     def _append(self, target, item):
         def size(entry):
-            return len(entry["message"].encode("utf-8")) + 128
+            # ASCII 快速路径（CPython 位标志 O(1)）：日志绝大多数为 ASCII +
+            # emoji 之外的中文也只需精确路径一次；免去每条消息两遍全量
+            # UTF-8 编码只为测长的临时 bytes 分配。
+            message = entry["message"]
+            return (len(message) + 128) if message.isascii() else len(message.encode("utf-8")) + 128
         if len(target) == target.maxlen:
             self.retained_bytes -= size(target[0])
         target.append(item)
@@ -344,6 +348,13 @@ class RequestRegistry:
         self.max_bytes = max_bytes
         self._records = OrderedDict()
         self._lock = threading.Lock()
+        # 摊销计数：create() 热路径每 _PRUNE_EVERY 次才做一次 O(N) 全表扫
+        # 描；list()/get()（控制台驱动，低频）始终全扫保证上限语义精确。
+        # 旧行为是每个请求 create()/get() 都扫全表 + 求和，高 RPS 下是纯
+        # 浪费的锁内 O(N) 开销（2026-10 优化）。
+        self._since_prune = 0
+
+    _PRUNE_EVERY = 8
 
     def _prune(self):
         finished = [(key, trace) for key, trace in self._records.items() if trace.ended is not None]
@@ -363,11 +374,26 @@ class RequestRegistry:
             if key in self._records:
                 used -= trace.retained_bytes
                 self._records.pop(key)
+        # 活跃 trace 的保底时限：任何上游代码路径泄漏 lease（release 未被
+        # 调用、挂死的后台生成）时，_settle 永不落 ended，TTL/数量/字节三重
+        # 上限全部失效（慢泄漏且不可自愈）。最长的合法生成性下游可达
+        # 7200s + 重试窗口，取 max(4×TTL, 4h) 作硬上限，超限强制退场并
+        # 留下诊断事件，正常请求永不受影响（2026-10 兑底）。
+        stuck_limit = max(4 * self.ttl_seconds, 4 * 3600)
+        now = time.monotonic()
+        for key, trace in list(self._records.items()):
+            if trace.ended is None and now - trace.started > stuck_limit:
+                trace.event("evicted", "请求跟踪记录超过活跃保底时限，已从监控历史退场"
+                            "（上游任务可能未正常释放，请结合运行日志排查）。")
+                self._records.pop(key, None)
 
     def create(self, path):
         trace = RequestTrace(path)
         with self._lock:
-            self._prune()
+            self._since_prune += 1
+            if self._since_prune >= self._PRUNE_EVERY:
+                self._since_prune = 0
+                self._prune()
             self._records[trace.id] = trace
         return trace
 
@@ -394,6 +420,29 @@ class RequestRegistry:
         return {"summary": summary, "total": len(rows), "items": rows[offset:offset + limit],
                 "offset": offset, "limit": limit, "retention": {"completed": self.max_completed, "seconds": self.ttl_seconds,
                                                                   "bytes": self.max_bytes}}
+
+    def summary(self):
+        """概览面板专用的轻量汇总：不构造任何 snapshot。
+
+        /api/stats 每 3 秒轮询一次，旧行为为了 5 个计数把全部 trace 各拷一
+        份 ~30 键 dict + timings 深拷贝再丢弃（列表接口另有专用路径），
+        并与每个请求的 create() 共用同一把全局锁。直接读活跃标志位即可，
+        快照语义与 list()["summary"] 完全一致（2026-10 优化）。
+        """
+        with self._lock:
+            self._prune()
+            connections = generations = background = retry_wait = active = 0
+            for trace in self._records.values():
+                data = trace.data
+                http_active = data["http_active"]
+                gen_active = data["generation_active"]
+                connections += http_active
+                generations += gen_active
+                background += gen_active and not http_active
+                active += http_active or gen_active
+                retry_wait += gen_active and data["phase"] == "retry_wait"
+        return {"connections": connections, "generations": generations,
+                "background": background, "retry_wait": retry_wait, "active": active}
 
 
 request_registry = RequestRegistry()

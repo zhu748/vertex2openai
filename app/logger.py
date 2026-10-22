@@ -1,4 +1,8 @@
+import atexit
 import builtins
+import io
+import queue
+import sys
 import time
 import asyncio
 import re
@@ -150,6 +154,79 @@ _in_hook = threading.local()
 _MAX_PUSH_CHARS = 8 * 1024
 
 
+# ---------------- stdout 后台写线程 ----------------
+# 为什么：Docker/journald 场景下 stdout 是管道（64KB 缓冲）；当读端
+# （docker logs 消费者/日志采集器）变慢或停住时，同步 print 会无限期
+# **阻塞事件循环线程**——所有并发流式请求一起停摆，这是唯一具备
+# “整体停机”尾风险的路径。专用写线程承担背压；队列满时丢最旧
+#（与 SSELogger 的有界队列同策略）。
+# 兼容性：redirect_stdout/capsys 活跃时（sys.stdout 不是导入时捕获的
+# 真实 stdout）仍走同步路径，测试的输出断言时序完全不变。
+_REAL_STDOUT = sys.stdout
+_STDOUT_QUEUE: "queue.Queue" = queue.Queue(maxsize=1000)
+_STDOUT_SENTINEL = object()
+_writer_thread: Optional[threading.Thread] = None
+_writer_lock = threading.Lock()
+
+
+def _stdout_writer_loop() -> None:
+    while True:
+        item = _STDOUT_QUEUE.get()
+        if item is _STDOUT_SENTINEL:
+            return
+        text, end, flush = item
+        try:
+            original_print(text, end=end, flush=flush, file=_REAL_STDOUT)
+        except Exception:
+            # stdout 被关闭/管道断裂：丢弃该条，钩子层已有异常隔离，
+            # 不能让写线程死亡（后续条目还得有人消费）。
+            pass
+
+
+def _ensure_stdout_writer() -> None:
+    global _writer_thread
+    with _writer_lock:
+        if _writer_thread is None or not _writer_thread.is_alive():
+            _writer_thread = threading.Thread(
+                target=_stdout_writer_loop, name="stdout-writer", daemon=True)
+            _writer_thread.start()
+
+
+def _enqueue_stdout(text: str, end: str, flush: bool) -> None:
+    _ensure_stdout_writer()
+    try:
+        _STDOUT_QUEUE.put_nowait((text, end, flush))
+    except queue.Full:
+        # 丢最旧腾位（与控制台 SSE 流同策略）：背压场景下保住最新日志。
+        try:
+            _STDOUT_QUEUE.get_nowait()
+            _STDOUT_QUEUE.put_nowait((text, end, flush))
+        except (queue.Empty, queue.Full):
+            pass
+
+
+def shutdown_stdout_writer(timeout: float = 2.0) -> None:
+    """排空并停止后台写线程（lifespan 关闭与 atexit 双保险）。"""
+    global _writer_thread
+    with _writer_lock:
+        thread = _writer_thread
+        _writer_thread = None
+    if thread is None or not thread.is_alive():
+        return
+    try:
+        _STDOUT_QUEUE.put_nowait(_STDOUT_SENTINEL)
+    except queue.Full:
+        return
+    thread.join(timeout)
+
+
+@atexit.register
+def _drain_stdout_at_exit() -> None:
+    # 进程退出前排空队列，保证 subprocess 捕获（check_project/smoke）
+    # 能看到全部日志；2 秒超时防性退出路径卡死。
+    shutdown_stdout_writer(2.0)
+
+
 def custom_print(*args, **kwargs):
     """把业务 print 同时推到控制台日志流。
 
@@ -169,7 +246,6 @@ def custom_print(*args, **kwargs):
             # 仅当调用方未显式指定 file 时才捕获进控制台日志流。旧实现
             # 无条件覆盖 file= ——开发者只想写 stderr 的内容被广播进 web
             # 控制台，而实际输出仍走原 file，行为分裂且有泄漏面。
-            import io
             buf = io.StringIO()
             kwargs_for_buffer = dict(kwargs)
             kwargs_for_buffer["file"] = buf
@@ -182,25 +258,43 @@ def custom_print(*args, **kwargs):
 
         try:
             trace = current_trace.get()
-            if trace and raw_msg and trace.id not in raw_msg:
-                original_print(f"[{trace.id}] {redact(raw_msg)}", end=kwargs.get("end", "\n"),
-                               flush=kwargs.get("flush", False))
-            elif raw_msg:
+            # redact 幂等（四个替换互不再生匹配点），整条钩子只算一次，
+            # 旧实现对同一条消息在 stdout 拷贝与推流分支各算一遍（每条
+            # 4 个正则 × 全文扫描，2026-10 去重）。
+            redacted = redact(raw_msg) if raw_msg else raw_msg
+            end, flush = kwargs.get("end", "\n"), kwargs.get("flush", False)
+            # stdout 写入改经有界队列 + 后台写线程：管道背压不再阻塞事件
+            # 循环（见 _stdout_writer_loop 注释）。重定向（测试）或显式
+            # file 之外的同步语义全部保留——sys.stdout 非导入时真实 stdout
+            # 时说明 redirect_stdout/capsys 活跃，走原同步路径。
+            via_queue = (sys.stdout is _REAL_STDOUT)
+            if trace and redacted and trace.id not in redacted:
+                line = f"[{trace.id}] {redacted}"
+            elif redacted:
                 # 无 trace 上下文（启动期/线程池 worker）的 stdout 拷贝同样脱敏：
                 # 旧实现此分支原样输出，Docker 日志/采集端恰在这里拿到明文凭据
                 # （与 SSE 流的 redact 口径不一致，2026-10 修复）。
-                original_print(redact(raw_msg), end=kwargs.get("end", "\n"),
-                               flush=kwargs.get("flush", False))
+                line = redacted
+            else:
+                line = None
+            if line is not None:
+                if via_queue:
+                    _enqueue_stdout(line, end, flush)
+                else:
+                    original_print(line, end=end, flush=flush)
             else:
                 original_print(*args, **kwargs)
         except Exception:
             pass
 
-        if not raw_msg:
+        if not redacted:
             return
 
         try:
-            message = redact(ANSI_ESCAPE.sub('', raw_msg))
+            # 推流分支：ANSI 剥离作用于已脱敏文本（redact 的四个模式不会触及
+            # 控制序列，等价于先剥后脱）；trace.log 内部的 redact 因幂等成为
+            # 纯冗余但无害，保留其防御性。
+            message = ANSI_ESCAPE.sub('', redacted)
             if trace := current_trace.get():
                 if trace.id not in message:
                     message = f"[{trace.id}] {message}"

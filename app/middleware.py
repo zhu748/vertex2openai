@@ -87,13 +87,14 @@ class StatsMiddleware:
         completed = False
         observer = None
         send_failed = False
+        error_counted = False
         connection = ClientConnection()
         scope.setdefault("state", {})["client_connection"] = connection
         receiver = ConnectionReceiver(receive, connection, lambda: trace.end_connection(disconnected=True),
                                       lambda: completed, max_body_bytes=MAX_CHAT_BODY_BYTES)
 
         async def relay(message):
-            nonlocal started, observer, completed, send_failed
+            nonlocal started, observer, completed, send_failed, error_counted
             if message["type"] == "http.response.start":
                 started = True
                 trace.data["http_status"] = message["status"]
@@ -105,6 +106,7 @@ class StatsMiddleware:
                 trace.milestone("response_start", f"开始响应前端：HTTP {message['status']}。")
                 if message["status"] >= 400:
                     stats.add_error()
+                    error_counted = True
                     trace.fail(f"HTTP {message['status']}", message["status"])
             # Await the real server send, including the stream's DONE frame.
             final_body = message["type"] == "http.response.body" and not message.get("more_body", False)
@@ -153,8 +155,13 @@ class StatsMiddleware:
         except Exception as exc:
             if send_failed:
                 raise
-            if not started:
+            # 响应已开始（如 200 流中途应用层异常）同样计入错误：旧行为只在
+            # 未开始时计数，这类请求在大盘上既非 success 也非 error，
+            # total ≠ success + error 的差值永久累积（口径漂移，2026-10 修复）。
+            # error_counted 防止 4xx/5xx start 后再抛异常的双重计数。
+            if not error_counted:
                 stats.add_error()
+                error_counted = True
             trace.fail(str(exc))
             raise
         finally:

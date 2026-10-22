@@ -520,8 +520,14 @@ class LoopbackTests(unittest.IsolatedAsyncioTestCase):
             clients = []
             def factory(raw, resolved):
                 options = {"proxy": resolved, "trust_env": False, "timeout": 2}
+                # 与 app/http_options.py 一致：显式钉住 httpx transport。
+                # 运行环境装有 aiohttp 时，google-genai 会自动切到 aiohttp
+                # 传输层并把 async_client_args 整体展开传给
+                # ClientSession.request(**kwargs)，timeout 形参冲突直接
+                # TypeError；这里保持与生产路径相同的构造方式。
+                async_options = dict(options, transport=httpx.AsyncHTTPTransport())
                 client = genai.Client(vertexai=True, api_key="fake-key", http_options=types.HttpOptions(
-                    base_url="http://unused.invalid", client_args=options, async_client_args=options,
+                    base_url="http://unused.invalid", client_args=options, async_client_args=async_options,
                     retry_options=types.HttpRetryOptions(attempts=1)))
                 clients.append(client)
                 return client

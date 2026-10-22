@@ -15,11 +15,19 @@ async def close_setup_task(setup):
     """
     if not setup.done() and not setup.cancelling():
         setup.cancel()
-    response = (await asyncio.gather(setup, return_exceptions=True))[0]
+    # bounded wait：operation() 若吞掉 CancelledError 不退出，无界 gather 会让
+    # cleanup（在 shield 里被调用）永久挂死、连接滞留；5 秒足够任何合理的
+    # 取消路径收尾，超时后放弃等待但仍然尝试关闭结果（2026-10 加固）。
+    try:
+        response = (await asyncio.wait_for(
+            asyncio.gather(setup, return_exceptions=True), 5.0))[0]
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        response = None
     if isinstance(response, StreamingResponse):
         # getattr 默认值不能急切求值：非 StreamingResponse 形态会先抛 AttributeError。
         close = getattr(response, "aclose", None) or response.body_iterator.aclose
-        await close()
+        with suppress(Exception):
+            await close()
 
 
 HEARTBEAT = object()

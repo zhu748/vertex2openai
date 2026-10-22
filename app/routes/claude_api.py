@@ -426,7 +426,12 @@ async def _express_exact_input_tokens(request_obj, fastapi_request: Request,
     if model_error or not base_model:
         return None
     try:
-        contents = create_gemini_prompt(request_obj.messages, base_model)
+        # 放线程池：create_gemini_prompt 内含远程图片下载（同步 httpx +
+        # DNS + 最多 3 跳重定向 + 代理链重试，单次超时 10s）与 PIL 全图
+        # 压缩——Express 主路径（api_helpers）与 Cookie 路径（cookie_request）
+        # 都已线程化，唯独此处曾在事件循环上直跑：多模态 count_tokens 可把
+        # 整个服务冻结 10~40s，所有并发流的心跳集体停摆（2026-10 修复）。
+        contents = await asyncio.to_thread(create_gemini_prompt, request_obj.messages, base_model)
     except Exception:
         return None
     if not contents:

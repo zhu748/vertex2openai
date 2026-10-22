@@ -42,8 +42,14 @@ class AppState:
         # 写入序号：并发 _save 时防止旧快照覆盖新快照（见 _save）。
         self._save_seq = 0
         self._persisted_seq = 0
+        # 在途写者集合与完成通知：失败回滚前先等更老的在途写者结算，
+        # 避免“后写者回滚把先写者尚未落盘的变更一并抹掉、先写者随后
+        # 落盘成功造成内存/磁盘分叉”的丢失更新（见 _save 失败分支）。
+        self._saved_all = threading.Condition(self._lock)
+        self._inflight: set = set()
         self._state = {}
         self._load_from_disk()
+        self._clean_orphan_temp_files()
         self._committed = copy.deepcopy(self._state)
 
     # ---------- 持久化 ----------
@@ -72,6 +78,7 @@ class AppState:
             backup = f"{STATE_FILE}.corrupt-{int(time.time())}"
             try:
                 os.replace(STATE_FILE, backup)
+                self._prune_corrupt_backups(backup)
                 # 备份继承了原文件的权限：旧版本可能是 0644，而里面同样有
                 # 完整 Cookie，必须与主文件一样立即收紧，否则这个备份会
                 # 永久滞留磁盘且全局可读。
@@ -86,6 +93,40 @@ class AppState:
                 print(f"⚠️ [状态管理器] 配置文件无法读取且备份失败（{e}）；"
                       f"注意：下次成功保存将覆盖该文件。")
 
+    def _prune_corrupt_backups(self, keep: str, limit: int = 2) -> None:
+        """只保留最近 limit 份损坏备份：状态卷持续故障时会半写入循环，
+        .corrupt-* 每次启动叠加一份且每份都含完整 Cookie，无限累积既是
+        磁盘垃圾也是数据残留面（2026-10 补齐）。"""
+        target_dir = os.path.dirname(STATE_FILE) or "."
+        prefix = os.path.basename(STATE_FILE) + ".corrupt-"
+        try:
+            backups = sorted(
+                (name for name in os.listdir(target_dir)
+                 if name.startswith(prefix) and name != os.path.basename(keep)),
+                reverse=True)  # 名含时间戳，字典序即时间序
+            for name in backups[limit - 1:]:
+                try:
+                    os.unlink(os.path.join(target_dir, name))
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+    def _clean_orphan_temp_files(self) -> None:
+        """清理崩溃残留的临时文件：进程在 mkstemp 与 replace 之间被 kill 时
+        .web_state-*.tmp 会永久滞留状态目录（含完整 Cookie），多次崩溃后
+        累积成数据残留面（2026-10 补齐）。"""
+        target_dir = os.path.dirname(STATE_FILE) or "."
+        try:
+            for name in os.listdir(target_dir):
+                if name.startswith(".web_state-") and name.endswith(".tmp"):
+                    try:
+                        os.unlink(os.path.join(target_dir, name))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
     def _save(self) -> None:
         """原子写：先写同目录临时文件再 os.replace（同一文件系统内是原子操作）。
 
@@ -99,48 +140,78 @@ class AppState:
             self._save_seq += 1
             seq = self._save_seq
             snapshot = copy.deepcopy(self._state)
-        with self._io_lock:
-            if seq <= self._persisted_seq:
-                # 已有更新的快照落盘（本写者拿到 IO 锁前被更新者超越）：跳过，防旧盖新。
-                return
-            failure = None
-            try:
-                target_dir = os.path.dirname(STATE_FILE) or "."
-                os.makedirs(target_dir, exist_ok=True)
-                fd, tmp_path = tempfile.mkstemp(prefix=".web_state-", suffix=".tmp", dir=target_dir)
+            self._inflight.add(seq)
+        try:
+            with self._io_lock:
+                if seq <= self._persisted_seq:
+                    # 已有更新的快照落盘（本写者拿到 IO 锁前被更新者超越）：跳过，防旧盖新。
+                    return
+                failure = None
                 try:
-                    with os.fdopen(fd, "w", encoding="utf-8") as f:
-                        json.dump(snapshot, f, ensure_ascii=False, indent=2)
-                        f.flush()
-                        os.fsync(f.fileno())
-                    os.replace(tmp_path, STATE_FILE)
-                except Exception:
+                    target_dir = os.path.dirname(STATE_FILE) or "."
+                    os.makedirs(target_dir, exist_ok=True)
+                    fd, tmp_path = tempfile.mkstemp(prefix=".web_state-", suffix=".tmp", dir=target_dir)
                     try:
-                        os.unlink(tmp_path)
+                        with os.fdopen(fd, "w", encoding="utf-8") as f:
+                            json.dump(snapshot, f, ensure_ascii=False, indent=2)
+                            f.flush()
+                            os.fsync(f.fileno())
+                        os.replace(tmp_path, STATE_FILE)
+                        # fsync 目录条目：POSIX 下 rename 只保证运行时原子，
+                        # 断电时目录项可能未持久化——重启后会退回旧版本且无
+                        # 感知；对目录 fsync 一次补齐崩溃一致性（失败不致命）。
+                        try:
+                            dir_fd = os.open(target_dir, os.O_RDONLY)
+                            try:
+                                os.fsync(dir_fd)
+                            finally:
+                                os.close(dir_fd)
+                        except OSError:
+                            pass
+                    except Exception:
+                        try:
+                            os.unlink(tmp_path)
+                        except OSError:
+                            pass
+                        raise
+                    try:
+                        os.chmod(STATE_FILE, 0o600)   # 里面有完整 Google Cookie
                     except OSError:
                         pass
-                    raise
-                try:
-                    os.chmod(STATE_FILE, 0o600)   # 里面有完整 Google Cookie
-                except OSError:
-                    pass
-                self._persisted_seq = seq
-                # 发布落盘快照必须与写文件处于同一 IO 临界区。若在释放锁后
-                # 发布，较慢的旧写者会覆盖新写者的回滚基准；下一次保存失败
-                # 就会把内存中的 Key / Cookie / 设置退回已经过时的版本。
-                self._committed = snapshot
-            except Exception as e:
-                failure = e
+                    self._persisted_seq = seq
+                    # 发布落盘快照必须与写文件处于同一 IO 临界区。若在释放锁后
+                    # 发布，较慢的旧写者会覆盖新写者的回滚基准；下一次保存失败
+                    # 就会把内存中的 Key / Cookie / 设置退回已经过时的版本。
+                    self._committed = snapshot
+                except Exception as e:
+                    failure = e
+        finally:
+            with self._lock:
+                self._inflight.discard(seq)
+                self._saved_all.notify_all()
         # _save 的状态快照和失败回滚均在 IO 临界区外获取状态锁，磁盘写入
         # 不阻塞 getter。变更器也必须在退出状态锁之后调用 _save。
         if failure is not None:
             print(f"⚠️ [状态管理器] 无法保存状态到磁盘: {failure}")
+            rolled_back = False
             with self._lock:
+                # 先等更老的在途写者结算（它们可能正在把包含本写者之前变更
+                # 的快照写向磁盘）：不等就回滚会把先写者的变更一并抹掉，
+                # 而先写者随后落盘成功会得到内存与磁盘的分叉（丢失更新，
+                # 2026-10 修复）。等待在专用 worker 线程里，不阻塞事件循环。
+                while any(s < seq for s in self._inflight):
+                    self._saved_all.wait()
                 # 仅当自己是最新写者时回滚（旧语义：本更新已回滚）；
                 # 已有更新写者在途时回滚会覆盖别人的待写状态。
                 if seq >= self._save_seq:
                     self._state = copy.deepcopy(self._committed)
-            raise StatePersistenceError("配置保存失败，请检查状态目录权限和磁盘空间；本次更新已回滚。") from failure
+                    rolled_back = True
+            if rolled_back:
+                raise StatePersistenceError(
+                    "配置保存失败，请检查状态目录权限和磁盘空间；本次更新已回滚。") from failure
+            raise StatePersistenceError(
+                "配置保存失败，请检查状态目录权限和磁盘空间；已有更新的写入在途，"
+                "本次更新可能未生效，请刷新后重试。") from failure
 
     def reload(self) -> None:
         """显式从磁盘重载（外部改了文件时用）。"""
@@ -503,7 +574,10 @@ class AppState:
             accepted = 0
             for k, v in patch.items():
                 if k in app_config.DEFAULT_SETTINGS and k != "model_overrides":
-                    current[k] = v
+                    # 深拷贝入参：写侧存引用、读侧深拷贝的不对称会让复用可变
+                    # dict/list 的调用方静默污染内存态（不触发落盘），防御性
+                    # 对齐读侧口径（2026-10 补齐）。
+                    current[k] = copy.deepcopy(v)
                     accepted += 1
             if "proxy_urls" in patch or "proxy_url" in patch:
                 proxies = parse_proxy_list(patch.get("proxy_urls") if "proxy_urls" in patch else patch["proxy_url"])

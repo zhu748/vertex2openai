@@ -1,4 +1,5 @@
 import random
+import threading
 from typing import List, Optional
 import config as app_config
 from runtime_state import app_state
@@ -18,6 +19,12 @@ class ExpressKeyManager:
     """
 
     def __init__(self):
+        # 轮询游标的读-改-写持锁：当前调用点都在事件循环线程内串行执行，
+        # 但项目已有把热路径工作迁入 to_thread 的先例（api_helpers 的消息
+        # 转换、图片压缩等），一旦 Key 选择同样被并发化，无锁游标会退化成
+        # 有偏随机（两请求拿到同一 index）。与 credential_manager._select
+        # 的持锁口径对齐（2026-10 补齐）。
+        self._rr_lock = threading.Lock()
         self.round_robin_index: int = 0
 
     # ---------- 读取 ----------
@@ -51,16 +58,17 @@ class ExpressKeyManager:
         if not records:
             print("❌ [密钥配置] 未配置任何 Express API Key，无法调用 Gemini Express Mode。")
             return None
-        if self.round_robin_index >= len(records):
-            self.round_robin_index = 0
-        original_idx = self.round_robin_index
-        for offset in range(len(records)):
-            candidate = (self.round_robin_index + offset) % len(records)
-            if records[candidate]["key"] != exclude_key:
-                original_idx = candidate
-                break
+        with self._rr_lock:
+            if self.round_robin_index >= len(records):
+                self.round_robin_index = 0
+            original_idx = self.round_robin_index
+            for offset in range(len(records)):
+                candidate = (self.round_robin_index + offset) % len(records)
+                if records[candidate]["key"] != exclude_key:
+                    original_idx = candidate
+                    break
+            self.round_robin_index = (original_idx + 1) % len(records)
         rec = records[original_idx]
-        self.round_robin_index = (original_idx + 1) % len(records)
         print(f"🔑 [密钥选择] 已按轮询策略选择第 {original_idx + 1} 个 Express API Key"
               f"（项目：{rec.get('project_id') or '未探测'}）。")
         return dict(rec, index=original_idx)
@@ -72,5 +80,6 @@ class ExpressKeyManager:
         return self.get_random_express_record(exclude_key)
 
     def refresh_keys(self):
-        self.round_robin_index = 0
+        with self._rr_lock:
+            self.round_robin_index = 0
         print(f"🔄 [密钥刷新] 当前共 {self.get_total_keys()} 个可用 Express API Key。")

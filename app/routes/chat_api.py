@@ -233,6 +233,26 @@ async def _resumable_stream(fastapi_request: Request, request_obj: OpenAIRequest
         resp = setup_task.result()
         if not isinstance(resp, StreamingResponse):
             return resp
+    else:
+        # 慢路径：HTTP 200 + SSE 已经发给本次客户端，后台 setup 稍后失败时
+        # 异常/错误响应只会进缓冲（错误帧），middleware 永远看不到——大盘
+        # 上既非 success 也非 error（total ≠ success + error 永久漂移）。
+        # 快路径（0.05s 内完成）由 result() re-raise / 真实状态码走 middleware
+        # 计数，这里只补慢路径且每 setup_task 一次，无双计（2026-10 修复）。
+        slow_path = True
+
+        def _count_slow_failure(task: asyncio.Task) -> None:
+            if not slow_path or task.cancelled():
+                return  # 取消（淘汰/停机）不算失败
+            exc = None
+            try:
+                exc = task.exception()
+            except asyncio.CancelledError:
+                return
+            if exc is not None or not isinstance(task.result(), StreamingResponse):
+                stats.add_error()
+
+        setup_task.add_done_callback(_count_slow_failure)
 
     return StreamingResponse(
         sse_from_buffer(buf, 0),
