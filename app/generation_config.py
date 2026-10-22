@@ -8,6 +8,7 @@ import config as app_config
 import model_capabilities as mc
 from models import OpenAIRequest, normalize_content_part
 from runtime_state import app_state
+from schema_validation import sanitize_for_gemini
 
 
 _TEXT_SAFETY_CATEGORIES = (
@@ -93,7 +94,10 @@ def _response_format(request: OpenAIRequest) -> dict[str, Any]:
     if fmt["type"] == "json_schema" and isinstance(json_schema, dict):
         schema = json_schema.get("schema")
         if isinstance(schema, dict):
-            result["response_schema"] = {key: value for key, value in schema.items() if key != "$schema"}
+            # 方言净化：OpenAI 宽松写法（空节点/{} / type 数组）会被 Gemini
+            # 服务端以 400 "missing field" 拒绝，或令 SDK 序列化崩溃。
+            result["response_schema"] = sanitize_for_gemini(
+                {key: value for key, value in schema.items() if key != "$schema"})
     return result
 
 
@@ -110,7 +114,9 @@ def _function_tools(request: OpenAIRequest) -> list[dict]:
         }
         parameters = declaration.get("parameters")
         if isinstance(parameters, dict):
-            declaration["parameters"] = {key: value for key, value in parameters.items() if key != "$schema"}
+            # 与 response_schema 同一严格 proto 校验：工具参数同样需要方言净化。
+            declaration["parameters"] = sanitize_for_gemini(
+                {key: value for key, value in parameters.items() if key != "$schema"})
         declarations.append(declaration)
     return [{"function_declarations": declarations}] if declarations else []
 
