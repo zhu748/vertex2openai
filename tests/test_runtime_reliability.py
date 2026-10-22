@@ -377,11 +377,27 @@ class SdkTests(unittest.IsolatedAsyncioTestCase):
         metadata = types.GenerateContentResponseUsageMetadata(
             prompt_token_count=10, candidates_token_count=5, thoughts_token_count=7,
             tool_use_prompt_token_count=3, total_token_count=25)
-        expected = {"prompt_tokens": 13, "completion_tokens": 12, "total_tokens": 25}
+        expected = {"prompt_tokens": 13, "completion_tokens": 12, "total_tokens": 25,
+                    "completion_tokens_details": {"reasoning_tokens": 7}}
         self.assertEqual(map_usage(metadata), expected)
         response = types.GenerateContentResponse(usage_metadata=metadata)
         self.assertEqual(api_helpers._record_usage(response), expected)
         self.assertEqual(message_processing.convert_to_openai_format(response, "gemini-test")["usage"], expected)
+
+    async def test_usage_details_only_present_when_nonzero(self):
+        # 无思考 / 无缓存命中：不携带 details 键（对老客户端保持字节级兼容）
+        metadata = types.GenerateContentResponseUsageMetadata(
+            prompt_token_count=10, candidates_token_count=5, total_token_count=15)
+        self.assertEqual(map_usage(metadata),
+                         {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15})
+        # 命中隐式缓存：prompt_tokens_details.cached_tokens 细分（Anthropic 侧
+        # 映射 cache_read_input_tokens 的数据来源）
+        metadata = types.GenerateContentResponseUsageMetadata(
+            prompt_token_count=100, candidates_token_count=5,
+            cached_content_token_count=60, total_token_count=105)
+        self.assertEqual(map_usage(metadata), {
+            "prompt_tokens": 100, "completion_tokens": 5, "total_tokens": 105,
+            "prompt_tokens_details": {"cached_tokens": 60}})
 
     async def test_success_without_usage_is_still_counted(self):
         api_helpers._record_usage(SimpleNamespace(usage_metadata=None))

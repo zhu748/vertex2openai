@@ -47,7 +47,8 @@ class StatsMiddleware:
         path = scope.get("path", "")
         method = scope.get("method", "")
         tracked = scope["type"] == "http" and method == "POST" and (
-            path == "/v1/chat/completions" or path.startswith(("/v1/models/", "/v1beta/models/")))
+            path == "/v1/chat/completions" or path == "/v1/messages"
+            or path.startswith(("/v1/messages/", "/v1/models/", "/v1beta/models/")))
         # 登录端点单独限流：不计入请求统计（避免大盘被登录轮询污染），
         # 也不建 trace；只做体积防护。
         if (not tracked and scope["type"] == "http" and method == "POST"
@@ -133,11 +134,18 @@ class StatsMiddleware:
             if started or send_failed:
                 raise
             print(f"⚠️ [体积限制] {path}：{exc}")
-            response = JSONResponse(
-                status_code=413,
-                content={"error": {"message": f"请求体超过 {MAX_CHAT_BODY_BYTES // (1024 * 1024)}MiB 上限。",
-                                  "type": "invalid_request_error", "code": 413}},
-            )
+            message = f"请求体超过 {MAX_CHAT_BODY_BYTES // (1024 * 1024)}MiB 上限。"
+            if path == "/v1/messages" or path.startswith("/v1/messages/"):
+                # Claude 生态客户端：Anthropic 错误形状（懒加载避免模块级
+                # 依赖顺序变化；此兜底分支本身极少命中）。
+                from routes import claude_api as _claude_api
+                response = _claude_api.claude_error(413, "invalid_request_error", message)
+            else:
+                response = JSONResponse(
+                    status_code=413,
+                    content={"error": {"message": message,
+                                      "type": "invalid_request_error", "code": 413}},
+                )
             await response(scope, receive, relay)
             return
         except (asyncio.CancelledError, ClientDisconnect):

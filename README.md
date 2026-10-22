@@ -25,6 +25,8 @@ Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风
   - Express API Key：多 Key 随机或轮询调用官方 SDK。
   - Cookie 直连反代：Cookie + SAPISIDHASH 直连 `batchGraphql`，走网页端配额（含最新预览模型），真流式、防 60s 超时。**注意：走的是私有接口，见下方风险提示。**
 - **OpenAI 兼容接口**：`GET /v1/models`、`POST /v1/chat/completions`。
+- **Claude（Anthropic）兼容接口**：`POST /v1/messages`、`POST /v1/messages/count_tokens`、
+  `GET /api/hello`；`GET /v1/models` 按请求头自动切换 Anthropic 目录格式。
 - **管理控制台（浅色风格，单文件，免构建）**
   - **仅密码登录**：打开根路径 `/`，输入密码（即 `API_KEY`）即可，无需账号。
   - 标准模式 / Cookie 直连 / Key + Cookie 混合模式在线切换；每个账号可独立启停。
@@ -187,6 +189,73 @@ curl -s https://你的域名/v1beta/models -H "x-goog-api-key: 你的API_KEY"
   fallback 行为一致；其余错误仍原样透传。
 - **客户端接入示例**（google-genai / Cherry Studio / LobeChat 等）：API Base 填
   `https://你的域名/`，API Key 填本服务 `API_KEY`，选 "Gemini / Google" 供应商类型即可。
+
+## Claude（Anthropic）格式端点
+
+本服务提供 **Anthropic Messages API 兼容端点**，供 Claude Code、Anthropic SDK、
+Claude Code Router、Cherry Studio 等说 Claude 协议的客户端直接接入——请求被翻译成
+内部 OpenAIRequest 后**完全复用** `/v1/chat/completions` 的上游管线（Express Key /
+Cookie 双通道调度、重试、抗截断、预填充兼容、思考档位、安全设置），再把响应翻译回
+Anthropic 格式（协议实现口径对齐 [vertex-master](https://github.com/zhu748/vertex-master) 的
+anthropic_handler）：
+
+```bash
+# 非流式
+ curl -s https://你的域名/v1/messages \
+  -H "x-api-key: 你的API_KEY" -H "anthropic-version: 2023-06-01" -H "Content-Type: application/json" \
+  -d '{"model":"claude-sonnet-4-5","max_tokens":1024,"messages":[{"role":"user","content":"你好"}]}'
+
+# SSE 流式（stream:true，事件序列 message_start → content_block_* → message_delta → message_stop）
+curl -N https://你的域名/v1/messages -H "x-api-key: 你的API_KEY" ... -d '{...,"stream":true}'
+
+# Token 计数（Claude Code 上下文管理依赖）
+curl -s https://你的域名/v1/messages/count_tokens -H "x-api-key: 你的API_KEY" \
+  -d '{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"你好"}]}'
+```
+
+要点：
+
+- **鉴权四种写法任选**：`x-api-key: <API_KEY>`（Anthropic 标准）、`Authorization: Bearer <API_KEY>`、
+  `x-goog-api-key: <API_KEY>`、`?key=<API_KEY>`（与其它端点同一把 Key，常量时间比较校验）；
+  401/400 等错误一律返回 Anthropic 错误形状 `{"type":"error","error":{...},"request_id":...}`。
+- **模型名映射**：`claude-opus-*` → 最新 Pro、`claude-sonnet-*` → 最新 Flash、
+  `claude-haiku-*` → Flash-Lite（静态别名表 + 模型目录热启发）；`gemini-*` 名字原样透传，
+  Claude 客户端也可直接用 Gemini 模型及其 `-search` / 抗截断后缀变体。
+- **思考兼容**：`thinking.budget_tokens`（整数 ≥1024）映射到内部思考档位
+  （≤1024 → low、≤8192 → medium、>8192 → high；`disabled` → off、`adaptive` → 跟随默认）；
+  优先级对齐 vertex-master：`thinking` 的 enabled/disabled 钉住档位，
+  `output_config.effort`（low/medium/high/xhigh/max/auto/default）仅在 thinking
+  缺失或 adaptive 时生效（effort 校验始终执行，非法值照样 400）；
+  `thinking.display: "omitted"` 时响应侧不回传思考块（模型照常思考、
+  reasoning_tokens 照计用量）；`summarized` 无法摘要、按完整回传（有意偏差）；
+  历史中 assistant 的 `thinking` / `redacted_thinking` 块静默丢弃（Gemini 无法消费
+  Anthropic 思考签名）；响应侧思考块携带 SHA-256 伪签名（非空，满足 SDK 历史校验）。
+- **工具兼容**：`tools[].input_schema` → 函数参数 schema；`tool_choice`
+  （auto/any/none/tool → OpenAI 同义档位）；`tool_use` / `tool_result` 块双向转换，
+  tool_result 纯文本拼接为字符串、复杂块剥离 `cache_control` 后整体透传；流式中工具
+  参数分片先累积，收尾时以一条完整 `input_json_delta` 下发（对齐 vertex-master）。
+- **流式保活**：`message_start` 先行（不等上游首字节）；上游心跳注释帧与 10s 空闲窗口
+  均转换为 `event: ping`——长思考场景 Gemini 可能 10-30s 不发内容，没有 ping 会导致
+  Claude Code SDK 误判超时断连；上游错误帧转换为 `event: error`，不改 HTTP 状态码。
+- **count_tokens 两级口径**：配置了 Express Key 时优先调 Vertex `countTokens`
+  拿模型侧精确计数（消息 contents + system_instruction + 工具声明全部计入，
+  与真实生成请求同一分词器；比 vertex-master 只计 contents 多算工具声明，
+  对齐 Anthropic 官方口径）；纯 Cookie 通道或精确计数失败时回退启发式估算
+  （CJK ≈ 1 token/字、其余 ≈ 4 字符/token），量级正确、非逐 token 精确。
+- **方法约束 405**：`/v1/messages` 与 count_tokens 仅接受 POST、`/api/hello`
+  仅接受 GET/HEAD，其余方法一律 405 + Anthropic 错误形状（对齐 vertex-master；
+  FastAPI 默认 405 是 `{"detail":...}` 形状，Claude 客户端无法解析）。
+- **模型目录双格式**：Anthropic 客户端访问 `GET /v1/models` 得 Anthropic List
+  Models 形状（claude 别名 + Gemini 模型）；`GET /v1/models/{id}` 单模型检索
+  同样双格式（Anthropic `models.retrieve` / OpenAI `models.retrieve`），
+  未知模型分别返回 `not_found_error` / `detail` 形状的 404。
+- **`cache_control` 全程剥离**（含 tool_result 复杂块，不做计费，`cache_*_tokens` 恒 0）；
+  中途 system 消息（Claude Code queued steering）降级为 user 轮；`stop_reason` 映射
+  tool_use / max_tokens / refusal / end_turn；`anthropic-version` / `anthropic-beta`
+  头放行不校验。
+- **Claude Code 接入**：`ANTHROPIC_BASE_URL=https://你的域名`、
+  `ANTHROPIC_AUTH_TOKEN=你的API_KEY`、`ANTHROPIC_MODEL=claude-sonnet-4-5`（或
+  `ANTHROPIC_SMALL_FAST_MODEL=claude-haiku-4-5`）。
 
 ## Cookie 通道浏览器档案（curl_cffi）
 

@@ -2,6 +2,42 @@
 
 基于原版 `vertex2openai-main`（2026-09-01），持续完善兼容性、可靠性和代码组织。
 
+## 2026-10-22 Claude（Anthropic）Messages API 兼容层
+
+对齐 vertex-master anthropic_handler 的完整协议兼容，Claude Code / Anthropic SDK /
+Claude Code Router 等客户端可直连本服务：
+
+- 新增 `POST /v1/messages`（流式 + 非流式）、`POST /v1/messages/count_tokens`、
+  `GET /api/hello` 三端点；协议转换纯逻辑独立于 `app/claude_protocol.py`，
+  上游完全复用 `/v1/chat/completions` 管线（双通道调度、重试、抗截断、预填充、思考档位）。
+- 鉴权兼容 `x-api-key` / `Bearer` / `x-goog-api-key` / `?key=`；全部错误（含 413、
+  上游透传、鉴权）返回 Anthropic 形状 `{"type":"error","error":{...},"request_id":...}`。
+- 思考兼容：`thinking.budget_tokens` → 内部档位（≤1024 low / ≤8192 medium / >8192 high）、
+  `disabled` → off、`adaptive` → 默认；优先级对齐 vertex-master——`thinking` 的
+  enabled/disabled 钉住档位，`output_config.effort` 仅在 thinking 缺失或 adaptive 时生效
+  （effort 校验始终执行）；`thinking.display: "omitted"` 响应侧不回传思考块（模型照常
+  思考、用量照计，对齐 includeThoughts 口径）；历史
+  thinking 块静默丢弃；响应侧思考块带 SHA-256 伪签名（流式增量哈希）。
+- 流式状态机：`message_start` 先行、10s 空闲补 `event: ping` 保活（防 Claude Code SDK
+  误判超时）、工具块延迟到收尾统一发射并单条完整 `input_json_delta` 下发；
+  有界帧队列背压防慢客户端堆内存。
+- 用量保真：`cache_read_input_tokens`（上游隐式缓存命中）与
+  `output_tokens_details.thinking_tokens` 细分透传，ccusage 成本统计可用。
+- count_tokens 两级口径：有 Express Key 时调 Vertex `countTokens` 拿模型侧精确计数
+  （contents + system_instruction + 工具声明，与生成同分词器；模型路径按 Key 项目钉定）；
+  失败或纯 Cookie 通道回退启发式估算（CJK ≈ 1 token/字、其余 ≈ 4 字符/token，
+  正则批量计数，38 万字符 ~11ms）。
+- 方法约束 405 Anthropic 形状：`/v1/messages` / count_tokens 仅 POST、`/api/hello` 仅
+  GET/HEAD，其余方法 405（FastAPI 默认 405 是 `{"detail":...}` 形状，Claude 客户端无法解析）。
+- `GET /v1/models` 按请求头切换 Anthropic / OpenAI 目录格式；新增
+  `GET /v1/models/{id}` 单模型检索双格式（Anthropic / OpenAI `models.retrieve`），
+  404 按客户端协议分别返回 `not_found_error` / `detail` 形状。
+- `cache_control` 全程剥离（含 tool_result 复杂块透传路径）；中途 system 消息降级
+  user 轮；tool_choice / stop_reason / 错误类型表全量映射。
+- 测试卫生：multi_credentials 测试的状态污染（`channel_mode=mixed` 泄漏到同进程
+  后续测试文件）修复为快照回滚，全量套件在单进程下恢复可信信号（原先 6 个
+  顺序依赖失败）；新增 62 个 Claude 协议测试与 `scripts/smoke_claude_round3.py` E2E 冒烟。
+
 ## 2026-10-21 深度复审：配置一致性、媒体保真与流完整性
 
 - 配置持久化在同一 IO 临界区发布成功快照，修复并发写入完成顺序倒置后，下一次保存失败把内存退回旧设置的问题；显式重载会作废尚未写入的旧快照。

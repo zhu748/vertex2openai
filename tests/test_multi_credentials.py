@@ -38,6 +38,15 @@ class StateFixture:
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(dir=_TEMP.name)
         self.addCleanup(self.directory.cleanup)
+        # 快照并回滚全局单例：本文件大量用 set_channel_mode("mixed") /
+        # set_express_keys([]) 改写 app_state；只重置不回滚会把 mixed 模式
+        # 泄漏给同进程后执行的测试文件（request_tracking / socket_recovery /
+        # streaming_optimizations 的 mock upstream 不接受 credential_record
+        # 关键字，mixed 路径必炸），整仓全量套件的信号因此不可信。
+        self._saved_state = app_state._state
+        self._saved_committed = app_state._committed
+        self.addCleanup(setattr, app_state, "_state", self._saved_state)
+        self.addCleanup(setattr, app_state, "_committed", self._saved_committed)
         for patch in (
             mock.patch.object(runtime_state, "STATE_FILE", str(Path(self.directory.name) / "web_state.json")),
             mock.patch.object(config, "GOOGLE_COOKIE", None),

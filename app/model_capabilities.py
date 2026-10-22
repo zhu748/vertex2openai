@@ -14,6 +14,8 @@
 - thinking: ai.google.dev/gemini-api/docs/thinking
 - 3.6/3.5 开发指南（采样弃用 + 预填充 400 + 去 candidate_count）
 - 生图: ai.google.dev/gemini-api/docs/image-generation ；Agent Platform 3-pro-image / 3-1-flash-image
+- per-model 官方档位表与档位收敛：vertex-master internal/transform/thinking.go
+  （thinkingKindForModel / supportedThinkingLevel / thinkingLevelForBudget，核对于 2026-10-22）
 """
 
 import re
@@ -49,6 +51,10 @@ _NANO_BANANA_ARS = _PRO_IMAGE_ARS
 #   MINIMAL 仅 Gemini 3 Flash / 3.1 Flash-Lite 有；
 #   MEDIUM 覆盖 Gemini 3 Flash / 3.1 Pro / 3.1 Flash-Lite；
 #   LOW / HIGH 所有 3.x 都有。
+# 补充核对（vertex-master thinking.go，2026-10-22）：
+#   gemini-3-pro(-preview) 官方仅 LOW/HIGH 两档，MEDIUM 会 400 → 折叠到 HIGH；
+#   3.7/3.8 Flash 与 Gemini 4 Argon 仅 LOW/MEDIUM/HIGH；
+#   3.1-flash-image(-lite) 仅 MINIMAL/HIGH。
 _LEVEL_ORDER = ["minimal", "low", "medium", "high"]
 
 # MINIMAL 的可用性上界（含）：3.6 及更早的非 Pro 机型实测/文档支持 MINIMAL
@@ -91,6 +97,30 @@ def _clamp_level(level: str, levels: set) -> str:
         if _LEVEL_ORDER[i] in levels:
             return _LEVEL_ORDER[i]
     return sorted(levels)[0]
+
+
+def _collapse_level(level: str, levels: set) -> str:
+    """把请求档位折叠到该模型的合法档位集合。
+
+    对齐 vertex-master internal/transform/thinking.go supportedThinkingLevel
+    的收敛语义：档位在集合内 → 原样；两档模型缺 MEDIUM 时 MEDIUM → HIGH
+    （向上折叠——用户选 medium 的意图是"要可观思考"，压到低档违背意图，
+    且直接下发 MEDIUM 会 400）；其余一律向下就近（NONE/MINIMAL/LOW 压到
+    模型最低合法档，保住 P0-1 "调低=少思考"的方向性）。
+
+    等价于 vertex-master 四类模型的收敛表：
+    - LevelsLowHigh（3-pro-preview）：NONE/MINIMAL/LOW→LOW，MEDIUM/HIGH→HIGH
+    - LevelsNoMinimal（3.1-pro / 3.7/3.8-flash / 4-argon）：NONE/MINIMAL→LOW
+    - LevelsMinimalHigh（3.1-flash-image）：NONE/MINIMAL/LOW→MINIMAL，MEDIUM→HIGH
+    - LevelsAll（3.6- Flash）：NONE→MINIMAL
+    """
+    if not levels:
+        return "low"
+    if level in levels:
+        return level
+    if level == "medium" and "high" in levels:
+        return "high"     # 缺 MEDIUM 的两档模型：向上折叠（对齐 vertex-master）
+    return _clamp_level(level, levels)
 
 
 def sort_levels(levels) -> list:
@@ -211,7 +241,12 @@ def _compute_profile(name: str) -> Dict[str, Any]:
         # temperature/top_p/top_k：自 3.6 Flash / 3.5 Flash-Lite 起（及所有更新/未来模型）已废弃，
         # 官方要求从请求移除（现忽略、未来 400）；更早的 3.x 仍可用但建议保持默认。
         levels = {"low", "medium", "high"}
-        if _supports_minimal(major, minor, is_pro):
+        if is_pro and major == 3 and minor == 0:
+            # Gemini 3 Pro（含 -preview）：官方档位仅 LOW/HIGH 两档
+            # （vertex-master thinkingModelLevelsLowHigh）——下发 MEDIUM 会 400，
+            # 在 resolve_thinking 里向上折叠到 HIGH。
+            levels = {"low", "high"}
+        elif _supports_minimal(major, minor, is_pro):
             levels = levels | {"minimal"}
         if "flash-lite" in name and "minimal" in levels:
             default_level = "minimal"
@@ -255,7 +290,7 @@ _EFFORT_ALIASES = {
     "min": "minimal", "minimal": "minimal",
     "low": "low", "medium": "medium", "med": "medium",
     "high": "high", "max": "high", "xhigh": "high", "x-high": "high", "very_high": "high",
-    "none": "off", "off": "off",
+    "none": "off", "off": "off", "disabled": "off",
 }
 
 
@@ -328,14 +363,16 @@ def resolve_thinking(model_name: str, request: Any, settings: Dict[str, Any],
         levels = prof["thinking_levels"]
         if suppress:
             # 压制：3.x 无法完全关闭思考 → 压到该模型最低合法档并隐藏
-            return {"mode": "level", "level": _clamp_level("minimal", levels),
+            # （NoMinimal 模型上 minimal 收敛为 low，对齐 vertex-master NONE→LOW）
+            return {"mode": "level", "level": _collapse_level("minimal", levels),
                     "include_thoughts": False}
         level = req_effort or settings.get("thinking_g3_level") or prof.get("default_level", "high")
         level = str(level).lower()
         if level in ("off", "none"):
             level = "minimal"
-        # 统一就近向下夹取：Pro 上选 minimal 得到 low，而不是被抬成 high
-        level = _clamp_level(level, levels)
+        # 折叠到该模型合法档位（缺 MEDIUM 的两档模型上 MEDIUM→HIGH，
+        # 其余向下就近；对齐 vertex-master supportedThinkingLevel）
+        level = _collapse_level(level, levels)
         return {"mode": "level", "level": level, "include_thoughts": include_thoughts}
 
     return {"mode": None}

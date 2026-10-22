@@ -20,9 +20,19 @@ def map_usage(metadata: Any) -> dict[str, int]:
     prompt = count("prompt_token_count", "promptTokenCount")
     prompt += count("tool_use_prompt_token_count", "toolUsePromptTokenCount")
     completion = count("candidates_token_count", "candidatesTokenCount")
-    completion += count("thoughts_token_count", "thoughtsTokenCount")
+    thoughts = count("thoughts_token_count", "thoughtsTokenCount")
+    completion += thoughts
+    cached = count("cached_content_token_count", "cachedContentTokenCount")
     total = count("total_token_count", "totalTokenCount") or (prompt + completion)
-    return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}
+    usage: dict[str, Any] = {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}
+    # 细分字段仅在非零时携带（与 OpenAI 官方同形的增量字段，老客户端可安全忽略）：
+    # cached → Anthropic 侧映射 cache_read_input_tokens；thinking → 映射
+    # output_tokens_details.thinking_tokens（Claude 生态成本统计依赖这两个细节）。
+    if cached:
+        usage["prompt_tokens_details"] = {"cached_tokens": cached}
+    if thoughts:
+        usage["completion_tokens_details"] = {"reasoning_tokens": thoughts}
+    return usage
 
 
 def wants_usage(request_obj: Any) -> bool:

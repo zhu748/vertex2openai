@@ -71,18 +71,25 @@ def _extract_usage(resp: Any) -> tuple[int, int, int]:
 
 
 def _record_usage(resp: Any) -> dict:
-    """记录 token 用量，并打印上游实际返回的流量等级。"""
+    """记录 token 用量，并打印上游实际返回的流量等级。
+
+    返回完整 map_usage 结果（含 prompt_tokens_details / completion_tokens_details
+    细分字段，供响应体透传——Claude 侧映射 cache_read_input_tokens 与
+    output_tokens_details.thinking_tokens 依赖这两个细节）。
+    """
     usage_metadata = getattr(resp, "usage_metadata", None)
     traffic_type = getattr(usage_metadata, "traffic_type", None) if usage_metadata else None
     if traffic_type:
         value = getattr(traffic_type, "value", None) or str(traffic_type)
         print(f"🚦 [流量等级] 上游实际 traffic_type={value}")
 
-    p_tk, c_tk, t_tk = _extract_usage(resp)
+    usage = map_usage(usage_metadata)
+    record_usage(usage)
+    p_tk, c_tk = usage["prompt_tokens"], usage["completion_tokens"]
     stats.add_tokens(p_tk, c_tk)
     if p_tk or c_tk:
-        print(f"💰 [算力消耗统计] 提示词: {p_tk} | 思考与生成: {c_tk} | 总计: {t_tk} Tokens")
-    return {"prompt_tokens": p_tk, "completion_tokens": c_tk, "total_tokens": t_tk}
+        print(f"💰 [算力消耗统计] 提示词: {p_tk} | 思考与生成: {c_tk} | 总计: {usage['total_tokens']} Tokens")
+    return usage
 
 
 def is_gemini_response_valid(response: Any) -> bool:
