@@ -344,7 +344,9 @@ TCP+TLS 握手（每次约省 100~300ms 与相应 CPU）；429 重试场景收�
 
 ### 多账号与混合模式配置
 
-控制台「通道与凭证」支持三种模式：仅 Express Key、仅 Cookie、Key + Cookie 混合。每条记录可独立启用或停用，账号数量可以为一个或多个。Cookie 的 Project ID 和代理始终跟随该账号，请勿把其他账号的 Cookie 与项目混用。结构化输出请求会在混合模式中只选择 Express Key；Gemini 原生 REST 调用仍要求 Express Key。
+控制台「通道与凭证」支持三种模式：仅 Express Key、仅 Cookie、Key + Cookie 混合。每条记录可独立启用或停用，账号数量可以为一个或多个。Cookie 的 Project ID 和代理始终跟随该账号，请勿把其他账号的 Cookie 与项目混用。结构化输出请求默认在混合模式中只选择 Express Key；Cookie 通道的结构化输出可经控制台开关 `cookie_structured_output` 显式启用（见下）。Gemini 原生 REST 调用仍要求 Express Key。
+
+> **Cookie 通道结构化输出（`cookie_structured_output`，默认关）**：batchGraphql 私有协议对 `responseMimeType` / `responseSchema` 的接受度没有官方承诺，离线无法验证，因此默认对 `response_format` 显式 400 并提示改用 Express 通道。要启用：先在部署环境运行 `python scripts/probe_cookie_structured_output.py --model 模型名`（凭证取 `--cookie/--project-id`、环境变量或加 `--use-state` 读控制台记录），脚本直连上游跑 json_object / 严格 schema / json_patch 宽松方言三档用例并给出「完全可开 / 仅 JSON 模式 / 不可开」结论；探测通过后在控制台「运行设置」打开开关。开启后转换链与工具参数完全一致：`sanitize_for_gemini`（OpenAI 宽松方言 → Gemini 严格方言，空节点/`type` 数组/元组 `items` 自动净化）→ Studio 私有 UI Schema。若探测报告 `QUERY_SIGNATURE_NOT_FOUND` 或未知字段错误，说明 Google 已改私有协议，保持开关关闭即可，其余功能不受影响。
 
 例如在 `.env` 中填写（以下均为占位值）：
 

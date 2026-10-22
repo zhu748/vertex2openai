@@ -1360,6 +1360,30 @@
            。
           </div>
          </div>
+         <div>
+          <div class="flex items-center justify-between">
+           <span class="text-sm">
+            Cookie 通道结构化输出
+            <button aria-controls="h_cso" aria-expanded="false" aria-label="展开说明" class="helpq" onclick="hlp(this,'h_cso')" type="button">?</button>
+           </span>
+           <label class="switch">
+            <input aria-label="Cookie 通道结构化输出" id="cookie_structured_output" type="checkbox"/>
+            <span class="slider">
+            </span>
+           </label>
+          </div>
+          <div class="helpbox" id="h_cso">
+           允许 Cookie 通道处理
+           <code>
+            response_format
+           </code>
+           （json_object / json_schema）。默认关闭：私有协议对该字段族的接受度未经真机验证。
+           <b>
+            开启前请先运行 scripts/probe_cookie_structured_output.py 探测
+           </b>
+           ；探测失败请保持关闭并改用 Express 通道。
+          </div>
+         </div>
         </div>
        </div>
        <div class="card settings-card">

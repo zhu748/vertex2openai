@@ -54,7 +54,13 @@ async def _call_upstream(request_obj: OpenAIRequest, fastapi_request: Request):
     async def prepare():
         async with asyncio.timeout(max(0.001, deadline - time.monotonic())):
             if app_state.get_channel_mode() == "mixed":
-                structured = bool(request_obj.response_format and request_obj.response_format.get("type") not in (None, "text"))
+                # 结构化输出默认只选 Express（Cookie 私有协议未验证）；控制台
+                # 打开 cookie_structured_output 后 Cookie 记录同样参与选择。
+                structured = bool(
+                    request_obj.response_format
+                    and request_obj.response_format.get("type") not in (None, "text")
+                    and not app_state.get_setting("cookie_structured_output", False)
+                )
                 record = credential_manager.get_mixed_record(
                     fastapi_request.app.state.express_key_manager, express_only=structured)
                 if record is None:

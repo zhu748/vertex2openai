@@ -152,6 +152,13 @@ DEFAULT_SETTINGS = {
     # （旧键名 cookie_debug 保留为别名，只作用于 Cookie 通道的额外诊断）
     "debug_outbound": False,
     "cookie_debug": False,
+    # Cookie 通道结构化输出（response_format.json_object / json_schema）：
+    # 默认关 = 保持显式 400 拒绝。batchGraphql 的 generationConfig 输入类型
+    # 是否接受 responseMimeType/responseSchema 属私有协议、离线不可验证——
+    # 开启前先跑 scripts/probe_cookie_structured_output.py 真机探测；
+    # 探测通过后在控制台打开本开关。转换链：sanitize_for_gemini（严格方言
+    # 净化）→ _cookie_ui_schema（Studio 私有 UI Schema，与工具参数同路径）。
+    "cookie_structured_output": False,
     # 思考签名内嵌开关（默认关）：
     #   关 = 生成短 tool_call_id，签名存进进程内旁路缓存（推荐，避免被前端截断）
     #   开 = 退回旧的 `{id}__thought__{base64}` 内嵌格式，供多进程/多副本部署使用

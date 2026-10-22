@@ -52,6 +52,7 @@ from thought_signatures import (
 from upstream_errors import create_openai_error_response, extract_upstream_error
 from upstreams.base import BaseUpstream
 from upstreams.cookie_request import (
+    COOKIE_STRUCTURED_OUTPUT_DISABLED_MESSAGE,
     build_request_body_async,
     classify_tool_traffic,
     is_builtin_search_name,
@@ -561,8 +562,15 @@ class CookieProxyUpstream(BaseUpstream):
         track_configure(mode="stream" if request_obj.stream else "json", channel="cookie")
         try:
             validate_openai_request(request_obj)
-            if request_obj.response_format and request_obj.response_format.get("type") not in (None, "text"):
-                raise SchemaValidationError("Cookie 通道尚未验证结构化输出支持，请改用 Express 通道。")
+            # 与 build_request_body 的门控同口径：开关关闭时快速失败（省去
+            # Cookie 认证与请求体构造的网络准备）；开启时放行，由构造侧注入
+            # responseMimeType/responseSchema。
+            if (
+                request_obj.response_format
+                and request_obj.response_format.get("type") not in (None, "text")
+                and not app_state.get_setting("cookie_structured_output", False)
+            ):
+                raise SchemaValidationError(COOKIE_STRUCTURED_OUTPUT_DISABLED_MESSAGE)
         except SchemaValidationError as exc:
             return JSONResponse(status_code=400, content={
                 "error": {"message": str(exc), "type": "invalid_request_error", "code": 400}

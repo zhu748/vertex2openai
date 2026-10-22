@@ -12,7 +12,7 @@ from cookie_auth import STREAM_GENERATE_OPERATION_NAME, STREAM_GENERATE_QUERY_SI
 from message_processing import _coerce_tool_response, openai_content_to_wire_parts
 from models import OpenAIRequest, normalize_content_part
 from runtime_state import app_state
-from schema_validation import SchemaValidationError
+from schema_validation import SchemaValidationError, sanitize_for_gemini
 from thought_signatures import (
     encode_thought_signature,
     google_metadata,
@@ -20,6 +20,14 @@ from thought_signatures import (
     requires_signature,
     resolve_tool_call_signature,
     signature_from_extra,
+)
+
+# Cookie 通道结构化输出未开启时的统一拒绝文案（cookie_proxy 的快速失败
+# 与 build_request_body 的构造侧共用同一事实源，避免两处漂移）。
+COOKIE_STRUCTURED_OUTPUT_DISABLED_MESSAGE = (
+    "Cookie 通道默认不启用结构化输出：batchGraphql 私有协议的接受度未经真机验证。"
+    "请先运行 scripts/probe_cookie_structured_output.py 探测，通过后在控制台打开"
+    " cookie_structured_output，或改用 Express 通道模型。"
 )
 
 
@@ -65,6 +73,45 @@ def _build_thinking_config(
     if t.get("mode") == "budget":
         return {"thinkingBudget": t["budget"], "includeThoughts": t.get("include_thoughts", True)}
     return None
+
+
+def _structured_output(request: OpenAIRequest, profile: dict) -> dict | None:
+    """response_format -> batchGraphql 结构化输出字段。
+
+    返回值语义：
+    - None：无结构化输出（不注入任何字段）；
+    - {}：json_object（仅 responseMimeType）；
+    - 非空 dict：UI Schema 形态的 responseSchema。
+
+    私有协议对该字段族的接受度未经 Google 承诺：cookie_structured_output
+    关闭时（默认）显式拒绝而非静默改变语义；开启前应先跑
+    scripts/probe_cookie_structured_output.py 真机探测。转换链与工具参数
+    完全一致：sanitize_for_gemini（OpenAI 宽松方言 -> Gemini 严格方言）
+    -> _cookie_ui_schema（严格方言 -> Studio 私有 UI Schema）。
+    """
+    fmt = request.response_format or {}
+    fmt_type = fmt.get("type")
+    if fmt_type in (None, "text"):
+        return None
+    if fmt_type not in ("json_object", "json_schema"):
+        raise SchemaValidationError(f"不支持的 response_format.type：{fmt_type}")
+
+    if not app_state.get_setting("cookie_structured_output", False):
+        raise SchemaValidationError(COOKIE_STRUCTURED_OUTPUT_DISABLED_MESSAGE)
+    if profile.get("is_image"):
+        raise SchemaValidationError("生图模型不支持 JSON 结构化输出（response_format）。")
+    if fmt_type == "json_object":
+        return {}
+
+    json_schema = fmt.get("json_schema")
+    schema = json_schema.get("schema") if isinstance(json_schema, dict) else None
+    if not isinstance(schema, dict):
+        # OpenAI 契约里 json_schema 类型必须带 schema 对象；与 Express 通道
+        # 同口径（那边缺 schema 时仅发 mime 类型，这里保持一致不发 schema）。
+        return {}
+    return _cookie_ui_schema(
+        sanitize_for_gemini({key: value for key, value in schema.items() if key != "$schema"})
+    )
 
 
 _BUILTIN_SEARCH_NAMES = {
@@ -534,8 +581,11 @@ def build_request_body(
 
         # These are accepted by the shared OpenAI contract. Unsupported private
         # protocol fields must fail explicitly rather than silently change it.
-        if request.response_format and request.response_format.get("type") not in (None, "text"):
-            raise SchemaValidationError("Cookie 通道尚未验证结构化输出支持，请改用 Express 通道。")
+        _structured = _structured_output(request, profile)
+        if _structured is not None:
+            gen_config["responseMimeType"] = "application/json"
+            if _structured:
+                gen_config["responseSchema"] = _structured
         for source, target in (("top_k", "topK"), ("seed", "seed"), ("n", "candidateCount")):
             capability = "candidate_count" if source == "n" else source
             value = getattr(request, source, None)
