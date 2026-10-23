@@ -71,8 +71,10 @@ current_proxy_usage = ContextVar("current_proxy_usage", default=None)
 
 class ProxyUsage:
     """Keep every proxy touched by a generation alive until its stream closes."""
-    def __init__(self):
+    def __init__(self, *, temporary=False):
         self._entries = set()
+        self._temporary_entries = set()
+        self._temporary = temporary
         self._closed = False
         self._lock = threading.Lock()
 
@@ -86,8 +88,10 @@ class ProxyUsage:
             entry = (manager, uri)
             if self._closed or entry in self._entries:
                 return
-            manager.retain(uri)
+            manager.retain(uri, temporary=self._temporary)
             self._entries.add(entry)
+            if self._temporary:
+                self._temporary_entries.add(entry)
 
     def close(self):
         with self._lock:
@@ -97,6 +101,11 @@ class ProxyUsage:
             for manager, uri in self._entries:
                 manager.release(uri)
             self._entries.clear()
+        # Probe callers close in a worker: process shutdown can wait. Only
+        # retire newly created, unused listeners; never interrupt a generation.
+        for manager, uri in self._temporary_entries:
+            manager.discard_unused(uri)
+        self._temporary_entries.clear()
 
 
 # ============================================================
@@ -708,10 +717,15 @@ class ProxyProcessManager:
         self._instances: dict[str, _SingboxInstance] = {}
         self._uri_locks = weakref.WeakValueDictionary()
         self._active_uses: dict[str, int] = {}
+        self._probe_only: set[str] = set()
         self._closed = False
 
-    def retain(self, uri):
+    def retain(self, uri, *, temporary=False):
         with self._lock:
+            if not temporary:
+                self._probe_only.discard(uri)  # Adopted by real traffic.
+            elif uri not in self._instances and not self._active_uses.get(uri):
+                self._probe_only.add(uri)
             self._active_uses[uri] = self._active_uses.get(uri, 0) + 1
 
     def release(self, uri):
@@ -724,6 +738,8 @@ class ProxyProcessManager:
             instance = self._instances.get(uri)
             if instance is not None:
                 instance.last_used = time.time()
+            elif count <= 0:
+                self._probe_only.discard(uri)
 
     # ---------- 对外 ----------
 
@@ -816,6 +832,7 @@ class ProxyProcessManager:
             self._closed = True
             instances = list(self._instances.values())
             self._instances.clear()
+            self._probe_only.clear()
         for inst in instances:
             self._terminate(inst)           # 锁外终止：terminate+kill 最多 6s，不阻塞取用
 
@@ -851,12 +868,30 @@ class ProxyProcessManager:
                     if inst.alive() and (idle_seconds <= 0 or now - inst.last_used <= idle_seconds):
                         continue
                     self._instances.pop(uri)
+                    self._probe_only.discard(uri)
                 # Keep the per-URI lock until the old listener has gone away.
                 self._terminate(inst)
                 removed += 1
             finally:
                 lock.release()
         return removed
+
+    def discard_unused(self, uri):
+        """Release a probe-only listener without racing startup or active users."""
+        lock = self._uri_lock(uri)
+        if not lock.acquire(blocking=False):
+            # In-flight startup sees its closed ProxyUsage and disposes itself.
+            return
+        try:
+            with self._lock:
+                if self._active_uses.get(uri) or uri not in self._probe_only:
+                    return
+                instance = self._instances.pop(uri, None)
+                self._probe_only.discard(uri)
+            if instance is not None:
+                self._terminate(instance)
+        finally:
+            lock.release()
 
     def stats(self) -> dict:
         """运行概览（供日志 / 控制台展示）。"""

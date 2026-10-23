@@ -2,6 +2,7 @@
  * Run: node scripts/verify_console_ui.cjs
  * PLAYWRIGHT_CHROMIUM_EXECUTABLE can select an existing Chromium binary.
  * UI_SCREENSHOT_DIR optionally saves screenshots. Uses temporary state and fake keys;
+ * UI_TEST_CJK_FONT optionally supplies a local CJK font for minimal CI images.
  * lifespan is disabled and probes are intercepted, so no Google requests are made.
  */
 const assert = require('node:assert/strict');
@@ -99,10 +100,26 @@ async function main() {
       if (!route.request().url().startsWith(origin)) {external.push(route.request().url());return route.abort();}
       return route.continue();
     });
+    if(process.env.UI_TEST_CJK_FONT){
+      await context.route('**/__ui-test-font.otf',route=>route.fulfill({path:process.env.UI_TEST_CJK_FONT,contentType:'font/otf'}));
+      await context.addInitScript(()=>document.addEventListener('DOMContentLoaded',()=>{
+        const style=document.createElement('style');
+        style.textContent="@font-face{font-family:ConsoleReviewCJK;src:url('/__ui-test-font.otf')}body{font-family:ConsoleReviewCJK,sans-serif!important}";
+        document.head.append(style);
+      }));
+    }
     const page = await context.newPage();
     const responseFor = (pathname, method = 'POST') => page.waitForResponse(r => new URL(r.url()).pathname === pathname && r.request().method() === method);
     const screenshot = async name => {if (screenshots) await page.screenshot({path: path.join(screenshots, name + '.png'), fullPage: false});};
     const openTab = async tab => {await page.evaluate(t => switchTab(t), tab);};
+    const openProxyForm = async () => {await page.click('#proxy-tab-form');};
+    const finishProxyBatch = async (allowEmpty=false) => {
+      await page.waitForSelector('#proxy-panel-import:not(.hidden)');
+      await page.click('#proxy-import-preview');
+      await page.waitForFunction(()=>!document.querySelector('#proxy-import-preview-panel').classList.contains('hidden') && document.querySelector('#proxy-stop-tests').classList.contains('hidden') && !document.querySelector('#proxy-import-preview').matches(':disabled'));
+      if(allowEmpty){assert.equal(await page.locator('#proxy-import-add').isDisabled(),true);await page.click('#proxy-tab-list');}
+      else {await page.click('#proxy-import-add');await page.waitForSelector('#proxy-panel-list:not(.hidden)');}
+    };
     await page.goto(origin);
     await page.fill('#pw', 'wrong-password');
     await page.click('#login-submit');
@@ -112,6 +129,7 @@ async function main() {
     await page.fill('#pw', 'ui-browser-test');
     await page.click('#login-submit');
     await page.waitForSelector('#s-total');
+    if(process.env.UI_TEST_CJK_FONT)await page.evaluate(()=>document.fonts.ready);
     await page.waitForFunction(() => document.querySelector('#s-total').textContent === '32');
     await page.waitForFunction(() => document.querySelector('#model-sel').options.length > 1);
     assert.equal(await page.textContent('#health-rate'), '83.3%');
@@ -137,12 +155,21 @@ async function main() {
     assert.equal(response.request().postDataJSON().prefill_cot_guard, true);
     assert.equal(response.request().postDataJSON().first_reply_timeout_seconds, 28.5);
     await page.waitForFunction(() => !document.querySelector('#btn-scope-save').disabled);
+    assert.equal(await page.locator('#cookie_structured_output').isChecked(),false);
+    await page.locator('#cookie_structured_output').check();
     pending = responseFor('/api/settings');
     await page.locator('button[onclick*="saveSettings"]').click();
     response = await pending;
     assert.equal(response.status(), 200);
     assert.ok(!('first_reply_timeout_seconds' in response.request().postDataJSON()));
     assert.ok(!('prefill_cot_guard' in response.request().postDataJSON()));
+    assert.equal(response.request().postDataJSON().cookie_structured_output,true);
+    const upstreamSettingsPage=await context.newPage();
+    await upstreamSettingsPage.goto(origin+'/#params');
+    await upstreamSettingsPage.waitForFunction(()=>document.querySelector('#cookie_structured_output')?.checked===true);
+    await upstreamSettingsPage.close();
+    await page.bringToFront();
+    check('上游 Cookie 结构化输出开关默认关闭，保存后在新页面正确回填');
     await page.selectOption('#model-sel', '__global__');
     assert.equal(await page.inputValue('#image_aspect_ratio'), '16:9');
     assert.match(await page.locator('#model-sel option').first().textContent(), /全局默认/);
@@ -273,33 +300,45 @@ async function main() {
     check('凭证保存期间隔离编辑与探测，长请求头状态不撑开页面');
 
     await page.getByRole('button',{name:'管理 / 添加代理',exact:true}).click();
+    await openProxyForm();
     await page.fill('#proxy-paste','socks5://127.0.0.1:1080:proxy-user:p%40ss');
     await page.click('.proxy-recognize');
     await page.waitForFunction(()=>document.querySelector('#proxy-username').value==='proxy-user' && !document.querySelector('#proxy-form-add').matches(':disabled'));
     assert.equal(await page.inputValue('#proxy-password'),'p@ss');
+    await openProxyForm();
     await page.click('#proxy-form-add');
     await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===1);
+    await openProxyForm();
     await page.selectOption('#proxy-type','http');
+    await openProxyForm();
     await page.fill('#proxy-paste','proxy-second.invalid:8080');
     await page.click('.proxy-recognize');
     await page.waitForFunction(()=>document.querySelector('#proxy-host').value==='proxy-second.invalid' && !document.querySelector('#proxy-form-add').matches(':disabled'));
     assert.equal(await page.inputValue('#proxy-type'),'http');
+    await openProxyForm();
     await page.click('#proxy-form-add');
     await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===2);
+    await page.click('#proxy-tab-list');
     await page.locator('[data-proxy-index="1"]').getByRole('button',{name:'将第 2 条设为首选',exact:true}).click();
+    await page.click('#proxy-tab-list');
     await page.locator('[data-proxy-index="0"]').getByRole('button',{name:'编辑',exact:true}).click();
     await page.waitForFunction(()=>document.querySelector('#proxy-host').value==='proxy-second.invalid' && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    await openProxyForm();
     await page.fill('#proxy-port','8081');
+    await page.click('#proxy-tab-list');
     await page.locator('[data-proxy-index="0"]').getByRole('button',{name:'下移第 1 条',exact:true}).click();
     assert.equal(await page.inputValue('#proxy-port'),'8081');
     assert.equal(await page.locator('[data-proxy-index="1"]').evaluate(el=>el.classList.contains('is-editing')),true);
     assert.equal(await page.textContent('#proxy-form-add'),'更新第 2 条');
+    await page.click('#proxy-tab-list');
     await page.locator('[data-proxy-index="1"]').getByRole('button',{name:'上移第 2 条',exact:true}).click();
     assert.equal(await page.inputValue('#proxy-port'),'8081');
     assert.equal(await page.textContent('#proxy-form-add'),'更新第 1 条');
+    await openProxyForm();
     await page.click('#proxy-form-add');
     await page.waitForFunction(()=>document.querySelector('[data-proxy-index="0"] strong').textContent.includes('8081'));
     await page.route('**/api/proxy/test',route=>route.fulfill({json:{ok:true,via_proxy:true,message:'代理连通成功',latency_ms:75,status_code:403}}));
+    await page.click('#proxy-tab-list');
     await page.locator('[data-proxy-index="0"]').getByRole('button',{name:'测试',exact:true}).click();
     await page.waitForFunction(()=>document.querySelector('#proxy-result-0').textContent.includes('75 ms') && !document.querySelector('#proxy-form-add').matches(':disabled'));
     await screenshot('proxy-editor-desktop');
@@ -337,17 +376,26 @@ async function main() {
     check('代理草稿提示、编辑后清除旧测试结果、错误定位与会话过期反馈');
 
     await page.getByRole('button',{name:'管理 / 添加代理',exact:true}).click();
+    await openProxyForm();
     await page.selectOption('#proxy-type','sstp');
+    await openProxyForm();
     await page.fill('#proxy-host','vpn.example.com');
+    await openProxyForm();
     await page.fill('#proxy-username','domain\\fixture');
+    await openProxyForm();
     await page.fill('#proxy-password','private:@password');
     await page.locator('#proxy-advanced summary').click();
+    await openProxyForm();
     await page.fill('#proxy-sni','certificate.example.com');
+    await openProxyForm();
     await page.fill('#proxy-ca','/app/certificates/company.pem');
+    await openProxyForm();
     await page.fill('#proxy-mtu','1280');
+    await openProxyForm();
     await page.click('#proxy-form-add');
     await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===3 && !document.querySelector('#proxy-form-add').matches(':disabled'),undefined,{polling:100});
     assert.ok(!(await page.locator('[data-proxy-index="2"] strong').textContent()).includes('private'));
+    await page.click('#proxy-tab-list');
     await page.locator('[data-proxy-index="2"]').getByRole('button',{name:'编辑',exact:true}).click();
     await page.waitForFunction(()=>document.querySelector('#proxy-type').value==='sstp' && !document.querySelector('#proxy-form-add').matches(':disabled'));
     assert.equal(await page.inputValue('#proxy-port'),'443');
@@ -356,47 +404,66 @@ async function main() {
     assert.equal(await page.inputValue('#proxy-ca'),'/app/certificates/company.pem');
     assert.equal(await page.inputValue('#proxy-mtu'),'1280');
     await screenshot('proxy-editor-sstp');
+    await openProxyForm();
     await page.click('#proxy-form-add');
     await page.waitForFunction(()=>document.querySelector('#proxy-type').value==='sstp' && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    await openProxyForm();
     await page.fill('#proxy-paste','turn:relay.example.com:3478?transport=tcp&username=fixture&password=private-turn-password');
     await page.click('.proxy-recognize');
     await page.waitForFunction(()=>document.querySelector('#proxy-type').value==='turn' && !document.querySelector('#proxy-form-add').matches(':disabled'));
     assert.equal(await page.inputValue('#proxy-host'),'relay.example.com');
     assert.equal(await page.locator('#proxy-tls-fields').isVisible(),false);
+    await openProxyForm();
     await page.click('#proxy-form-add');
     await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===4 && !document.querySelector('#proxy-form-add').matches(':disabled'),undefined,{polling:100});
+    await openProxyForm();
     await page.selectOption('#proxy-type','turns');
+    await openProxyForm();
     await page.fill('#proxy-host','relay-tls.example.com');
+    await openProxyForm();
     await page.fill('#proxy-username','fixture');
+    await openProxyForm();
     await page.fill('#proxy-password','private-turns-password');
+    await openProxyForm();
     await page.click('#proxy-form-add');
     await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===5 && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    await openProxyForm();
     await page.selectOption('#proxy-type','sstp');
+    await openProxyForm();
     await page.fill('#proxy-paste','vpn-supplier.example|443|domain\\fixture|private@password');
     // Add also recognizes fresh paste without clicking Recognize first.
+    await openProxyForm();
     await page.click('#proxy-form-add');
     await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===6 && !document.querySelector('#proxy-form-add').matches(':disabled'),undefined,{polling:100});
     assert.match(await page.locator('[data-proxy-index="5"] strong').textContent(),/sstp:\/\/\*\*\*@vpn-supplier.example:443/);
+    await openProxyForm();
     await page.fill('#proxy-paste',JSON.stringify({iceServers:[{urls:'stun:discovery.example'},{
       urls:['turn:ice.example:3478?transport=tcp','turns:ice.example:5349?transport=tcp'],username:'fixture',credential:'private+ice%password'}]}));
     await page.click('.proxy-recognize');
+    await finishProxyBatch();
     await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===8 && !document.querySelector('#proxy-form-add').matches(':disabled'));
     const node={type:'sstp',server:'json-vpn.example',username:'fixture',password:'private-json-password',name:'办公 VPN',options:{sni:'cert.example',mtu:1280}};
+    await openProxyForm();
     await page.fill('#proxy-paste',JSON.stringify(node));
     await page.click('.proxy-recognize');
     await page.waitForFunction(()=>document.querySelector('#proxy-name').value==='办公 VPN' && !document.querySelector('#proxy-form-add').matches(':disabled'));
     // A changed paste takes precedence over the previous recognized fields.
     node.server='updated-json-vpn.example';node.name='备用 VPN';
+    await openProxyForm();
     await page.fill('#proxy-paste',JSON.stringify(node));
+    await openProxyForm();
     await page.click('#proxy-form-add');
     await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===9 && !document.querySelector('#proxy-form-add').matches(':disabled'));
     assert.match(await page.locator('[data-proxy-index="8"] strong').textContent(),/updated-json-vpn.example:443 · 备用 VPN/);
     assert.ok(!(await page.textContent('#proxy-editor-list')).includes('private'));
+    await page.click('#proxy-tab-list');
     await page.locator('[data-proxy-index="8"]').getByRole('button',{name:'编辑',exact:true}).click();
     await page.waitForFunction(()=>document.querySelector('#proxy-name').value==='备用 VPN' && !document.querySelector('#proxy-form-add').matches(':disabled'));
     assert.equal(await page.inputValue('#proxy-sni'),'cert.example');
     assert.equal(await page.inputValue('#proxy-mtu'),'1280');
+    await openProxyForm();
     await page.fill('#proxy-name','VPN 备份');
+    await openProxyForm();
     await page.click('#proxy-form-add');
     await page.waitForFunction(()=>document.querySelector('[data-proxy-index="8"] strong').textContent.includes('VPN 备份') && !document.querySelector('#proxy-form-add').matches(':disabled'));
     await screenshot('proxy-editor-import-formats');
@@ -406,6 +473,7 @@ async function main() {
     const originalProxyDraft=await page.inputValue('#proxy-input');
     await page.fill('#proxy-input',JSON.stringify({urls:['turn:raw-ice.example?transport=tcp','turns:raw-ice.example?transport=tcp'],username:'fixture',credential:'private-raw-ice'}));
     await page.getByRole('button',{name:'管理 / 添加代理',exact:true}).click();
+    await page.click('#proxy-tab-list');
     await page.locator('[data-proxy-index="0"]').getByRole('button',{name:'编辑',exact:true}).click();
     await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===2 && !document.querySelector('#proxy-form-add').matches(':disabled'));
     assert.match(await page.locator('[data-proxy-index="0"] strong').textContent(),/turn:\/\//);
@@ -415,8 +483,10 @@ async function main() {
     check('原始 ICE JSON 编辑先展开全部节点，取消保留配置草稿');
 
     await page.getByRole('button',{name:'管理 / 添加代理',exact:true}).click();
+    await openProxyForm();
     await page.selectOption('#proxy-type','turn');
     const pasteProxy=async value=>{
+      await openProxyForm();
       await page.evaluate(text=>{
         const input=document.querySelector('#proxy-paste');
         input.value=text;input.dispatchEvent(new Event('paste',{bubbles:true}));
@@ -426,6 +496,7 @@ async function main() {
     await page.waitForFunction(()=>document.querySelector('#proxy-password').value==='1234' && !document.querySelector('#proxy-form-add').matches(':disabled'),undefined,{polling:100});
     assert.equal(await page.inputValue('#proxy-type'),'turn');
     assert.equal(await page.inputValue('#proxy-host'),'192.0.2.10');
+    await openProxyForm();
     await page.click('#proxy-form-add');
     await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===3 && !document.querySelector('#proxy-form-add').matches(':disabled'),undefined,{polling:100});
     assert.equal(await page.inputValue('#proxy-type'),'turn');
@@ -439,10 +510,13 @@ async function main() {
     assert.deepEqual(await page.evaluate(()=>proxyMissingFields('turn://12.192.169.147:3479')),[]);
     // SSTP 的 MS-CHAPv2 认证协议强制：无凭据节点仍被标记待补齐（与后端同口径）。
     assert.deepEqual(await page.evaluate(()=>proxyMissingFields('sstp://192.0.2.50:443')),['账号','密码']);
+    await openProxyForm();
     await page.fill('#proxy-username','test');await page.fill('#proxy-password','test');
+    await openProxyForm();
     await page.click('#proxy-form-add');
     await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===4 && !document.querySelector('#proxy-form-add').matches(':disabled'),undefined,{polling:100});
     await pasteProxy('test:1234@192.0.2.30:3478\n192.0.2.40:3479');
+    await finishProxyBatch();
     await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===6 && !document.querySelector('#proxy-form-add').matches(':disabled'),undefined,{polling:100});
     // 无凭据 TURN 节点直接加入：可测试、可直接应用，不再阻断保存。
     assert.equal((await page.locator('[data-proxy-index="5"] small').textContent()).includes('待补齐'),false);
@@ -455,14 +529,18 @@ async function main() {
 
     await page.getByRole('button',{name:'管理 / 添加代理',exact:true}).click();
     const legacySsPayload=Buffer.from('chacha20-ietf-poly1305:private-password@9.9.9.9:9999').toString('base64');
+    await openProxyForm();
     await page.fill('#proxy-paste','ss://'+legacySsPayload);
     await page.click('.proxy-recognize');
     await page.waitForFunction(()=>document.querySelector('#proxy-type').value==='singbox' && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    await openProxyForm();
     await page.click('#proxy-form-add');
     await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===3 && !document.querySelector('#proxy-form-add').matches(':disabled'),undefined,{polling:100});
     assert.ok(!(await page.locator('[data-proxy-index="2"] strong').textContent()).includes(legacySsPayload));
+    await page.click('#proxy-tab-list');
     await page.locator('[data-proxy-index="2"]').getByRole('button',{name:'删除第 3 条代理',exact:true}).click();
     // 分享链接协议：下拉统一归入 sing-box 节点选项，列表行显示协议://端点 与节点名。
+    await openProxyForm();
     await page.fill('#proxy-paste','vless://12345678-90ab-4cde-8f90-1234567890ab@203.0.113.10:2096?security=tls&type=ws&path=%2F#NL%20Node');
     await page.click('.proxy-recognize');
     await page.waitForFunction(()=>document.querySelector('#proxy-type').value==='singbox' && !document.querySelector('#proxy-form-add').matches(':disabled'));
@@ -471,26 +549,35 @@ async function main() {
     assert.equal(await page.textContent('#proxy-paste-label'),'节点链接');
     assert.equal(await page.inputValue('#proxy-paste'),'vless://12345678-90ab-4cde-8f90-1234567890ab@203.0.113.10:2096?security=tls&type=ws&path=%2F#NL%20Node');
     await screenshot('proxy-editor-singbox-node');
+    await openProxyForm();
     await page.click('#proxy-form-add');
     await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===3 && !document.querySelector('#proxy-form-add').matches(':disabled'),undefined,{polling:100});
     const vlessLabel=await page.locator('[data-proxy-index="2"] strong').textContent();
     assert.ok(vlessLabel.includes('vless://203.0.113.10:2096') && vlessLabel.includes('NL Node'),vlessLabel);
     const vmessPayload=Buffer.from(JSON.stringify({v:'2',ps:'东京 01',add:'vm.example.com',port:'443',id:'11111111-2222-3333-4444-555555555555',aid:'0',scy:'auto',net:'ws',type:'none',host:'',path:'/ws',tls:'tls',sni:'',alpn:'',fp:''})).toString('base64');
+    await openProxyForm();
     await page.fill('#proxy-paste','vmess://'+vmessPayload);
     await page.click('.proxy-recognize');
     await page.waitForFunction(()=>document.querySelector('#proxy-type').value==='singbox' && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    await openProxyForm();
     await page.click('#proxy-form-add');
     await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===4 && !document.querySelector('#proxy-form-add').matches(':disabled'),undefined,{polling:100});
     const vmessLabel=await page.locator('[data-proxy-index="3"] strong').textContent();
     assert.ok(vmessLabel.includes('vmess://vm.example.com:443') && vmessLabel.includes('东京 01'),vmessLabel);
     assert.ok(!vmessLabel.includes(vmessPayload));
+    await page.click('#proxy-tab-list');
     await page.locator('[data-proxy-index="3"]').getByRole('button',{name:'删除第 4 条代理',exact:true}).click();
+    await page.click('#proxy-tab-list');
     await page.locator('[data-proxy-index="2"]').getByRole('button',{name:'删除第 3 条代理',exact:true}).click();
+    await openProxyForm();
     await page.fill('#proxy-paste',JSON.stringify(Array.from({length:30},(_,index)=>`http://draft-${index}.invalid:8080`)));
     await page.click('.proxy-recognize');
+    await finishProxyBatch();
     await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===32 && !document.querySelector('#proxy-form-add').matches(':disabled'));
+    await openProxyForm();
     await page.fill('#proxy-paste','["http://draft-0.invalid:8080","http://draft-1.invalid:8080"]');
     await page.click('.proxy-recognize');
+    await finishProxyBatch(true);
     await page.waitForFunction(()=>document.querySelector('#proxy-paste').value==='' && !document.querySelector('#proxy-form-add').matches(':disabled'));
     assert.equal(await page.textContent('#proxy-editor-error'),'');
     assert.equal(await page.locator('[data-proxy-index]').count(),32);
@@ -498,10 +585,161 @@ async function main() {
     assert.equal(await page.inputValue('#proxy-input'),'http://proxy-second.invalid:8081\nsocks5://proxy-user:p%40ss@127.0.0.1:1080');
     check('编辑代理时排序保留输入，重复批量导入按去重后的数量校验，取消不保存草稿');
 
+    const batchBaseline=await page.inputValue('#proxy-input');
+    const batchCalls=[];
+    let batchActive=0,batchMaxActive=0,failBatchNode=true,slowBatch=false;
+    const slowBatchReleases=[];
+    const batchProbe=async route=>{
+      const body=route.request().postDataJSON();batchCalls.push(body);batchActive++;
+      batchMaxActive=Math.max(batchMaxActive,batchActive);
+      try{
+        if(slowBatch&&body.proxy_url.includes('cancel-batch-')) await new Promise(resolve=>slowBatchReleases.push(resolve));
+        else await sleep(80);
+        const failed=body.proxy_url.includes('all-fail-')||(failBatchNode&&body.proxy_url.includes('batch-retry.invalid'));
+        await route.fulfill({json:{ok:!failed,via_proxy:true,latency_ms:failed?8000:120,status_code:failed?504:403,
+          message:failed?'本次连接超时，可重试':'目标站可达 <img src=x onerror="window.uiInjected=true">'}});
+      }catch{/* Aborted browser requests have no response recipient. */}
+      finally{batchActive--;}
+    };
+    await page.route('**/api/proxy/test',batchProbe);
+    await page.getByRole('button',{name:'批量导入',exact:true}).click();
+    const batchText=['http://batch-user:batch-private@batch-fast.invalid:8080#主用出口',
+      'http://batch-retry.invalid:8080','socks5://batch-third.invalid:1080',
+      'http://batch-user:batch-private@batch-fast.invalid:8080#同节点不同备注',
+      'socks5://bad-batch.invalid:0',batchBaseline.split('\n')[0]].join('\n');
+    await page.fill('#proxy-import-text',batchText);
+    await page.click('#proxy-import-preview');
+    await page.waitForFunction(()=>document.querySelector('#proxy-stop-tests').classList.contains('hidden')&&document.querySelector('#proxy-import-summary').textContent.includes('失败 1')&&!document.querySelector('#proxy-import-preview').matches(':disabled'));
+    assert.equal(await page.locator('[data-import-id]').count(),6);
+    assert.equal(await page.locator('[data-import-id] input:checked').count(),2);
+    assert.equal(await page.locator('[data-import-id] [data-state="invalid"]').count(),1);
+    assert.equal(await page.locator('[data-import-id] [data-state="duplicate"]').count(),2);
+    assert.equal(batchMaxActive,3);
+    assert.ok(!(await page.textContent('#proxy-import-list')).includes('batch-private'));
+    assert.equal(await page.evaluate(()=>Boolean(window.uiInjected)),false);
+    await screenshot('proxy-import-results-desktop');
+    await page.click('#proxy-tab-list');
+    await page.locator('[data-proxy-index="0"]').getByRole('button',{name:'下移第 1 条',exact:true}).click();
+    assert.ok((await page.textContent('#proxy-result-1')).includes('75 ms'));
+    await page.locator('[data-proxy-index="1"]').getByRole('button',{name:'上移第 2 条',exact:true}).click();
+    await page.click('#proxy-tab-import');
+    await page.selectOption('#proxy-test-target','cookie');
+    assert.equal(await page.locator('[data-import-id] input:checked').count(),0);
+    await page.selectOption('#proxy-test-target','vertex');
+    assert.equal(await page.locator('[data-import-id] input:checked').count(),2);
+    await page.locator('[data-import-id="0"] input').uncheck();
+    const callsBeforeRetry=batchCalls.length;failBatchNode=false;
+    await page.click('#proxy-import-retry');
+    await page.waitForFunction(()=>document.querySelector('#proxy-stop-tests').classList.contains('hidden')&&document.querySelector('#proxy-import-summary').textContent.includes('通过 3'));
+    assert.equal(batchCalls.length,callsBeforeRetry+1);
+    assert.equal(await page.locator('[data-import-id] input:checked').count(),2);
+    await page.click('#proxy-import-select');
+    const failBatchSave=route=>route.request().method()==='POST'?route.fulfill({status:503,json:{error:'测试落盘失败'}}):route.fallback();
+    await page.route('**/api/settings',failBatchSave);
+    await page.click('#proxy-import-commit');
+    await page.waitForFunction(()=>document.querySelector('#proxy-editor-error').textContent.includes('测试落盘失败')&&!document.querySelector('#proxy-import-commit').matches(':disabled'));
+    assert.equal(await page.inputValue('#proxy-import-text'),batchText);
+    assert.equal(await page.locator('[data-import-id] input:checked').count(),3);
+    assert.equal(await page.locator('[data-proxy-index]').count(),2);
+    assert.equal(await page.inputValue('#proxy-input'),batchBaseline);
+    await page.unroute('**/api/settings',failBatchSave);
+    let releaseBatchSave;
+    const batchSaveGate=new Promise(resolve=>{releaseBatchSave=resolve;});
+    const delayedBatchSave=async route=>{if(route.request().method()==='POST')await batchSaveGate;await route.fallback();};
+    await page.route('**/api/settings',delayedBatchSave);
+    const savingBatchRequest=page.waitForRequest(r=>new URL(r.url()).pathname==='/api/settings'&&r.method()==='POST');
+    await page.click('#proxy-import-commit');await savingBatchRequest;
+    assert.equal(await page.locator('#proxy-dialog-close').isDisabled(),true);
+    assert.equal(await page.locator('#proxy-dialog-cancel').isDisabled(),true);
+    releaseBatchSave();
+    await page.waitForFunction(()=>!document.querySelector('#proxy-dialog').open);
+    await page.unroute('**/api/settings',delayedBatchSave);
+    const importedSettings=await (await page.request.get(origin+'/api/settings')).json();
+    assert.equal(importedSettings.cookie_structured_output,true,'Proxy import must preserve the upstream structured output setting');
+    const importedGlobal=importedSettings.proxy_urls;
+    assert.equal(importedGlobal.length,5);
+    assert.deepEqual(importedGlobal.slice(2).map(uri=>new URL(uri).hostname),['batch-fast.invalid','batch-retry.invalid','batch-third.invalid']);
+    assert.equal(await page.locator('#proxy-draft-state').isVisible(),false);
+    await page.fill('#proxy-input',batchBaseline);
+    await page.locator('button[onclick*="saveProxy()"]').click();
+    await page.waitForFunction(()=>document.querySelector('#proxy-draft-state').classList.contains('hidden')&&!document.querySelector('#proxy-input').matches(':disabled'));
+    check('批量导入逐条错误、去重、三路并发、目标隔离、重试、结果保留、保存失败回滚和按原序保存');
+
+    await page.getByRole('button',{name:'批量导入',exact:true}).click();
+    await page.fill('#proxy-import-text','http://untested-one.invalid:8080\nhttp://untested-two.invalid:8080');
+    await page.locator('#proxy-import-tested').uncheck();
+    const callsBeforeUntested=batchCalls.length;
+    await page.click('#proxy-import-preview');
+    await page.waitForFunction(()=>!document.querySelector('#proxy-import-add').matches(':disabled'));
+    assert.equal(batchCalls.length,callsBeforeUntested);
+    await page.click('#proxy-import-add');
+    await page.waitForSelector('#proxy-panel-list:not(.hidden)');
+    assert.equal(await page.textContent('#proxy-result-2'),'未测试');
+    await page.click('#proxy-dialog-close');
+    await page.waitForSelector('#proxy-close-prompt:not(.hidden)');
+    await page.locator('#proxy-close-prompt').getByRole('button',{name:'继续编辑',exact:true}).click();
+    assert.equal(await page.locator('[data-proxy-index]').count(),4);
+    await page.click('#proxy-dialog-cancel');
+    assert.equal(await page.inputValue('#proxy-input'),batchBaseline);
+    check('可选跳过测试、未测试状态、关闭前草稿保护和明确放弃操作');
+
+    await page.getByRole('button',{name:'批量导入',exact:true}).click();
+    await page.fill('#proxy-import-text',Array.from({length:40},(_,index)=>`http://capacity-${index}.invalid:8080`).join('\n'));
+    await page.locator('#proxy-import-tested').uncheck();
+    await page.click('#proxy-import-preview');
+    await page.waitForFunction(()=>document.querySelector('#proxy-import-summary').textContent.includes('识别 40'));
+    assert.equal(await page.locator('#proxy-import-commit').isDisabled(),true);
+    await page.click('#proxy-import-select');
+    assert.equal(await page.locator('[data-import-id] input:checked').count(),30);
+    assert.equal(await page.locator('#proxy-import-commit').isDisabled(),false);
+    assert.equal(await page.locator('#proxy-dialog-save').isVisible(),false);
+    assert.equal(await page.locator('#proxy-dialog-apply').isVisible(),false);
+    await page.click('#proxy-dialog-cancel');
+    check('候选列表可超过 32 条，按剩余容量一键选择，导入视图只提供对应导入动作');
+
+    await page.getByRole('button',{name:'批量导入',exact:true}).click();
+    await page.fill('#proxy-import-text','http://all-fail-one.invalid:8080\nhttp://all-fail-two.invalid:8080');
+    await page.click('#proxy-import-preview');
+    await page.waitForFunction(()=>document.querySelector('#proxy-stop-tests').classList.contains('hidden')&&document.querySelector('#proxy-import-summary').textContent.includes('失败 2'));
+    assert.equal(await page.locator('#proxy-import-commit').isDisabled(),true);
+    assert.equal((await (await page.request.get(origin+'/api/settings')).json()).proxy_urls.length,2);
+    await page.click('#proxy-dialog-cancel');
+    check('全部探测失败时禁止空导入，保留原有生效代理');
+
+    await page.getByRole('button',{name:'批量导入',exact:true}).click();
+    await page.fill('#proxy-import-text',Array.from({length:8},(_,index)=>`http://cancel-batch-${index}.invalid:8080`).join('\n'));
+    slowBatch=true;const callsBeforeCancel=batchCalls.length;
+    await page.click('#proxy-import-preview');
+    await page.waitForFunction(()=>document.querySelector('#proxy-job-state').textContent.includes('0 / 8'));
+    for(let i=0;i<30&&batchCalls.length<callsBeforeCancel+3;i++)await sleep(20);
+    assert.equal(batchCalls.length,callsBeforeCancel+3);
+    assert.equal(await page.locator('#proxy-import-text').getAttribute('readonly'),'');
+    await page.click('#proxy-stop-tests');
+    await page.waitForFunction(()=>document.querySelector('#proxy-stop-tests').classList.contains('hidden'));
+    assert.equal(await page.locator('[data-import-id] [data-state="cancelled"]').count(),8);
+    assert.equal(await page.locator('#proxy-import-commit').isDisabled(),true);
+    slowBatch=false;slowBatchReleases.splice(0).forEach(resolve=>resolve());
+    await sleep(100);assert.equal(batchCalls.length,callsBeforeCancel+3);
+    await page.click('#proxy-import-retry');
+    await page.waitForFunction(()=>document.querySelector('#proxy-stop-tests').classList.contains('hidden')&&document.querySelector('#proxy-import-summary').textContent.includes('通过 8'));
+    assert.equal(await page.locator('[data-import-id] input:checked').count(),8);
+    await page.setViewportSize({width:390,height:900});
+    assert.ok(await page.locator('#proxy-dialog').evaluate(el=>el.scrollWidth<=el.clientWidth));
+    assert.equal(await page.locator('#proxy-import-source').evaluate(el=>el.open),false);
+    assert.ok(await page.locator('[data-import-id]').first().evaluate(el=>el.getBoundingClientRect().bottom<=document.querySelector('.proxy-import-selection').getBoundingClientRect().top),'Mobile results should be visible without scrolling through the original input');
+    await screenshot('proxy-import-results-mobile');
+    await page.click('#proxy-dialog-cancel');
+    await page.setViewportSize({width:1440,height:1000});
+    await page.unroute('**/api/proxy/test',batchProbe);
+    check('停止测试立即取消在途与排队项，忽略迟到结果，并可重试未完成节点；移动端导入布局');
+
     await page.locator('#keys-list .field-heading button').first().click();
+    await page.click('#proxy-tab-list');
     await page.locator('[data-proxy-index="0"]').getByRole('button',{name:'删除第 1 条代理',exact:true}).click();
+    await openProxyForm();
     await page.fill('#proxy-paste','["socks5://10.0.0.1:1080:user:pass","http://dedicated-backup:8080"]');
     await page.click('.proxy-recognize');
+    await finishProxyBatch();
     await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===2 && !document.querySelector('#proxy-form-add').matches(':disabled'));
     await page.click('#proxy-dialog-apply');
     await page.waitForFunction(()=>!document.querySelector('#proxy-dialog').open);
@@ -527,10 +765,15 @@ async function main() {
     await page.locator('.c-cookie').nth(1).fill('SAPISID=ui-cookie-two; SID=ui-sid-two');
     await page.locator('.c-project').nth(1).fill('cookie-project-two');
     await page.locator('#cookies-list .field-heading button').first().click();
+    await openProxyForm();
     await page.fill('#proxy-host','cookie-proxy.invalid');
+    await openProxyForm();
     await page.fill('#proxy-port','1080');
+    await openProxyForm();
     await page.fill('#proxy-username','cookie-user');
+    await openProxyForm();
     await page.fill('#proxy-password','private:password');
+    await openProxyForm();
     await page.click('#proxy-form-add');
     await page.waitForFunction(()=>document.querySelectorAll('[data-proxy-index]').length===1);
     await page.click('#proxy-dialog-apply');
@@ -632,14 +875,20 @@ async function main() {
       assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),`${width}px modal page overflow`);
       if(width===390) await screenshot('proxy-editor-mobile');
       if(width===320 || width===390){
+        await openProxyForm();
         await page.selectOption('#proxy-type','sstp');
         await page.locator('#proxy-advanced summary').click();
+        await openProxyForm();
         await page.fill('#proxy-ca','/app/certificates/company.pem');
+        await openProxyForm();
         await page.fill('#proxy-mtu','1280');
         assert.ok(await page.locator('#proxy-dialog').evaluate(el=>el.scrollWidth<=el.clientWidth),`${width}px SSTP advanced settings overflow`);
         await page.locator('#proxy-password').click();
+        await openProxyForm();
         await page.fill('#proxy-host','mobile-draft.invalid');
+        await openProxyForm();
         await page.fill('#proxy-port','1080');
+        await openProxyForm();
         await page.fill('#proxy-password','mobile-draft');
         const fieldBounds=await page.locator('#proxy-password').evaluate(el=>{
           const rect=el.getBoundingClientRect(), header=document.querySelector('.proxy-dialog-head').getBoundingClientRect(), footer=document.querySelector('.proxy-dialog-foot').getBoundingClientRect();
@@ -651,6 +900,7 @@ async function main() {
         assert.ok(fieldBounds.top>=fieldBounds.header-1 && fieldBounds.bottom<=fieldBounds.footer+1,`${width}px mobile password field obscured: ${JSON.stringify(fieldBounds)}`);
       }
       await page.keyboard.press('Escape');
+      if(await page.locator('#proxy-close-prompt').isVisible()) await page.locator('#proxy-close-prompt').getByRole('button',{name:'放弃并关闭',exact:true}).click();
       assert.equal(await page.locator('#proxy-dialog').evaluate(el=>el.open),false);
     }
     check('五个页面及长请求详情通过 320 / 390 / 768 / 1024 / 1440px 宽度检查');

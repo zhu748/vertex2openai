@@ -61,6 +61,7 @@ class ConsoleRoutesTests(unittest.TestCase):
             ("POST", "/api/express-keys/project"),
             ("POST", "/api/cookie"),
             ("POST", "/api/proxy/test"),
+            ("POST", "/api/proxy/import-preview"),
             ("GET", "/stream-logs"),
         ):
             with self.subTest(method=method, path=path):

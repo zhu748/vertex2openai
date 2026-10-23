@@ -360,7 +360,7 @@
       <fieldset class="card settings-card channel-wide">
        <legend class="visually-hidden">全局代理列表</legend>
        <div class="card-toolbar"><div><div class="text-sm font-semibold">全局代理列表 <button aria-controls="h_proxy" aria-expanded="false" aria-label="展开说明" class="helpq" onclick="hlp(this,'h_proxy')" type="button">?</button></div><div class="text-xs text-neutral-500 mt-0.5">从第一条开始使用，失败后依次切换。账号专属代理优先于此列表</div></div>
-        <div class="toolbar-actions"><span class="pill" id="proxy-status">加载中…</span><span class="pill hidden" id="proxy-draft-state" role="status">未保存</span><button type="button" onclick="manageProxies('global')">管理 / 添加代理</button><button type="button" onclick="runAction(this,()=>testProxy())">测试首条</button><button type="button" class="btn px-4 py-1.5 text-sm" onclick="runAction(this,()=>saveProxy())">保存代理</button></div>
+        <div class="toolbar-actions"><span class="pill" id="proxy-status">加载中…</span><span class="pill hidden" id="proxy-draft-state" role="status">未保存</span><button type="button" onclick="manageProxies('global')">管理 / 添加代理</button><button type="button" onclick="manageProxies('global',0,'import')">批量导入</button><button type="button" onclick="runAction(this,()=>testProxy())">测试首条</button><button type="button" class="btn px-4 py-1.5 text-sm" onclick="runAction(this,()=>saveProxy())">保存代理</button></div>
        </div>
        <div class="helpbox" id="h_proxy">每行一条，或用「管理 / 添加代理」填写类型、IP、端口、账号、密码，也可粘贴后自动识别。支持 HTTP / HTTPS / SOCKS5 / SOCKS5H，以及由 sing-box 转换的 SOCKS4、VLESS、VMess、Trojan、SS、Hysteria2、TUIC。TURN / TURNS / SSTP 可直接填写，由内置转换器连接；TURN 需支持 TCP 中继，SSTP 使用 MS-CHAPv2 认证。<br>连接异常、代理超时或 HTTP 407 / 502 / 503 / 504 时尝试下一条；账号鉴权、配额与参数错误沿用模型重试策略。<br>账号专属代理全部失败后，默认继续尝试全局列表；可在每个账号下取消此回退。清空全局列表并保存即可直连；已配置代理全部失败时，不会额外增加直连出口。账号填写 <code>direct</code> 可强制直连。</div>
        <textarea aria-label="全局出站代理" class="inp log" id="proxy-input" rows="3" spellcheck="false" autocomplete="off" placeholder="每行一条，第一条为首选；留空 = 直连。点击「管理 / 添加代理」填写或识别代理"></textarea>
@@ -1614,13 +1614,19 @@
   </div>
   <dialog id="proxy-dialog" aria-labelledby="proxy-dialog-title" aria-describedby="proxy-dialog-hint">
    <div class="proxy-dialog-head"><div><h2 id="proxy-dialog-title">代理列表</h2><p id="proxy-dialog-hint"></p></div><button type="button" class="btn-ghost" id="proxy-dialog-close" aria-label="关闭代理编辑器">关闭</button></div>
+   <div class="proxy-nav" role="tablist" aria-label="代理管理">
+    <button type="button" id="proxy-tab-list" role="tab" aria-controls="proxy-panel-list" aria-selected="true" onclick="switchProxyView('list')">代理列表 <span id="proxy-editor-count">0 / 32</span></button>
+    <button type="button" id="proxy-tab-form" role="tab" aria-controls="proxy-panel-form" aria-selected="false" tabindex="-1" onclick="switchProxyView('form')">单条添加</button>
+    <button type="button" id="proxy-tab-import" role="tab" aria-controls="proxy-panel-import" aria-selected="false" tabindex="-1" onclick="switchProxyView('import')">批量导入</button>
+   </div>
+   <div class="proxy-test-toolbar"><label for="proxy-test-target">测试目标 <select id="proxy-test-target" onchange="proxyTargetChanged()"><option value="vertex">Google Vertex</option><option value="cookie">Google Cookie 通道</option></select></label><span id="proxy-job-state" role="status" aria-live="polite">连通性测试不代表账号或模型调用成功</span><button type="button" class="btn-ghost hidden" id="proxy-stop-tests" onclick="stopProxyTests()">停止测试</button></div>
    <div class="proxy-dialog-body">
-    <fieldset class="proxy-list-panel"><legend class="visually-hidden">按优先级排序的代理列表</legend><div class="field-heading"><strong>出口优先级</strong><span class="pill" id="proxy-editor-count">0 / 32 条</span></div><div id="proxy-editor-list"></div></fieldset>
-    <fieldset class="proxy-form-panel"><legend class="visually-hidden">代理填写与识别</legend>
-     <label class="lbl" for="proxy-paste" id="proxy-paste-label">粘贴代理 · 自动识别</label><textarea id="proxy-paste" class="inp log" rows="3" spellcheck="false" autocomplete="off" placeholder="粘贴一条自动填入字段，粘贴多条可批量导入"></textarea>
-     <p class="proxy-form-hint" id="proxy-paste-hint"></p><button type="button" class="btn-ghost proxy-recognize" onclick="runAction(this,()=>recognizeProxyPaste())">识别粘贴内容</button>
+    <fieldset class="proxy-list-panel" id="proxy-panel-list" role="tabpanel" aria-labelledby="proxy-tab-list"><legend class="visually-hidden">按优先级排序的代理列表</legend><div class="field-heading"><strong>按顺序故障切换</strong><div class="toolbar-actions"><button type="button" class="btn-ghost" id="proxy-test-all" onclick="testAllEditorProxies()">测试全部</button><button type="button" class="btn-ghost" onclick="switchProxyView('form')">＋ 添加代理</button></div></div><div id="proxy-editor-list"></div></fieldset>
+    <fieldset class="proxy-form-panel hidden" id="proxy-panel-form" role="tabpanel" aria-labelledby="proxy-tab-form"><legend class="visually-hidden">代理填写与识别</legend>
      <label class="lbl" for="proxy-type">代理类型</label><select class="inp" id="proxy-type" onchange="proxyTypeChanged()"><option value="socks5">SOCKS5</option><option value="socks5h">SOCKS5H（远程 DNS）</option><option value="http">HTTP</option><option value="https">HTTPS</option><option value="socks4">SOCKS4</option><option value="socks4a">SOCKS4A</option><option value="turn">TURN（TCP 中继）</option><option value="turns">TURNS（TLS + TCP 中继）</option><option value="sstp">SSTP（MS-CHAPv2）</option><option value="singbox">sing-box 节点（VLESS / VMess / TUIC / Hysteria2 等）</option><option value="direct">强制直连</option></select>
      <p class="proxy-form-hint" id="proxy-protocol-hint"></p>
+     <label class="lbl" for="proxy-paste" id="proxy-paste-label">粘贴代理 · 自动识别</label><textarea id="proxy-paste" class="inp log" rows="3" spellcheck="false" autocomplete="off" placeholder="粘贴一条自动填入字段，粘贴多条可批量导入"></textarea>
+     <p class="proxy-form-hint" id="proxy-paste-hint"></p><button type="button" class="btn-ghost proxy-recognize" onclick="runAction(this,()=>recognizeProxyPaste())">识别粘贴内容</button>
      <div id="proxy-structured-fields" class="proxy-form-grid">
       <div><label class="lbl" for="proxy-host">IP / 主机名</label><input class="inp log" id="proxy-host" spellcheck="false" placeholder="127.0.0.1 或 proxy.example.com" autocomplete="off"/></div><div><label class="lbl" for="proxy-port">端口</label><input class="inp log" id="proxy-port" inputmode="numeric" placeholder="1080" autocomplete="off"/></div>
       <div><label class="lbl" for="proxy-username">账号（可选）</label><input class="inp log" id="proxy-username" spellcheck="false" autocomplete="off"/></div><div><label class="lbl" for="proxy-password">密码（可选）</label><input class="inp log" id="proxy-password" type="password" autocomplete="new-password"/></div>
@@ -1635,11 +1641,24 @@
       <div id="proxy-turn-fields"><label class="lbl" for="proxy-realm">TURN Realm（可选）</label><input class="inp log" id="proxy-realm" placeholder="留空使用服务器返回的 Realm" autocomplete="off"/></div>
       <div id="proxy-sstp-fields"><label class="lbl" for="proxy-mtu">SSTP MTU（可选）</label><input class="inp log" id="proxy-mtu" inputmode="numeric" placeholder="1400" autocomplete="off"/></div>
      </details>
-     <div class="proxy-form-actions"><button type="button" class="btn-ghost" onclick="resetProxyForm();renderProxyEditor()">清空表单</button><button type="button" class="btn" id="proxy-form-add" onclick="runAction(this,()=>addProxyDraft())">加入列表</button></div>
+     <div class="proxy-form-actions"><button type="button" class="btn-ghost" onclick="resetProxyForm();renderProxyEditor()">清空表单</button><button type="button" class="btn-ghost" id="proxy-form-test-add" onclick="runAction(this,()=>addProxyDraft(true))">测试并加入</button><button type="button" class="btn" id="proxy-form-add" onclick="runAction(this,()=>addProxyDraft())">加入列表</button></div>
+    </fieldset>
+    <fieldset class="proxy-import-panel hidden" id="proxy-panel-import" role="tabpanel" aria-labelledby="proxy-tab-import"><legend class="visually-hidden">批量识别、测试与导入</legend>
+     <details id="proxy-import-source" open><summary>粘贴与识别</summary>
+     <label class="lbl" for="proxy-import-text">粘贴待导入代理</label><textarea id="proxy-import-text" class="inp log" rows="5" spellcheck="false" autocomplete="off" placeholder="每行一条，也支持完整链接逗号分隔、JSON 数组或 ICE 配置。最多 200 条候选，最终列表最多 32 条。"></textarea>
+     <div class="proxy-import-options"><label for="proxy-import-type">无协议前缀时按 <select id="proxy-import-type"><option value="socks5">SOCKS5</option><option value="socks5h">SOCKS5H</option><option value="http">HTTP</option><option value="https">HTTPS</option><option value="socks4">SOCKS4</option><option value="socks4a">SOCKS4A</option><option value="turn">TURN</option><option value="turns">TURNS</option><option value="sstp">SSTP</option></select> 识别</label><label><input type="checkbox" id="proxy-import-tested" checked onchange="proxyImportPolicyChanged()"/>先测试，仅导入通过项</label></div>
+     <div class="proxy-import-actions"><button type="button" class="btn" id="proxy-import-preview" onclick="runAction(this,()=>previewProxyImport())">识别并测试</button><span class="proxy-form-hint">追加到现有列表，保留输入顺序；重复项自动跳过。</span></div>
+     </details>
+     <div id="proxy-import-preview-panel" class="hidden">
+      <div class="proxy-import-summary"><strong id="proxy-import-summary" role="status" aria-live="polite"></strong><div class="toolbar-actions"><button type="button" class="btn-ghost" id="proxy-import-retry" onclick="testProxyImport(true)">重试失败 / 未完成项</button><button type="button" class="btn-ghost" id="proxy-import-select" onclick="selectProxyImport()">选择可导入项</button><button type="button" class="btn-ghost" onclick="selectProxyImport(false)">取消选择</button></div></div>
+      <div id="proxy-import-list"></div>
+      <div class="proxy-import-selection"><span id="proxy-import-selection" role="status"></span><div class="toolbar-actions"><button type="button" class="btn-ghost" id="proxy-import-add" onclick="runAction(this,()=>importSelectedProxies())">加入列表草稿</button><button type="button" class="btn" id="proxy-import-commit" onclick="runAction(this,()=>importSelectedProxies(true))">导入并保存</button></div></div>
+     </div>
     </fieldset>
    </div>
    <div class="proxy-editor-error" id="proxy-editor-error" role="alert"></div>
-   <div class="proxy-dialog-foot"><span>排序、删除和编辑仅修改当前草稿</span><div><button type="button" class="btn-ghost" id="proxy-dialog-cancel">取消</button><button type="button" class="btn" id="proxy-dialog-apply" onclick="runAction(this,()=>applyProxyEditor())">应用到配置</button></div></div>
+   <div class="proxy-close-prompt hidden" id="proxy-close-prompt" role="alert"><span>有未保存的编辑，关闭后将丢弃。</span><button type="button" class="btn-ghost" onclick="document.getElementById('proxy-close-prompt').classList.add('hidden')">继续编辑</button><button type="button" class="btn-ghost" onclick="closeProxyEditor(true)">放弃并关闭</button></div>
+   <div class="proxy-dialog-foot"><span id="proxy-save-hint">排序、删除和编辑仅修改当前草稿</span><div><button type="button" class="btn-ghost" id="proxy-dialog-cancel">放弃草稿</button><button type="button" class="btn-ghost" id="proxy-dialog-apply" onclick="runAction(this,()=>applyProxyEditor())">应用到页面草稿</button><button type="button" class="btn" id="proxy-dialog-save" onclick="runAction(this,()=>applyProxyEditor(true))">保存并生效</button></div></div>
   </dialog>
   <dialog aria-describedby="request-detail-id" aria-labelledby="request-detail-title" id="request-dialog">
    <div class="request-detail-head">

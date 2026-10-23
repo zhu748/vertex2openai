@@ -310,8 +310,8 @@ function mergeProbeResults(results,saved){
 function updateProxyPill(on){
   const p=$('proxy-status'); if(!p) return;
   p.textContent = on ? (typeof on==='number'?'已配置 '+on+' 条':'已启用') : '未启用（直连）';
-  p.style.background = on ? '#ecfdf5' : '#f5f5f5';
-  p.style.color = on ? '#047857' : '#737373';
+  p.style.background = on ? '#eeeeff' : '#f5f5f5';
+  p.style.color = on ? '#5556d9' : '#737373';
 }
 function updateProxyDraft(){
   const saved=proxyDraft(GLOBAL_SETTINGS.proxy_urls??GLOBAL_SETTINGS.proxy_url);
@@ -789,9 +789,9 @@ async function loadChannelFeatures(){
     channelAssetNotice('');
   }catch(error){channelAssetNotice(error.message+'。已保存的 Key、代理和模型参数仍可查看与修改，请刷新或重新加载配置以重试编辑器。');}
 }
-async function manageProxies(scope='global',index=0){
+async function manageProxies(scope='global',index=0,view='list'){
   try{
-    const channels=await ensureChannelConfig();channels.init();channels.open(scope,index);
+    const channels=await ensureChannelConfig();channels.init();channels.open(scope,index,view);
   }catch(error){channelAssetNotice(error.message+'，请重新加载配置或刷新面板。');toast(error.message);}
 }
 // Keep buttons in a cached previous HTML document usable during an upgrade.
@@ -815,7 +815,7 @@ async function runAction(button,action){
   const disabled=groups.map(group=>group.disabled);
   groups.forEach(group=>{group.disabled=true;group.setAttribute('aria-busy','true');});
   try{await action();}
-  finally{button.disabled=false;button.removeAttribute('aria-busy');if(button.textContent==='处理中…') button.textContent=label;groups.forEach((group,i)=>{group.disabled=disabled[i];group.removeAttribute('aria-busy');});}
+  finally{button.disabled=false;button.removeAttribute('aria-busy');if(button.textContent==='处理中…') button.textContent=label;groups.forEach((group,i)=>{group.disabled=disabled[i];group.removeAttribute('aria-busy');});window.consoleChannels?.sync?.();}
 }
 document.addEventListener('input',event=>{
   event.target.removeAttribute('aria-invalid');

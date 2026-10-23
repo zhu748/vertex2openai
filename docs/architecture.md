@@ -15,7 +15,7 @@ Express SDK 或 Cookie 上游；Gemini 原生请求通过 Express REST 透传。
 | `app/routes/console.py` | 页面、登录退出、统计和日志流 |
 | `app/routes/settings_api.py` | 全局设置、模型设置和能力摘要 |
 | `app/routes/credentials_api.py` | Express Key、项目探测和 Cookie 凭证 |
-| `app/routes/system_api.py` | 健康检查和代理连通性测试 |
+| `app/routes/system_api.py` | 健康检查、代理导入预览和有界连通性测试 |
 | `app/templates/` | 登录和控制台 HTML；页面按文件路径加载并缓存，无需前端构建 |
 | `app/static/dashboard.js`、`app/static/login.js` | 概览、配置、凭证与日志交互，以及登录表单反馈；全部使用本地资源 |
 | `app/static/console.css`、`app/static/dashboard.css` | 手写组件与响应式样式，以及预编译的 Tailwind 工具样式 |
@@ -24,6 +24,7 @@ Express SDK 或 Cookie 上游；Gemini 原生请求通过 Express REST 透传。
 | `app/runtime_state.py`、`app/config.py` | 可持久化运行状态、环境变量和内置默认值 |
 | `app/credential_config.py`、`app/credential_manager.py` | 多 Key / Cookie 环境导入、混合账号选择，以及 Cookie 与项目绑定 |
 | `app/proxy_config.py`、`app/proxy_failover.py` | 代理输入归一化、有序候选链、账号到全局回退及交付前切换 |
+| `app/proxy_import.py` | 有界批量导入预览、逐条错误定位、连接去重；正式保存仍使用严格解析器 |
 | `app/static/channel-config.js` | Cookie 账号列表、账号回退策略，以及共用代理编辑弹窗 |
 | `app/console_assets.py` | 控制台资源内容版本与缓存重新验证，防止部署后混用新旧脚本 |
 | `app/upstreams/` | 两种上游协议，以及共用的消息准备流程 |
