@@ -31,7 +31,7 @@ import anti_truncation
 import config
 import main
 from logger import ProxyStats
-from routes import claude_api, gemini_native, models_api
+from routes import claude_api, gemini_native
 
 AVAILABLE = ["gemini-3.8-flash", "gemini-3.1-pro-preview", "gemini-3.1-flash-lite"]
 
