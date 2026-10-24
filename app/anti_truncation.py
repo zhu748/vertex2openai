@@ -61,6 +61,38 @@ def listed_suffixes(model: str, settings: dict) -> tuple[str, ...]:
                  if suffix != "-antitruncation" and selected in (mode, "both"))
 
 
+def search_variant_available(model_id: str) -> bool:
+    """-search 目录变体规则：Gemini 文本模型（生图等除外）。
+
+    OpenAI /v1/models、Anthropic /v1/models（claude 客户端）与 Gemini 原生
+    /v1beta/models 三套目录共用的单一事实源——三种协议的请求侧都支持
+    -search 后缀（OpenAI/Claude 走统一管线剥后缀强制搜索；Gemini 原生
+    透传在 gemini_native 里剥后缀并注入 google_search 工具）。
+    """
+    lowered = (model_id or "").lower()
+    return ("gemini" in lowered and "image" not in lowered
+            and not lowered.endswith("-search"))
+
+
+def catalog_variant_ids(model_id: str, settings: dict) -> list[str]:
+    """一个目录基底模型展开出的全部模型 ID（含自身）。
+
+    与 OpenAI /v1/models 的展开口径逐字一致（models_api 复用本函数）：
+    - 裸模型：[base, base-search?, 已开启的抗截断后缀...]
+    - 自带抗截断后缀的条目：该后缀开启时仅 [自身]，未开启时不列出
+    settings 为该模型的有效设置（app_state.get_effective_settings 结果）。
+    """
+    plain_id, mode = split_model_alias(model_id)
+    available = listed_suffixes(plain_id, settings)
+    if mode is not None:
+        return [model_id] if f"-antitruncation-{mode}" in available else []
+    suffixes = [""]
+    if search_variant_available(model_id):
+        suffixes.append("-search")
+    suffixes.extend(available)
+    return [f"{model_id}{suffix}" for suffix in suffixes]
+
+
 def supports_argument_stream(model: str) -> bool:
     """Official native stream: Gemini 3+, except 3.1 Flash-Lite."""
     match = re.search(r"gemini-(\d+)", model, re.I)

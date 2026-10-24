@@ -33,6 +33,7 @@ Cherry Studio 等说 Claude 协议的客户端）说的是另一套协议：
 
 import asyncio
 import json
+import time
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, Request
@@ -169,7 +170,8 @@ def _json_response_payload(response) -> Optional[dict]:
 
 
 def _claude_stream_response(response: StreamingResponse, display_model: str, *,
-                           omit_thinking: bool) -> ManagedStreamingResponse:
+                           omit_thinking: bool,
+                           started_at: Optional[float] = None) -> ManagedStreamingResponse:
     """把上游 OpenAI SSE 流翻译成 Anthropic 事件流（claude_messages 的流式段）。
 
     职责与保活策略（详见模块 docstring 与 IDLE_PING_SECONDS 注释）：
@@ -209,6 +211,7 @@ def _claude_stream_response(response: StreamingResponse, display_model: str, *,
 
     async def event_stream():
         failed = False
+        delivered = False  # message_stop 已完整发出（客户端断开/异常时不算完成）
         producer = asyncio.create_task(_produce_frames())
         try:
             # message_start 先行：不等上游首字节，客户端连接立刻建立
@@ -257,6 +260,7 @@ def _claude_stream_response(response: StreamingResponse, display_model: str, *,
             if not failed:
                 for event in state.finish_events():
                     yield event
+                delivered = True
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -265,6 +269,16 @@ def _claude_stream_response(response: StreamingResponse, display_model: str, *,
             print(f"❌ [Claude] 模型 {display_model} 流式转发失败 | HTTP {code} | {message[:200]}")
             yield error_event(anthropic_error_type(code), message[:1024])
         finally:
+            # 与 OpenAI 通道的完成日志同构：显示模型（claude-* 或原样 gemini-*）
+            # | 耗时 | tokens；上游内部管线已按内部模型名打过 📊/✅，这里补齐
+            # Claude 协议视角的收尾行。
+            if delivered:
+                elapsed = time.monotonic() - started_at if started_at is not None else 0.0
+                usage = state.usage or {}
+                tokens = ""
+                if usage.get("input_tokens") or usage.get("output_tokens"):
+                    tokens = f" | 输入 {usage.get('input_tokens', 0)} / 输出 {usage.get('output_tokens', 0)} tokens"
+                print(f"✅ [Claude] 模型 {display_model} | 流式翻译完成 | 耗时 {elapsed:.1f}s{tokens}")
             # 结束/异常/客户端断开：停掉生产者并回收任务，释放上游连接
             producer.cancel()
             try:
@@ -327,6 +341,7 @@ async def claude_messages(fastapi_request: Request, api_key: str = Depends(get_c
     # thinking.display=omitted：响应侧不回传思考块（对齐 vertex-master
     # includeThoughts 口径；模型照常思考，reasoning_tokens 照计 usage）。
     omit_thinking = anthropic_omit_thinking(body)
+    request_started = time.monotonic()
 
     track_configure(model=display_model, protocol="claude",
                     stream=bool(request_obj.stream), channel=_track_channel())
@@ -352,11 +367,20 @@ async def claude_messages(fastapi_request: Request, api_key: str = Depends(get_c
             message = _openai_error_message(payload, f"上游请求失败（HTTP {status}）。")
             err_status = status if status >= 400 else 502
             return claude_error(err_status, anthropic_error_type(err_status), message)
-        return JSONResponse(content=openai_completion_to_anthropic(
-            payload or {}, display_model, new_message_id(), omit_thinking=omit_thinking))
+        anthropic_payload = openai_completion_to_anthropic(
+            payload or {}, display_model, new_message_id(), omit_thinking=omit_thinking)
+        # 与 OpenAI 通道的完成日志同构：显示模型 | 耗时 | tokens
+        usage = (anthropic_payload.get("usage") or {}) if isinstance(anthropic_payload, dict) else {}
+        tokens = ""
+        if usage.get("input_tokens") or usage.get("output_tokens"):
+            tokens = f" | 输入 {usage.get('input_tokens', 0)} / 输出 {usage.get('output_tokens', 0)} tokens"
+        print(f"✅ [Claude] 模型 {display_model} | 非流式响应完成 | "
+              f"耗时 {time.monotonic() - request_started:.1f}s{tokens}")
+        return JSONResponse(content=anthropic_payload)
 
     # ---- 流式：OpenAI SSE 帧 → Anthropic SSE 事件 ----
-    return _claude_stream_response(response, display_model, omit_thinking=omit_thinking)
+    return _claude_stream_response(response, display_model, omit_thinking=omit_thinking,
+                                   started_at=request_started)
 
 
 def _sse_data_lines(frame_text: str):
@@ -544,9 +568,23 @@ def is_anthropic_client(fastapi_request: Request) -> bool:
 
 
 async def anthropic_models_data() -> dict:
-    """Anthropic 模型目录数据体（列表 /v1/models 与单模型检索共用）。"""
+    """Anthropic 模型目录数据体（列表 /v1/models 与单模型检索共用）。
+
+    变体目录与 OpenAI /v1/models 同源展开（anti_truncation.catalog_variant_ids
+    单一事实源）：-search 变体与按模型设置开启的抗截断后缀一并列出——
+    请求侧 resolve_claude_model 对非 claude-* 名字原样透传，Claude 客户端
+    可直接使用这些变体，目录应与实际能力一致。
+    """
+    from anti_truncation import catalog_variant_ids, split_model_alias
+
     available = await _available_models()
-    return anthropic_models_payload(available)
+    settings_base = app_state.get_settings()
+    variants: list[str] = []
+    for model_id in available:
+        plain_id, _ = split_model_alias(model_id)
+        effective = app_state.get_effective_settings(plain_id, base=settings_base)
+        variants.extend(catalog_variant_ids(model_id, effective))
+    return anthropic_models_payload(available, variants)
 
 
 async def anthropic_model_list() -> JSONResponse:

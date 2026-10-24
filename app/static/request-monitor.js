@@ -4,6 +4,12 @@
     receiving:'接收上游分片', thinking:'返回思考', streaming:'输出正文 / 工具', retry_wait:'退避等待',
     resuming:'续接已有生成', delivery:'发送响应', succeeded:'完成', error:'失败', cancelled:'已取消', cancelling:'取消旧任务中'};
   const modes = {stream:'真流式', fake_stream:'假流式', json:'非流式'};
+  const protocols = {openai:'OpenAI', claude:'Claude', gemini:'Gemini 原生'};
+  const channels = {express:'Express', cookie:'Cookie', mixed:'混合'};
+  // 协议·通道·模式三段标签：mode 恒有值，旧写法 modes[r.mode]||r.protocol 会把协议吞掉，
+  // 三协议共存的部署里无法分辨请求来自哪套端点。
+  const flowLabel = r => [protocols[r.protocol] || r.protocol, channels[r.channel] || r.channel, modes[r.mode]]
+    .filter(Boolean).join(' · ');
   const connections = {open:'连接中', completed:'发送结束', disconnected:'已断开'};
   const state = {offset:0, limit:25, total:0, selected:null, listController:null, detailController:null, listLoading:false, detailLoading:false, loaded:false};
   const duration = ms => ms == null ? '—' : ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} 秒`;
@@ -45,7 +51,7 @@
       state.loaded=true;
       const focusedRequest=document.activeElement.closest('#request-rows [data-request]')?.dataset.request;
       $('request-rows').innerHTML=data.items.length ? data.items.map(r => `<tr data-request="${esc(r.id)}" tabindex="0" role="button" aria-label="查看请求 ${esc(r.id)}">
-        <td><span class="request-link request-id">${esc(r.id.slice(-8))}</span><div class="request-model" title="${esc(r.model)}">${esc(r.model || '尚未通过校验')}</div><div class="lbl">${esc(r.channel)} · ${esc(modes[r.mode] || r.protocol)}</div></td>
+        <td><span class="request-link request-id">${esc(r.id.slice(-8))}</span><div class="request-model" title="${esc(r.model)}">${esc(r.model || '尚未通过校验')}</div><div class="lbl">${esc(flowLabel(r))}</div></td>
         <td>${badge(r)}${r.parent_id?'<div class="lbl mt-1">续传读者</div>':''}${r.generation_active&&!r.http_active?'<div class="lbl mt-1">后台仍在生成</div>':''}</td>
         <td data-label="开始时间">${esc(date(r.created_at))}</td><td data-label="总耗时">${duration(r.duration_ms)}</td><td data-label="首回复 / 正文">${timing(r,r.parent_id?'first_sent_reply':'first_reply')} / ${timing(r,r.parent_id?'first_sent_content':'first_content')}</td>
         <td data-label="尝试 / 重试">${r.attempts} / ${r.retries}</td><td data-label="输出 / 思考">${fmt(r.content_chars || r.sent_content_chars)} / ${fmt(r.reasoning_chars || r.sent_reasoning_chars)} 字符</td><td data-label="连接状态">${esc(connections[r.connection])}</td></tr>`).join('') : '<tr><td colspan="8" class="table-empty"><span class="empty-title">没有符合条件的请求</span><span class="empty-description">可调整搜索与筛选；新请求将自动出现在这里。</span></td></tr>';
@@ -85,7 +91,7 @@
       $('request-detail-id').textContent=r.id;
       const retry = r.retry_at && r.phase==='retry_wait' ? ` · 预计 ${Math.max(0,Math.ceil(r.retry_at-Date.now()/1000))} 秒后重试` : '';
       const waiting = r.first_reply_deadline ? ` · 首回复还可等待 ${Math.max(0,Math.ceil(r.first_reply_deadline-Date.now()/1000))} 秒` : '';
-      $('request-detail-state').innerHTML=badge(r)+` <span class="lbl">${esc(connections[r.connection])} · ${esc(r.channel)} · ${esc(modes[r.mode]||r.protocol)}${esc(retry+waiting)}</span>`;
+      $('request-detail-state').innerHTML=badge(r)+` <span class="lbl">${esc(connections[r.connection])} · ${esc(flowLabel(r))}${esc(retry+waiting)}</span>`;
       const oldLogs=$('request-detail-logs');
       const detailScroll=$('request-dialog').scrollTop;
       const scroll=oldLogs?.scrollTop||0;

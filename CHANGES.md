@@ -2,6 +2,49 @@
 
 基于原版 `vertex2openai-main`（2026-09-01），持续完善兼容性、可靠性和代码组织。
 
+## 2026-10-24 三协议对齐：模型目录变体统一 + 运行日志补齐（Gemini 原生 / Claude）
+
+Gemini 原生（/v1beta）与 Claude（/v1/messages）端点是后加的，此前与 OpenAI 端点
+存在模型目录与运行日志两类不对齐，本次统一。
+
+- **目录变体展开单一事实源**（`app/anti_truncation.py`）：
+  - 新增 `search_variant_available()`（-search 变体规则：Gemini 文本模型）与
+    `catalog_variant_ids()`（完整展开：base / base-search / 已开启的抗截断后缀）；
+  - OpenAI `/v1/models`（`models_api`）改为复用，行为逐字不变。
+- **Anthropic 目录对齐**（`claude_api.anthropic_models_data`、`claude_protocol`）：
+  - claude 别名之后同时列出与 OpenAI 目录同源展开的变体（-search 与按模型设置
+    开启的抗截断后缀）——请求侧 `resolve_claude_model` 本就原样透传这些变体，
+    目录从「少列」修正为与实际能力一致；
+  - `anthropic_models_payload()` 新增可选 `catalog_variants` 参数，单参调用兼容。
+- **Gemini 原生通道支持 -search 变体**（`gemini_native`）：
+  - 透传侧新增 `_strip_search_variant()`：模型名带 -search 后缀时剥后缀并注入
+    `{"google_search": {}}` 工具（仅对显式后缀请求做 body 最小重组；普通模型仍
+    字节级透传，原注释「转发原始字节」的形态保真原则不变——该后缀是本服务
+    扩展名，Google 无此模型，不重组只会 404）；
+  - countTokens / embedContent 只剥后缀；客户端已带搜索工具时不重复注入；
+    不支持变体的模型（生图等）回 400 明确报错；监控按客户端原始模型名记录；
+  - `/v1beta/models` 目录列出 -search 变体（条目描述注明），`models/{id}` 检索
+    同步接受变体名；抗截断后缀仍不列出（其传输语义只在 OpenAI 兼容管线实现）。
+- **Gemini 透传运行日志对齐**（`gemini_native`）：
+  - 流式完成日志从「共 N 字节」升级为 `✅ [Gemini 透传] {模型} | 流式转发完成 |
+    耗时 X.Xs | 共 N 字节`，中止日志同样带模型与耗时；
+  - 非流式成功路径此前零完成日志，补同构 ✅ 行；
+  - `_NativeStreamState` 捕获尾帧 `usageMetadata`，完成时打 `💰 [算力消耗统计]`
+    行（提示词 / 生成 / 思考 / 总计），非流式从缓冲 body 提取（子串存在才解析），
+    与 OpenAI 通道的算力日志同口径；请求监控的 usage 此前已由中间件观察器捕获。
+- **Claude 运行日志对齐**（`claude_api`）：
+  - 流式翻译完整发出 message_stop 后打 `✅ [Claude] 模型 {显示名} | 流式翻译完成 |
+    耗时 X.Xs | 输入 X / 输出 Y tokens`（客户端断开 / 失败不打，避免误导）；
+  - 非流式响应补同构 ✅ 行；此前的 🔵 开始 / ❌ 失败日志不变。
+- **请求监控面板**（`static/request-monitor.js`）：
+  - 行内与详情标签从「通道 · 模式（协议被吞）」改为 `协议 · 通道 · 模式` 三段
+    （OpenAI / Claude / Gemini 原生 · Express / Cookie / 混合 · 真流式/假流式/非流式），
+    三协议共存的部署可分辨请求来自哪套端点。
+
+测试：新增 `tests/test_protocol_alignment.py` 23 项（变体展开 / 三目录 / 透传
+-search 改写与字节级透传不破坏 / 用量提取与日志 / Claude 完成日志）；全量
+717 通过（基线固有的 2 个顺序敏感失败不变）。
+
 ## 2026-10-24 对齐上游 bad-woman/vertex2openai：跨通道兜底、坏凭证隔离与重试关键词加固
 
 对比上游仓库 2026-10-23 批次改动（多 Key 轮换容灾、Key ↔ Cookie 跨通道互备、

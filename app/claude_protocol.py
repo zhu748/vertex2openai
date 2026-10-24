@@ -1045,8 +1045,15 @@ def estimate_request_tokens(body: dict) -> int:
 # Anthropic 格式模型目录（Anthropic 客户端访问 /v1/models 时切换格式）
 # ============================================================
 
-def anthropic_models_payload(available_models: list) -> dict:
-    """Anthropic List Models 响应：claude 别名 + 内部 Gemini 模型并列展示。"""
+def anthropic_models_payload(available_models: list, catalog_variants: Optional[list] = None) -> dict:
+    """Anthropic List Models 响应：claude 别名 + 内部 Gemini 模型并列展示。
+
+    catalog_variants 为 None 时按旧口径直接列 available_models（单测直调）；
+    生产路径由 claude_api.anthropic_models_data 传入与 OpenAI /v1/models
+    同源展开的变体目录（-search / 已开启的抗截断后缀）——请求侧
+    resolve_claude_model 对非 claude-* 名字原样透传，这些变体在 Claude
+    协议下同样可用，目录应当如实反映。
+    """
     from datetime import datetime, timezone
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1064,7 +1071,7 @@ def anthropic_models_payload(available_models: list) -> dict:
         internal = _CLAUDE_MODEL_ALIASES.get(alias)
         suffix = f"（映射 {internal}）" if internal else ""
         add(alias, f"Claude 别名 {suffix}" if suffix else alias)
-    for model in available_models:
+    for model in (catalog_variants if catalog_variants is not None else available_models):
         if isinstance(model, str):
             add(model, model)
 

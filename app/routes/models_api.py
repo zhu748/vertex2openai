@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from auth import validate_api_key
 from model_loader import get_express_models
 from runtime_state import app_state
-from anti_truncation import split_model_alias, listed_suffixes
+from anti_truncation import catalog_variant_ids, split_model_alias
 from routes import claude_api
 
 router = APIRouter()
@@ -103,20 +103,11 @@ async def openai_model_entries(express_key_manager_instance) -> List[Dict[str, A
     current_time = int(time.time())
 
     def add_model(base_id: str):
-        suffixes = [""]
-        plain_id, mode = split_model_alias(base_id)
-        available = listed_suffixes(plain_id, app_state.get_effective_settings(plain_id, base=settings_base))
-        if mode is not None and f"-antitruncation-{mode}" not in available:
-            return
-        if mode is None and not base_id.endswith("-search") and "gemini" in base_id.lower() and "image" not in base_id.lower():
-            suffixes.append("-search")
-        # Native Gemini listings remain a transparent upstream catalog. These
-        # transport variants belong only to the OpenAI-compatible endpoint.
-        if mode is None:
-            suffixes.extend(available)
-
-        for suffix in suffixes:
-            final_id = f"{base_id}{suffix}"
+        # 展开口径单一事实源：anti_truncation.catalog_variant_ids（OpenAI /
+        # Anthropic / Gemini 原生三套目录共用，变体集合保持一致）。
+        plain_id, _ = split_model_alias(base_id)
+        effective = app_state.get_effective_settings(plain_id, base=settings_base)
+        for final_id in catalog_variant_ids(base_id, effective):
             if final_id in processed_ids:
                 continue
             final_model_list.append({

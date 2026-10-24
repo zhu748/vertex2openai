@@ -153,14 +153,36 @@ def _native_error(status: int, message: str, status_detail: Optional[str] = None
 
 def _native_model_entry(model_id: str) -> dict:
     """Gemini 原生 models.list / models.get 共用的目录条目。"""
+    variant_note = "（Google 搜索增强变体：请求时注入 google_search 工具）" \
+        if model_id.lower().endswith("-search") else ""
     return {
         "name": f"models/{model_id}",
         "displayName": model_id,
-        "description": f"Vertex Express 模型（经 vertex2openai 透传）：{model_id}",
+        "description": f"Vertex Express 模型（经 vertex2openai 透传）：{model_id}{variant_note}",
         "inputTokenLimit": 1048576,
         "outputTokenLimit": 65536,
         "supportedGenerationMethods": ["generateContent", "streamGenerateContent", "countTokens"],
     }
+
+
+def _native_catalog_ids(raw_models: list) -> list[str]:
+    """原生目录 ID 列表：裸模型 + -search 变体（与 OpenAI / Anthropic 目录
+    同源，规则来自 anti_truncation.search_variant_available）。
+
+    抗截断后缀不列入：其解码/重建语义只在 OpenAI 兼容端点的统一管线里
+    实现，原生透传无法承载（保持「透明目录」的老约束，测试也断言这一点）。
+    """
+    from anti_truncation import search_variant_available
+
+    ids: list[str] = []
+    seen: set[str] = set()
+    for model_id in sorted(raw_models):
+        for candidate in (model_id, f"{model_id}-search"):
+            if candidate not in seen:
+                seen.add(candidate)
+                if candidate == model_id or search_variant_available(model_id):
+                    ids.append(candidate)
+    return ids
 
 
 # ============================================================
@@ -179,6 +201,46 @@ def _split_model_action(model_action: str) -> tuple[str, str]:
         model, _, action = name.partition(":")
         return model.strip(), action.strip()
     return name.strip(), ""
+
+
+def _strip_search_variant(model: str, action: str, parsed: dict) -> tuple[str, Optional[bytes]]:
+    """-search 变体的最小改写：返回 (基础模型名, 重组后的请求体或 None)。
+
+    与 OpenAI / Claude 端点对齐：三套协议的模型目录都列出 -search 变体，
+    请求侧统一「剥后缀 + 强制 Google 搜索」。原生透传的差异在于普通模型
+    保持字节级透传不变；仅当模型名显式带 -search 后缀（本服务的扩展名，
+    不存在任何「客户端 SDK 原生序列化形态」，Google 也无此模型名）时才
+    重组 body——否则该请求会在上游 404（Publisher model not found）。
+
+    - 生成动作（generateContent / streamGenerateContent）：注入
+      {"google_search": {}} 工具（客户端已自带搜索工具 / tools 非法时不注入，
+      交给上游按原样处理）；
+    - countTokens / embedContent：只剥后缀（body 与模型无关，无需重组）。
+    body 为 None 表示未做任何改写，调用方继续用原始字节。
+    """
+    from anti_truncation import search_variant_available
+
+    lowered = (model or "").lower()
+    if not lowered.endswith("-search") or len(lowered) <= len("-search"):
+        return model, None
+    base = model[: -len("-search")]
+    if not search_variant_available(base):
+        return model, None
+    if action not in ("generateContent", "streamGenerateContent"):
+        return base, None
+    tools = parsed.get("tools")
+    if tools is None:
+        parsed["tools"] = [{"google_search": {}}]
+    elif isinstance(tools, list) and all(isinstance(t, dict) for t in tools):
+        if any("google_search" in t or "googleSearch" in t for t in tools):
+            return base, None  # 客户端已自带搜索工具
+        parsed["tools"] = [*tools, {"google_search": {}}]
+    else:
+        return base, None  # tools 非法：原样透传，让上游报真实错误
+    body = json.dumps(parsed, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base, body
+
+
 
 
 def _resolve_upstream_model_path(model: str, key_project_id: str,
@@ -291,6 +353,9 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
     last_error_body = b""
     last_error_status = 502
     last_error_headers: dict[str, str] = {}
+    # 每轮尝试的流式契约状态（帧源与 _relay_stream 共享；成功路径下在
+    # 拿到 2xx 流式响应时创建，重试换轮自动丢弃旧用量）。
+    stream_state: Optional[_NativeStreamState] = None
 
     def _new_client(proxy_raw: str = "") -> httpx.AsyncClient:
         """按指定代理（原始 URI）建透传客户端。
@@ -384,12 +449,17 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
                 if upstream.status_code < 400:
                     first_reply.accept()
             elif upstream.status_code < 400:
+                # state 由本层创建并共享给帧源与 _relay_stream：帧源负责
+                # 契约校验（含首回复 guard 的 accept），收尾时从同一 state
+                # 读 usageMetadata 打 💰 日志。reply_guard 必须传入：帧源
+                # 收到首个有效回复时通过它结束首回复计时。
+                stream_state = _NativeStreamState(reply_guard=first_reply)
                 is_sse = is_sse_request
                 if "text/event-stream" in upstream.headers.get("content-type", "").lower():
-                    source = _native_sse_frames(upstream, reply_guard=first_reply)
+                    source = _native_sse_frames(upstream, reply_guard=first_reply, state=stream_state)
                     prefetched = await first_reply.prefetch(source, lambda _frame: first_reply.ready)
                 elif not is_sse:
-                    source = _native_json_chunks(upstream, first_reply)
+                    source = _native_json_chunks(upstream, first_reply, state=stream_state)
                     # A native JSON object may contain a whole generated image.
                     # Its partial raw bytes are response data, not SSE metadata.
                     prefetched = (await first_reply.prefetch(source, lambda _chunk: first_reply.ready,
@@ -480,7 +550,9 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
         if is_stream and upstream.status_code < 400:
             return await _relay_stream(
                 upstream, keepalive=is_sse_request,
-                deadline=deadline, source=prefetched)
+                deadline=deadline, source=prefetched,
+                model=model, started_at=started_at,
+                state=stream_state if stream_state is not None else None)
 
         # 错误（或非流式响应）：缓冲 body 再透传，顺带供钉定失败判定
         status = upstream.status_code
@@ -514,6 +586,10 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
         # 原样透传（保留上游真实状态码与 body）
         if status < 400:
             stats.add_success()
+            # 与 OpenAI 通道的完成日志同构：模型 | 结果 | 耗时 | 体量 + 💰 用量
+            print(f"✅ [Gemini 透传] {model} | 非流式响应完成 | "
+                  f"耗时 {time.monotonic() - started_at:.1f}s | 共 {len(body)} 字节")
+            _log_native_usage(_native_body_usage(body))
         return Response(content=body, status_code=status, media_type=ctype,
                         headers=headers or None)
 
@@ -541,6 +617,9 @@ class _NativeStreamState:
         self.seen, self.finished = set(), set()
         self.received = False
         self.blocked = False
+        # 最后一次出现的 usageMetadata（Gemini 流式会在尾帧携带汇总用量；
+        # 多次出现时后写覆盖前写，与官方 SDK 取末值的口径一致）。
+        self.usage: Optional[dict] = None
 
     def inspect(self, payload):
         for obj in payload if isinstance(payload, list) else [payload]:
@@ -549,6 +628,9 @@ class _NativeStreamState:
             self.received = True
             if obj.get("error"):
                 raise NativeStreamError(obj)
+            usage = obj.get("usageMetadata")
+            if isinstance(usage, dict):
+                self.usage = usage
             feedback = obj.get("promptFeedback")
             if isinstance(feedback, dict) and has_finish_reason(feedback.get("blockReason")):
                 self.blocked = True
@@ -582,11 +664,11 @@ class _NativeStreamState:
             raise IncompleteResponseError("上游流已结束，但未收到模型结束标记或请求拦截结果。")
 
 
-async def _native_json_chunks(upstream, reply_guard=None):
+async def _native_json_chunks(upstream, reply_guard=None, state=None):
     """Validate complete JSON objects in linear time, preserving every raw byte."""
     decoder = codecs.getincrementaldecoder("utf-8")()
     parser = JsonObjects(document=True)
-    state = _NativeStreamState(reply_guard)
+    state = state or _NativeStreamState(reply_guard)
     try:
         async for chunk in upstream.aiter_bytes():
             if chunk:
@@ -602,8 +684,8 @@ async def _native_json_chunks(upstream, reply_guard=None):
     state.finish()
 
 
-async def _native_sse_frames(upstream, reply_guard=None):
-    state = _NativeStreamState(reply_guard)
+async def _native_sse_frames(upstream, reply_guard=None, state=None):
+    state = state or _NativeStreamState(reply_guard)
     async def observed_bytes():
         async for chunk in upstream.aiter_bytes():
             if chunk:
@@ -625,7 +707,41 @@ async def _native_sse_frames(upstream, reply_guard=None):
         await frames.aclose()
 
 
-async def _relay_stream(upstream: httpx.Response, *, keepalive=False, deadline=None, source=None) -> StreamingResponse:
+def _log_native_usage(usage: Optional[dict]) -> None:
+    """💰 token 用量日志（与 OpenAI 通道的算力消耗统计同口径）。"""
+    if not isinstance(usage, dict) or not usage:
+        return
+    prompt = usage.get("promptTokenCount")
+    candidates = usage.get("candidatesTokenCount")
+    thoughts = usage.get("thoughtsTokenCount")
+    total = usage.get("totalTokenCount")
+    gen_parts = [f"生成 {candidates}"] if candidates is not None else []
+    if thoughts is not None:
+        gen_parts.append(f"思考 {thoughts}")
+    parts = [f"提示词 {prompt}"] if prompt is not None else []
+    parts.extend(gen_parts)
+    if total is not None:
+        parts.append(f"总计 {total}")
+    if parts:
+        print("💰 [算力消耗统计] " + " | ".join(parts) + " Tokens")
+
+
+def _native_body_usage(body: bytes) -> Optional[dict]:
+    """从非流式响应 body 中提取 usageMetadata（仅当子串存在才解析，
+    避免为巨型生图响应白白做一次全量 JSON 解析）。"""
+    if b"usageMetadata" not in body:
+        return None
+    try:
+        parsed = json.loads(body)
+    except (ValueError, UnicodeError):
+        return None
+    usage = parsed.get("usageMetadata") if isinstance(parsed, dict) else None
+    return usage if isinstance(usage, dict) else None
+
+
+async def _relay_stream(upstream: httpx.Response, *, keepalive=False, deadline=None, source=None,
+                        model: str = "", started_at: Optional[float] = None,
+                        state: Optional[_NativeStreamState] = None) -> StreamingResponse:
     """把上游 SSE（或 JSON array 流）以解压后的字节转发给客户端。
 
     用 aiter_bytes()（透明解压）：上游可能按我们的 accept-encoding
@@ -684,14 +800,19 @@ async def _relay_stream(upstream: httpx.Response, *, keepalive=False, deadline=N
                     await events.aclose()
             # 先打日志再关连接：客户端断开（任务被取消）时 finally 里的
             # await 也可能被再取消，保证中止日志一定落盘。
+            elapsed = time.monotonic() - started_at if started_at is not None else 0.0
             if completed:
                 stats.add_success()
-                print(f"📤 [Gemini 透传] 流式转发完成（共 {total} 字节）。")
+                # 与 OpenAI 通道的完成日志同构：模型 | 结果 | 耗时 | 体量
+                print(f"✅ [Gemini 透传] {model or '未知模型'} | 流式转发完成 | "
+                      f"耗时 {elapsed:.1f}s | 共 {total} 字节")
+                _log_native_usage(state.usage if state is not None else None)
             else:
                 # 响应头已发送为 200，中间件无法根据状态码捕获流中失败。
                 stats.add_error()
-                print(f"✂️ [Gemini 透传] 流式中止（已转发 {total} 字节；"
-                      "客户端断开或上游/网络异常）。")
+                print(f"✂️ [Gemini 透传] {model or '未知模型'} | 流式中止 | "
+                      f"已转发 {total} 字节 | 耗时 {elapsed:.1f}s"
+                      "（客户端断开或上游/网络异常）。")
             await _close_upstream(upstream)
 
     class NativeStreamingResponse(StreamingResponse):
@@ -856,6 +977,21 @@ def _passthrough_endpoint():
         if not isinstance(parsed, dict):
             return _native_error(400, "请求体必须是 JSON 对象（Gemini 原生格式）。")
 
+        # -search 变体（与 OpenAI / Claude 端点对齐；目录也列出这些变体）：
+        # 剥后缀 + 注入 google_search 工具。监控按客户端原始请求名记录。
+        requested_model = model
+        if model.lower().endswith("-search"):
+            from anti_truncation import search_variant_available
+            base_probe = model[: -len("-search")]
+            if not search_variant_available(base_probe):
+                return _native_error(
+                    400, f"模型 {base_probe} 不支持 -search 变体（仅 Gemini 文本模型支持）。")
+            model, rebuilt = _strip_search_variant(model, action, parsed)
+            if rebuilt is not None:
+                raw_body = rebuilt
+                print(f"🔎 [Gemini 透传] {model} | -search 变体：已注入 google_search 工具"
+                      "（body 最小重组；普通模型仍字节级透传）。")
+
         # 透传 query（alt=sse 等），但剔除本服务鉴权用的 key 参数。
         # query_params 取出的是已解码值，重新下发前必须再编码，否则值里
         # 带 & / = / 空格会把 URL 拼坏（alt=sse 之外的参数被截断）。
@@ -863,7 +999,7 @@ def _passthrough_endpoint():
         query = "&".join(f"{quote(k, safe='')}={quote(v, safe='')}" for k, v in qp)
 
         is_stream = action == "streamGenerateContent"
-        track_configure(model=model, protocol="gemini", channel="express", stream=is_stream,
+        track_configure(model=requested_model, protocol="gemini", channel="express", stream=is_stream,
                         mode="stream" if is_stream else "json")
         print(f"🔁 [Gemini 透传] {model}:{action} | {'流式' if is_stream else '非流式'}"
               f" | 原生协议透传（Express 通道）")
@@ -928,12 +1064,17 @@ for _prefix in ("/v1beta", "/v1"):
 @router.get("/v1beta/models")
 async def native_list_models(fastapi_request: Request,
                              _auth: str = Depends(get_gemini_auth)):
-    """把内部模型清单映射成 Gemini 原生 models.list 响应。"""
+    """把内部模型清单映射成 Gemini 原生 models.list 响应。
+
+    与 OpenAI /v1/models、Anthropic 目录同源：裸模型 + -search 变体
+    （透传侧 _strip_search_variant 会剥后缀并注入 google_search 工具，
+    目录与实际能力一致）。抗截断后缀仍仅限 OpenAI 兼容端点。
+    """
     manager = fastapi_request.app.state.express_key_manager
     has_any = manager.get_total_keys() > 0 or app_state.get_channel_mode() in ("web_proxy", "mixed")
     raw = await get_express_models() if has_any else []
 
-    models = [_native_model_entry(mid) for mid in sorted(raw)]
+    models = [_native_model_entry(mid) for mid in _native_catalog_ids(raw)]
     return {"models": models}
 
 
@@ -948,6 +1089,6 @@ async def native_get_model(model_action: str, fastapi_request: Request,
     if action:
         return _native_error(400, f"GET 不支持 :{action}，请用 POST。")
     raw = await get_express_models() if has_any else []
-    if model and model in raw:
+    if model and model in _native_catalog_ids(raw):
         return _native_model_entry(model)
     return _native_error(404, f"Model {model} not found.", status_detail="NOT_FOUND")
