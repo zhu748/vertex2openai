@@ -6,7 +6,6 @@
 finishReason 缺失报错）、toolConfig 收窄、SSE 错误帧格式。
 """
 import asyncio
-import json
 import os
 import sys
 import tempfile
