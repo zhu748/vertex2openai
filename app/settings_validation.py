@@ -5,6 +5,7 @@ import math
 import config
 from proxy_resolver import validate_proxy_uri
 from proxy_config import ProxyFormatError, parse_proxy_list
+from keepalive import validate_keepalive_url
 
 
 _SETTING_ENUMS = {
@@ -147,7 +148,7 @@ def validate_global_settings_patch(patch: dict) -> dict | None:
         if not isinstance(v, str):
             return {"error": "keepalive_url 必须是字符串。", "field": "keepalive_url"}
         v = v.strip()
-        if v and not (v.startswith("http://") or v.startswith("https://")):
-            return {"error": "keepalive_url 必须以 http:// 或 https:// 开头（例如 https://你的域名/healthz），或留空关闭保活。",
+        if not validate_keepalive_url(v):
+            return {"error": "keepalive_url 必须是包含主机名的合法 HTTP(S) 地址（例如 https://你的域名/healthz），或留空关闭保活。",
                     "field": "keepalive_url"}
     return validate_settings_patch(patch)

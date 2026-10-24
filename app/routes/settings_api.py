@@ -13,6 +13,7 @@ from console_auth import require_auth
 from keepalive import keepalive_service
 from model_loader import get_express_models
 from runtime_state import app_state
+from request_connection import BodyTooLargeError
 from settings_validation import validate_global_settings_patch, validate_settings_patch
 
 
@@ -69,6 +70,8 @@ async def get_settings_api(_auth: bool = Depends(require_auth)):
 async def update_settings_api(request: Request, _auth: bool = Depends(require_auth)):
     try:
         patch = await request.json()
+    except BodyTooLargeError:
+        raise
     except Exception:
         return JSONResponse(status_code=400, content={"error": "请求体必须是合法 JSON 对象。"})
     if not isinstance(patch, dict):
@@ -110,6 +113,8 @@ async def list_model_overrides(_auth: bool = Depends(require_auth)):
 async def save_model_override(model_name: str, request: Request, _auth: bool = Depends(require_auth)):
     try:
         patch = await request.json()
+    except BodyTooLargeError:
+        raise
     except Exception:
         return JSONResponse(status_code=400, content={"error": "请求体必须是合法 JSON 对象。"})
     if not isinstance(patch, dict):

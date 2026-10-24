@@ -8,11 +8,14 @@ from typing import List, Dict, Optional
 import config as app_config
 from proxy_failover import ProxyChain
 from express_fingerprint import build_direct_headers
+from http_io import read_limited_bytes
 
 _model_cache: Optional[Dict[str, List[str]]] = None
 _cache_lock = asyncio.Lock()
 _next_refresh_allowed = 0.0
 _refresh_task: Optional[asyncio.Task] = None
+MAX_MODELS_CONFIG_BYTES = 1024 * 1024
+MODELS_FETCH_TIMEOUT_SECONDS = 20.0
 DEFAULT_MODELS_CONFIG_URL = "https://raw.githubusercontent.com/bad-woman/vertex2openai/main/vertexModels.json"
 FALLBACK_MODELS_CONFIG_URLS = [
     "https://cdn.jsdelivr.net/gh/bad-woman/vertex2openai@main/vertexModels.json",
@@ -79,10 +82,11 @@ async def fetch_and_parse_models_config() -> Optional[Dict[str, List[str]]]:
                 if resolved:
                     options["proxy"] = resolved
                 async with httpx.AsyncClient(**options) as client:
-                    return await client.get(url, headers=fp_headers)
-            response = await chain.run(fetch)
-            response.raise_for_status()
-            normalized = _normalize_models_config(response.json())
+                    async with client.stream("GET", url, headers=fp_headers) as response:
+                        response.raise_for_status()
+                        return json.loads(await read_limited_bytes(response, MAX_MODELS_CONFIG_BYTES))
+            async with asyncio.timeout(MODELS_FETCH_TIMEOUT_SECONDS):
+                normalized = _normalize_models_config(await chain.run(fetch))
             if normalized is not None:
                 print(f"✅ [模型配置] 远程模型配置加载成功，共 {len(normalized['models'])} 个模型。")
                 return normalized

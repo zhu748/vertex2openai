@@ -3,9 +3,9 @@ import asyncio
 
 import anyio
 from request_connection import BodyTooLargeError, ClientConnection, ConnectionReceiver
+from request_errors import body_too_large_response, declared_body_exceeds
 from request_tracking import PayloadObserver, current_trace, request_registry
 from starlette.requests import ClientDisconnect
-from starlette.responses import JSONResponse
 
 # 请求体体积上限：与原生透传通道（gemini_native.MAX_NATIVE_BODY_BYTES）的
 # 32MiB 防护对齐。/v1/chat/completions 的 body 由 FastAPI/Pydantic 全量读入
@@ -18,10 +18,11 @@ MAX_CHAT_BODY_BYTES = 32 * 1024 * 1024
 # 未认证端点（/api/login）的请求体上限：Pydantic 全量解析巨型 JSON 同样
 # 是内存放大面，而这里无需鉴权即可触达。口令本身就是短字符串，256KB 绰绰有余。
 LOGIN_BODY_BYTES = 256 * 1024
+MANAGEMENT_BODY_BYTES = 8 * 1024 * 1024
 
 
-class _LoginBodyLimitReceive:
-    """给 /api/login 包一层计数 receive（不建 trace、不计入大盘统计）。"""
+class _BodyLimitReceive:
+    """Bound management uploads before JSON parsing, including chunked bodies."""
 
     def __init__(self, receive, max_bytes: int):
         self._receive = receive
@@ -49,37 +50,26 @@ class StatsMiddleware:
         tracked = scope["type"] == "http" and method == "POST" and (
             path == "/v1/chat/completions" or path == "/v1/messages"
             or path.startswith(("/v1/messages/", "/v1/models/", "/v1beta/models/")))
-        # 登录端点单独限流：不计入请求统计（避免大盘被登录轮询污染），
-        # 也不建 trace；只做体积防护。
-        if (not tracked and scope["type"] == "http" and method == "POST"
-                and path == "/api/login"):
-            limited = _LoginBodyLimitReceive(receive, LOGIN_BODY_BYTES)
+        declared_length = next((value.decode("latin-1") for key, value in scope.get("headers", [])
+                                if key == b"content-length"), "")
+        if (not tracked and scope["type"] == "http" and method in ("POST", "PUT", "PATCH", "DELETE")
+                and path.startswith("/api/")):
+            limit = LOGIN_BODY_BYTES if path == "/api/login" else MANAGEMENT_BODY_BYTES
+            if declared_body_exceeds(declared_length, limit):
+                await body_too_large_response(path, limit)(scope, receive, send)
+                return
+            limited = _BodyLimitReceive(receive, limit)
             try:
                 await self.app(scope, limited, send)
             except BodyTooLargeError:
-                response = JSONResponse(
-                    status_code=413,
-                    content={"error": {"message": f"登录请求体超过 {LOGIN_BODY_BYTES // 1024}KiB 上限。",
-                                      "type": "invalid_request_error", "code": 413}},
-                )
-                await response(scope, receive, send)
+                await body_too_large_response(path, limit)(scope, receive, send)
             return
         if not tracked:
             return await self.app(scope, receive, send)
         stats.increment_total()
-        declared_length = ""
-        for key, value in scope.get("headers", []):
-            if key == b"content-length":
-                declared_length = value.decode("latin-1", "")
-                break
-        if declared_length.isdigit() and int(declared_length) > MAX_CHAT_BODY_BYTES:
+        if declared_body_exceeds(declared_length, MAX_CHAT_BODY_BYTES):
             stats.add_error()
-            response = JSONResponse(
-                status_code=413,
-                content={"error": {"message": f"请求体超过 {MAX_CHAT_BODY_BYTES // (1024 * 1024)}MiB 上限。",
-                                  "type": "invalid_request_error", "code": 413}},
-            )
-            await response(scope, receive, send)
+            await body_too_large_response(path, MAX_CHAT_BODY_BYTES)(scope, receive, send)
             return
         trace = request_registry.create(path)
         token = current_trace.set(trace)
@@ -136,18 +126,7 @@ class StatsMiddleware:
             if started or send_failed:
                 raise
             print(f"⚠️ [体积限制] {path}：{exc}")
-            message = f"请求体超过 {MAX_CHAT_BODY_BYTES // (1024 * 1024)}MiB 上限。"
-            if path == "/v1/messages" or path.startswith("/v1/messages/"):
-                # Claude 生态客户端：Anthropic 错误形状（懒加载避免模块级
-                # 依赖顺序变化；此兜底分支本身极少命中）。
-                from routes import claude_api as _claude_api
-                response = _claude_api.claude_error(413, "invalid_request_error", message)
-            else:
-                response = JSONResponse(
-                    status_code=413,
-                    content={"error": {"message": message,
-                                      "type": "invalid_request_error", "code": 413}},
-                )
+            response = body_too_large_response(path, MAX_CHAT_BODY_BYTES)
             await response(scope, receive, relay)
             return
         except (asyncio.CancelledError, ClientDisconnect):

@@ -65,6 +65,7 @@ from model_loader import get_express_models
 from proxy_failover import FailoverSDKClient, ProxyChain, ProxyResolveError
 from client_pool import get_pooled_express_client
 from request_tracking import configure as track_configure
+from request_connection import BodyTooLargeError
 from routes.chat_api import _call_upstream
 from runtime_state import app_state
 from streaming import sse_frames
@@ -131,6 +132,8 @@ async def _parse_json_body(fastapi_request: Request) -> dict:
     """手动解析 JSON 体：让 400 错误保持 Anthropic 形状（而非 FastAPI 422）。"""
     try:
         body = await fastapi_request.json()
+    except BodyTooLargeError:
+        raise
     except Exception:
         raise ClaudeRequestError("invalid JSON request body") from None
     if not isinstance(body, dict):

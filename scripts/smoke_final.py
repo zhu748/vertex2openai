@@ -1,9 +1,12 @@
 """冒烟测试：启动完整服务，验证核心端点与修复点。"""
 import os
 import sys
+import tempfile
+from unittest import mock
 
 os.environ["API_KEY"] = "smoke-test-key"
-os.environ["STATE_DIR"] = "/tmp/v2o-final-smoke"
+_STATE = tempfile.TemporaryDirectory(prefix="v2o-final-smoke-")
+os.environ["STATE_DIR"] = _STATE.name
 
 _APP_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "app"))
 sys.path.insert(0, _APP_DIR)
@@ -20,7 +23,10 @@ def check(name, cond, detail=""):
     print(("✅" if cond else "❌"), name, detail)
 
 
-with TestClient(main.app) as c:
+# Use the bundled model catalog: smoke validation must stay offline and must
+# not reuse state left behind by a previous invocation.
+with mock.patch("lifecycle.schedule_models_refresh"), \
+     mock.patch("model_loader.schedule_models_refresh"), TestClient(main.app) as c:
     # ---- 基础端点 ----
     r = c.get("/healthz")
     check("GET /healthz", r.status_code == 200 and r.json()["status"] == "ok")

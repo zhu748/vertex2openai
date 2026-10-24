@@ -21,12 +21,26 @@ from typing import Optional
 
 import httpx
 
+import config as app_config
 from runtime_state import app_state
 
 # 单次保活请求的超时（秒）。
 _REQUEST_TIMEOUT_SECONDS = 30.0
 # 间隔下限（秒）：防止误配成秒级高频请求打爆保活目标。
 _MIN_INTERVAL_SECONDS = 5
+_MAX_REDIRECTS = 5
+
+
+def validate_keepalive_url(url: str) -> bool:
+    if not url:
+        return True
+    try:
+        parsed = httpx.URL(url)
+        return (parsed.scheme in ("http", "https") and bool(parsed.host)
+                and not any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in url)
+                and (parsed.port is None or 1 <= parsed.port <= 65535))
+    except (httpx.InvalidURL, ValueError):
+        return False
 
 
 class KeepAliveService:
@@ -34,6 +48,7 @@ class KeepAliveService:
 
     def __init__(self):
         self._task: Optional[asyncio.Task] = None
+        self._lifecycle_lock = asyncio.Lock()
 
     def _current_config(self) -> tuple[str, int]:
         """读取当前生效配置（控制台保存值 > 环境变量初始值 > 内置默认）。"""
@@ -47,12 +62,26 @@ class KeepAliveService:
             # 客户端随任务生命周期创建/关闭：重启（改配置）会换新客户端，
             # 取消时 async with 保证连接池不悬挂。
             async with httpx.AsyncClient(
-                timeout=_REQUEST_TIMEOUT_SECONDS, follow_redirects=True
+                timeout=_REQUEST_TIMEOUT_SECONDS, follow_redirects=False, trust_env=False,
+                verify=app_config.SSL_CERT_FILE or True,
             ) as client:
                 while True:
                     try:
-                        response = await client.get(url)
-                        print(f"💓 [保活] GET {url} -> {response.status_code}")
+                        # Only response headers are needed. A large or endless
+                        # body must not consume memory or hold the task forever.
+                        async with asyncio.timeout(_REQUEST_TIMEOUT_SECONDS):
+                            current = httpx.URL(url)
+                            for redirect in range(_MAX_REDIRECTS + 1):
+                                async with client.stream("GET", current) as response:
+                                    if response.has_redirect_location:
+                                        if redirect == _MAX_REDIRECTS:
+                                            raise ValueError("保活重定向次数超过上限。")
+                                        current = current.join(response.headers["location"])
+                                        if not validate_keepalive_url(str(current)):
+                                            raise ValueError("保活重定向地址无效。")
+                                        continue
+                                    print(f"💓 [保活] GET {url} -> {response.status_code}")
+                                    break
                     except asyncio.CancelledError:
                         raise
                     except Exception as e:
@@ -64,16 +93,24 @@ class KeepAliveService:
 
     async def start(self):
         """按当前配置启动保活任务；未配置 URL / 配置非法时不启动。"""
+        async with self._lifecycle_lock:
+            self._start()
+
+    def _start(self):
         if self._task and not self._task.done():
             # 已有任务在运行，不重复启动（重启走 restart）。
             return
 
-        url, interval = self._current_config()
+        try:
+            url, interval = self._current_config()
+        except (TypeError, ValueError, OverflowError):
+            print("⚠️ [保活] 间隔配置无效，保活未启动。")
+            return
         if not url:
             # 未配置：静默跳过，不在每次启动时给不使用保活的用户刷日志。
             return
-        if not (url.startswith("http://") or url.startswith("https://")):
-            print(f"⚠️ [保活] URL 必须以 http:// 或 https:// 开头（收到 {url!r}），保活未启动。")
+        if not validate_keepalive_url(url):
+            print("⚠️ [保活] URL 必须是包含主机名的合法 HTTP(S) 地址，保活未启动。")
             return
         if interval < _MIN_INTERVAL_SECONDS:
             print(f"⚠️ [保活] 间隔 {interval}s 低于下限 {_MIN_INTERVAL_SECONDS}s，保活未启动。")
@@ -82,18 +119,20 @@ class KeepAliveService:
 
     async def stop(self):
         """停止保活任务（幂等；未运行时为空操作）。"""
-        if self._task and not self._task.done():
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-        self._task = None
+        async with self._lifecycle_lock:
+            await self._stop()
+
+    async def _stop(self):
+        task, self._task = self._task, None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     async def restart(self):
         """重启保活服务：控制台改配置后调用，按最新配置决定启停。"""
-        await self.stop()
-        await self.start()
+        async with self._lifecycle_lock:
+            await self._stop()
+            self._start()
 
     @property
     def is_running(self) -> bool:

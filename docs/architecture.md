@@ -20,6 +20,7 @@ Express SDK 或 Cookie 上游；Gemini 原生请求通过 Express REST 透传。
 | `app/static/dashboard.js`、`app/static/login.js` | 概览、配置、凭证与日志交互，以及登录表单反馈；全部使用本地资源 |
 | `app/static/console.css`、`app/static/dashboard.css` | 手写组件与响应式样式，以及预编译的 Tailwind 工具样式 |
 | `app/auth.py`、`app/console_auth.py` | 分别处理 API Key 鉴权、控制台会话与登录限速 |
+| `app/request_errors.py`、`app/http_io.py` | 请求边界错误的协议映射、敏感校验输入剥离，以及辅助 HTTP 响应的有界读取 |
 | `app/settings_validation.py` | 管理入口的类型、范围和专项设置校验 |
 | `app/runtime_state.py`、`app/config.py` | 可持久化运行状态、环境变量和内置默认值 |
 | `app/credential_config.py`、`app/credential_manager.py` | 多 Key / Cookie 环境导入、混合账号选择，以及 Cookie 与项目绑定 |
@@ -119,6 +120,33 @@ Cookie 执行器只编排认证、重试、协议降级与交付，不再承担�
 管理入口的持久化写入在线程中执行；状态层负责原子落盘和失败回滚。
 成功落盘的快照在同一 IO 临界区内登记，作为后续失败回滚的基准；显式重载会
 作废重载前尚未落盘的快照，避免并发写者覆盖新配置。
+
+## 资源边界与错误交付
+
+`StatsMiddleware` 在解析 JSON 前按实际收到的字节数限制请求体；
+Content-Length 预检只是快速拒绝，不能替代分块上传计数。登录上限为
+256 KiB，其他管理写入为 8 MiB，生成接口为 32 MiB。数字头比较不执行
+不受信任的大整数转换。超限响应共用 `request_errors.py`，分别保留 OpenAI、
+Anthropic 与 Gemini 错误形状；CORS 中间件位于该边界之外，使预检拒绝也能
+由浏览器客户端读取。
+
+Pydantic 校验错误保留最多 50 个字段位置与说明，不返回原始 `input` 或 `ctx`。
+这既避免密码与整份请求回显，也防止非法 NaN/Infinity 在错误序列化时变成 500。
+管理接口保留 HTTP 422 与 `detail` 数组；OpenAI 附带兼容错误对象。
+
+模型清单按解码后的字节数限制到 1 MiB，每个来源连同代理切换总计最多 20 秒；
+刷新失败保留当前缓存。Key 探测响应上限为 256 KiB，单次网络探测连同代理
+切换最多 45 秒，所有入口共享 4 路网络并发，批量调用只创建最多 4 个 worker。
+保活请求只读取响应头，逐跳关闭重定向响应，不读取任何响应正文；最多跟随
+5 次重定向，总计最多 30 秒。保活明确忽略环境代理，并沿用自定义 CA。
+
+流式准备任务取消后使用 `asyncio.wait` 等待最多 5 秒；不要换成
+`wait_for(gather(...))`，后者会等待被取消任务退出，无法约束吞掉取消信号的
+上游。超窗任务迟到的响应交由生命周期登记的后台任务关闭。
+该边界只限制等待任务退出的时间，不保证任意第三方 `aclose()` 都能限时完成。
+
+日志和上游错误响应使用同一脱敏函数。新增 URI 协议时应保留正则的前缀边界
+与长度约束，避免在长纯文本上从每个字符重复扫描。
 
 ## 本地验证
 

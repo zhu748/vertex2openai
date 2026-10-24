@@ -6,6 +6,26 @@ from contextlib import suppress
 from fastapi.responses import StreamingResponse
 
 
+SETUP_CLOSE_TIMEOUT_SECONDS = 5.0
+
+
+async def _close_setup_result(setup):
+    try:
+        response = setup.result()
+    except (asyncio.CancelledError, Exception):
+        return
+    if isinstance(response, StreamingResponse):
+        close = getattr(response, "aclose", None) or getattr(response.body_iterator, "aclose", None)
+        if close:
+            with suppress(Exception):
+                await close()
+
+
+def _close_late_setup(setup):
+    from lifecycle import start_background_task
+    start_background_task(_close_setup_result(setup))
+
+
 async def close_setup_task(setup):
     """等待/取消快窗口 setup 任务，并关闭其持有的流式结果。
 
@@ -18,16 +38,18 @@ async def close_setup_task(setup):
     # bounded wait：operation() 若吞掉 CancelledError 不退出，无界 gather 会让
     # cleanup（在 shield 里被调用）永久挂死、连接滞留；5 秒足够任何合理的
     # 取消路径收尾，超时后放弃等待但仍然尝试关闭结果（2026-10 加固）。
+    # wait_for waits for cancellation to finish, so it is not a hard bound
+    # when the producer suppresses CancelledError. wait leaves that task alone;
+    # a late result is still closed and its exception is always retrieved.
     try:
-        response = (await asyncio.wait_for(
-            asyncio.gather(setup, return_exceptions=True), 5.0))[0]
-    except (asyncio.TimeoutError, asyncio.CancelledError):
-        response = None
-    if isinstance(response, StreamingResponse):
-        # getattr 默认值不能急切求值：非 StreamingResponse 形态会先抛 AttributeError。
-        close = getattr(response, "aclose", None) or response.body_iterator.aclose
-        with suppress(Exception):
-            await close()
+        done, _ = await asyncio.wait({setup}, timeout=SETUP_CLOSE_TIMEOUT_SECONDS)
+    except asyncio.CancelledError:
+        setup.add_done_callback(_close_late_setup)
+        raise
+    if done:
+        await _close_setup_result(setup)
+    else:
+        setup.add_done_callback(_close_late_setup)
 
 
 HEARTBEAT = object()

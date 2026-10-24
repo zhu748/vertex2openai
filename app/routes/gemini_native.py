@@ -57,6 +57,7 @@ from auth import constant_time_equal
 from config import API_KEY
 from logger import stats
 from request_tracking import configure as track_configure, upstream_attempt, upstream_chunk
+from request_errors import declared_body_exceeds
 # 别名导入：_passthrough_request 内有同名局部变量 first_reply（guard 实例），
 # 直接 import first_reply 会被局部变量遮蔽成 UnboundLocalError。
 import first_reply as first_reply_module
@@ -843,7 +844,7 @@ def _passthrough_endpoint():
         # 体积上限：解析、指纹、重试全程持有原始 bytes，不设限等于允许
         # 认证后的内存放大（32MiB 远大于任何正常请求，含数张 4K 图）。
         declared_length = request.headers.get("content-length", "")
-        if declared_length.isdigit() and int(declared_length) > MAX_NATIVE_BODY_BYTES:
+        if declared_body_exceeds(declared_length, MAX_NATIVE_BODY_BYTES):
             return _native_error(413, f"请求体超过 {MAX_NATIVE_BODY_BYTES // (1024 * 1024)}MiB 上限。")
         raw_body = await request.body()
         if len(raw_body) > MAX_NATIVE_BODY_BYTES:

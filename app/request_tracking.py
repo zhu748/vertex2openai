@@ -22,9 +22,9 @@ MAX_INSPECTION_BYTES = 2 * 1024 * 1024
 _FRAME_SEP_RE = re.compile(rb"\r\n\r\n|\n\n|\r\r")
 
 # redact 在每条日志/每个 SSE 块上都会执行，必须用预编译 pattern。
-_RE_URL_CREDS = re.compile(r"(?i)(https?|socks\w*)://[^/\s@]+@")
+_RE_URL_CREDS = re.compile(r"(?i)(?<![a-z0-9+.-])([a-z][a-z0-9+.-]{0,31})://[^/\s@]+@")
 _RE_QUERY_KEY = re.compile(r"(?i)([?&](?:key|api_key|access_token)=)[^&\s'\"]+")
-_RE_BEARER = re.compile(r"(?i)(bearer\s+)[\w.\-]+")
+_RE_BEARER = re.compile(r"(?i)(bearer[ \t]+)[^\s'\",;]+")
 _RE_GOOGLE_KEY = re.compile(r"AIza[\w\-]{20,}")
 
 

@@ -5,6 +5,7 @@ from typing import Any
 
 import httpx
 from curl_cffi.requests.exceptions import ConnectionError as CurlConnectionError, Timeout as CurlTimeout
+from request_tracking import redact
 
 
 def error_status(error: Exception) -> int | None:
@@ -27,13 +28,13 @@ def google_status_detail(code: int) -> str:
     """
     return {
         400: "INVALID_ARGUMENT", 401: "UNAUTHENTICATED", 403: "PERMISSION_DENIED",
-        404: "NOT_FOUND", 429: "RESOURCE_EXHAUSTED", 500: "INTERNAL",
+        404: "NOT_FOUND", 413: "RESOURCE_EXHAUSTED", 429: "RESOURCE_EXHAUSTED", 500: "INTERNAL",
         502: "UNAVAILABLE", 503: "UNAVAILABLE", 504: "DEADLINE_EXCEEDED",
     }.get(code, "UNKNOWN")
 
 
 def create_openai_error_response(status_code: int, message: str, error_type: str) -> dict[str, Any]:
-    safe_message = re.sub(r"([?&]key=)[^&\s'\"]+", r"\1***HIDDEN_API_KEY***", message)
+    safe_message = redact(message)
     return {"error": {"message": safe_message, "type": error_type, "code": status_code, "param": None}}
 
 
@@ -64,4 +65,4 @@ def extract_upstream_error(e: Exception) -> tuple[int, str]:
             code = 400
         else:
             code = 500
-    return code, msg
+    return code, redact(msg)

@@ -27,7 +27,8 @@ import config as app_config
 from runtime_state import app_state
 from express_fingerprint import build_direct_headers
 from proxy_resolver import resolve_proxy_uri
-from proxy_failover import ProxyChain
+from proxy_failover import PROXY_FAILURE_STATUSES, ProxyChain
+from http_io import read_limited_bytes
 
 # 调模型的正确 URL（Express 全局端点格式），{model} 处填一个不存在的模型名来探测
 GENERATE_CONTENT_URL = (
@@ -35,6 +36,10 @@ GENERATE_CONTENT_URL = (
 )
 PROBE_FAKE_MODEL = "vertex2openai-probe-nonexistent-model"
 PROBE_TIMEOUT_SECONDS = 15.0
+PROBE_TOTAL_TIMEOUT_SECONDS = 45.0
+MAX_PROBE_RESPONSE_BYTES = 256 * 1024
+MAX_CONCURRENT_PROBES = 4
+_probe_semaphore = asyncio.Semaphore(MAX_CONCURRENT_PROBES)
 
 
 def _client_args(key_proxy_raw: str = "") -> dict:
@@ -89,8 +94,16 @@ async def probe_project_id(key: str) -> Tuple[Optional[str], str]:
     try:
         async def send(raw, resolved):
             async with httpx.AsyncClient(**_client_args(raw)) as client:
-                return await client.post(url, content=json.dumps(body), headers=build_direct_headers(key))
-        resp = await ProxyChain(rec).run(send)
+                async with client.stream("POST", url, content=json.dumps(body), headers=build_direct_headers(key)) as response:
+                    # A probe expects 404, but gateway failures must still move
+                    # to the next configured proxy before reading its body.
+                    if response.status_code in PROXY_FAILURE_STATUSES:
+                        response.raise_for_status()
+                    data = await read_limited_bytes(response, MAX_PROBE_RESPONSE_BYTES)
+                    return httpx.Response(response.status_code, content=data, request=response.request)
+        async with _probe_semaphore:
+            async with asyncio.timeout(PROBE_TOTAL_TIMEOUT_SECONDS):
+                resp = await ProxyChain(rec).run(send)
     except Exception as e:
         return None, f"探测请求失败：{type(e).__name__} - {e}"
 
@@ -139,14 +152,19 @@ async def probe_all(*, force: bool = False, keys: Optional[list] = None) -> list
     if not targets:
         return []
     started = time.time()
-    results = await asyncio.gather(*[probe_and_store(k, force=force) for k in targets],
-                                   return_exceptions=True)
-    out = []
-    for key, res in zip(targets, results):
-        if isinstance(res, Exception):
-            out.append({"key": key, "ok": False, "project_id": "", "message": f"探测异常：{res}"})
-        else:
-            out.append(res)
+    # A fixed worker set bounds both sockets and scheduled tasks for large
+    # credential lists. Preserve input order and isolate individual failures.
+    pending = iter(enumerate(targets))
+    out = [None] * len(targets)
+
+    async def worker():
+        for index, key in pending:
+            try:
+                out[index] = await probe_and_store(key, force=force)
+            except Exception as exc:
+                out[index] = {"key": key, "ok": False, "project_id": "", "message": f"探测异常：{exc}"}
+
+    await asyncio.gather(*(worker() for _ in range(min(MAX_CONCURRENT_PROBES, len(targets)))))
     ok = sum(1 for r in out if r.get("ok"))
     print(f"🔎 [密钥探测] 共探测 {len(out)} 个 Key，成功 {ok} 个，耗时 {time.time() - started:.1f}s。")
     return out

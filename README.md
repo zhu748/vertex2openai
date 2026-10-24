@@ -899,7 +899,8 @@ Gemini 原生 `streamGenerateContent?alt=sse` 默认增加安全的事件间注�
 
 ## 本地开发与检查
 
-目录职责和扩展位置见 [代码结构与维护约定](docs/architecture.md)。
+目录职责和扩展位置见 [代码结构与维护约定](docs/architecture.md)，
+本次审查的问题与修复说明见 [项目审查与优化记录](docs/optimization-review.md)。
 应用入口为 `app/main.py`，管理路由位于 `app/routes/`，页面位于 `app/templates/`；
 离线回归集中在 `tests/`，`scripts/` 保留检查入口与诊断工具。
 
@@ -920,3 +921,9 @@ uvicorn main:app --host 0.0.0.0 --port 7860
 
 测试使用隔离临时状态和模拟上游，不需要真实 Key，也不会修改部署配置。
 CI 在 Python 3.11 / 3.12 上执行同一套检查，通过后才构建镜像。
+
+请求体按实际接收字节限制：登录 256 KiB、其他管理写入 8 MiB、生成接口
+32 MiB；无 Content-Length 的分块上传同样生效。错误响应保留对应 API 协议，
+参数校验失败不回显密码或完整请求体。远程模型清单限制为 1 MiB；Express
+项目探测最多同时执行 4 路，响应限制为 256 KiB。出站保活只读取响应头，
+最多跟随 5 次重定向，单次总时限 30 秒，忽略环境代理并支持 `SSL_CERT_FILE`。
