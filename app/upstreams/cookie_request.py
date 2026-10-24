@@ -40,6 +40,34 @@ def _get_experiment_flags() -> str:
     return app_config.EXPERIMENT_FLAGS or ""
 
 
+# batchGraphql generationConfig 已验证可接受的字段族（超出者由调用方决定
+# 是否透传/告警；真机验证记录见 CHANGES.md 各条“出站参数调试”）。
+_NATIVE_GENERATION_KEYS = frozenset({
+    "temperature", "topP", "topK", "maxOutputTokens", "candidateCount",
+    "stopSequences", "seed", "responseMimeType", "responseSchema",
+    "responseModalities", "imageConfig", "mediaResolution", "thinkingConfig",
+})
+
+
+def _native_supported_generation_keys() -> frozenset:
+    """供 Cookie 原生桥（cookie_native）做未知字段告警的已知键集合。"""
+    return _NATIVE_GENERATION_KEYS
+
+
+def _native_default_safety_settings() -> list:
+    """客户端未带 safetySettings 时的默认全 OFF 集合（与 OpenAI 兼容通道同口径：
+    safety_score 开关决定 OFF / BLOCK_NONE——OFF 上游不回传 safetyRatings）。"""
+    want_scores = bool(app_state.get_setting("safety_score", app_config.SAFETY_SCORE))
+    threshold = "BLOCK_NONE" if want_scores else "OFF"
+    return [
+        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": threshold},
+        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": threshold},
+        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": threshold},
+        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": threshold},
+        {"category": "HARM_CATEGORY_JAILBREAK", "threshold": threshold},
+    ]
+
+
 def build_probe_body(project_id: str) -> dict:
     """零配额消耗的 Cookie 会话探测体：请求一个不存在的模型名。
 

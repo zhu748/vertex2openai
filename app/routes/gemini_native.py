@@ -31,8 +31,11 @@ cachedContent / responseSchema 等字段保持原请求体，兼容性取决于�
   裸模型名重试一次，与 OpenAI 兼容通道的 fallback 行为对齐。
 - 模型列表用内部模型清单映射成 Gemini 原生格式（models/get 也支持）。
 
-限制：Cookie 通道（batchGraphql）是私有 GraphQL 协议，无法承载原生 REST
-请求，故本透传始终走 Express 通道；未配置任何 Express Key 时返回明确错误。
+通道选择：有 Express Key 时**字节级透传**（上述保真要点全部成立）；没有任何
+Express Key 但配置了 Cookie 账号时，generateContent / streamGenerateContent
+改走 Cookie 通道**协议级桥接**（upstreams/cookie_native.py：原生 JSON →
+batchGraphql 转码、响应重组回原生形状，countTokens / embedContent 不支持）；
+两者皆无时返回明确错误。
 """
 
 import json
@@ -344,9 +347,8 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
     if manager.get_total_keys() == 0:
         return _native_error(
             403,
-            "该透传端点需要至少一个 Express API Key（控制台「通道与凭证」页添加，"
-            "或设环境变量 VERTEX_EXPRESS_API_KEY）。Cookie 直连通道是私有 GraphQL 协议，"
-            "无法承载 Gemini 原生 REST 请求。",
+            "该端点需要至少一个 Express API Key（字节级透传）或一个启用的 Cookie 账号"
+            "（协议级桥接，仅 generateContent / streamGenerateContent）。",
             status_detail="PERMISSION_DENIED",
         )
 
@@ -991,6 +993,36 @@ def _passthrough_endpoint():
                 raw_body = rebuilt
                 print(f"🔎 [Gemini 透传] {model} | -search 变体：已注入 google_search 工具"
                       "（body 最小重组；普通模型仍字节级透传）。")
+
+        # 通道选择：有 Express Key 走字节级透传（最保真）；没有任何 Key 但配了
+        # Cookie 账号时走 Cookie 通道**协议级桥接**（cookie_native：原生 JSON →
+        # batchGraphql 转码，响应重组回原生形状）——旧实现在此直接 403，导致
+        # 仅配 Cookie 的部署无法使用 Gemini 原生生态客户端。
+        # getattr 防御：单测的 SimpleNamespace 桩可能不带 app（生产 Starlette 必有）。
+        express_manager = getattr(getattr(request, "app", None), "state", None)
+        manager = getattr(express_manager, "express_key_manager", None)
+        if manager is not None and manager.get_total_keys() == 0:
+            from credential_manager import credential_manager
+            if credential_manager.get_cookie_record() is not None:
+                if action in ("generateContent", "streamGenerateContent"):
+                    from upstreams.cookie_native import handle_native_request
+                    is_stream = action == "streamGenerateContent"
+                    track_configure(model=requested_model, protocol="gemini", channel="cookie",
+                                    stream=is_stream, mode="stream" if is_stream else "json")
+                    return await handle_native_request(
+                        request, model, action, parsed, requested_model=requested_model)
+                return _native_error(
+                    400,
+                    f"Cookie 通道暂不支持 :{action}（上游 batchGraphql 无对应操作），"
+                    "请配置 Express API Key 使用该操作。",
+                    "INVALID_ARGUMENT")
+            return _native_error(
+                403,
+                "该端点需要至少一个 Express API Key（字节级透传）或一个启用的 Cookie 账号"
+                "（协议级桥接，仅 generateContent / streamGenerateContent）。"
+                "请在控制台「通道与凭证」页配置，或设环境变量 VERTEX_EXPRESS_API_KEY / GOOGLE_COOKIE。",
+                status_detail="PERMISSION_DENIED",
+            )
 
         # 透传 query（alt=sse 等），但剔除本服务鉴权用的 key 参数。
         # query_params 取出的是已解码值，重新下发前必须再编码，否则值里
