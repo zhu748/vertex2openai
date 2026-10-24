@@ -118,6 +118,11 @@ Fork 本仓库后无需任何配置：GitHub Actions 会自动登录 GHCR（内�
 标签策略：`latest`（默认分支）、`main-<短 SHA>`（可回溯版本）、`vX.Y.Z`（推 tag 时）。
 PR 只构建验证不推送，workflow 已收敛到最小权限（`contents:read` + `packages:write`）。
 
+发布构建使用 amd64 / arm64 原生 runner 并行执行，镜像构建与 Python/Go
+检查并行；全部通过后才合并并发布双架构标签。各架构使用独立缓存，Go 编译、
+sing-box 下载和 Python 依赖分别缓存。同一分支的新提交会取消旧构建。
+缓存首次需要预热，实际耗时以 Actions 日志为准；详见 [镜像构建与缓存](docs/image-build.md)。
+
 镜像内置 `HEALTHCHECK`（HEAD `/healthz`），`docker ps` / 编排平台可直接看到健康状态。
 
 ## 健康检查端点 `/healthz`
@@ -914,7 +919,8 @@ Gemini 原生 `streamGenerateContent?alt=sse` 默认增加安全的事件间注�
 ## 本地开发与检查
 
 目录职责和扩展位置见 [代码结构与维护约定](docs/architecture.md)，
-本次审查的问题与修复说明见 [项目审查与优化记录](docs/optimization-review.md)。
+最新问题与修复见 [全面审查与优化](docs/comprehensive-review.md)，
+此前记录见 [项目审查与优化记录](docs/optimization-review.md)。
 应用入口为 `app/main.py`，管理路由位于 `app/routes/`，页面位于 `app/templates/`；
 离线回归集中在 `tests/`，`scripts/` 保留检查入口与诊断工具。
 
@@ -939,5 +945,11 @@ CI 在 Python 3.11 / 3.12 上执行同一套检查，通过后才构建镜像。
 请求体按实际接收字节限制：登录 256 KiB、其他管理写入 8 MiB、生成接口
 32 MiB；无 Content-Length 的分块上传同样生效。错误响应保留对应 API 协议，
 参数校验失败不回显密码或完整请求体。远程模型清单限制为 1 MiB；Express
-项目探测最多同时执行 4 路，响应限制为 256 KiB。出站保活只读取响应头，
+项目探测最多同时执行 4 路，响应限制为 256 KiB。Cookie 会话探测同样最多
+4 路并发、读取最多 256 KiB，单次总时限 45 秒（含代理切换）；批量探测保持
+账号顺序，单项失败不影响其他账号。空响应、登录 HTML 或畸形结果不会被判为
+有效会话。替换账号的 Cookie 或 Project ID 后，旧凭证的冷却状态自动失效，
+旧请求迟到的结果不会修改新凭证的健康状态。Cookie 和 `cookie_authuser`
+保存时校验请求头字符，拒绝换行、控制字符和非 ASCII 内容。
+出站保活只读取响应头，
 最多跟随 5 次重定向，单次总时限 30 秒，忽略环境代理并支持 `SSL_CERT_FILE`。

@@ -164,6 +164,7 @@ _MAX_PUSH_CHARS = 8 * 1024
 # 真实 stdout）仍走同步路径，测试的输出断言时序完全不变。
 _REAL_STDOUT = sys.stdout
 _STDOUT_QUEUE: "queue.Queue" = queue.Queue(maxsize=1000)
+_MAX_STDOUT_CHARS = 16 * 1024
 _STDOUT_SENTINEL = object()
 _writer_thread: Optional[threading.Thread] = None
 _writer_lock = threading.Lock()
@@ -193,6 +194,10 @@ def _ensure_stdout_writer() -> None:
 
 
 def _enqueue_stdout(text: str, end: str, flush: bool) -> None:
+    # A bounded item count alone does not bound memory: one exception can
+    # contain an entire image/request body. Bound each retained log as well.
+    if len(text) > _MAX_STDOUT_CHARS:
+        text = text[:_MAX_STDOUT_CHARS] + f"…（已截断，原长度 {len(text)} 字符）"
     _ensure_stdout_writer()
     try:
         _STDOUT_QUEUE.put_nowait((text, end, flush))

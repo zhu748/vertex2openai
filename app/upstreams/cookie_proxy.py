@@ -807,7 +807,7 @@ class CookieProxyUpstream(BaseUpstream):
                     # 关键：整张图作为单个 chunk 发出，绝不分块
                     yield make_openai_chunk(response_id, model_display, content=full_text or " ")
                     stats.add_success()
-                    credential_manager.record_cookie_success(account_id)
+                    credential_manager.record_cookie_success(account_id, credential=record)
                     # 生图正文是 base64 data URL，字符估算失真极大，不做 usage 估算
                     usage = map_usage(res.get("usage_meta"))
                     if want_usage:
@@ -968,7 +968,7 @@ class CookieProxyUpstream(BaseUpstream):
 
                                 elif status == "cookie_error":
                                     stats.add_error()
-                                    credential_manager.record_cookie_auth_failure(account_id)
+                                    credential_manager.record_cookie_auth_failure(account_id, credential=record)
                                     code = getattr(data, "status_code", None) or 403
                                     error = create_openai_error_response(code, str(data)[:1024], "upstream_error")
                                     yield "data: " + json.dumps(error, ensure_ascii=False) + "\n\n"
@@ -1030,7 +1030,7 @@ class CookieProxyUpstream(BaseUpstream):
 
                         if got_text or got_tool_call:
                             stats.add_success()
-                            credential_manager.record_cookie_success(account_id)
+                            credential_manager.record_cookie_success(account_id, credential=record)
                             if got_tool_call and stream_ordinary_metadata:
                                 google = {
                                     "ordinary_parts": list(stream_ordinary_metadata),
@@ -1228,7 +1228,7 @@ class CookieProxyUpstream(BaseUpstream):
                             continue
                         if api_error:
                             if api_error_status in (401, 403):
-                                credential_manager.record_cookie_auth_failure(account_id)
+                                credential_manager.record_cookie_auth_failure(account_id, credential=record)
                             return JSONResponse(status_code=api_error_status, content={"error": {
                                 "code": api_error_status, "message": api_error, "type": "upstream_error"}})
 
@@ -1241,13 +1241,13 @@ class CookieProxyUpstream(BaseUpstream):
 
                         if got_output:
                             require_finish_reason(finish_raw)
-                            credential_manager.record_cookie_success(account_id)
+                            credential_manager.record_cookie_success(account_id, credential=record)
                             # 预填充智能兼容：去重后把预填充文本拼回输出开头
                             if prefill_text and got_text:
                                 full_text = prefill_text + strip_prefill_overlap(prefill_text, full_text)
                             finish_reason = "tool_calls" if tool_calls else map_finish_reason_to_openai(finish_raw)
                             stats.add_success()
-                            credential_manager.record_cookie_success(account_id)
+                            credential_manager.record_cookie_success(account_id, credential=record)
                             print(f"✅ [Studio] {base_model_name} | {len(full_text)} 字符 | {elapsed:.1f}s")
                         else:
                             # 无正文（只有思考 / 完全空）：返回明确诊断而不是一个空格

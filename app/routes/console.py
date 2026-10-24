@@ -54,7 +54,8 @@ async def login(body: LoginBody, request: Request):
     # P2-2：失败三次后指数退避，避免对口令（同时也是 API Key）无限爆破
     remain = login_retry_after(ip)
     if remain > 0:
-        return JSONResponse(status_code=429, content={"error": f"尝试过于频繁，请 {remain} 秒后再试"})
+        return JSONResponse(status_code=429, content={"error": f"尝试过于频繁，请 {remain} 秒后再试"},
+                            headers={"Retry-After": str(remain), "Cache-Control": "no-store"})
 
     if config.API_KEY and constant_time_equal(body.password, config.API_KEY):
         clear_login_failure(ip)

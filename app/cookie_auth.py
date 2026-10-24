@@ -140,6 +140,9 @@ def build_headers(cookie_str: str) -> Optional[Dict[str, str]]:
 
 def validate_cookie(cookie_str: str) -> dict:
     """验证 Cookie 是否包含必要字段"""
+    if not cookie_str.isascii() or any(ord(char) < 32 or ord(char) == 127 for char in cookie_str):
+        return {"valid": False, "has_sapisid": False, "has_sid": False,
+                "message": "❌ Cookie 必须是不含换行或控制字符的 ASCII 请求头。"}
     sapisid = parse_cookie_value(cookie_str, "SAPISID")
     sapisid_3p = parse_cookie_value(cookie_str, "__Secure-3PAPISID")
     sapisid_1p = parse_cookie_value(cookie_str, "__Secure-1PAPISID")

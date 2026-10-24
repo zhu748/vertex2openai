@@ -23,3 +23,7 @@ Dockerfile
 .dockerignore
 bin/
 proxy-bridge/
+# 测试仍由 CI 在完整检出中执行，不进入生产 Go 编译的缓存键。
+proxybridge/*_test.go
+docs/
+**/*.log

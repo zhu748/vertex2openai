@@ -1,10 +1,7 @@
 name: Build & Publish Docker Image
 
-# 构建并推送 ghcr.io/<owner>/vertex2openai
-# - push 到 main：打 latest + main-<sha> 标签
-# - 推送 v* 标签：打语义化版本标签（v1.2.3 → 1.2.3 / 1.2 / latest）
-# - PR：只构建验证，不推送（fork PR 没有写权限，也不会误覆盖镜像）
-# - 手动触发：workflow_dispatch
+# PR 仅验证 amd64；发布时在原生 amd64 / arm64 runner 上并行构建。
+# 镜像按摘要暂存，Python / Go 检查和两个架构全部通过后才发布正式标签。
 on:
   push:
     branches: [ "main" ]
@@ -13,22 +10,20 @@ on:
     branches: [ "main" ]
   workflow_dispatch:
 
-# 最小权限原则：旧版 write-all 会把仓库所有写权限（含 release、deployments）
-# 都发给 workflow，这里只需要读代码 + 写 GHCR 包。
 permissions:
   contents: read
-  packages: write
+
+# 同一分支的新提交替代旧构建；版本标签的发布不被自动中断。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 env:
   REGISTRY: ghcr.io
-  # github.repository = <owner>/<repo>，GHCR 要求全小写
-  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  # 推镜像前先做导入级 CI：语法检查 + 真实 import app/main.py，
-  # 把「构建成功但启动即崩溃」的镜像挡在仓库门外。
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         python-version: ['3.11', '3.12']
@@ -49,7 +44,7 @@ jobs:
         run: python scripts/check_project.py
 
   proxy-bridge:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -61,38 +56,38 @@ jobs:
       - name: Protocol integration and race checks
         working-directory: proxybridge
         run: go test -race -count=1 -timeout=90s ./...
-      - name: Build protocol converter
-        working-directory: proxybridge
-        run: CGO_ENABLED=0 go build -trimpath -o ../bin/vertex-proxy-bridge .
+      # CGO_ENABLED=0 的生产编译由 Docker 构建完成，不再生成未使用的副本。
 
-  build-and-push:
-    needs: [test, proxy-bridge]
-    runs-on: ubuntu-latest
+  build:
+    # 与测试并行：此处只推摘要，正式标签由 publish 在全部检查通过后生成。
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(github.event_name == 'pull_request' && '[{"arch":"amd64","runner":"ubuntu-24.04"}]' || '[{"arch":"amd64","runner":"ubuntu-24.04"},{"arch":"arm64","runner":"ubuntu-24.04-arm"}]') }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Set up QEMU（arm64 交叉构建）
-        uses: docker/setup-qemu-action@v3
-
+      - name: Normalize image name
+        id: image
+        run: echo "name=${REGISTRY}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-
       - name: Login to GHCR
-        # PR 事件没有 packages 写权限，跳过登录（后面也只 build 不 push）
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract metadata (tags, labels)
+      - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          # latest 只在默认分支 push 或版本 tag 时打，PR 构建不带 latest
+          images: ${{ steps.image.outputs.name }}
           flavor: |
             latest=${{ github.event_name == 'push' && (github.ref == format('refs/heads/{0}', github.event.repository.default_branch) || startsWith(github.ref, 'refs/tags/v')) }}
           tags: |
@@ -100,17 +95,91 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=ref,event=pr
-
-      - name: Build and push
+      - name: Build native image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
-          # PR 只验证默认平台（QEMU 模拟 arm64 很慢）；push 时双平台发布
-          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
+          platforms: linux/${{ matrix.arch }}
+          # PR 不推镜像；发布构建按摘要推送，避免并发覆盖正式标签。
+          outputs: ${{ github.event_name == 'pull_request' && 'type=cacheonly' || format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', steps.image.outputs.name) }}
           labels: ${{ steps.meta.outputs.labels }}
-          # GHA 缓存：依赖层不变时构建从 ~3 分钟降到 ~30 秒
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # 架构分桶防止相互覆盖；缓存服务故障不阻断已成功的镜像构建。
+          cache-from: type=gha,scope=image-${{ matrix.arch }},version=2
+          cache-to: type=gha,scope=image-${{ matrix.arch }},version=2,mode=max,ignore-error=true,timeout=3m
+      - name: Export image digest
+        if: github.event_name != 'pull_request'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+      - name: Upload image digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    if: github.event_name != 'pull_request'
+    needs: [test, proxy-bridge, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download image digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+      - name: Normalize image name
+        id: image
+        run: echo "name=${REGISTRY}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          flavor: |
+            latest=${{ github.event_name == 'push' && (github.ref == format('refs/heads/{0}', github.event.repository.default_branch) || startsWith(github.ref, 'refs/tags/v')) }}
+          tags: |
+            type=raw,value=main-{{sha}},enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=pr
+      - name: Publish multi-platform manifest
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          # 每个架构必须且只应提供一个摘要，缺失时禁止发布单架构 latest。
+          shopt -s nullglob
+          digests=(*)
+          [[ ${#digests[@]} -eq 2 ]]
+          sources=()
+          for digest in "${digests[@]}"; do
+            [[ "$digest" =~ ^[a-f0-9]{64}$ ]]
+            sources+=("${IMAGE_NAME}@sha256:${digest}")
+          done
+          tags=()
+          while IFS= read -r tag; do
+            [[ -z "$tag" ]] || tags+=(--tag "$tag")
+          done <<< "$TAGS"
+          [[ ${#tags[@]} -gt 0 ]]
+          docker buildx imagetools create "${tags[@]}" "${sources[@]}"

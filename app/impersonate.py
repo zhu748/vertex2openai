@@ -7,6 +7,7 @@ upstream account restrictions or private API changes.
 """
 
 from contextlib import asynccontextmanager
+import asyncio
 import codecs
 import threading
 from typing import Any, AsyncIterator, Callable
@@ -122,17 +123,17 @@ class _CurlRespShim:
         self._consumed = True
         return bytes(self._buffered)
 
-    def aiter_text(self) -> AsyncIterator[str]:
-        """与 httpx 调用约定一致：普通方法返回异步生成器（不需要 await）。
+    def aiter_bytes(self, chunk_size=None) -> AsyncIterator[bytes]:
+        """Expose bounded byte reads to auxiliary probes without buffering a body."""
+        if chunk_size is not None and chunk_size < 1:
+            raise ValueError("chunk_size must be positive")
 
-        cookie_proxy 的用法是 `async for chunk in response.aiter_text():`，
-        shim 必须保持同一形态。每块顺带写入自缓冲（供 aread 幂等语义使用），
-        缓冲超过 _CURL_SELF_BUFFER_LIMIT_BYTES 后放弃缓冲纯透传。
-        """
         async def _gen():
-            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-            if self._consumed:
-                yield bytes(self._buffered).decode("utf-8", errors="replace")
+            if not self._from_stream or self._consumed:
+                data = bytes(self._buffered) if self._from_stream else (self._r.content or b"")
+                size = chunk_size or max(1, len(data))
+                for offset in range(0, len(data), size):
+                    yield data[offset:offset + size]
                 return
             async for chunk in self._r.aiter_content():
                 if not chunk:
@@ -145,16 +146,40 @@ class _CurlRespShim:
                         self._buffered.clear()
                     else:
                         self._buffered.extend(chunk)
-                text = decoder.decode(chunk)
-                if text:
-                    yield text
+                size = chunk_size or len(chunk)
+                for offset in range(0, len(chunk), size):
+                    yield chunk[offset:offset + size]
             self._consumed = True
+        return _gen()
+
+    def aiter_text(self) -> AsyncIterator[str]:
+        """Decode incrementally, sharing the byte iterator's bounded replay buffer."""
+        async def _gen():
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+            source = self.aiter_bytes()
+            try:
+                async for chunk in source:
+                    text = decoder.decode(chunk)
+                    if text:
+                        yield text
+            finally:
+                await source.aclose()
             tail = decoder.decode(b"", final=True)
             if tail:
                 yield tail
         return _gen()
 
     async def aclose(self) -> None:
+        # curl_cffi Response.aclose() only awaits astream_task. On an early
+        # exit it otherwise downloads the rest (up to 1800s) into its queue.
+        # Cancelling the producer runs AsyncSession's registered cleanup and
+        # returns its curl handle to the pool without closing the shared session.
+        task = getattr(self._r, "astream_task", None) if self._from_stream else None
+        if task is not None:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            return
         await self._r.aclose()
 
 
@@ -176,9 +201,15 @@ class _CurlClientShim:
 
     @asynccontextmanager
     async def _stream_ctx(self, method: str, url: str, *, headers=None, json=None):
-        async with self._s.stream(method, url, headers=headers, json=json,
-                                  timeout=self._stream_timeout) as resp:
-            yield _CurlRespShim(resp, from_stream=True)
+        # Own response closure: AsyncSession.stream() unconditionally awaits
+        # the raw aclose(), which re-raises a cancelled producer on early exit.
+        resp = await self._s.request(method, url, headers=headers, json=json,
+                                     timeout=self._stream_timeout, stream=True)
+        response = _CurlRespShim(resp, from_stream=True)
+        try:
+            yield response
+        finally:
+            await response.aclose()
 
     async def aclose(self) -> None:
         await self._s.close()

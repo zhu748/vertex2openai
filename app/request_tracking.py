@@ -267,70 +267,60 @@ class PayloadObserver:
         raw = chunk.encode("utf-8") if isinstance(chunk, str) else bytes(chunk)
         with self.trace._lock:
             self.trace.data["sent_bytes" if self.sent else "generated_bytes"] += len(raw)
-        if self.skipping:
-            # 跳过期间到达的块整块计入跳过字节（分隔符后残余被回灌检查，
-            # 计数轻微高估属于保守方向，不影响投递）。
-            with self.trace._lock:
-                self.trace.data["inspection_skipped_bytes"] += len(raw)
-            self._skip_step(raw, final=final)
-            return
-        if len(self.buffer) + len(raw) > MAX_INSPECTION_BYTES:
-            with self.trace._lock:
-                self.trace.data["inspection_skipped_bytes"] += len(raw)
-            self.buffer.clear()
-            self._scan = 0
-            self.skipping = True
-            # 触发块自身可能已含超限帧的终结分隔符（帧在本块内结束）：
-            # 走同一检测路径，块内分隔符之后的残余是新的正常帧
-            # （旧实现在此直接 return，块尾带分隔符时下一块被误吞）。
-            self._skip_step(raw, final=final)
-            return
-        self._ingest(raw, final=final)
-
-    def _skip_step(self, raw, final=False):
-        """跳过模式处理一块：定位超限帧的终结分隔符（支持横跨块与 \\r\\r），
-        找到则复位跳过并回灌分隔符之后的残余。"""
         if not self.sse:
-            return
-        # 上一块的 3 字节尾与本块拼接检测（分隔符可能横跨块）。
-        joined = bytes(self.buffer) + raw
-        pos, mlen = -1, 0
-        for marker in (b"\r\n\r\n", b"\n\n", b"\r\r"):
-            p = joined.find(marker)
-            if p != -1 and (pos == -1 or p < pos):
-                pos, mlen = p, len(marker)
-        self.buffer.clear()
-        self.buffer.extend(raw[-3:])
-        if pos == -1:
-            return
-        self.skipping = False
-        self.buffer.clear()
-        self._scan = 0
-        # 分隔符之后是新的正常帧：回灌（不得整块丢弃）。
-        self._ingest(joined[pos + mlen:], final=final)
-
-    def _ingest(self, raw, final=False):
-        self.buffer.extend(raw)
-        if not self.sse:
+            if self.skipping or len(self.buffer) + len(raw) > MAX_INSPECTION_BYTES:
+                self._skipped(len(raw) + len(self.buffer))
+                self.buffer.clear()
+                self.skipping = True
+                return
+            self.buffer.extend(raw)
             if final:
                 self._payload(bytes(self.buffer))
                 self.buffer.clear()
-                self._scan = 0
             return
-        while True:
-            match = _FRAME_SEP_RE.search(self.buffer, self._scan)
-            if not match:
-                # 分隔符可能横跨两个网络块，保留末尾 3 字节重叠下次接着扫。
-                self._scan = max(0, len(self.buffer) - 3)
-                return
-            frame = bytes(self.buffer[:match.start()])
-            del self.buffer[:match.end()]
+        # Bound working copies independently of network chunk size. A large
+        # chunk containing many small frames is valid and must be inspected.
+        step = min(64 * 1024, max(1, MAX_INSPECTION_BYTES))
+        for offset in range(0, len(raw), step):
+            self.buffer.extend(raw[offset:offset + step])
+            self._ingest_sse()
+
+    def _skipped(self, count):
+        with self.trace._lock:
+            self.trace.data["inspection_skipped_bytes"] += count
+
+    def _ingest_sse(self):
+        start = 0
+        scan = self._scan
+        while match := _FRAME_SEP_RE.search(self.buffer, scan):
+            end = match.end()
+            if self.skipping or end - start > MAX_INSPECTION_BYTES:
+                self._skipped(end - start)
+            else:
+                frame = bytes(self.buffer[start:match.start()])
+                data = b"\n".join(line[5:].lstrip() for line in frame.splitlines() if line.startswith(b"data:"))
+                if data and data != b"[DONE]":
+                    with self.trace._lock:
+                        self.trace.data["sent_frames" if self.sent else "generated_frames"] += 1
+                    self._payload(data)
+            self.skipping = False
+            start = scan = end
+        remaining = len(self.buffer) - start
+        if self.skipping or remaining > MAX_INSPECTION_BYTES:
+            # Preserve the delimiter overlap even when first crossing the
+            # budget. Otherwise a split \r\n\r\n can swallow the next frame.
+            keep = min(3, remaining)
+            self._skipped(remaining - keep)
+            tail = self.buffer[-keep:] if keep else b""
+            self.buffer.clear()
+            self.buffer.extend(tail)
+            self.skipping = True
             self._scan = 0
-            data = b"\n".join(line[5:].lstrip() for line in frame.splitlines() if line.startswith(b"data:"))
-            if data and data != b"[DONE]":
-                with self.trace._lock:
-                    self.trace.data["sent_frames" if self.sent else "generated_frames"] += 1
-                self._payload(data)
+        else:
+            # Compact once per bounded input slice, not once per frame.
+            if start:
+                del self.buffer[:start]
+            self._scan = max(0, len(self.buffer) - 3)
 
     def _payload(self, raw):
         try:

@@ -68,6 +68,10 @@ def _check_setting_value(key: str, v) -> str | None:
     if isinstance(default, str):
         if not isinstance(v, str):
             return f"{key} 必须是字符串，收到的是「{v!r}」"
+        if key == "cookie_authuser" and (
+            len(v) > 128 or not v.isascii() or any(ord(c) < 32 or ord(c) == 127 for c in v)
+        ):
+            return "cookie_authuser 必须是不含控制字符的 ASCII 请求头，最多 128 字符。"
         return None
     if default is None:
         # default_temperature / default_top_p / default_max_tokens：None=不注入，或数字

@@ -643,9 +643,16 @@ class _SingboxInstance:
         return self.process is not None and self.process.poll() is None
 
     def log_tail(self, limit: int = 400) -> str:
+        if limit <= 0:
+            return ""
         try:
-            with open(self.log_path, "r", encoding="utf-8", errors="replace") as f:
-                return f.read()[-limit:]
+            # A long-lived bridge can have a large log; never load it all just
+            # to display a few hundred characters. UTF-8 uses at most 4 bytes
+            # per character, so this bounded suffix contains the desired tail.
+            with open(self.log_path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - limit * 4))
+                return f.read(limit * 4).decode("utf-8", errors="replace")[-limit:]
         except Exception:
             return ""
 

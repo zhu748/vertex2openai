@@ -1,5 +1,6 @@
 """控制台会话与登录限速；API Key 鉴权由 auth.py 负责。"""
 
+import math
 import os
 import secrets
 import threading
@@ -112,8 +113,11 @@ def login_retry_after(ip: str) -> int:
             return 0
         if count < 3:
             return 0
-        wait = min(LOGIN_LOCK_BASE_SECONDS * (2 ** (count - 3)), LOGIN_LOCK_MAX_SECONDS)
-        remain = int(last + wait - time.time())
+        # Clamp before exponentiation: a long-lived failure counter must not
+        # construct an arbitrarily large integer just to cap it at 300 seconds.
+        exponent = min(count - 3, LOGIN_LOCK_MAX_SECONDS.bit_length())
+        wait = min(LOGIN_LOCK_BASE_SECONDS * (2 ** exponent), LOGIN_LOCK_MAX_SECONDS)
+        remain = math.ceil(last + wait - time.time())
         return max(0, remain)
 
 

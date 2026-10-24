@@ -19,7 +19,6 @@ APP_DIR = Path(__file__).resolve().parents[1] / "app"
 sys.path.insert(0, str(APP_DIR))
 os.chdir(APP_DIR)
 
-import config  # noqa: E402
 from cookie_auth import (  # noqa: E402
     DEFAULT_CLIENT_VERSION,
     STREAM_GENERATE_QUERY_SIGNATURE,

@@ -7,6 +7,7 @@ is_auth_or_billing_error 已做当轮隔离，这里补齐 Cookie 多账号池�
 机制——失效账号不再持续承接 1/N 的流量反复报错。
 """
 
+import hashlib
 import random
 import threading
 import time
@@ -19,6 +20,7 @@ _random = random.SystemRandom()
 # （Cookie 失效是会话级事实，重启不影响判定；持久化反而会挡住换新 Cookie）。
 COOKIE_AUTH_FAILURE_THRESHOLD = 3
 COOKIE_COOLDOWN_SECONDS = 600
+MAX_COOKIE_HEALTH_ENTRIES = 10_000
 
 
 class CredentialManager:
@@ -41,6 +43,23 @@ class CredentialManager:
 
     # ===== Cookie 账号健康隔离 =====
 
+    @staticmethod
+    def _credential_identity(record) -> str:
+        # Health belongs to a credential/project pair, not an editable row ID.
+        return hashlib.sha256(
+            f"{record.get('cookie', '')}\0{record.get('project_id', '')}".encode()
+        ).hexdigest()
+
+    def _prune_cookie_health_locked(self, records):
+        current = {record["id"]: record for record in records}
+        for account_id, entry in list(self._cookie_health.items()):
+            identity = entry.get("credential")
+            if identity is not None and (
+                account_id not in current
+                or identity != self._credential_identity(current[account_id])
+            ):
+                self._cookie_health.pop(account_id, None)
+
     def _cookie_cooldown_remaining(self, account_id) -> float:
         with self._lock:
             entry = self._cookie_health.get(account_id)
@@ -48,32 +67,54 @@ class CredentialManager:
                 return 0.0
             return max(0.0, entry.get("cooldown_until", 0.0) - time.time())
 
-    def record_cookie_auth_failure(self, account_id: str) -> None:
+    def record_cookie_auth_failure(self, account_id: str, *, credential=None) -> None:
         """一次鉴权类失败（401/403/permission）。达到阈值进入冷却。"""
         if not account_id:
             return
+        records = app_state.get_cookie_accounts() if credential is not None else None
+        identity = self._credential_identity(credential) if credential is not None else None
+        if records is not None and not any(
+            record["id"] == account_id and self._credential_identity(record) == identity
+            for record in records
+        ):
+            return  # An old in-flight request must not quarantine a replacement.
+        now = time.time()
         with self._lock:
+            if records is not None:
+                self._prune_cookie_health_locked(records)
+            if account_id not in self._cookie_health:
+                while len(self._cookie_health) >= MAX_COOKIE_HEALTH_ENTRIES:
+                    self._cookie_health.pop(next(iter(self._cookie_health)))
             entry = self._cookie_health.setdefault(account_id, {"failures": 0, "cooldown_until": 0.0})
-            if entry.get("cooldown_until", 0.0) > time.time():
+            if identity is not None:
+                entry["credential"] = identity
+            if entry.get("cooldown_until", 0.0) > now:
                 return  # 冷却中重复失败不累计，避免续期无限延长
             entry["failures"] = entry.get("failures", 0) + 1
             if entry["failures"] >= COOKIE_AUTH_FAILURE_THRESHOLD:
-                entry["cooldown_until"] = time.time() + COOKIE_COOLDOWN_SECONDS
+                entry["cooldown_until"] = now + COOKIE_COOLDOWN_SECONDS
                 entry["failures"] = 0  # 冷却结束后重新计数
                 print(f"🚑 [凭证隔离] Cookie 账号 {account_id} 连续 {COOKIE_AUTH_FAILURE_THRESHOLD} 次"
                       f"鉴权失败，冷却 {COOKIE_COOLDOWN_SECONDS // 60} 分钟内不再选中。")
 
-    def record_cookie_success(self, account_id: str) -> None:
+    def record_cookie_success(self, account_id: str, *, credential=None) -> None:
         """一次成功调用：清零失败计数、解除冷却。"""
         if not account_id:
             return
         with self._lock:
+            entry = self._cookie_health.get(account_id)
+            if credential is not None and entry and entry.get("credential") not in (
+                None, self._credential_identity(credential)
+            ):
+                return  # A stale success must not clear the new credential's failures.
             self._cookie_health.pop(account_id, None)
 
     def cookie_health_snapshot(self) -> dict:
         """各账号健康状态（控制台展示用）：{id: {"cooldown_remaining": 秒, "failures": n}}。"""
         now = time.time()
+        records = app_state.get_cookie_accounts()
         with self._lock:
+            self._prune_cookie_health_locked(records)
             return {
                 account_id: {
                     "cooldown_remaining": round(max(0.0, entry.get("cooldown_until", 0.0) - now), 1),
@@ -88,7 +129,8 @@ class CredentialManager:
         # 多账号池里选中缺 project 的账号会在 cookie 通道给出 400，其余账号正常，
         # 表现为按比例间歇失败（2026-10 修复）。
         # 全部都缺 project 时保留旧行为（选中后由通道给出明确的 400 配置提示）。
-        records = [dict(r, channel="cookie") for r in app_state.get_cookie_accounts() if r["enabled"]]
+        accounts = app_state.get_cookie_accounts()
+        records = [dict(r, channel="cookie") for r in accounts if r["enabled"]]
         if not records:
             return None
         complete = [r for r in records if r["project_id"]]
@@ -97,6 +139,7 @@ class CredentialManager:
         # 冷却是概率性优化，不是硬性准入）。
         now = time.time()
         with self._lock:
+            self._prune_cookie_health_locked(accounts)
             healthy = [r for r in pool
                        if not self._cookie_health.get(r["id"])
                        or self._cookie_health[r["id"]].get("cooldown_until", 0.0) <= now]
@@ -106,15 +149,12 @@ class CredentialManager:
         records = [dict(r, channel="express") for r in key_manager.get_records()]
         if not express_only:
             now = time.time()
-            cookie_records = []
-            for r in app_state.get_cookie_accounts():
-                if not (r["enabled"] and r["project_id"]):
-                    continue
-                with self._lock:
-                    entry = self._cookie_health.get(r["id"])
-                if entry and entry.get("cooldown_until", 0.0) > now:
-                    continue
-                cookie_records.append(dict(r, channel="cookie"))
+            accounts = app_state.get_cookie_accounts()
+            with self._lock:
+                self._prune_cookie_health_locked(accounts)
+                cookie_records = [dict(r, channel="cookie") for r in accounts
+                                  if r["enabled"] and r["project_id"]
+                                  and self._cookie_health.get(r["id"], {}).get("cooldown_until", 0.0) <= now]
             records += cookie_records
         return self._select(records, "mixed-express" if express_only else "mixed")
 
