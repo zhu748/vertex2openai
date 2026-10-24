@@ -416,7 +416,7 @@ async function loadParams(){
     settingsLoaded=true;
     curAR = s.image_aspect_ratio || "";
     ['resumable_disconnect_grace_seconds','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','retry_jitter_seconds','fake_streaming_interval','prefill_mode','express_location','resumable_ttl_seconds','resumable_max_streams','request_timeout_seconds','upstream_max_concurrency','resumable_max_buffer_mb','resumable_max_total_mb','keepalive_url','keepalive_interval'].forEach(k=>setV(k,s[k]));
-    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','resumable_enabled','cookie_structured_output'].forEach(k=>setV(k,s[k]));
+    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','resumable_enabled','cookie_structured_output','cross_channel_fallback'].forEach(k=>setV(k,s[k]));
     setV('credential-strategy',s.roundrobin?'roundrobin':'random');
     // 出站代理：回填输入框并刷新状态徽标
     setV('proxy-input', proxyDraft(s.proxy_urls??s.proxy_url).join('\n'));
@@ -645,6 +645,7 @@ async function saveSettings(){
     retry_max:numOr('retry_max',10),
     retry_backoff_seconds:numOr('retry_backoff_seconds',5),
     retry_jitter_seconds:numOr('retry_jitter_seconds',1),
+    cross_channel_fallback:$('cross_channel_fallback').checked,
     fake_streaming:$('fake_streaming').checked,
     fake_streaming_interval:numOr('fake_streaming_interval',1),
     roundrobin:$('roundrobin').checked,

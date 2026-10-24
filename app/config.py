@@ -115,6 +115,9 @@ DEFAULT_SETTINGS = {
     "retry_max": 10,
     "retry_backoff_seconds": 5,
     "retry_jitter_seconds": 1,
+    # 跨通道兜底（对齐上游 bad-woman/vertex2openai）：主通道在未输出内容前
+    # 遇 429/401/403/5xx 失败时，自动切换另一通道（Express ↔ Cookie）接力。
+    "cross_channel_fallback": True,
     "first_reply_timeout_seconds": 15.0,  # 每次上游尝试等待模型首回复；0=关闭，可按模型覆盖
     # 开关（初始值取环境变量）
     "fake_streaming": FAKE_STREAMING_ENABLED,

@@ -1162,6 +1162,17 @@
           <input class="inp" id="retry_jitter_seconds" min="0" step="0.5" type="number"/>
          </div>
         </div>
+        <div class="flex items-center justify-between mt-3">
+         <span class="text-sm">跨通道兜底重试（Express ↔ Cookie 互备）
+          <button aria-controls="h_ccf" aria-expanded="false" aria-label="展开说明" class="helpq" onclick="hlp(this,'h_ccf')" type="button">?</button>
+         </span>
+         <label class="switch">
+          <input aria-label="跨通道兜底重试" id="cross_channel_fallback" type="checkbox"/>
+          <span class="slider">
+          </span>
+         </label>
+        </div>
+        <div class="helpbox" id="h_ccf" hidden="">主通道（Express 或 Cookie）在尚未输出任何内容前遇 429 拥堵、401/403 凭证问题或 5xx 服务端错误时，自动切换另一通道接力完成回复；已输出内容绝不切换，避免半截答案重发。结构化输出在未开启 Cookie 结构化支持时仍锁定 Express。鉴权失败或欠费的 Key / Cookie 会在本轮请求内自动隔离并跳过。</div>
         <div class="text-xs opacity-60 mt-2">实际等待 = 重试间隔 ± 抖动幅度/2（固定不变，不随重试次数增长；上游 Retry-After 更短时采纳其提示）</div>
        </div>
        <div class="card settings-card">

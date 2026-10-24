@@ -22,11 +22,21 @@ from proxy_failover import FailoverSDKClient, ProxyChain
 from schema_validation import SchemaValidationError
 from request_validation import validate_openai_request
 from request_tracking import configure as track_configure
+from retry_policy import is_auth_or_billing_error
 
 LEGACY_EXPRESS_PREFIX = "[EXPRESS] "
 LEGACY_PAY_PREFIX = "[PAY]"
 OPENAI_DIRECT_SUFFIX = "-openai"
 OPENAI_SEARCH_SUFFIX = "-openaisearch"
+
+
+def _mask_key(key: str) -> str:
+    """日志用 Key 掩码：只保留首尾少量字符，避免完整密钥泄漏到控制台日志。"""
+    if not key:
+        return "(空)"
+    if len(key) <= 10:
+        return key[:2] + "…" + key[-2:]
+    return key[:6] + "…" + key[-4:]
 
 
 def _normalize_model_name(model_name: str) -> tuple[str, bool, str | None]:
@@ -259,10 +269,21 @@ class ExpressSDKUpstream(BaseUpstream):
             }
             print(f"🔎 [出站调试] Express 通道 生成参数={_dbg}")
 
-        async def retry_target_factory():
+        # 本轮请求内已被隔离的坏凭证（鉴权失败/欠费）
+        dead_keys: set = set()
+
+        async def retry_target_factory(error=None):
             # A newly selected proxy must be warmed asynchronously as well.
             nonlocal express_api_key, key_record, client_to_use
-            record = express_key_manager_instance.get_express_record(exclude_key=express_api_key)
+            # 坏凭证（鉴权失败/欠费）当轮硬隔离：同一把 Key 重试只会得到
+            # 相同结果，全部 Key 隔离完后返回 None，由上层结束本通道重试
+            # （并交给跨通道兜底，对齐上游 dead_targets 语义）。
+            if error is not None and is_auth_or_billing_error(error):
+                dead_keys.add(express_api_key)
+            record = express_key_manager_instance.get_express_record(
+                exclude_key=express_api_key,
+                exclude_keys=frozenset(dead_keys) or None,
+            )
             if record is None:
                 return None
             if any(record.get(k) != key_record.get(k) for k in
@@ -280,6 +301,21 @@ class ExpressSDKUpstream(BaseUpstream):
                 base_model_name if model_path != base_model_name else None,
             )
 
+        def _describe_current_credential() -> str:
+            """红色告警用：定位到具体哪把 Key（序号 + 掩码 + 项目）。"""
+            idx = None
+            get_records = getattr(express_key_manager_instance, "get_records", None)
+            if callable(get_records):
+                try:
+                    all_records = get_records()
+                    idx = next((i for i, r in enumerate(all_records)
+                                if r.get("key") == express_api_key), None)
+                except Exception:
+                    idx = None
+            pos = f"第 {idx + 1} 个" if idx is not None else "当前"
+            pid = (key_record or {}).get("project_id") or "未绑定"
+            return f"{pos} Express API Key（{_mask_key(express_api_key)} | 项目={pid}）"
+
         return await execute_gemini_call(
             client_to_use,
             model_to_call,
@@ -295,4 +331,5 @@ class ExpressSDKUpstream(BaseUpstream):
             fallback_client_factory=(lambda: client_to_use),
             retry_target_factory=retry_target_factory,
             text_transport=text_transport,
+            credential_describer=_describe_current_credential,
         )

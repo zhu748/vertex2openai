@@ -24,6 +24,11 @@ _STATUS_IN_TEXT_RE = re.compile(r"(?<![0-9])(429|500|502|503|504)(?![0-9])")
 
 # 可重试错误的文本关键词（Express / Cookie 两条通道共用一套口径，防两份列表漂移；
 # Cookie 通道的 _is_retryable_error 直接引用，不再自带一份）。
+# 2026-10 对齐上游 bad-woman/vertex2openai：补充网络截断与服务端 5xx 文本短语——
+# 异常被上层包装成普通 Exception/字符串后类型信息丢失（httpx.RemoteProtocolError 等
+# isinstance 白名单失效），文本匹配是最后一道防线；上游实测缺失这两个短语时
+# "peer closed connection without sending complete message body (incomplete chunked read)"
+# 被包装后不会重试。
 RETRYABLE_MARKERS = (
     "too many requests",
     "quota",
@@ -34,6 +39,39 @@ RETRYABLE_MARKERS = (
     "overloaded",
     "temporarily unavailable",
     "internal error",
+    # —— 上游补充：服务端 5xx / 超时文本 ——
+    "internal",
+    "backend error",
+    "unavailable",
+    "deadline_exceeded",
+    "deadline exceeded",
+    "timed out",
+    "timeout",
+    # —— 上游补充：网络层截断 / 连接异常文本 ——
+    "remoteprotocolerror",
+    "connecterror",
+    "readerror",
+    "writeerror",
+    "proxyerror",
+    "pooltimeout",
+    "server disconnected",
+    "connection reset",
+    "incomplete chunked read",
+    "peer closed connection",
+)
+
+# 坏凭证（鉴权失效 / 项目欠费 / 账号停用）的文本特征：命中后本轮请求内
+# 隔离该凭证并切换下一个，不再浪费重试预算（对齐上游
+# is_express_auth_or_billing_error，同时适用于 Express Key 与 Cookie 通道）。
+AUTH_OR_BILLING_MARKERS = (
+    "api_key_invalid",
+    "api key not valid",
+    "unauthenticated",
+    "permission_denied",
+    "requires billing",
+    "billing to be enabled",
+    "account_suspended",
+    "consumer_invalid",
 )
 
 
@@ -96,6 +134,30 @@ def is_retryable_exception(e: Exception) -> bool:
     # 数字标记用有界正则匹配：裸子串 "429" 会误中 "port 4292"/"elapsed
     # 42912ms"，把不可重试错误判成可重试 → 白白重试烧配额（2026-10 修复）。
     return is_retryable_message(error_str)
+
+
+def is_auth_or_billing_error(error: object) -> bool:
+    """判断异常是否为单个凭证的鉴权失效或所属项目欠费/无权限错误。
+
+    用途（对齐上游“坏凭证自动隔离”体系）：
+    - Express Key 遇 401 API_KEY_INVALID / 项目欠费 → 当轮隔离该 Key 并切换下一个；
+    - Cookie 通道遇同类错误 → 终止该通道并触发跨通道兜底；
+    - 命中时同时打印红色醒目告警，提醒管理员删除或更换凭证。
+    注意与可重试错误的区别：可重试错误换凭证后值得再试；坏凭证问题换一个
+    凭证才有意义，同一把凭证重试只会得到相同结果。
+    """
+    if error is None:
+        return False
+    if getattr(error, "is_auth_or_billing", None) is True:
+        return True
+    if isinstance(error, (ValueError, TypeError)):
+        # 本地参数构造错误与凭证无关（对齐上游：ValueError 直接排除）。
+        return False
+    code = error_status(error)
+    if code in (401, 403):
+        return True
+    low = str(error).lower()
+    return any(marker in low for marker in AUTH_OR_BILLING_MARKERS)
 
 
 def _retry_delay_value(retry_after: Optional[str], default: float, attempt: int = 0, jitter: float = 1.0) -> float:

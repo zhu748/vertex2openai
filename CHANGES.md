@@ -2,6 +2,54 @@
 
 基于原版 `vertex2openai-main`（2026-09-01），持续完善兼容性、可靠性和代码组织。
 
+## 2026-10-24 对齐上游 bad-woman/vertex2openai：跨通道兜底、坏凭证隔离与重试关键词加固
+
+对比上游仓库 2026-10-23 批次改动（多 Key 轮换容灾、Key ↔ Cookie 跨通道互备、
+500 智能重试体系），把其中当前仓库缺失的三项核心优化按本仓库架构对齐移植；
+上游的统一调度引擎整体替换不引入（会破坏 first_reply/keepalive/resumable/
+proxy_failover 等深度集成），仅提取其语义。
+
+- **跨通道兜底重试（Express ↔ Cookie 互备）**（`app/routes/chat_api.py`）：
+  - 新增 `cross_channel_fallback` 设置（默认开，控制台「重试与退避」卡片开关）：
+    主通道在尚未向客户端输出任何内容前，遇 429 / 401 / 403 / 5xx 失败时自动切换
+    另一通道接力完成回复；已输出内容绝不切换（半截答案不能重发，与通道内重试
+    安全线同口径）。
+  - 流式路径：包装主通道帧流，识别"错误帧前置"（真实内容帧之前的 `data: {"error": ...}`），
+    吞掉错误帧与收尾帧后无缝切换备用通道；客户端只看到接力输出，无重复 [DONE]。
+  - 非流式路径：主通道返回可兜底错误时用另一通道再试一次，失败保留主通道错误
+    （不误导排查方向）。
+  - 门控：结构化输出在未开启 `cookie_structured_output` 时锁定 Express；
+    400/404/422 等请求级错误不兜底；备用通道需有可用凭证（Key 或 Cookie+项目）；
+    兜底只一层不递归，受整轮请求期限约束。
+- **坏凭证自动隔离与红色告警**（`app/retry_policy.py`、`app/express_key_manager.py`、
+  `app/upstreams/express_sdk.py`、`app/api_helpers.py`）：
+  - 新增 `is_auth_or_billing_error()` 分类：401/403、`API_KEY_INVALID`、
+    `requires billing`、`account_suspended` 等命中即为坏凭证；`ValueError` 等
+    本地参数错误不算（对齐上游）。
+  - `get_express_record()` 新增 `exclude_keys` 硬排除参数：坏凭证当轮隔离，
+    全部 Key 隔离完后返回 None 交由跨通道兜底接管；`exclude_key` 软排除语义
+    不变（单 Key + 429 仍吃满完整重试预算）。
+  - `retry_target_factory(error=...)`：把失败错误交给工厂做隔离标记；
+  `_call_retry_factory` 用签名探测兼容旧式无参工厂（测试桩不受影响）。
+  - Express 三条重试循环（真流式/假流式/非流式）：坏凭证**跳过退避等待立即切换**
+    下一把 Key（优于上游的照常等待）；红色告警（🔴 含 Key 序号、掩码、项目 ID）
+    每凭证每请求只打一次。
+- **可重试关键词扩充**（`app/retry_policy.py`）：补充
+  `incomplete chunked read`、`peer closed connection`、`server disconnected`、
+  `connection reset`、`deadline_exceeded`、`backend error`、`pooltimeout` 等网络
+  截断与服务端 5xx 文本短语——异常被上层包装成普通 Exception（类型信息丢失，
+  isinstance 白名单失效）时的最后防线；既有数字边界正则（防 "4292ms" 误报）
+  与永久状态码不重试语义保持不变。
+- **Express 完成日志**（对齐上游）：真流式首帧「⚡ 连接建立，正在实时流式输出…」、
+  完毕「✅ 流式传输顺利完毕 | 耗时 Xs」、假流式与非流式完成日志，便于观测。
+- 不对齐项（核实后确认当前仓库已等价或更优）：Cookie `batchGraphql` 签名
+  （两边一致）；Gemini 2.5 清理（模型列表已一致）；非流式错误双倍计数
+  （已有 is_auto_attempt 外层统一计数机制）；`has_yielded_output` 细化
+  （当前 first_reply guard + deferred finishes 实现更精细）。
+- 新增 `tests/test_upstream_alignment.py`：48 个回归（关键词、分类、隔离、
+  帧解析、兜底切换安全线、设置校验）；全量 694 通过，与基线一致
+  （基线本身有 2 个与本次无关的顺序敏感失败）。
+
 ## 2026-10-23 代理面板与批量测试导入
 
 - 代理管理拆分为列表、单条添加、批量导入，扩展列表宽度与移动端操作区；全局代理可在弹窗内保存生效，账号专属代理明确提示保存账号列表。

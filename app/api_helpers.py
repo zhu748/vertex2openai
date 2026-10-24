@@ -36,6 +36,7 @@ from response_validation import (
 from retry_policy import (
     exception_retry_delay,
     get_retry_settings,
+    is_auth_or_billing_error,
     is_retryable_exception,
     wait_for_retry,
 )
@@ -475,6 +476,46 @@ def _resolve_retry_target(current_client, current_model, current_fallback, targe
     return client, model, fallback
 
 
+def _call_retry_factory(factory: Callable, error: Optional[Exception]):
+    """调用重试目标工厂；兼容旧的无参工厂（测试桩等），仅在工厂声明接受 error 时传递。
+
+    坏凭证（鉴权/欠费）需要随错误一起交给工厂做隔离标记；用签名探测而非
+    try/except TypeError，避免把工厂内部的真实 TypeError 误当参数不匹配。
+    """
+    if error is not None:
+        try:
+            params = inspect.signature(factory).parameters
+        except (TypeError, ValueError):
+            params = {}
+        if "error" in params or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+        ):
+            return factory(error=error)
+    return factory()
+
+
+def _warn_bad_credential(
+    describer: Optional[Callable[[], str]], error: Exception, warned: set
+) -> bool:
+    """坏凭证红色醒目告警（每凭证只告警一次，对齐上游 _emit_credential_invalid_warning）。
+
+    返回是否命中坏凭证分类，便于调用方据此决定隔离与立即切换。
+    """
+    if not is_auth_or_billing_error(error):
+        return False
+    if describer is not None:
+        label = describer()
+        if label not in warned:
+            warned.add(label)
+            code = error_status(error)
+            print(
+                f"🔴 [密钥失效提醒] {label} 鉴权或计费失败（HTTP {code or '?'}），"
+                f"本轮请求已自动隔离并跳过该凭证！"
+                f"👉 请及时前往控制台「通道与凭证」页检查、删除或更换。原因：{str(error)[:300]}"
+            )
+    return True
+
+
 async def gemini_fake_stream_generator(
     gemini_client_instance: Any,
     model_for_api_call: str,
@@ -486,10 +527,13 @@ async def gemini_fake_stream_generator(
     fastapi_request: Optional[Any] = None,
     fallback_model: Optional[str] = None,
     fallback_client_factory: Optional[Callable[[], Any]] = None,
-    retry_target_factory: Optional[Callable[[], Any]] = None,
+    retry_target_factory: Optional[Callable] = None,
     text_transport: Optional[TextTransport] = None,
+    credential_describer: Optional[Callable[[], str]] = None,
 ):
     print(f"🌊 [假流式] 已开始调用 Gemini 模型 {model_for_api_call}，客户端请求模型名为 {request_obj.model}。")
+    fake_stream_started = time.monotonic()
+    warned_credentials: set = set()
 
     # P1-6：不再使用 tenacity 的硬编码 20 次，改为与真流式/非流式一致的手写退避，
     # 读取控制台的 retry_max / retry_backoff_seconds / retry_jitter_seconds
@@ -517,7 +561,7 @@ async def gemini_fake_stream_generator(
 
             if retry_pending:
                 if retry_target_factory:
-                    target = retry_target_factory()
+                    target = _call_retry_factory(retry_target_factory, last_error)
                     if inspect.isawaitable(target):
                         target = await target
                     if target is None:
@@ -562,21 +606,27 @@ async def gemini_fake_stream_generator(
                         gemini_client_instance = fallback_client_factory()
                     print(f"↩️ [上游端点] 假流式钉定失败，退回裸模型名 {fallback_model} 重试。")
                     continue
-                if is_retryable_exception(e_call) and attempt < max_retries:
-                    wait_time = exception_retry_delay(e_call, backoff_sec, attempt, jitter_sec)
-                    print(f"⚠️ [自动重试] 假流式上游繁忙（{e_call.__class__.__name__}），"
-                          f"第 {attempt + 1} 次退避重试，等待 {wait_time} 秒。")
-                    waited = 0.0
-                    while waited < wait_time:
-                        step = min(0.5, wait_time - waited)
-                        await asyncio.sleep(step)
-                        waited += step
-                        if await _request_disconnected(fastapi_request):
-                            print("ℹ️ [客户端断开] 假流式退避期间客户端已断开，停止重试。")
-                            return
-                        if outer_keep_alive_interval > 0 and time.monotonic() >= heartbeat_due:
-                            yield _keepalive_frame(request_obj.model)
-                            heartbeat_due = time.monotonic() + outer_keep_alive_interval
+                # 坏凭证（鉴权失效/欠费）：告警 + 隔离 + 立即切换下一把 Key，
+                # 同一把凭证重试只会得到相同结果（对齐上游坏凭证隔离体系）。
+                bad_credential = _warn_bad_credential(credential_describer, e_call, warned_credentials)
+                if (is_retryable_exception(e_call) or bad_credential) and attempt < max_retries:
+                    if bad_credential:
+                        print(f"⚠️ [凭证隔离] 假流式检测到坏凭证（{e_call.__class__.__name__}），跳过退避等待，立即切换下一个 Express Key。")
+                    else:
+                        wait_time = exception_retry_delay(e_call, backoff_sec, attempt, jitter_sec)
+                        print(f"⚠️ [自动重试] 假流式上游繁忙（{e_call.__class__.__name__}），"
+                              f"第 {attempt + 1} 次退避重试，等待 {wait_time} 秒。")
+                        waited = 0.0
+                        while waited < wait_time:
+                            step = min(0.5, wait_time - waited)
+                            await asyncio.sleep(step)
+                            waited += step
+                            if await _request_disconnected(fastapi_request):
+                                print("ℹ️ [客户端断开] 假流式退避期间客户端已断开，停止重试。")
+                                return
+                            if outer_keep_alive_interval > 0 and time.monotonic() >= heartbeat_due:
+                                yield _keepalive_frame(request_obj.model)
+                                heartbeat_due = time.monotonic() + outer_keep_alive_interval
                     attempt += 1
                     retry_pending = True
                     continue
@@ -603,6 +653,7 @@ async def gemini_fake_stream_generator(
                 yield make_usage_chunk(openai_response_dict["id"], request_obj.model,
                                        openai_response_dict.get("usage", {}))
             yield chunk_sse
+        print(f"✅ [Express] {request_obj.model} | 假流式传输完成 | 耗时 {time.monotonic() - fake_stream_started:.1f}s")
 
     except asyncio.CancelledError:
         print(f"ℹ️ [客户端断开] 假流式响应期间客户端已断开，正在清理模型 {request_obj.model} 的后台任务。")
@@ -644,8 +695,9 @@ async def execute_gemini_call(
     prefill_text: str = "",
     fallback_model: Optional[str] = None,
     fallback_client_factory: Optional[Callable[[], Any]] = None,
-    retry_target_factory: Optional[Callable[[], Any]] = None,
+    retry_target_factory: Optional[Callable] = None,
     text_transport: Optional[TextTransport] = None,
+    credential_describer: Optional[Callable[[], str]] = None,
 ):
     def _get_fallback_client():
         if fallback_client_factory is None:
@@ -653,11 +705,11 @@ async def execute_gemini_call(
         # 工厂本身走池化；不能缓存上一次 Key 的客户端供换 Key 后兜底使用。
         return fallback_client_factory()
 
-    async def _select_retry_target() -> bool:
+    async def _select_retry_target(error: Optional[Exception] = None) -> bool:
         nonlocal current_client, model_to_call, fallback_model
         if retry_target_factory is None:
             return True
-        target = retry_target_factory()
+        target = _call_retry_factory(retry_target_factory, error)
         if inspect.isawaitable(target):
             target = await target
         if target is None:
@@ -665,6 +717,9 @@ async def execute_gemini_call(
         current_client, model_to_call, fallback_model = _resolve_retry_target(
             current_client, model_to_call, fallback_model, target)
         return True
+
+    # 坏凭证红色告警的去重集合：真流式与非流式共用，每把 Key 每请求只告警一次。
+    warned_credentials: set = set()
 
     # P1-2：prompt 构建内部有远程图片下载与 PIL 压缩（同步阻塞），
     # 放到线程里执行，避免卡住整个事件循环。
@@ -692,6 +747,7 @@ async def execute_gemini_call(
                     fallback_client_factory=fallback_client_factory,
                     retry_target_factory=retry_target_factory,
                     text_transport=text_transport,
+                    credential_describer=credential_describer,
                 ), media_type="text/event-stream"
             )
         else: # True Streaming
@@ -706,6 +762,7 @@ async def execute_gemini_call(
                 max_retries, backoff_sec, jitter_sec = get_retry_settings()
                 fr_seconds = timeout_seconds(request_obj.model)
                 has_yielded = False  # 是否已向客户端输出过内容
+                stream_started = time.monotonic()  # 完成日志耗时统计（对齐上游）
                 thinking = gen_config_dict.get("thinking_config") or {}
                 print(f"🌊 [流式模式] {request_obj.model}：真流式，"
                       f"思考档位={thinking.get('thinking_level', '默认')}，"
@@ -727,7 +784,7 @@ async def execute_gemini_call(
                     attempt_started = time.monotonic()
                     try:
                         if retry_pending:
-                            if not await _select_retry_target():
+                            if not await _select_retry_target(last_error):
                                 target_unavailable = True
                                 raise last_error or RuntimeError("没有可用的 Express API Key。")
                             stats.add_retry()
@@ -838,6 +895,9 @@ async def execute_gemini_call(
                                 if prefill_text and not has_yielded:
                                     for _pf_chunk in _pf_frames:
                                         yield f"data: {json.dumps(_pf_chunk, ensure_ascii=False)}\n\n"
+                                if not has_yielded:
+                                    # 对齐上游：首个真实输出帧时明确告知流式已建立
+                                    print(f"⚡ [Express] {request_obj.model} | 连接建立，正在实时流式输出…")
                                 has_yielded = True
                                 yield f"data: {json.dumps(chunk_payload, ensure_ascii=False)}\n\n"
 
@@ -884,6 +944,7 @@ async def execute_gemini_call(
                             })
 
                         yield "data: [DONE]\n\n"
+                        print(f"✅ [Express] {request_obj.model} | 流式传输顺利完毕 | 耗时 {time.monotonic() - stream_started:.1f}s")
                         return
 
                     except asyncio.CancelledError:
@@ -897,6 +958,9 @@ async def execute_gemini_call(
                                 await close()
                         stream_gen_obj = None
                         is_retryable = is_retryable_exception(e_stream_call)
+                        # 坏凭证（鉴权失效/欠费）：告警 + 隔离 + 立即切换下一把 Key
+                        bad_credential = _warn_bad_credential(
+                            credential_describer, e_stream_call, warned_credentials)
 
                         # Older endpoints can reject the preview argument-stream
                         # field. Remove only that field, once, before any output.
@@ -918,19 +982,27 @@ async def execute_gemini_call(
 
                         # 关键修复：只有在“尚未向客户端输出任何内容”时才重试；
                         # 否则重试会导致整段答案重复输出（前半段 + 完整重发）。
-                        if is_retryable and not has_yielded and not target_unavailable and attempt < max_retries:
-                            # F-5：退避时长改读控制台的 retry_backoff_seconds，
-                            # 原先硬编码 2**(attempt%4)，控制台设置对真流式完全没作用。
-                            wait_time = exception_retry_delay(e_stream_call, backoff_sec, attempt, jitter_sec)
-                            code, _ = extract_upstream_error(e_stream_call)
-                            elapsed = time.monotonic() - attempt_started
-                            # 首回复超时等有完整中文说明的异常直接展示 message，
-                            # 与 429 重试日志一致可读，不再只报英文类名。
-                            detail = (str(e_stream_call).rstrip("。") if isinstance(e_stream_call, FirstReplyTimeout)
-                                      else type(e_stream_call).__name__)
-                            print(f"⚠️ [自动重试] Agent Platform Express Mode 流式请求失败（HTTP {code}，"
-                                  f"{detail}，本次已等待 {elapsed:.1f} 秒）。"
-                                  f"第 {attempt + 1} 次退避重试，等待 {wait_time:.1f} 秒。")
+                        # 坏凭证同样必须未输出内容才允许切换（半截答案绝不重发）。
+                        if ((is_retryable or bad_credential) and not has_yielded
+                                and not target_unavailable and attempt < max_retries):
+                            if bad_credential:
+                                # 坏凭证立即切换，退避等待没有意义（对齐上游隔离语义）
+                                wait_time = 0.0
+                                print(f"⚠️ [凭证隔离] 检测到坏凭证（{type(e_stream_call).__name__}），"
+                                      f"跳过退避等待，立即切换下一个 Express Key。")
+                            else:
+                                # F-5：退避时长改读控制台的 retry_backoff_seconds，
+                                # 原先硬编码 2**(attempt%4)，控制台设置对真流式完全没作用。
+                                wait_time = exception_retry_delay(e_stream_call, backoff_sec, attempt, jitter_sec)
+                                code, _ = extract_upstream_error(e_stream_call)
+                                elapsed = time.monotonic() - attempt_started
+                                # 首回复超时等有完整中文说明的异常直接展示 message，
+                                # 与 429 重试日志一致可读，不再只报英文类名。
+                                detail = (str(e_stream_call).rstrip("。") if isinstance(e_stream_call, FirstReplyTimeout)
+                                          else type(e_stream_call).__name__)
+                                print(f"⚠️ [自动重试] Agent Platform Express Mode 流式请求失败（HTTP {code}，"
+                                      f"{detail}，本次已等待 {elapsed:.1f} 秒）。"
+                                      f"第 {attempt + 1} 次退避重试，等待 {wait_time:.1f} 秒。")
                             if await _request_disconnected(fastapi_request):
                                 print(f"ℹ️ [客户端断开] 重试前检测到客户端已断开，停止调用模型 {model_to_call}。")
                                 return
@@ -988,7 +1060,7 @@ async def execute_gemini_call(
             target_unavailable = False
             try:
                 if retry_pending:
-                    if not await _select_retry_target():
+                    if not await _select_retry_target(last_error):
                         target_unavailable = True
                         raise last_error or RuntimeError("没有可用的 Express API Key。")
                     stats.add_retry()
@@ -1011,13 +1083,21 @@ async def execute_gemini_call(
                     model_to_call, current_client = _pin_failure_fallback(
                         fallback_model, e_call, _get_fallback_client)
                     continue
-                if is_retryable_exception(e_call) and not target_unavailable and attempt < max_retries:
-                    wait_time = exception_retry_delay(e_call, backoff_sec, attempt, jitter_sec)
-                    detail = str(e_call).rstrip("。") if isinstance(e_call, FirstReplyTimeout) else e_call.__class__.__name__
-                    print(f"⚠️ [自动重试] 上游繁忙或触发配额限制（{detail}）。第 {attempt + 1} 次退避重试，等待 {wait_time} 秒。")
-                    if not await wait_for_retry(fastapi_request, wait_time):
-                        return JSONResponse(status_code=499, content=create_openai_error_response(
-                            499, "客户端已断开连接，请求已取消。", "client_closed_request"))
+                # 坏凭证（鉴权失效/欠费）：告警 + 隔离 + 立即切换下一把 Key
+                bad_credential = _warn_bad_credential(
+                    credential_describer, e_call, warned_credentials)
+                if ((is_retryable_exception(e_call) or bad_credential)
+                        and not target_unavailable and attempt < max_retries):
+                    if bad_credential:
+                        print(f"⚠️ [凭证隔离] 非流式检测到坏凭证（{e_call.__class__.__name__}），"
+                              f"跳过退避等待，立即切换下一个 Express Key。")
+                    else:
+                        wait_time = exception_retry_delay(e_call, backoff_sec, attempt, jitter_sec)
+                        detail = str(e_call).rstrip("。") if isinstance(e_call, FirstReplyTimeout) else e_call.__class__.__name__
+                        print(f"⚠️ [自动重试] 上游繁忙或触发配额限制（{detail}）。第 {attempt + 1} 次退避重试，等待 {wait_time} 秒。")
+                        if not await wait_for_retry(fastapi_request, wait_time):
+                            return JSONResponse(status_code=499, content=create_openai_error_response(
+                                499, "客户端已断开连接，请求已取消。", "client_closed_request"))
                     attempt += 1
                     retry_pending = True
                     continue
@@ -1065,4 +1145,5 @@ async def execute_gemini_call(
 
         openai_response_content = convert_to_openai_format(response_obj_call, request_obj.model)
         _prepend_prefill(openai_response_content, prefill_text)
+        print(f"✅ [Express] {request_obj.model} | 非流式响应完成")
         return JSONResponse(content=openai_response_content)
