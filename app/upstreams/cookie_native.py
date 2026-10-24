@@ -16,7 +16,10 @@ Express 通道可以字节级透传原生 REST 请求；Cookie 通道的私有 G
 
 与 OpenAI 兼容通道的差异（有意为之）：
 - 不做控制台消息注入 / 预填充兼容 / 抗截断传输——原生请求自带完整语义；
-- thinkingConfig / 采样参数由客户端原生字段直接透传，不套模型档案默认；
+- thinkingConfig / 采样参数以客户端原生字段为准（不注入默认值），但按模型
+  档案规范化后发送：thinkingLevel 大小写/别名/非法档位折叠、thinkingBudget
+  换算档位、废弃采样参数剥离——私有协议是 GraphQL 强类型校验，原样透传
+  会被 $generationConfig 校验直接 400；
 - countTokens / embedContent：上游无对应 GraphQL 操作，明确拒绝。
 
 由 routes/gemini_native.py 在「无 Express Key 且有启用 Cookie 账号」时启用。
@@ -65,6 +68,85 @@ _IMAGE_MD_RE = re.compile(r"^!\[.*?\]\(data:([^;,]+);base64,([A-Za-z0-9+/=]+)\)$
 
 # 原生请求里上游 GraphQL 无法承载、需要静默丢弃的字段（丢弃时打一条日志）
 _DROPPED_NATIVE_KEYS = ("cachedContent", "labels")
+
+# 原生 generationConfig 采样键（camelCase）→ 模型档案采样键（OpenAI 命名）。
+# 用于按模型档案剥离官方已废弃 / 私有协议拒绝的采样参数（与 OpenAI 通道同口径）。
+_NATIVE_SAMPLING_KEYS = {
+    "temperature": "temperature", "topP": "top_p", "topK": "top_k",
+    "candidateCount": "candidate_count", "seed": "seed",
+    "stopSequences": "stop_sequences", "maxOutputTokens": "max_output_tokens",
+}
+
+
+def _normalize_thinking_config(gen: dict, profile: dict) -> None:
+    """原生 thinkingConfig → 私有协议线格式（原地修改 gen）。
+
+    官方 REST 接受小写 thinkingLevel（low/high…）与若干别名，而 batchGraphql 的
+    google_cloud_aiplatform_ui_GenerationConfig_ThinkingConfig_ThinkingLevel 只认
+    大写枚举，且档位集合因模型而异（3 Pro 无 MEDIUM、3.7+ 无 MINIMAL）——原样
+    透传必 400（真机：gemini-3.5-flash-lite thinkingLevel 小写被拒）。
+    归一化规则与 OpenAI 兼容通道（resolve_thinking）对齐：
+    别名折叠（max→high / off→minimal）、非法档位就近折叠（_collapse_level）、
+    Gemini 3.x 官方已废弃的 thinkingBudget 换算成档位（<=1024 LOW、<=8192
+    MEDIUM、其余 HIGH，与 claude_protocol 同口径）。
+    """
+    tc = gen.get("thinkingConfig")
+    if tc is None:
+        return
+    if not isinstance(tc, dict):
+        print("⚠️ [Cookie 原生桥] thinkingConfig 非法（需对象），已丢弃。")
+        gen.pop("thinkingConfig", None)
+        return
+    if profile.get("thinking_kind") is None:
+        print("⚠️ [Cookie 原生桥] 该模型不支持思考参数，已丢弃 thinkingConfig。")
+        gen.pop("thinkingConfig", None)
+        return
+
+    levels = profile.get("thinking_levels") or {"low", "high"}
+    cleaned = dict(tc)
+    level = cleaned.pop("thinkingLevel", None)
+    budget = cleaned.pop("thinkingBudget", None)
+    include = cleaned.get("includeThoughts")
+
+    if profile.get("thinking_kind") == "budget" and budget is not None:
+        # 未来若出现 budget 型模型：透传整数，丢弃档位
+        try:
+            out = {"thinkingBudget": int(budget)}
+        except (TypeError, ValueError):
+            print(f"⚠️ [Cookie 原生桥] thinkingBudget 非法（{budget!r}），已丢弃。")
+            out = {}
+    else:
+        if level is not None:
+            raw = str(level).strip().lower()
+            if raw in ("auto", "dynamic", ""):   # 动态思考 → 模型默认档
+                lv = profile.get("default_level", "high")
+            else:
+                lv = mc._norm_effort(raw) or profile.get("default_level", "high")
+            if lv in ("off", "none", "disabled"):
+                lv = "minimal"
+        elif budget is not None:
+            try:
+                b = int(budget)
+            except (TypeError, ValueError):
+                b = -1
+            if b <= 0:
+                lv = profile.get("default_level", "high")
+            else:
+                lv = "low" if b <= 1024 else ("medium" if b <= 8192 else "high")
+            print(f"ℹ️ [Cookie 原生桥] thinkingBudget={budget} → 换算档位（私有协议仅接受 thinkingLevel）。")
+        else:
+            lv = None
+        out = {"thinkingLevel": mc._collapse_level(lv, levels).upper()} if lv else {}
+
+    if include is not None:
+        out["includeThoughts"] = bool(include)
+    unknown = [k for k in cleaned if k != "includeThoughts"]
+    if unknown:
+        print(f"⚠️ [Cookie 原生桥] thinkingConfig 不支持的字段已丢弃：{sorted(unknown)}")
+    if out:
+        gen["thinkingConfig"] = out
+    else:
+        gen.pop("thinkingConfig", None)
 
 
 def _google_error_body(code: int, message: str, status_detail: Optional[str] = None) -> dict:
@@ -164,13 +246,24 @@ def native_request_to_variables(parsed: dict, model_name: str, project_id: str) 
 
     raises SchemaValidationError：结构化输出被策略拒绝（与 OpenAI 通道同口径）。
     """
-    profile = mc.get_profile(model_name)
+    profile = mc.apply_sampling_policy(
+        mc.get_profile(model_name), app_state.get_effective_settings(model_name)
+    )
 
     gen = parsed.get("generationConfig")
     gen = dict(gen) if isinstance(gen, dict) else {}
     unknown_gen = [k for k in gen if k not in _native_supported_generation_keys()]
     if unknown_gen:
         print(f"⚠️ [Cookie 原生桥] generationConfig 未经验证的字段将原样透传：{unknown_gen}")
+    # 采样参数与 thinkingConfig 按模型档案规范化（不注入默认值，只剥离/换算
+    # 必败字段）：batchGraphql 是 GraphQL 强类型校验，透传官方已废弃或该模型
+    # 不接受的字段会直接 400（Invalid value for variable $generationConfig）。
+    allowed = profile.get("allowed_sampling", set())
+    for native_key, prof_key in _NATIVE_SAMPLING_KEYS.items():
+        if native_key in gen and prof_key not in allowed:
+            print(f"⚠️ [Cookie 原生桥] 该模型不支持 {native_key}，已剥离。")
+            gen.pop(native_key, None)
+    _normalize_thinking_config(gen, profile)
     if gen.get("responseMimeType") or gen.get("responseSchema"):
         if not app_state.get_setting("cookie_structured_output", False):
             raise SchemaValidationError(COOKIE_STRUCTURED_OUTPUT_DISABLED_MESSAGE)

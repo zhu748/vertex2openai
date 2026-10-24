@@ -41,10 +41,13 @@ class RequestConversionTests(unittest.TestCase):
             "contents": [{"role": "user", "parts": [{"text": "你好"}]}],
             "generationConfig": {"temperature": 0.7, "maxOutputTokens": 512},
         }
-        with _settings():
-            variables = native_request_to_variables(parsed, "gemini-3.5-flash-lite", "proj-1")
+        with mock.patch.object(cookie_native, "print"):
+            with _settings():
+                variables = native_request_to_variables(parsed, "gemini-3.5-flash-lite", "proj-1")
         self.assertEqual(variables["contents"], parsed["contents"])
-        self.assertEqual(variables["generationConfig"]["temperature"], 0.7)
+        # 3.5-flash-lite 官方已废弃 temperature → 与 OpenAI 通道同口径剥离
+        self.assertNotIn("temperature", variables["generationConfig"])
+        self.assertEqual(variables["generationConfig"]["maxOutputTokens"], 512)
         self.assertEqual(
             variables["model"],
             "projects/proj-1/locations/global/publishers/google/models/gemini-3.5-flash-lite")
@@ -52,6 +55,80 @@ class RequestConversionTests(unittest.TestCase):
         self.assertTrue(variables["safetySettings"])
         self.assertTrue(all(s["threshold"] == "OFF" for s in variables["safetySettings"]))
         self.assertNotIn("tools", variables)
+
+    def test_temperature_kept_for_model_that_allows_it(self):
+        parsed = {"contents": [], "generationConfig": {"temperature": 0.7}}
+        with _settings():
+            variables = native_request_to_variables(parsed, "gemini-3-pro", "p")
+        self.assertEqual(variables["generationConfig"]["temperature"], 0.7)
+
+    def test_candidate_count_stripped_for_g3_seed_kept(self):
+        parsed = {"contents": [], "generationConfig": {"candidateCount": 2, "seed": 42}}
+        with mock.patch.object(cookie_native, "print"):
+            with _settings():
+                variables = native_request_to_variables(parsed, "gemini-3.5-flash-lite", "p")
+        self.assertNotIn("candidateCount", variables["generationConfig"])
+        self.assertEqual(variables["generationConfig"]["seed"], 42)
+
+    def test_thinking_level_normalized_to_uppercase_enum(self):
+        # 真机回归：官方 REST 小写 thinkingLevel 原样透传会被私有协议枚举校验
+        # 400（Invalid value ... ThinkingConfig_ThinkingLevel），必须转大写。
+        parsed = {"contents": [], "generationConfig": {"thinkingConfig": {"thinkingLevel": "low"}}}
+        with _settings():
+            variables = native_request_to_variables(parsed, "gemini-3.5-flash-lite", "p")
+        self.assertEqual(variables["generationConfig"]["thinkingConfig"]["thinkingLevel"], "LOW")
+
+    def test_thinking_level_alias_max_maps_high(self):
+        parsed = {"contents": [], "generationConfig": {"thinkingConfig": {"thinkingLevel": "max"}}}
+        with _settings():
+            variables = native_request_to_variables(parsed, "gemini-3.5-flash-lite", "p")
+        self.assertEqual(variables["generationConfig"]["thinkingConfig"]["thinkingLevel"], "HIGH")
+
+    def test_thinking_level_medium_folds_up_on_two_level_model(self):
+        # 3 Pro 仅 LOW/HIGH：MEDIUM 向上折叠到 HIGH（对齐 resolve_thinking）
+        parsed = {"contents": [], "generationConfig": {"thinkingConfig": {"thinkingLevel": "medium"}}}
+        with _settings():
+            variables = native_request_to_variables(parsed, "gemini-3-pro", "p")
+        self.assertEqual(variables["generationConfig"]["thinkingConfig"]["thinkingLevel"], "HIGH")
+
+    def test_thinking_level_off_maps_to_minimal(self):
+        parsed = {"contents": [], "generationConfig": {"thinkingConfig": {"thinkingLevel": "off"}}}
+        with _settings():
+            variables = native_request_to_variables(parsed, "gemini-3.5-flash-lite", "p")
+        self.assertEqual(variables["generationConfig"]["thinkingConfig"]["thinkingLevel"], "MINIMAL")
+
+    def test_thinking_level_dynamic_uses_model_default(self):
+        parsed = {"contents": [], "generationConfig": {"thinkingConfig": {"thinkingLevel": "dynamic"}}}
+        with _settings():
+            variables = native_request_to_variables(parsed, "gemini-3.5-flash-lite", "p")
+        # flash-lite 家族默认档 minimal
+        self.assertEqual(variables["generationConfig"]["thinkingConfig"]["thinkingLevel"], "MINIMAL")
+
+    def test_thinking_budget_converted_to_level(self):
+        # Gemini 3.x 官方已废弃 thinkingBudget；私有协议仅接受档位枚举
+        parsed = {"contents": [], "generationConfig": {"thinkingConfig": {"thinkingBudget": 2048}}}
+        with mock.patch.object(cookie_native, "print"):
+            with _settings():
+                variables = native_request_to_variables(parsed, "gemini-3.5-flash-lite", "p")
+        tc = variables["generationConfig"]["thinkingConfig"]
+        self.assertEqual(tc["thinkingLevel"], "MEDIUM")
+        self.assertNotIn("thinkingBudget", tc)
+
+    def test_thinking_unknown_fields_dropped_include_thoughts_kept(self):
+        parsed = {"contents": [], "generationConfig": {"thinkingConfig": {
+            "thinkingLevel": "high", "includeThoughts": True, "foo": 1}}}
+        with mock.patch.object(cookie_native, "print"):
+            with _settings():
+                variables = native_request_to_variables(parsed, "gemini-3.5-flash-lite", "p")
+        self.assertEqual(variables["generationConfig"]["thinkingConfig"],
+                         {"thinkingLevel": "HIGH", "includeThoughts": True})
+
+    def test_thinking_dropped_on_model_without_thinking(self):
+        parsed = {"contents": [], "generationConfig": {"thinkingConfig": {"thinkingLevel": "high"}}}
+        with mock.patch.object(cookie_native, "print"):
+            with _settings():
+                variables = native_request_to_variables(parsed, "gemini-2.0-flash", "p")
+        self.assertNotIn("thinkingConfig", variables["generationConfig"])
 
     def test_system_instruction_string_normalized(self):
         parsed = {"contents": [], "systemInstruction": "你是助手"}
