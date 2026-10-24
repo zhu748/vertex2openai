@@ -2,6 +2,38 @@
 
 基于原版 `vertex2openai-main`（2026-09-01），持续完善兼容性、可靠性和代码组织。
 
+## 2026-10-24 修复：curl_cffi 路径 SOCKS5 域名解析位置错误（测试通过但实战失败）
+
+**现象**：面板「测试代理」通过的两条 socks5 代理，在 Cookie 通道实战请求里全部
+失败：`curl: (97) cannot complete SOCKS5 connection to cloudconsole-pa.clients6.google.com. (4)`
+（SOCKS5 reply 4 = host unreachable），或被包装为 `ProxyError` 触发代理切换，
+两条出口耗尽后整请求 500。
+
+**根因**：DNS 解析位置在两条路径上不一致——
+
+- 面板测试走 **httpx**：httpcore 的 SOCKS 实现把目标**域名**原样发给代理，
+  由**代理端**解析（`httpcore/_async/socks_proxy.py` 以 `_remote_origin.host`
+  构造 CONNECT 请求）；
+- Cookie 通道开启浏览器伪装后走 **curl_cffi**：libcurl 对 `socks5://` 的语义是
+  **本机**先解析域名、再把解析出的 IP 交给代理。
+
+容器本地 DNS 对 Google 域名被污染或不可达时（典型：大陆部署环境），代理会收到
+一个连不上的假 IP，回 SOCKS5 reply(4) host unreachable。两条「好」代理都失败，
+是因为它们被要求连接的是**同一个坏 IP**——代理本身没有任何问题。
+
+**修复**（`app/impersonate.py`）：
+
+- 新增 `_curl_remote_dns_proxy()`：curl_cffi 分支把代理 scheme `socks5://`
+  统一改写为 `socks5h://`（域名交给代理解析），`socks5h/http/https` 原样透传；
+- 改写发生在 `_create_upstream_client` 单点（生产路径唯一的 curl_cffi 会话
+  构造处），httpx 分支与面板测试路径保持原行为；
+- sing-box 本地入站（`socks5://127.0.0.1:port`，vless/vmess/trojan/ss/
+  hysteria2/tuic/socks4 转换）同样受益：域名交给 sing-box 出站节点解析，
+  不再受容器本机解析结果影响。
+
+改写后「面板测试」与「实战请求」的 DNS 行为完全一致（都由代理解析），
+测试结果恢复对实战的预测力。
+
 ## 2026-10-24 三协议对齐：模型目录变体统一 + 运行日志补齐（Gemini 原生 / Claude）
 
 Gemini 原生（/v1beta）与 Claude（/v1/messages）端点是后加的，此前与 OpenAI 端点

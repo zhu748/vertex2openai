@@ -245,6 +245,24 @@ async def open_upstream_client(client_kwargs: dict):
     yield client
 
 
+def _curl_remote_dns_proxy(proxy: str) -> str:
+    """curl_cffi 路径下 socks5:// → socks5h://：SOCKS5 域名解析统一交给代理端。
+
+    libcurl 对 socks5:// 的语义是**本机**先解析域名、再把解析出的 IP 交给代理；
+    httpx（httpcore 的 SOCKS 实现）无论 socks5/socks5h 都把**域名**原样交给
+    代理解析。面板「测试代理」走 httpx（远端解析）能通过，而 Cookie 通道开启
+    浏览器伪装后走 curl_cffi（本机解析）：容器本地 DNS 对 Google 域名被污染
+    或不可达时（典型：大陆部署环境），代理会收到一个连不上的 IP，回
+    SOCKS5 reply(4) host unreachable（curl 97 ProxyError）——出现「测试通过
+    但实战必失败」的口径差。统一改写为 socks5h 让两条路径行为一致；sing-box
+    本地入站（socks5://127.0.0.1:port）同样受益——域名交给 sing-box，由
+    远端出站节点解析，不再受本机解析结果影响。
+    """
+    if proxy.startswith("socks5://"):
+        return "socks5h://" + proxy[len("socks5://"):]
+    return proxy
+
+
 def _create_upstream_client(client_kwargs: dict):
     profile = get_impersonate_profile()
     if profile == "off":
@@ -264,7 +282,7 @@ def _create_upstream_client(client_kwargs: dict):
         "default_headers": True,
     }
     if proxy:
-        session_kwargs["proxy"] = proxy
+        session_kwargs["proxy"] = _curl_remote_dns_proxy(proxy)
     return _CurlClientShim(AsyncSession(**session_kwargs), post_timeout, stream_timeout)
 
 

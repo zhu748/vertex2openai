@@ -22,7 +22,7 @@ from google.genai import types
 
 from client_pool import close_all_clients
 from first_reply import FirstReplyGuard, FirstReplyTimeout, sdk_has_reply, timed_call
-from impersonate import open_upstream_client
+from impersonate import open_upstream_client, _curl_remote_dns_proxy
 from proxy_config import (ProxyFormatError, build_proxy_uri, normalize_proxy_uri,
                           parse_proxy_list, proxy_fields)
 from proxy_failover import FailoverHTTPClient, FailoverSDKClient, ProxyChain
@@ -583,6 +583,47 @@ class LoopbackTests(unittest.IsolatedAsyncioTestCase):
             body = b"".join([chunk async for chunk in response.body_iterator])
         self.assertIn(b"answer", body)
         self.assertEqual([s for s, _ in self.hits], ["empty-body", 200])
+
+
+class CurlRemoteDNSTests(unittest.TestCase):
+    """socks5:// 在 curl_cffi 路径下必须改写为 socks5h://（域名交代理解析）。
+
+    面板「测试代理」走 httpx：httpcore 把目标域名原样发给 SOCKS5 代理解析；
+    Cookie 通道开启浏览器伪装后走 curl_cffi：libcurl 对 socks5:// 是本机解析。
+    本地 DNS 对 Google 域名被污染/不可达时（大陆部署），代理会收到连不上的
+    IP，回 SOCKS5 reply(4) host unreachable（curl 97）——「测试通过但实战
+    必失败」。改写后两条路径的 DNS 位置一致。
+    """
+
+    def test_socks5_rewritten_to_socks5h(self):
+        self.assertEqual(_curl_remote_dns_proxy("socks5://user:pass@1.2.3.4:1080"),
+                         "socks5h://user:pass@1.2.3.4:1080")
+        self.assertEqual(_curl_remote_dns_proxy("socks5://127.0.0.1:12080"),
+                         "socks5h://127.0.0.1:12080")
+
+    def test_non_socks5_schemes_pass_through(self):
+        for url in ("socks5h://user:pass@1.2.3.4:1080", "http://user:pass@1.2.3.4:8080",
+                    "https://proxy.example.com:443", ""):
+            self.assertEqual(_curl_remote_dns_proxy(url), url)
+
+    def test_curl_session_receives_socks5h_proxy(self):
+        """_create_upstream_client 必须把改写后的 URL 传给 curl_cffi AsyncSession。"""
+        import impersonate
+        captured = {}
+
+        class _FakeSession:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        app_state.update_settings({"cookie_impersonate": "chrome"})
+        try:
+            with mock.patch("curl_cffi.requests.AsyncSession", _FakeSession):
+                impersonate._create_upstream_client(
+                    {"proxy": "socks5://user:pass@38.154.185.97:6370", "timeout": 5})
+        finally:
+            app_state.update_settings({"cookie_impersonate": "off"})
+        self.assertEqual(captured.get("proxy"), "socks5h://user:pass@38.154.185.97:6370")
+        self.assertEqual(captured.get("impersonate"), "chrome")
 
 
 if __name__ == "__main__":
