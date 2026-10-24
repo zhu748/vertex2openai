@@ -346,7 +346,12 @@ async def _events_with_retry(fastapi_request: Request, record: dict, body: dict,
     }
     if app_config.SSL_CERT_FILE:
         client_kwargs["verify"] = app_config.SSL_CERT_FILE
-    client_kwargs["_proxy_chain"] = ProxyChain(record).bind_to_generation()
+    proxy_chain = ProxyChain(record)
+    # 与 Express 通道同款出站可观测性（直连静默）。
+    if proxy_chain.current:
+        from proxy_resolver import mask_proxy_uri
+        print(f"🌐 [出站代理] 当前出口：{mask_proxy_uri(proxy_chain.current)}")
+    client_kwargs["_proxy_chain"] = proxy_chain.bind_to_generation()
 
     retry_max, backoff_sec, jitter_sec = get_retry_settings()
     for attempt in range(retry_max + 1):

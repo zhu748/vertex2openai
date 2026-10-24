@@ -419,6 +419,11 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
                 # 预热（sing-box 首启放线程池）；随后池签名/工厂里的同步
                 # resolve 命中缓存，不卡事件循环。
                 await proxy_chain.prepare(client_for)
+                # 与 Express SDK 通道同款出站可观测性：本次请求的实际首选出口
+                # （Key 级优先、全局兑底）；直连（无候选）静默。
+                if proxy_chain.current:
+                    from proxy_resolver import mask_proxy_uri
+                    print(f"🌐 [出站代理] 当前出口：{mask_proxy_uri(proxy_chain.current)}")
             except ProxyResolveError as e:
                 print(f"❌ [Gemini 透传] 出站代理不可用：{e}")
                 if key_attempts >= retry_max:

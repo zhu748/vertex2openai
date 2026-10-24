@@ -213,7 +213,7 @@ class RetryPumpTests(unittest.TestCase):
              mock.patch.object(cookie_native, "_execute_stream_request_generator", fake_events), \
              mock.patch.object(cookie_native, "_sleep_with_heartbeat", new=_no_wait_heartbeat), \
              mock.patch.object(cookie_native, "ProxyChain", return_value=SimpleNamespace(
-                 bind_to_generation=lambda self=None: None)), \
+                 current="", bind_to_generation=lambda self=None: None)), \
              mock.patch.object(cookie_native, "get_retry_settings", return_value=(3, 0.0, 0.0)):
             async def run():
                 return [(k, d) async for k, d in _events_with_retry(request, record, {}, "m")]
@@ -233,7 +233,7 @@ class RetryPumpTests(unittest.TestCase):
              mock.patch.object(cookie_native, "open_upstream_client", new=_fake_client_ctx), \
              mock.patch.object(cookie_native, "_execute_stream_request_generator", fake_events), \
              mock.patch.object(cookie_native, "ProxyChain", return_value=SimpleNamespace(
-                 bind_to_generation=lambda self=None: None)), \
+                 current="", bind_to_generation=lambda self=None: None)), \
              mock.patch.object(cookie_native.credential_manager, "record_cookie_auth_failure") as fail:
             async def run():
                 try:

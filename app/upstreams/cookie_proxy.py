@@ -721,7 +721,13 @@ class CookieProxyUpstream(BaseUpstream):
         }
         if app_config.SSL_CERT_FILE:
             client_kwargs["verify"] = app_config.SSL_CERT_FILE
-        client_kwargs["_proxy_chain"] = ProxyChain(record).bind_to_generation()
+        proxy_chain = ProxyChain(record)
+        # 与 Express 通道同款出站可观测性：本次请求的实际首选出口（账号级优先、
+        # 全局兑底）；直连（无候选）静默，与 express_sdk 的行为一致。
+        if proxy_chain.current:
+            from proxy_resolver import mask_proxy_uri
+            print(f"🌐 [出站代理] 当前出口：{mask_proxy_uri(proxy_chain.current)}")
+        client_kwargs["_proxy_chain"] = proxy_chain.bind_to_generation()
 
         # 重试配置（控制台可调）；语义与 Express 通道统一：总尝试次数 = retry_max + 1
         # 间隔为固定值 + 抖动（backoff ± jitter/2，不随次数放大）
