@@ -8,7 +8,11 @@ from typing import Any, Optional
 
 import config as app_config
 import model_capabilities as mc
-from cookie_auth import STREAM_GENERATE_OPERATION_NAME, STREAM_GENERATE_QUERY_SIGNATURE
+from cookie_auth import (
+    STREAM_GENERATE_OPERATION_NAME,
+    get_client_version,
+    get_stream_query_signature,
+)
 from message_processing import _coerce_tool_response, openai_content_to_wire_parts
 from models import OpenAIRequest, normalize_content_part
 from runtime_state import app_state
@@ -36,13 +40,33 @@ def _get_experiment_flags() -> str:
     return app_config.EXPERIMENT_FLAGS or ""
 
 
+def build_probe_body(project_id: str) -> dict:
+    """零配额消耗的 Cookie 会话探测体：请求一个不存在的模型名。
+
+    鉴权有效时上游返回 gRPC 5 NOT_FOUND（或 3 INVALID_ARGUMENT）——证明
+    Cookie 通过了认证，只是模型不存在；Cookie 失效则返回 401/403 或
+    gRPC 7/16。全程不触发生成、不消耗配额。供 /api/cookie-accounts/test 使用。
+    """
+    return {
+        "requestContext": _build_request_context(project_id),
+        "querySignature": get_stream_query_signature(),
+        "operationName": STREAM_GENERATE_OPERATION_NAME,
+        "variables": {
+            "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
+            "model": f"projects/{project_id}/locations/global/publishers/google/models/__cookie_health_probe__",
+            "generationConfig": {"maxOutputTokens": 1},
+        },
+    }
+
+
 def _build_request_context(project_id: str) -> dict:
     """
     构建 batchGraphql 的 requestContext
     包含 experimentFlagsBinary，这是 Express Mode 权限的关键标识。
+    clientVersion 可被控制台 cookie_client_version 设置热覆盖（Console 前端版本老化时抓包更新）。
     """
     return {
-        "clientVersion": "boq_cloud-boq-clientweb-vertexaistudio_20260609.06_p0",
+        "clientVersion": get_client_version(),
         "pagePath": "/agent-platform/studio/multimodal",
         "pageViewId": int(time.time() * 1000) % (10**15),
         "trackingId": str(int(time.time() * 1000000) % (10**17)),
@@ -679,7 +703,7 @@ def build_request_body(
 
     return {
         "requestContext": _build_request_context(project_id),
-        "querySignature": STREAM_GENERATE_QUERY_SIGNATURE,
+        "querySignature": get_stream_query_signature(),
         "operationName": STREAM_GENERATE_OPERATION_NAME,
         "variables": variables,
     }

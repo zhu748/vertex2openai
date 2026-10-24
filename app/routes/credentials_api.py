@@ -116,9 +116,12 @@ class CookieAccountsBody(BaseModel):
 
 def _cookie_accounts_payload():
     from routes.settings_api import mask_cookie
+    from credential_manager import credential_manager
     records = app_state.get_cookie_accounts()
+    health = credential_manager.cookie_health_snapshot()
     accounts = [{**{k: v for k, v in rec.items() if k != "cookie"},
-                 "cookie_configured": bool(rec["cookie"]), "cookie_preview": mask_cookie(rec["cookie"])}
+                 "cookie_configured": bool(rec["cookie"]), "cookie_preview": mask_cookie(rec["cookie"]),
+                 "health": health.get(rec["id"], {"cooldown_remaining": 0.0, "failures": 0})}
                 for rec in records]
     return {"accounts": accounts, "total": len(accounts), "enabled": sum(r["enabled"] for r in accounts)}
 
@@ -173,6 +176,121 @@ async def save_cookie_accounts(body: CookieAccountsBody, _auth: bool = Depends(r
     await asyncio.to_thread(app_state.set_cookie_accounts, clean)
     return JSONResponse(content={"status": "success", **_cookie_accounts_payload()},
                         headers={"Cache-Control": "no-store"})
+
+
+class CookieTestBody(BaseModel):
+    id: str = ""  # 指定账号 ID；空 = 测试全部启用账号
+
+
+async def _probe_cookie_account(record: dict) -> dict:
+    """零配额消耗的 Cookie 会话探测：请求不存在的模型名。
+
+    鉴权有效 → 上游返回 gRPC 5 NOT_FOUND / 3 INVALID_ARGUMENT（证明认证通过）；
+    Cookie 失效 → HTTP 401/403 或 gRPC 7 PERMISSION_DENIED / 16 UNAUTHENTICATED。
+    结果同步写入账号健康状态（成功清零 / 失败累计）。
+    """
+    import time as _time
+    import httpx
+    from cookie_auth import BATCH_GRAPHQL_URL, build_headers
+    from credential_manager import credential_manager
+    from impersonate import open_upstream_client
+    from proxy_failover import ProxyChain
+    from upstreams.cookie_request import build_probe_body
+    from upstreams.cookie_proxy import _grpc_status_code, _is_cookie_expired_error
+
+    started = _time.time()
+
+    def _done(status: str, detail: str, *, account_id: str = "", invalid: bool = False) -> dict:
+        if account_id:
+            if status == "valid":
+                credential_manager.record_cookie_success(account_id)
+            elif invalid:
+                credential_manager.record_cookie_auth_failure(account_id)
+        return {"id": record.get("id", ""), "label": record.get("note", "") or record.get("id", ""),
+                "status": status, "detail": detail,
+                "elapsed_ms": round((_time.time() - started) * 1000)}
+
+    headers = build_headers(record.get("cookie", ""))
+    if headers is None:
+        return _done("invalid", "Cookie 缺少 SAPISID 族字段，无法计算认证头。",
+                     account_id=record.get("id", ""), invalid=True)
+    project = (record.get("project_id", "") or app_state.get_project_id() or "").strip()
+    if not project:
+        return _done("error", "该账号未填写 Project ID，无法构造探测请求。")
+
+    client_kwargs = {
+        "timeout": httpx.Timeout(connect=15.0, read=30.0, write=15.0, pool=15.0),
+        "follow_redirects": False,
+        "trust_env": False,
+    }
+    if config.SSL_CERT_FILE:
+        client_kwargs["verify"] = config.SSL_CERT_FILE
+    client_kwargs["_proxy_chain"] = ProxyChain(record)
+    body = build_probe_body(project)
+    try:
+        async with open_upstream_client(client_kwargs) as client:
+            resp = await client.post(BATCH_GRAPHQL_URL, headers=headers, json=body)
+            status_code, text = resp.status_code, resp.text
+    except Exception as exc:
+        return _done("error", f"网络/代理错误：{type(exc).__name__}: {exc}")
+
+    if status_code in (401, 403):
+        return _done("invalid", f"HTTP {status_code}：会话已失效或无权访问该 Project。",
+                     account_id=record.get("id", ""), invalid=True)
+
+    # 解析错误块里的 gRPC 状态码做判定（结构化优先，文本兜底）
+    import json as _json
+    detail = ""
+    grpc = None
+    try:
+        decoder = _json.JSONDecoder()
+        idx = 0
+        while idx < len(text):
+            while idx < len(text) and text[idx] not in "{[":
+                idx += 1
+            if idx >= len(text):
+                break
+            try:
+                obj, end = decoder.raw_decode(text, idx)
+            except _json.JSONDecodeError:
+                break
+            idx = end
+            if not isinstance(obj, dict):
+                continue
+            for result in obj.get("results") or []:
+                for err in (result or {}).get("errors") or []:
+                    grpc = _grpc_status_code(err) or grpc
+                    detail = (err or {}).get("message") or detail
+    except Exception:
+        pass
+
+    if grpc in (7, 16):
+        return _done("invalid", f"鉴权失败（gRPC {grpc}）：{detail or 'permission/unauthenticated'}",
+                     account_id=record.get("id", ""), invalid=True)
+    if grpc is not None:
+        # NOT_FOUND(5)/INVALID_ARGUMENT(3)/RESOURCE_EXHAUSTED(8) 等都证明认证已通过
+        return _done("valid", f"会话有效（gRPC {grpc}：{detail or '模型不存在属预期'}）",
+                     account_id=record.get("id", ""))
+    if status_code == 200 and not detail:
+        return _done("valid", "会话有效（上游 200 且无错误块）。", account_id=record.get("id", ""))
+    if detail and _is_cookie_expired_error(detail):
+        return _done("invalid", f"疑似会话失效：{detail}", account_id=record.get("id", ""), invalid=True)
+    return _done("error", f"无法判定（HTTP {status_code}）：{(detail or text)[:200]}")
+
+
+@router.post("/api/cookie-accounts/test")
+async def test_cookie_accounts(body: CookieTestBody, _auth: bool = Depends(require_auth)):
+    accounts = [rec for rec in app_state.get_cookie_accounts() if rec["enabled"]]
+    if body.id.strip():
+        accounts = [rec for rec in accounts if rec["id"] == body.id.strip()]
+    if not accounts:
+        return JSONResponse(status_code=404, content={"error": "没有匹配的启用 Cookie 账号。"})
+    results = [await _probe_cookie_account(rec) for rec in accounts]
+    valid = sum(1 for r in results if r["status"] == "valid")
+    return JSONResponse(content={
+        "results": results, "total": len(results), "valid": valid,
+        "invalid": len(results) - valid,
+    }, headers={"Cache-Control": "no-store"})
 
 
 @router.post("/api/express-keys/probe")

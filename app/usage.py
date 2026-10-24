@@ -1,8 +1,65 @@
 """统一 SDK 与原生 usageMetadata 的 OpenAI 用量映射。"""
 
 import json
+import re
 import time
 from typing import Any
+
+# CJK 统一表意文字与全角标点：粗估 1 字 ≈ 1 token；其余按 4 字符 ≈ 1 token。
+_CJK_RE = re.compile(r"[\u2e80-\u9fff\uf900-\ufaff\uff00-\uffef]")
+
+
+def estimate_token_count(text: str) -> int:
+    """字符级粗估（无分词器依赖）：CJK 字符逐字计，其余 4 字符折 1 token。"""
+    if not text:
+        return 0
+    cjk = len(_CJK_RE.findall(text))
+    return cjk + max(0, (len(text) - cjk + 3) // 4)
+
+
+def estimate_usage(prompt_text: str, completion_text: str) -> dict[str, Any]:
+    """上游未回传 usageMetadata 时的粗估（usage_estimation 开关控制启用）。
+
+    返回值携带 "estimated": true，客户端可区分真实计量与估算。
+    """
+    prompt = estimate_token_count(prompt_text)
+    completion = estimate_token_count(completion_text)
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": prompt + completion,
+        "estimated": True,
+    }
+
+
+def messages_prompt_text(messages: Any) -> str:
+    """把 OpenAI messages 里全部文本内容拼成一段（估算 prompt 用量用）。"""
+    parts: list[str] = []
+
+    def _walk(content: Any) -> None:
+        if content is None:
+            return
+        if isinstance(content, str):
+            parts.append(content)
+            return
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+
+    for message in messages or []:
+        content = getattr(message, "content", None)
+        if content is None and isinstance(message, dict):
+            content = message.get("content")
+        _walk(content)
+        for tc in getattr(message, "tool_calls", None) or []:
+            fn = (tc or {}).get("function") or {}
+            args = fn.get("arguments")
+            if isinstance(args, str):
+                parts.append(args)
+    return "\n".join(parts)
 
 
 def map_usage(metadata: Any) -> dict[str, int]:

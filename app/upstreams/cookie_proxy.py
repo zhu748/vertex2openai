@@ -68,19 +68,22 @@ from upstreams.cookie_response import (
     openai_tool_call,
 )
 from upstreams.request_preparation import prepare_messages
-from usage import make_usage_chunk, map_usage, wants_usage
+from usage import estimate_usage, make_usage_chunk, map_usage, messages_prompt_text, wants_usage
 from request_tracking import configure as track_configure, upstream_attempt, upstream_chunk
 from first_reply import FirstReplyGuard, FirstReplyTimeout, timed_call, timeout_seconds
 
 COOKIE_EXPIRED_KEYWORDS = [
-    "permission",
-    "denied",
-    "aiplatform.endpoints.predict",
-    "not authorized",
+    # 短语级匹配：2026-10 收窄——旧的单词级 "denied"/"permission" 会把安全拒绝类
+    # 文案（如 "request denied by safety ..."）误报成 Cookie 失效，误导用户刷新
+    # 本来健康的 Cookie。真实验权失败优先由结构化状态码兜住（401/403 HTTP 或
+    # gRPC 7/16 → _api_error_details 映射），文本只是最后防线。
+    "permission denied",
     "unauthenticated",
     "login required",
     "session expired",
     "invalid credentials",
+    "not authorized",
+    "aiplatform.endpoints.predict",
 ]
 
 
@@ -233,10 +236,47 @@ def _native_tool_error_response(status_code: int, payload: str) -> bool:
     return has_error_envelope and _native_tool_error(payload)
 
 
+# gRPC 状态码 → HTTP：batchGraphql 的 GraphQL 错误块带 extensions.status.code
+# （gRPC 码），结构化信号优先于文本关键词（8=RESOURCE_EXHAUSTED 实测回传）。
+_GRPC_TO_HTTP = {
+    2: 500,    # UNKNOWN
+    3: 400,    # INVALID_ARGUMENT
+    4: 504,    # DEADLINE_EXCEEDED
+    5: 404,    # NOT_FOUND
+    7: 403,    # PERMISSION_DENIED
+    8: 429,    # RESOURCE_EXHAUSTED
+    9: 400,    # FAILED_PRECONDITION
+    13: 500,   # INTERNAL
+    14: 503,   # UNAVAILABLE
+    15: 500,   # DATA_LOSS
+    16: 401,   # UNAUTHENTICATED
+}
+
+
+def _grpc_status_code(data) -> int | None:
+    """从 GraphQL 错误块提取 gRPC 状态码（extensions.status.code）。"""
+    if not isinstance(data, dict):
+        return None
+    extensions = data.get("extensions")
+    if not isinstance(extensions, dict):
+        return None
+    status = extensions.get("status")
+    if not isinstance(status, dict):
+        return None
+    code = status.get("code")
+    if isinstance(code, bool) or not isinstance(code, int):
+        return None
+    return code
+
+
 def _api_error_details(data) -> tuple[int, str]:
     raw = data.get("message") if isinstance(data, dict) else data
     message = raw if isinstance(raw, str) and raw.strip() else str(data)
     code = data.get("code") if isinstance(data, dict) else None
+    if not isinstance(code, int) or not 400 <= code <= 599:
+        # 结构化信号优先：gRPC 状态码（extensions.status.code）→ HTTP；
+        # 都没有再落到文本关键词（旧口径，兜底）。
+        code = _GRPC_TO_HTTP.get(_grpc_status_code(data))
     if not isinstance(code, int) or not 400 <= code <= 599:
         code = 429 if _is_retryable_error(message) else 502
     return code, message
@@ -255,6 +295,20 @@ async def _sleep_with_heartbeat(total_sec: float, hb_interval: float = 3.0, requ
 
 def _get_cookie_string() -> str:
     return app_state.get_google_cookie() or ""
+
+
+def _final_usage(usage_meta, request_obj, completion_text: str, reasoning_text: str = "") -> dict:
+    """上游真实计量优先；未回传且 usage_estimation 开启时给字符级粗估。
+
+    粗估附带 "estimated": true；生图（正文为 base64 data URL）不适用，调用方不走本函数。
+    """
+    usage = map_usage(usage_meta)
+    if usage_meta is None and app_state.get_setting("usage_estimation", False):
+        prompt = messages_prompt_text(getattr(request_obj, "messages", None) or [])
+        estimated = estimate_usage(prompt, (completion_text or "") + "\n" + (reasoning_text or ""))
+        if estimated["total_tokens"]:
+            return estimated
+    return usage
 
 
 def _get_project_id() -> str:
@@ -313,10 +367,15 @@ async def _execute_stream_request_generator_once(
 
             # 2. 实时遍历并抛出流式 JSON 事件块
             async for obj in iter_json_objects(response):
-                upstream_chunk()
                 if sampler is not None:
                     sampler.add(obj)
-                for event_type, data in extract_events(obj):
+                events = list(extract_events(obj))
+                # 「收到首个上游分片」只对真实内容/元数据分片记账：空分片与纯错误
+                # 分片不算——否则 429 场景时间线会先报“收到分片”再报“上游失败”，
+                # 自相矛盾（首个分片常是 streamGenerateContentV2:[] 空壳）。
+                if any(et != "error" for et, _ in events):
+                    upstream_chunk()
+                for event_type, data in events:
                     if event_type in ("text", "thought", "image", "function_call", "thought_signature"):
                         has_content = True
                         yield event_type, data
@@ -454,7 +513,7 @@ async def _execute_stream_request_generator(client, headers, body, sampler=None,
             await source.aclose()
 
 
-async def _collect_full_response(project_id, base_model_name, request_obj, headers, client_kwargs,
+async def _collect_full_response(project_id, base_model_name, request_obj, cookie_str, client_kwargs,
                                  retry_max, backoff_sec, jitter_sec, fastapi_request, *,
                                  prefill_active=False, force_search=False) -> dict:
     """非流式地完整取回一次响应（供生图假流式复用）。返回 dict。"""
@@ -471,18 +530,25 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
         if attempt:
             stats.add_retry()
         try:
-            req_headers = build_headers(headers.get("cookie", "")) or headers
+            # 兼容旧调用形态：本参数历史上是现成的 headers dict（测试桩直传
+            # {}），按旧口径原样放行；新形态传 cookie 字符串，按次重算认证头。
+            if isinstance(cookie_str, dict):
+                req_headers = build_headers(cookie_str.get("cookie", "")) or cookie_str
+            else:
+                req_headers = build_headers(cookie_str)
+                if not req_headers:
+                    return {"kind": "error", "code": 401, "message": "Cookie 中未找到 SAPISID，无法计算认证头。"}
             async with open_upstream_client(client_kwargs) as client:
                 upstream_attempt()
                 # 整取响应（生图假流式路径）：首回复窗口按整调用预算放宽，
                 # 否则生图 30-120s 会在默认 15s 窗口下永远超时。
                 response = await timed_call(base_model_name, client.post(BATCH_GRAPHQL_URL, headers=req_headers, json=body),
                                             whole_call=True, seconds=fr_seconds)
-                upstream_chunk()
 
             if is_retryable_status(response.status_code) and attempt < retry_max:
-                delay = retry_delay(getattr(response, "headers", {}).get("retry-after"), backoff_sec, attempt, jitter_sec)
-                print(f"⚠️ [Studio] HTTP {response.status_code}（生图，尝试 {attempt+1}），{delay:.1f}s 后重试...")
+                delay = retry_delay(getattr(response, "headers", {}).get("retry-after"), backoff_sec, attempt, jitter_sec,
+                                    error=f"HTTP {response.status_code}: {response.text[:200]}")
+                print(f"⚠️ [Studio] HTTP {response.status_code}（生图，尝试 {attempt+1}）: {response.text[:300]} | {delay:.1f}s 后重试...")
                 if not await wait_for_retry(fastapi_request, delay):
                     return {"kind": "error", "message": "客户端已断开连接。"}
                 continue
@@ -502,7 +568,11 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
                 # 错误分支的返回值不依赖后续对象，继续拼接是纯浪费。
                 if api_error:
                     break
-                for et, data in extract_events(obj):
+                events = list(extract_events(obj))
+                # 与流式路径同口径：空分片/纯错误分片不计入「收到首个上游分片」。
+                if any(et != "error" for et, _ in events):
+                    upstream_chunk()
+                for et, data in events:
                     if et == "text":
                         full_text += data
                     elif et == "thought":
@@ -522,8 +592,8 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
                         break
 
             if api_error and is_retryable_status(api_error_status) and attempt < retry_max:
-                delay = retry_delay(None, backoff_sec, attempt, jitter_sec)
-                print(f"⚠️ [Studio] 生图 429/限流（尝试 {attempt+1}），{delay:.1f}s 后重试...")
+                delay = retry_delay(None, backoff_sec, attempt, jitter_sec, error=api_error)
+                print(f"⚠️ [Studio] 生图 429/限流（尝试 {attempt+1}）: {api_error[:300]} | {delay:.1f}s 后重试...")
                 if not await wait_for_retry(fastapi_request, delay):
                     return {"kind": "error", "message": "客户端已断开连接。"}
                 continue
@@ -542,8 +612,8 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
         except Exception as e:
             em = str(e)
             if is_retryable_exception(e) and attempt < retry_max:
-                delay = retry_delay(None, backoff_sec, attempt, jitter_sec)
-                print(f"⚠️ [Studio] 生图异常（尝试 {attempt+1}）：{em[:80]}，{delay:.1f}s 后重试...")
+                delay = retry_delay(None, backoff_sec, attempt, jitter_sec, error=em)
+                print(f"⚠️ [Studio] 生图异常（尝试 {attempt+1}）：{em[:300]} | {delay:.1f}s 后重试...")
                 if not await wait_for_retry(fastapi_request, delay):
                     return {"kind": "error", "message": "客户端已断开连接。"}
                 continue
@@ -595,13 +665,16 @@ class CookieProxyUpstream(BaseUpstream):
                 "可从 Studio URL 中获取：...?project=YOUR_PROJECT_ID"
             ), "type": "config_error"}})
 
-        # ===== 2. 构建请求头 =====
-        headers = build_headers(cookie_str)
-        if not headers:
+        # ===== 2. 校验认证字段 =====
+        # 认证头包含实时时间戳、每次出站都重算；这里只做一次字段校验。
+        if not build_headers(cookie_str):
             return JSONResponse(status_code=401, content={"error": {"message": (
                 "Cookie 中未找到 SAPISID，无法计算认证头。\n"
                 "请确保 Cookie 来自已登录的 console.cloud.google.com 页面。"
             ), "type": "auth_error"}})
+
+        # 账号健康隔离钩子：鉴权类失败累计冷却、成功清零（credential_manager）。
+        account_id = (record or {}).get("id", "")
 
         # ===== 2.5 工具流量处理：原生函数调用 =====
         _tool_info = classify_tool_traffic(request_obj.messages, request_obj.tools)
@@ -697,7 +770,7 @@ class CookieProxyUpstream(BaseUpstream):
                 # buffered_stream 的首心跳行为不一致）。
                 yield HEARTBEAT_FRAME
                 collect_task = asyncio.create_task(_collect_full_response(
-                    project_id, base_model_name, request_obj, headers, client_kwargs,
+                    project_id, base_model_name, request_obj, cookie_str, client_kwargs,
                     retry_max, backoff_sec, jitter_sec, fastapi_request,
                     prefill_active=prefill_active, force_search=force_builtin_search,
                 ))
@@ -720,7 +793,7 @@ class CookieProxyUpstream(BaseUpstream):
                     yield make_openai_chunk(response_id, model_display, role="assistant")
                     if res.get("kind") != "ok":
                         stats.add_error()
-                        print(f"❌ [Studio] 生图失败 | {res.get('message', '')[:150]}")
+                        print(f"❌ [Studio] 生图失败 | {res.get('message', '')[:300]}")
                         error = create_openai_error_response(
                             res.get("code", 502), res.get("message", "生图失败"), "upstream_error")
                         yield "data: " + json.dumps(error, ensure_ascii=False) + "\n\n"
@@ -734,6 +807,8 @@ class CookieProxyUpstream(BaseUpstream):
                     # 关键：整张图作为单个 chunk 发出，绝不分块
                     yield make_openai_chunk(response_id, model_display, content=full_text or " ")
                     stats.add_success()
+                    credential_manager.record_cookie_success(account_id)
+                    # 生图正文是 base64 data URL，字符估算失真极大，不做 usage 估算
                     usage = map_usage(res.get("usage_meta"))
                     if want_usage:
                         yield make_usage_chunk(response_id, model_display, usage)
@@ -774,7 +849,7 @@ class CookieProxyUpstream(BaseUpstream):
                     fallback_body = (body_cache.degraded
                                      if native_custom_tools and use_native_tools and not text_transport
                                      else None)
-                    req_headers = build_headers(cookie_str) or headers
+                    req_headers = build_headers(cookie_str)
                     if cookie_debug:
                         print(f"🔎 [Studio 调试] 出站 generationConfig: "
                               f"{json.dumps(body['variables'].get('generationConfig', {}), ensure_ascii=False)}")
@@ -893,6 +968,7 @@ class CookieProxyUpstream(BaseUpstream):
 
                                 elif status == "cookie_error":
                                     stats.add_error()
+                                    credential_manager.record_cookie_auth_failure(account_id)
                                     code = getattr(data, "status_code", None) or 403
                                     error = create_openai_error_response(code, str(data)[:1024], "upstream_error")
                                     yield "data: " + json.dumps(error, ensure_ascii=False) + "\n\n"
@@ -908,7 +984,7 @@ class CookieProxyUpstream(BaseUpstream):
                                     default_code = 429 if status == "retryable_error" else 502
                                     code = getattr(data, "status_code", None) or default_code
                                     error = create_openai_error_response(code, str(data)[:1024], "upstream_error")
-                                    print(f"❌ [Studio] HTTP {code} | {str(data)[:150]}")
+                                    print(f"❌ [Studio] HTTP {code} | {str(data)[:300]}")
                                     yield "data: " + json.dumps(error, ensure_ascii=False) + "\n\n"
                                     yield "data: [DONE]\n\n"
                                     return
@@ -921,8 +997,9 @@ class CookieProxyUpstream(BaseUpstream):
                             if await fastapi_request.is_disconnected():
                                 print("ℹ️ [Studio] 客户端已断开连接，取消后续重试。")
                                 return
-                            wait_sec = retry_delay(getattr(error_to_raise, "retry_after", None), backoff_sec, attempt, jitter_sec)
-                            print(f"⚠️ [Studio] 遇到可重试拥堵/限流: {error_to_raise[:80]}... {wait_sec}s 后进行第 {attempt+2} 次退避重试")
+                            wait_sec = retry_delay(getattr(error_to_raise, "retry_after", None), backoff_sec, attempt, jitter_sec,
+                                                   error=str(error_to_raise))
+                            print(f"⚠️ [Studio] 遇到可重试拥堵/限流: {str(error_to_raise)[:300]} | {wait_sec}s 后进行第 {attempt+2} 次退避重试")
                             # 退避等待期间持续吐心跳，保活前端连接（issue4：3.1-pro 频繁 429 长等待易被前端断开）
                             async for _hb in _sleep_with_heartbeat(wait_sec, request=fastapi_request):
                                 if await fastapi_request.is_disconnected():
@@ -953,6 +1030,7 @@ class CookieProxyUpstream(BaseUpstream):
 
                         if got_text or got_tool_call:
                             stats.add_success()
+                            credential_manager.record_cookie_success(account_id)
                             if got_tool_call and stream_ordinary_metadata:
                                 google = {
                                     "ordinary_parts": list(stream_ordinary_metadata),
@@ -981,7 +1059,8 @@ class CookieProxyUpstream(BaseUpstream):
                             yield make_openai_chunk(response_id, model_display,
                                                      finish_reason=no_body_finish)
 
-                        usage = map_usage(usage_meta)
+                        usage = _final_usage(usage_meta, request_obj, "\n".join(
+                            part.get("text", "") for part in stream_ordinary_metadata))
                         if want_usage:
                             yield make_usage_chunk(response_id, model_display, usage)
 
@@ -1041,7 +1120,7 @@ class CookieProxyUpstream(BaseUpstream):
                         fallback_body = (body_cache.degraded
                                          if native_custom_tools and use_native_tools and not text_transport
                                          else None)
-                        req_headers = build_headers(cookie_str) or headers
+                        req_headers = build_headers(cookie_str)
                         if cookie_debug:
                             print(f"🔎 [Studio 调试] 出站 generationConfig: "
                                   f"{json.dumps(body['variables'].get('generationConfig', {}), ensure_ascii=False)}")
@@ -1051,7 +1130,6 @@ class CookieProxyUpstream(BaseUpstream):
                             response = await timed_call(base_model_name, client.post(
                                 BATCH_GRAPHQL_URL, headers=req_headers, json=body
                             ), whole_call=True, seconds=fr_seconds)
-                            upstream_chunk()
                             if fallback_body is not None and _native_tool_error_response(
                                     response.status_code, response.text):
                                 resolved_fallback = await fallback_body()  # degraded() 同时锁定后续重试
@@ -1060,13 +1138,13 @@ class CookieProxyUpstream(BaseUpstream):
                                 response = await timed_call(base_model_name, client.post(
                                     BATCH_GRAPHQL_URL, headers=req_headers, json=resolved_fallback
                                 ), whole_call=True, seconds=fr_seconds)
-                                upstream_chunk()
                                 fallback_body = None
 
                         if is_retryable_status(response.status_code):
                             if attempt < retry_max:
-                                delay = retry_delay(getattr(response, "headers", {}).get("retry-after"), backoff_sec, attempt, jitter_sec)
-                                print(f"⚠️ [Studio] HTTP {response.status_code} (尝试 {attempt+1}), {delay:.1f}s 后重试...")
+                                delay = retry_delay(getattr(response, "headers", {}).get("retry-after"), backoff_sec, attempt, jitter_sec,
+                                                    error=f"HTTP {response.status_code}: {response.text[:200]}")
+                                print(f"⚠️ [Studio] HTTP {response.status_code} (尝试 {attempt+1}): {response.text[:300]} | {delay:.1f}s 后重试...")
                                 if not await wait_for_retry(fastapi_request, delay):
                                     return JSONResponse(status_code=499, content={"error": {"message": "客户端已断开连接。"}})
                                 continue
@@ -1104,6 +1182,12 @@ class CookieProxyUpstream(BaseUpstream):
                             events = extract_events(obj)
                             if text_decoder:
                                 events = text_decoder.cookie_events(events)
+                            # list() 物化：extract_events / cookie_events 是生成器，
+                            # 下方 any() 与 for 各消费一次，不物化后者会拿到空。
+                            events = list(events)
+                            # 与流式路径同口径：空分片/纯错误分片不计入「收到首个上游分片」。
+                            if any(et != "error" for et, _ in events):
+                                upstream_chunk()
                             for event_type, data in events:
                                 if event_type == "text":
                                     full_text += data
@@ -1137,12 +1221,14 @@ class CookieProxyUpstream(BaseUpstream):
                                     break
 
                         if api_error and is_retryable_status(api_error_status) and attempt < retry_max:
-                            wait_sec = retry_delay(None, backoff_sec, attempt, jitter_sec)
-                            print(f"⚠️ [Studio] 429/限流 (尝试 {attempt+1}): {api_error[:100]}, {wait_sec:.1f}s 后重试...")
+                            wait_sec = retry_delay(None, backoff_sec, attempt, jitter_sec, error=api_error)
+                            print(f"⚠️ [Studio] 429/限流 (尝试 {attempt+1}): {api_error[:300]} | {wait_sec:.1f}s 后重试...")
                             if not await wait_for_retry(fastapi_request, wait_sec):
                                 return JSONResponse(status_code=499, content={"error": {"message": "客户端已断开连接。"}})
                             continue
                         if api_error:
+                            if api_error_status in (401, 403):
+                                credential_manager.record_cookie_auth_failure(account_id)
                             return JSONResponse(status_code=api_error_status, content={"error": {
                                 "code": api_error_status, "message": api_error, "type": "upstream_error"}})
 
@@ -1155,11 +1241,13 @@ class CookieProxyUpstream(BaseUpstream):
 
                         if got_output:
                             require_finish_reason(finish_raw)
+                            credential_manager.record_cookie_success(account_id)
                             # 预填充智能兼容：去重后把预填充文本拼回输出开头
                             if prefill_text and got_text:
                                 full_text = prefill_text + strip_prefill_overlap(prefill_text, full_text)
                             finish_reason = "tool_calls" if tool_calls else map_finish_reason_to_openai(finish_raw)
                             stats.add_success()
+                            credential_manager.record_cookie_success(account_id)
                             print(f"✅ [Studio] {base_model_name} | {len(full_text)} 字符 | {elapsed:.1f}s")
                         else:
                             # 无正文（只有思考 / 完全空）：返回明确诊断而不是一个空格
@@ -1170,7 +1258,7 @@ class CookieProxyUpstream(BaseUpstream):
                             print(f"🔎 [Studio 诊断] 原始响应样本：\n{sampler.dump()}")
                             full_text = notice
 
-                        usage = map_usage(usage_meta)
+                        usage = _final_usage(usage_meta, request_obj, full_text, reasoning_text)
 
                         content_value = full_text + safety_html
                         message_obj = {"role": "assistant", "content": content_value if content_value else None}
@@ -1207,14 +1295,14 @@ class CookieProxyUpstream(BaseUpstream):
                         is_retryable = is_retryable_exception(e)
 
                         if is_retryable and attempt < retry_max:
-                            wait_sec = retry_delay(None, backoff_sec, attempt, jitter_sec)
-                            print(f"⚠️ [Studio] 异常 (尝试 {attempt+1}): {err_msg[:100]}, {wait_sec:.1f}s 后重试...")
+                            wait_sec = retry_delay(None, backoff_sec, attempt, jitter_sec, error=err_msg)
+                            print(f"⚠️ [Studio] 异常 (尝试 {attempt+1}): {err_msg[:300]} | {wait_sec:.1f}s 后重试...")
                             if not await wait_for_retry(fastapi_request, wait_sec):
                                 return JSONResponse(status_code=499, content={"error": {"message": "客户端已断开连接。"}})
                             continue
 
                         elapsed = time.time() - start_time
-                        print(f"❌ [Studio] {base_model_name} | 异常 | {elapsed:.1f}s: {err_msg[:150]}")
+                        print(f"❌ [Studio] {base_model_name} | 异常 | {elapsed:.1f}s: {err_msg[:300]}")
                         if not isinstance(e, (AntiTruncationError, IncompleteResponseError)):
                             traceback.print_exc()
                         code, _ = extract_upstream_error(e)

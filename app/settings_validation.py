@@ -16,6 +16,7 @@ _SETTING_ENUMS = {
     "thinking_g3_level": ("", "minimal", "low", "medium", "high"),
     "image_size": ("", "512", "1K", "2K", "4K"),
     "cookie_impersonate": ("off", "chrome", "edge", "safari", "firefox", "safari_ios"),
+    "retry_backoff_mode": ("fixed", "exponential"),
 }
 # 数值键的允许范围（与读取侧的钳位逻辑一致，如 get_retry_settings 0-50/0-120）
 _SETTING_NUMERIC_RANGE = {

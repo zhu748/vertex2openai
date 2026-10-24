@@ -115,6 +115,10 @@ DEFAULT_SETTINGS = {
     "retry_max": 10,
     "retry_backoff_seconds": 5,
     "retry_jitter_seconds": 1,
+    # 重试间隔模式：fixed（默认）= 固定间隔 + 抖动，与「每次重试换凭证」语义匹配；
+    # exponential = 按 2^attempt 放大并封顶 120 秒——单凭证场景配额按分钟窗口限流时，
+    # 长蹲守的成功率更高（对齐旧版行为，按需开启）。
+    "retry_backoff_mode": "fixed",
     # 跨通道兜底（对齐上游 bad-woman/vertex2openai）：主通道在未输出内容前
     # 遇 429/401/403/5xx 失败时，自动切换另一通道（Express ↔ Cookie）接力。
     "cross_channel_fallback": True,
@@ -162,6 +166,10 @@ DEFAULT_SETTINGS = {
     # 探测通过后在控制台打开本开关。转换链：sanitize_for_gemini（严格方言
     # 净化）→ _cookie_ui_schema（Studio 私有 UI Schema，与工具参数同路径）。
     "cookie_structured_output": False,
+    # usage 估算（默认关）：batchGraphql 私有接口不回传 usageMetadata，OpenAI 响应的
+    # usage 恒为 0。开启后在上游未回传时按字符粗估（ASCII 4 字符≈1 token、CJK 1 字≈1
+    # token），并在 usage 里附带 "estimated": true 供客户端区分。
+    "usage_estimation": False,
     # 思考签名内嵌开关（默认关）：
     #   关 = 生成短 tool_call_id，签名存进进程内旁路缓存（推荐，避免被前端截断）
     #   开 = 退回旧的 `{id}__thought__{base64}` 内嵌格式，供多进程/多副本部署使用
@@ -215,6 +223,17 @@ DEFAULT_SETTINGS = {
     # = 用 curl_cffi 伪装成真实浏览器的 TLS 指纹，并补齐 UA / sec-ch-ua / sec-fetch 等浏览器头。
     # batchGraphql 是 Cloud Console 前端接口，Python TLS 指纹 + 无 UA 的裸请求极易被风控识别。
     "cookie_impersonate": "chrome",
+    # ===== Cookie 通道协议参数热更新（防 Google 轮换 querySignature 全线瘫痪）=====
+    # 2026-10-04 Google 作废过一次硬编码签名（QUERY_SIGNATURE_NOT_FOUND 全线空回复），
+    # 当时只能改代码重建镜像。现支持控制台热改覆盖内置值，失效时抓包粘贴即恢复：
+    #   cookie_query_signature：batchGraphql 的 querySignature（F12 抓 Cloud Console
+    #     前端 batchGraphql 请求的 Payload）；留空 = 用下方 cookie_auth 内置默认。
+    #   cookie_client_version：requestContext.clientVersion（Console 前端版本号）；留空 = 内置。
+    #   cookie_authuser：x-goog-authuser 头。浏览器多账号登录、导出 Cookie 的不是
+    #     默认账号（authuser=1/2...）时按需修改；默认 0。
+    "cookie_query_signature": "",
+    "cookie_client_version": "",
+    "cookie_authuser": "0",
     # ===== Express API Key 通道请求头指纹（热改，见 express_fingerprint.py）=====
     # SDK 通道 TLS 栈换不了（google-genai 强依赖 httpx），但请求头可完整接管：
     #   sdk（默认）= 官方 Python genai SDK 原生形态（SDK 自动管理，零改动）

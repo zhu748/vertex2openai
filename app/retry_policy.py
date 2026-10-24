@@ -161,19 +161,28 @@ def is_auth_or_billing_error(error: object) -> bool:
 
 
 def _retry_delay_value(retry_after: Optional[str], default: float, attempt: int = 0, jitter: float = 1.0) -> float:
-    """计算一次重试的等待秒数：**固定间隔 + 小幅抖动**，不随重试次数增长。
+    """计算一次重试的等待秒数。
 
+    - retry_backoff_mode == "fixed"（默认）：**固定间隔 + 小幅抖动**，不随重试次数
+      增长——对「每次重试换 Key/换 Cookie」的语义最合适（旧实现按 2^attempt 放大
+      并封顶 120 秒，只会越拖越久，2026-10 改为固定）。
+    - retry_backoff_mode == "exponential"：按 2^attempt 放大并封顶 120 秒——
+      单凭证场景配额按分钟窗口限流时，长蹲守成功率更高（对齐旧版行为，按需开启）。
     - default：基础间隔秒数（控制台 retry_backoff_seconds，默认 5）；
     - jitter：抖动幅度秒数（控制台 retry_jitter_seconds，默认 1），实际等待在
-      [default - jitter/2, default + jitter/2] 内均匀采样，且不低于 0；
-    - attempt：仅为兼容旧调用签名保留的形参，**不再参与计算**。旧实现按
-      2^attempt 指数放大并封顶 120 秒（默认 10 次重试累计可等 10 分钟以上），
-      对本项目「每次重试换 Key/换 Cookie」的语义只会越拖越久，已改为固定间隔；
+      [base - jitter/2, base + jitter/2] 内均匀采样，且不低于 0；
     - retry_after：上游 Retry-After（秒数或 HTTP 日期）仍被采纳，但钳位到
-      [0, default + jitter/2]：更短的服务器提示照常生效，更长的等待不再
+      [0, base + jitter/2]：更短的服务器提示照常生效，更长的等待不再
       拖住重试（上一身份的 429 对换到的新身份没有约束力）。
     """
     base = max(0.0, default)
+    try:
+        mode = str(app_state.get_setting("retry_backoff_mode", "fixed") or "fixed").strip().lower()
+    except Exception:
+        mode = "fixed"
+    if mode == "exponential":
+        # 2^attempt 放大，封顶 120 秒（旧版行为）；attempt 钳位防溢出。
+        base = min(120.0, base * (2 ** max(0, min(attempt, 30))))
     # 抖动只围绕非零基准生效：backoff=0 语义就是「立即重试」，
     # 不再叠加抖动（兼容零退避快速重试的既有用法）。
     half = max(0.0, jitter) / 2.0 if base > 0.0 else 0.0

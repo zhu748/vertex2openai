@@ -26,9 +26,44 @@ BATCH_GRAPHQL_URL = (
 
 # StreamGenerateContent 的固定签名（登录模式）
 # 2026-10-04 更新：Google 作废了旧签名（QUERY_SIGNATURE_NOT_FOUND），
-# 从 Cloud Console 前端 batchGraphql 请求中重新抓取
+# 从 Cloud Console 前端 batchGraphql 请求中重新抓取。
+# 控制台设置 cookie_query_signature 可热覆盖本值（Google 再次轮换时
+# 抓包粘贴即恢复，无需改代码重建镜像）。
 STREAM_GENERATE_QUERY_SIGNATURE = "2/Hc4FpJfYmM+gO5TB0hcjYY0Iwj0rqLIVDZOhurBbu/I="
 STREAM_GENERATE_OPERATION_NAME = "StreamGenerateContent"
+
+# requestContext.clientVersion 内置默认（可被 cookie_client_version 设置热覆盖）
+DEFAULT_CLIENT_VERSION = "boq_cloud-boq-clientweb-vertexaistudio_20260609.06_p0"
+
+
+def get_stream_query_signature() -> str:
+    """当前生效的 querySignature：控制台覆盖值优先，留空回内置默认。"""
+    try:
+        from runtime_state import app_state
+        override = str(app_state.get_setting("cookie_query_signature", "") or "").strip()
+    except Exception:
+        override = ""
+    return override or STREAM_GENERATE_QUERY_SIGNATURE
+
+
+def get_client_version() -> str:
+    """当前生效的 requestContext.clientVersion：控制台覆盖值优先。"""
+    try:
+        from runtime_state import app_state
+        override = str(app_state.get_setting("cookie_client_version", "") or "").strip()
+    except Exception:
+        override = ""
+    return override or DEFAULT_CLIENT_VERSION
+
+
+def get_authuser() -> str:
+    """x-goog-authuser 头取值（多账号浏览器导出非默认账号时按需修改）。"""
+    try:
+        from runtime_state import app_state
+        value = str(app_state.get_setting("cookie_authuser", "0") or "0").strip()
+    except Exception:
+        value = "0"
+    return value or "0"
 
 # SAPISIDHASH 计算使用的 origin
 SAPISIDHASH_ORIGIN = "https://console.cloud.google.com"
@@ -94,7 +129,7 @@ def build_headers(cookie_str: str) -> Optional[Dict[str, str]]:
         "authorization": auth,
         "cookie": cookie_str,
         "content-type": "application/json",
-        "x-goog-authuser": "0",
+        "x-goog-authuser": get_authuser(),
         "x-same-domain": "1",
         "origin": "https://console.cloud.google.com",
         "referer": "https://console.cloud.google.com/",
