@@ -150,12 +150,16 @@ async function main(){
   assert.equal(cookieInput.value,'保留本地备注');assert.equal(w.consoleForms.dirty(),true);assert.equal(d.querySelector('.cookie-probe-result img'),null);
   assert.deepEqual(requests.filter(r=>r.path==='/api/cookie-accounts/test').at(-1).body,{id:'cookie-one'});
   assert.equal(d.activeElement,cookieInput);
+  cookieResult={status:'valid',reason:'resource_exhausted',detail:'资源受限',health:{failures:0,cooldown_remaining:0}};
+  await w.probeCookieAccounts(0);assert.equal(d.querySelector('.cookie-health-badge').textContent,'认证通过 · 资源受限');
+  assert(el('cookie-probe-summary').textContent.includes('资源受限 1'));
   cookieResult={status:'invalid',reason:'permission_denied',detail:'访问被拒绝',health:{failures:0,cooldown_remaining:120}};
   await w.probeCookieAccounts(0);assert.equal(d.querySelector('.cookie-health-badge').textContent,'权限被拒绝');
   assert(d.querySelector('.cookie-probe-result').textContent.includes('冷却中'));assert.equal(d.querySelector('.c-enabled').checked,true);
   transport=target=>{if(target.pathname==='/api/cookie-accounts/test'){transport=null;return new Response('{}',{status:503});}};
   await w.probeCookieAccounts(0);assert.equal(d.querySelector('.cookie-health-badge').textContent,'无法判断');
   edit('cookie-project-0','unsaved-project');assert.equal(d.querySelector('.cookie-probe-button').disabled,true);
+  assert.equal(d.querySelector('.cookie-health-badge').textContent,'待保存重测');
   const probeCount=requests.filter(r=>r.path==='/api/cookie-accounts/test').length;await w.probeCookieAccounts(0);
   assert.equal(requests.filter(r=>r.path==='/api/cookie-accounts/test').length,probeCount);
   edit('cookie-project-0','project-cookie');edit('cookie-0','SAPISID=unsaved');assert.equal(d.querySelector('.cookie-probe-button').disabled,true);

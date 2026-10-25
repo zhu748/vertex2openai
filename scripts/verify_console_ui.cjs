@@ -113,7 +113,7 @@ async function main() {
     const screenshot = async name => {if (screenshots) await page.screenshot({path: path.join(screenshots, name + '.png'), fullPage: false});};
     const openTab = async tab => {
       await page.evaluate(t => switchTab(t), tab);
-      if(tab==='channel') for(const summary of await page.locator('#view-channel .account-editor:not([open]) > summary:visible').all()) await summary.click();
+      if(tab==='channel') await page.locator('#view-channel .account-editor').evaluateAll(items=>items.forEach(el=>el.open=true));
     };
     const openProxyForm = async () => {await page.click('#proxy-tab-form');};
     const finishProxyBatch = async (allowEmpty=false) => {
@@ -811,7 +811,7 @@ async function main() {
     await page.route('**/api/cookie-accounts/test',route=>{
       if(cookieProbeMode==='network')return route.fulfill({status:503,json:{error:'fixture network failure'}});
       const id=route.request().postDataJSON().id;
-      return route.fulfill({json:{results:[{id,status:cookieProbeMode,reason:'permission_denied',detail:'fixture <img src=x onerror="window.uiInjected=true">',checked_at:Date.now()/1000,elapsed_ms:125,health:{failures:0,cooldown_remaining:0}}]}});
+      return route.fulfill({json:{results:[{id,status:cookieProbeMode==='limited'?'valid':cookieProbeMode,reason:cookieProbeMode==='limited'?'resource_exhausted':'permission_denied',detail:'fixture <img src=x onerror="window.uiInjected=true">',checked_at:Date.now()/1000,elapsed_ms:125,health:{failures:0,cooldown_remaining:0}}]}});
     });
     await page.locator('#cookies-list .account-editor').first().evaluate(el=>el.open=true);
     await page.locator('.c-note').first().fill('检测期间保留草稿');
@@ -821,6 +821,8 @@ async function main() {
     assert.equal(await page.locator('.c-note').first().inputValue(),'检测期间保留草稿');
     assert.equal(await page.locator('.c-note').first().getAttribute('data-probe-identity'),'retained');
     assert.equal(await page.locator('.cookie-probe-result img').count(),0);
+    cookieProbeMode='limited';await page.locator('.cookie-probe-button').first().click();
+    await page.waitForFunction(()=>document.querySelector('.cookie-health-badge').textContent==='认证通过 · 资源受限');
     cookieProbeMode='invalid';await page.locator('.cookie-probe-button').first().click();
     await page.waitForFunction(()=>document.querySelector('.cookie-health-badge').textContent==='权限被拒绝');
     assert.equal(await page.locator('.c-enabled').first().isChecked(),true);

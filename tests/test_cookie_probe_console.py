@@ -106,6 +106,14 @@ class CookieProbeReasonTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['reason'], 'session_accepted')
         manager.record_cookie_success.assert_called_once()
 
+    async def test_resource_exhaustion_is_accepted_authentication_with_a_visible_limit(self):
+        result, manager = await self.run_probe(200, 8)
+        self.assertEqual(result['status'], 'valid')
+        self.assertEqual(result['reason'], 'resource_exhausted')
+        self.assertIn('资源/配额受限', result['detail'])
+        manager.record_cookie_auth_failure.assert_not_called()
+        manager.record_cookie_success.assert_called_once()
+
 
 if __name__ == '__main__':
     unittest.main()

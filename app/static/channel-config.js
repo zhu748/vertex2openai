@@ -36,7 +36,7 @@ function cookieProbeState(record){
   if(cookieProbeJob?.items.some(item=>item.id===record.id)&&!cookieProbeJob.finished.has(record.id))return {label:'等待检测',state:'pending'};
   if(!result)return {label:'未检测',state:'idle'};
   if(result.context!==cookieProbeContext())return {label:'配置已变化',state:'idle'};
-  if(result.status==='valid')return {label:'会话有效',state:'valid'};
+  if(result.status==='valid')return result.reason==='resource_exhausted'?{label:'认证通过 · 资源受限',state:'limited'}:{label:'会话有效',state:'valid'};
   if(result.status==='invalid')return {label:result.reason==='permission_denied'?'权限被拒绝':result.reason==='missing_cookie'?'凭证格式无效':'认证未通过',state:'invalid'};
   return {label:'无法判断',state:'error'};
 }
@@ -45,7 +45,9 @@ function syncCookieProbes(){
   let available=0;
   for(const [index,record] of COOKIE_ACCOUNTS.entries()){
     const row=$('cookies-list').children[index];if(!row)continue;
-    const eligibility=cookieProbeEligibility(index),state=cookieProbeState(record),result=cookieProbeResults.get(record.id);
+    const eligibility=cookieProbeEligibility(index),result=cookieProbeResults.get(record.id);
+    let state=cookieProbeState(record);
+    if(result&&eligibility.reason&&!job?.pending.has(record.id))state={label:'待保存重测',state:'idle'};
     if(eligibility.saved)available++;
     const button=row.querySelector('.cookie-probe-button');button.disabled=!!job||!eligibility.saved;button.title=eligibility.reason;
     const badge=row.querySelector('.cookie-health-badge');badge.textContent=state.label;badge.dataset.state=state.state;
@@ -65,7 +67,7 @@ function syncCookieProbes(){
   $('cookie-probe-stop').hidden=!job;
 }
 function cookieProbeProgress(job,stopped=false){
-  $('cookie-probe-summary').textContent=`${stopped?'已停止':cookieProbeJob===job?'正在检测':'检测完成'} · 已完成 ${job.finished.size} / ${job.items.length} · 会话有效 ${job.valid} · 认证/权限未通过 ${job.invalid} · 无法判断 ${job.errors}`
+  $('cookie-probe-summary').textContent=`${stopped?'已停止':cookieProbeJob===job?'正在检测':'检测完成'} · 已完成 ${job.finished.size} / ${job.items.length} · 会话有效 ${job.valid}${job.limited?`（资源受限 ${job.limited}）`:''} · 认证/权限未通过 ${job.invalid} · 无法判断 ${job.errors}`
     +(job.skipped?`；跳过 ${job.skipped} 个未保存或未启用账号。`:'')
     +(stopped?'；未完成项未获得本次检测结果。':'');
 }
@@ -79,7 +81,7 @@ async function probeCookieAccounts(index=null){
   const choices=index===null?COOKIE_ACCOUNTS.map((_,i)=>i):[index];
   const items=choices.map(i=>cookieProbeEligibility(i).saved).filter(Boolean);
   if(!items.length){toast(index===null?'没有可检测的已保存、已启用账号':cookieProbeEligibility(index).reason);return;}
-  const job=cookieProbeJob={items,context:cookieProbeContext(),controller:new AbortController(),pending:new Set(),finished:new Set(),next:0,valid:0,invalid:0,errors:0,skipped:choices.length-items.length};
+  const job=cookieProbeJob={items,context:cookieProbeContext(),controller:new AbortController(),pending:new Set(),finished:new Set(),next:0,valid:0,limited:0,invalid:0,errors:0,skipped:choices.length-items.length};
   cookieProbeProgress(job);syncCookieProbes();
   async function worker(){
     while(cookieProbeJob===job&&job.next<items.length){
@@ -103,6 +105,7 @@ async function probeCookieAccounts(index=null){
         if(result.health)rememberCookieHealth([{id:saved.id,health:result.health}]);
       }
       if(result.status==='valid')job.valid++;else if(result.status==='invalid')job.invalid++;else job.errors++;
+      if(result.status==='valid'&&result.reason==='resource_exhausted')job.limited++;
       cookieProbeProgress(job);syncCookieProbes();
     }
   }

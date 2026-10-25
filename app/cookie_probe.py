@@ -98,7 +98,9 @@ async def probe_account(record: dict) -> dict:
             return done("invalid", f"项目或账号权限被拒绝：{detail or 'permission denied'}", "permission_denied")
         if any(_is_cookie_expired_error(str(e.get("message", ""))) for e in errors):
             return done("invalid", f"鉴权未通过：{detail}", "auth_rejected")
-        if codes & {3, 5, 8}:
+        if 8 in codes:
+            return done("valid", f"会话认证通过，但上游资源/配额受限：{detail or 'resource exhausted'}", "resource_exhausted")
+        if codes & {3, 5}:
             return done("valid", f"会话有效：{detail or '模型不存在属预期'}", "session_accepted")
         if status_code == 200 and recognized and not errors:
             return done("valid", "会话有效（上游 200 且无错误块）。", "session_accepted")
