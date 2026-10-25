@@ -27,7 +27,7 @@ Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风
 - **OpenAI 兼容接口**：`GET /v1/models`、`POST /v1/chat/completions`。
 - **Claude（Anthropic）兼容接口**：`POST /v1/messages`、`POST /v1/messages/count_tokens`、
   `GET /api/hello`；`GET /v1/models` 按请求头自动切换 Anthropic 目录格式。
-- **管理控制台（浅色风格，单文件，免构建）**
+- **管理控制台（浅色风格，本地静态资源，免前端构建）**
   - **仅密码登录**：打开根路径 `/`，输入密码（即 `API_KEY`）即可，无需账号。
   - 标准模式 / Cookie 直连 / Key + Cookie 混合模式在线切换；每个账号可独立启停。
   - 全局与账号专属代理均支持有序列表，失败后依次切换；每个账号可关闭向全局代理回退。代理弹窗支持类型与字段填写、智能粘贴识别、排序与逐条测试。
@@ -939,6 +939,8 @@ Gemini 原生 `streamGenerateContent?alt=sse` 默认增加安全的事件间注�
 目录职责和扩展位置见 [代码结构与维护约定](docs/architecture.md)，
 最新问题与修复见 [全面审查与优化](docs/comprehensive-review.md)，
 此前记录见 [项目审查与优化记录](docs/optimization-review.md)。
+模块职责与维护入口见 [架构约定](docs/architecture.md)，
+本轮结构调整与复查结果见 [可维护性重构记录](docs/maintainability-2026-10-25.md)。
 应用入口为 `app/main.py`，管理路由位于 `app/routes/`，页面位于 `app/templates/`；
 离线回归集中在 `tests/`，`scripts/` 保留检查入口与诊断工具。
 
@@ -946,8 +948,13 @@ Gemini 原生 `streamGenerateContent?alt=sse` 默认增加安全的事件间注�
 # 安装运行和开发检查依赖
 pip install -r requirements-dev.txt
 
-# 完整检查：语法、静态分析、工作流、所有回归及 SDK 档案兼容
+# 完整检查：语法、静态分析、工作流、模块边界、所有回归及 SDK 档案兼容
 python scripts/check_project.py
+
+# 控制台格式与交互检查（开发时可用 npm run format:console 自动格式化）
+npm ci
+npm run check:format
+npm run test:console
 
 # 单独运行一组回归
 python tests/test_generation_config.py

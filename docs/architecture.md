@@ -1,7 +1,8 @@
 # 代码结构与维护约定
 
-项目对外提供 OpenAI 兼容接口、Gemini 原生接口和管理控制台。OpenAI 请求可以选择
-Express SDK 或 Cookie 上游；Gemini 原生请求通过 Express REST 透传。
+项目对外提供 OpenAI、Anthropic 兼容接口、Gemini 原生接口和管理控制台。
+OpenAI 请求可以选择 Express SDK 或 Cookie 上游，Anthropic 请求通过协议适配复用生成链路；
+Gemini 原生请求通过 Express REST 透传，或经 Cookie 原生桥接交付。
 
 ## 目录与模块职责
 
@@ -10,6 +11,7 @@ Express SDK 或 Cookie 上游；Gemini 原生请求通过 Express REST 透传。
 | `app/main.py` | ASGI 入口；注册路由、中间件与异常处理 |
 | `app/lifecycle.py` | 启动初始化、后台任务登记、关闭连接池与代理进程 |
 | `app/routes/chat_api.py` | OpenAI 请求分流、请求期限、续传与轮询 |
+| `app/routes/claude_api.py`、`app/claude_protocol.py` | Anthropic 路由、消息/事件转换与 count_tokens 请求准备 |
 | `app/routes/gemini_native.py` | Gemini 原生鉴权、REST 透传和响应交付 |
 | `app/routes/models_api.py` | OpenAI 模型清单 |
 | `app/routes/console.py` | 页面、登录退出、统计和日志流 |
@@ -17,7 +19,7 @@ Express SDK 或 Cookie 上游；Gemini 原生请求通过 Express REST 透传。
 | `app/routes/credentials_api.py` | Express Key、项目探测和 Cookie 凭证 |
 | `app/routes/system_api.py` | 健康检查、代理导入预览和有界连通性测试 |
 | `app/templates/` | 登录和控制台 HTML；页面按文件路径加载并缓存，无需前端构建 |
-| `app/static/dashboard.js`、`app/static/login.js` | 概览、配置、凭证与日志交互，以及登录表单反馈；全部使用本地资源 |
+| `app/static/` | 按功能划分的控制台脚本；加载顺序和具体职责见下文 |
 | `app/static/console.css`、`app/static/dashboard.css` | 手写组件与响应式样式，以及预编译的 Tailwind 工具样式 |
 | `app/auth.py`、`app/console_auth.py` | 分别处理 API Key 鉴权、控制台会话与登录限速 |
 | `app/request_errors.py`、`app/http_io.py` | 请求边界错误的协议映射、敏感校验输入剥离，以及辅助 HTTP 响应的有界读取 |
@@ -26,21 +28,28 @@ Express SDK 或 Cookie 上游；Gemini 原生请求通过 Express REST 透传。
 | `app/credential_config.py`、`app/credential_manager.py` | 多 Key / Cookie 环境导入、混合账号选择，以及 Cookie 与项目绑定 |
 | `app/express_key_probe.py`、`app/cookie_probe.py` | 有界凭证探测；固定 worker、共享并发限制、总期限与响应读取预算 |
 | `app/proxy_config.py`、`app/proxy_failover.py` | 代理输入归一化、有序候选链、账号到全局回退及交付前切换 |
+| `app/proxies/protocols.py` | URI 分类、脱敏、校验与 sing-box outbound 转换；不管理进程或网络连接 |
+| `app/proxy_resolver.py` | sing-box / proxybridge 发现、启动、复用、空闲回收与本地出口生命周期 |
 | `app/proxy_import.py` | 有界批量导入预览、逐条错误定位、连接去重；正式保存仍使用严格解析器 |
 | `app/static/channel-config.js` | Cookie 账号列表、账号回退策略，以及共用代理编辑弹窗 |
 | `app/console_assets.py` | 控制台资源内容版本与缓存重新验证，防止部署后混用新旧脚本 |
 | `app/upstreams/` | 两种上游协议，以及共用的消息准备流程 |
 | `app/upstreams/cookie_request.py` | batchGraphql 请求参数、消息及工具协议转换 |
 | `app/upstreams/cookie_response.py` | 连续 JSON 对象解析、事件与签名还原、响应诊断 |
+| `app/upstreams/cookie_transport.py` | Cookie HTTP 事件读取、首回复窗口、代理切换、工具降级及传输错误分类 |
+| `app/upstreams/cookie_proxy.py` | Cookie 请求准备与 OpenAI 响应交付；`CookieGeneration` 持有单次请求状态 |
+| `app/upstreams/cookie_native.py` | Gemini 原生协议到 Cookie 的桥接；直接复用传输与解析模块 |
+| `app/upstreams/express_response.py` | SDK chunk 到 OpenAI 的转换、工具索引、预填充和 SSE 分块；不选择客户端或编排重试 |
 | `app/generation_config.py` | OpenAI 请求到 SDK 生成参数的映射与裁剪 |
 | `app/request_validation.py`、`app/schema_validation.py` | 两通道共用的消息、工具扩展字段和 JSON Schema 校验 |
 | `app/express_endpoint.py` | SDK 与原生 REST 共用的模型路径、项目区域钉定和兜底判据 |
 | `app/upstream_errors.py`、`app/response_validation.py` | 共享错误映射，以及响应拦截、完整性校验 |
 | `app/message_processing.py`、`app/model_capabilities.py` | SDK / OpenAI 消息及响应转换、模型能力判定 |
 | `app/image_processing.py` | 图片压缩、内联图片解码与远程抓取 |
+| `app/media_tasks.py` | 有界线程任务入口；将包含图片处理的同步请求准备移出事件循环 |
 | `app/thought_signatures.py`、`app/signature_store.py` | 思考签名编码、恢复与有界 TTL/LRU 缓存 |
 | `app/prefill.py` | 消息注入、预填充兼容、标签守卫与输出去重 |
-| `app/api_helpers.py` | SDK 响应适配、流式输出、调用与重试编排 |
+| `app/api_helpers.py` | SDK 调用与重试编排；`SDKGeneration` 管理单次请求、流式与非流式交付 |
 | `app/retry_policy.py`、`app/streaming.py` | 重试配置、可重试性、等待、断连检查和流式心跳 |
 | `app/json_stream.py` | 有界 JSON 对象增量分帧；Cookie 连续对象与原生 JSON 文档复用 |
 | `app/first_reply.py` | 每次尝试的首回复期限、有效输出识别、可重试超时及原生流预读 |
@@ -50,10 +59,53 @@ Express SDK 或 Cookie 上游；Gemini 原生请求通过 Express REST 透传。
 | `app/usage.py` | SDK / REST 用量映射、用量开关与 OpenAI 用量尾块 |
 | `app/keepalive.py` | 出站保活：定期 GET 配置的 URL，配置校验、任务启停与热重启 |
 | `app/resumable.py`、`app/admission.py` | 有界响应缓冲、后台生成、期限与并发准入 |
-| `app/client_pool.py`、`app/impersonate.py`、`app/proxy_resolver.py` | 连接复用、传输适配和代理解析 |
+| `app/client_pool.py`、`app/impersonate.py` | 连接复用和传输适配 |
 | `proxybridge/` | TURN RFC6062 / SSTP MS-CHAPv2 转本地 SOCKS5，独立进程与用户态网络栈 |
 | `tests/` | 不依赖真实凭据或远程上游的回归测试 |
 | `scripts/` | 统一检查入口、SDK 请求形态探针和手动诊断 |
+
+## 依赖方向与请求内状态
+
+解析、传输和响应转换模块不反向导入路由或上游编排器。Cookie 的 OpenAI 适配器、
+原生桥接和凭证探测直接引用 `cookie_transport.py` 的公共函数，不再借用
+`cookie_proxy.py` 的私有传输函数。代理协议规则在 `proxies/protocols.py` 修改，
+进程租约和二进制路径查找留在 `proxy_resolver.py`。
+
+`execute_gemini_call()`、`CookieProxyUpstream.chat_completions()` 仍是调用入口，
+分别创建独立的 `SDKGeneration`、`CookieGeneration`。请求参数、当前客户端、
+回退目标和计时状态是实例字段；重试和交付方法不再通过长嵌套闭包共享这些变量。
+这些对象只服务一次请求，不注册为全局单例，也不拥有共享连接池的关闭权限。
+
+`create_gemini_prompt()` 只负责角色分流和轮次组装：工具结果、assistant 工具调用、
+普通消息分别由独立函数转换，最后统一合并相邻轮次。签名和 Part 顺序规则仍在各自转换函数中。
+
+已有的 `proxy_resolver` 公共解析入口和 `api_helpers` 响应转换入口以显式导入方式保留，
+避免现有调用方随内部拆分失效；新增内部调用优先引用实际归属模块。
+`scripts/check_architecture.py` 静态检查三处模块的反向依赖（含函数内导入），
+并检查应用模块加载时的导入环；动态导入和运行时调用关系仍需人工复查。
+
+## 控制台脚本职责
+
+| 文件 | 职责 |
+| --- | --- |
+| `dashboard.js` | 共用 DOM/API 辅助函数、页签、通道模式和 Express 凭证 |
+| `console-models.js` | 模型选择、能力摘要、全局/模型配置草稿与保存 |
+| `console-overview.js` | 概览统计与近期指标刷新，内部持有轮询状态 |
+| `console-logs.js` | 有界 SSE 日志、过滤和滚动，暴露 `consoleLogs.onShow()` |
+| `channel-config.js` | Cookie 账号、回退策略和共用代理编辑器 |
+| `console-forms.js` | 专项设置表单、校验与保存交互 |
+| `request-monitor.js` | 请求监控、分页、详情与关联日志 |
+| `console-bootstrap.js` | 最后加载：启动、共享事件绑定和可选通道脚本恢复 |
+| `login.js` | 独立登录页表单交互 |
+
+控制台继续使用本地 classic scripts 和 `defer`，无需运行时打包；模板中的 script 标签
+是加载顺序的唯一清单，DOM 测试从模板读取，不另维护一份文件数组。
+共用函数、模型草稿状态和 HTML 内联事件处理器仍保留既有全局接口；新功能应进入所属模块，
+不要向 bootstrap 或 dashboard 持续堆叠。日志与概览的内部状态封装在各自作用域中。
+
+全部静态 JavaScript 使用锁定版本的 Prettier。编辑后执行 `npm run format:console`；
+`npm run check:format` 在 CI 中检查格式，DOM 与浏览器回归负责验证实际交互。
+文件拆分和格式化会增加物理行数，维护目标是明确职责、可定位修改点，不以总行数减少作为验收标准。
 
 ## 请求处理边界
 
@@ -62,7 +114,8 @@ OpenAI 路由负责交付与上游分流，上游负责协议适配。两条通�
 Cookie 通道会额外检查历史函数往返，因此共享函数显式接收 `has_tools`，保留各通道的判断。
 
 通道模式为 `api_key` / `web_proxy` / `mixed`，旧布尔开关会映射为前两者。
-混合模式在已启用的两类记录间统一随机或轮询；结构化输出只选择 Express Key。
+混合模式在已启用的两类记录间统一随机或轮询；默认结构化输出只选择 Express Key，
+显式开启实验性的 `cookie_structured_output` 后才允许 Cookie 记录参与。
 一次 Cookie 生成使用同一条记录中的 Cookie、Project ID 和代理快照，重试时重新计算认证头，
 不会重新读取另一个账号的 Cookie。Cookie 列表接口不返回原始凭证；空 Cookie 按记录 ID 保留。
 
@@ -169,7 +222,7 @@ Pydantic 校验错误保留最多 50 个字段位置与说明，不返回原始 
 ## 本地验证
 
 安装 `requirements-dev.txt` 后，运行 `python scripts/check_project.py`。
-检查会执行语法、静态分析、工作流校验、全部 `tests/test_*.py` 和 SDK 档案探针。
+检查会执行语法、静态分析、工作流校验、模块边界、全部 `tests/test_*.py` 和 SDK 档案探针。
 每个测试文件单独启动 Python 进程，隔离模块级状态和事件循环资源。
 
 单组测试可以直接运行，例如 `python tests/test_console_routes.py`。
@@ -179,6 +232,8 @@ Pydantic 校验错误保留最多 50 个字段位置与说明，不返回原始 
 手动诊断脚本，可离线运行，不依赖真实凭据。
 新增离线回归请放在 `tests/test_*.py`，由统一入口自动发现。
 
-前端浏览器回归为 `node scripts/verify_console_ui.cjs`，需另装 Playwright 和 Chromium，配置见 README。
+前端先运行 `npm ci`、`npm run check:format`、`npm run test:console`；
+样式变更使用 `npm run build:css` 重建并检查 `dashboard.css`。
+浏览器回归为 `npm run test:browser`，需另装 Playwright 和 Chromium，配置见 README。
 它在临时状态中启动真实管理接口，并为上游探测提供固定结果；不需要 Google 凭证，也不触发模型调用。
 修改模板、前端脚本或 CSS 后，重点检查模型保存作用域、未保存凭证编辑、自动刷新焦点及移动端溢出。

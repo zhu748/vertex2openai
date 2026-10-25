@@ -31,7 +31,7 @@ from logger import ProxyStats
 from models import OpenAIRequest
 from routes import chat_api
 from runtime_state import AppState, app_state
-from upstreams import cookie_proxy, express_sdk, cookie_request
+from upstreams import cookie_transport, cookie_proxy, express_sdk, cookie_request
 
 
 MODEL = "gemini-3.6-flash"
@@ -428,12 +428,12 @@ class CookieStreamTests(unittest.IsolatedAsyncioTestCase):
         closed = asyncio.Event()
         async def events(*args, **kwargs):
             try:
-                yield "fatal_error", cookie_proxy._StreamRequestError("failure", status_code=502)
+                yield "fatal_error", cookie_transport.StreamRequestError("failure", status_code=502)
                 await asyncio.Event().wait()
             finally:
                 closed.set()
         self.pool(SimpleNamespace())
-        with mock.patch.object(cookie_proxy, "_execute_stream_request_generator", side_effect=events):
+        with mock.patch.object(cookie_proxy, "stream_events", side_effect=events):
             response = await cookie_proxy.CookieProxyUpstream().chat_completions(req(stream=True), self.request)
             body = "".join([frame async for frame in response.body_iterator])
         self.assertIn('"code": 502', body)
@@ -452,8 +452,8 @@ class CookieStreamTests(unittest.IsolatedAsyncioTestCase):
         def fallback():
             self.assertTrue(closed.is_set())
             return {"fallback": True}
-        with mock.patch.object(cookie_proxy, "_execute_stream_request_generator_once", side_effect=events):
-            result = [event async for event in cookie_proxy._execute_stream_request_generator(
+        with mock.patch.object(cookie_transport, "_execute_stream_request_generator_once", side_effect=events):
+            result = [event async for event in cookie_transport.stream_events(
                 None, {}, {}, fallback_body=fallback)]
         self.assertEqual(result, [("text", "fallback")])
 

@@ -22,6 +22,10 @@ class StatePersistenceError(RuntimeError):
     """A management update could not be durably committed."""
 
 
+class CredentialRevisionConflictError(ValueError):
+    """A console editor is attempting to overwrite a newer snapshot."""
+
+
 class CookieAccountConflictError(ValueError):
     """A saved credential needed by a blank-cookie update no longer exists."""
 
@@ -365,7 +369,27 @@ class AppState:
                     out.append(rec)
             return out
 
-    def set_express_keys(self, records: list) -> list:
+    def credential_snapshot(self, kind: str) -> tuple[list, str]:
+        """Read records and their content revision under the same state lock."""
+        with self._lock:
+            records = self.get_express_keys() if kind == "keys" else self.get_cookie_accounts()
+            revision_data = records
+            if kind == "cookies":
+                # Token rotation must not invalidate metadata drafts. Manual
+                # credential edits advance an epoch in the same persisted state;
+                # blank-cookie saves still preserve the latest token under lock.
+                revision_data = [{k: v for k, v in rec.items() if k != "cookie"} for rec in records]
+                revision_data = [self._state.get("cookie_accounts_revision", 0), revision_data]
+            revision = hashlib.sha256(json.dumps(revision_data, sort_keys=True, ensure_ascii=False,
+                                                 separators=(",", ":")).encode()).hexdigest()
+            return records, revision
+
+    def _check_credential_revision(self, kind: str, expected_revision: str | None) -> None:
+        # Called while the mutation lock is held; optional for legacy API clients.
+        if expected_revision is not None and self.credential_snapshot(kind)[1] != expected_revision:
+            raise CredentialRevisionConflictError("服务器凭证列表已更新，当前草稿已保留。请重新加载列表并合并修改后再保存。")
+
+    def set_express_keys(self, records: list, *, expected_revision: str | None = None) -> list:
         """整表覆盖保存（控制台的增删改都走这里）。
 
         同时打上 express_keys_initialized 标记：**用户保存空列表后，
@@ -373,6 +397,7 @@ class AppState:
         """
         clean = self._clean_express_records(records)
         with self._lock:
+            self._check_credential_revision("keys", expected_revision)
             self._state["express_keys"] = clean
             self._state["express_keys_initialized"] = True
         self._save()
@@ -479,7 +504,8 @@ class AppState:
                     stored = app_config.ENV_COOKIE_ACCOUNTS
             return [rec for item in stored if (rec := self._normalize_cookie_record(item))]
 
-    def set_cookie_accounts(self, records: list, *, preserve_cookie_ids: set[str] | None = None) -> list:
+    def set_cookie_accounts(self, records: list, *, preserve_cookie_ids: set[str] | None = None,
+                            expected_revision: str | None = None) -> list:
         clean, ids, cookies = [], set(), set()
         for item in records:
             rec = self._normalize_cookie_record(item)
@@ -489,6 +515,7 @@ class AppState:
             cookies.add(rec["cookie"])
             clean.append(rec)
         with self._lock:
+            self._check_credential_revision("cookies", expected_revision)
             if preserve_cookie_ids:
                 current = {rec["id"]: rec for rec in self.get_cookie_accounts()}
                 for rec in clean:
@@ -501,6 +528,8 @@ class AppState:
                 if len({rec["cookie"] for rec in clean}) != len(clean):
                     raise CookieAccountConflictError("Cookie 凭证已更新并产生重复，请重新加载列表后再保存。")
             self._state["cookie_accounts"] = clean
+            epoch = self._state.get("cookie_accounts_revision", 0)
+            self._state["cookie_accounts_revision"] = (epoch if isinstance(epoch, int) else 0) + 1
             self._state["cookie_accounts_initialized"] = True
             # Old credentials must not resurrect after deleting every account.
             self._state.pop("google_cookie", None)

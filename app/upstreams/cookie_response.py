@@ -197,7 +197,7 @@ def _wire_list(value, label):
     return value
 
 
-def extract_events(obj: dict):
+def extract_events(obj: dict, *, preserve_parts: bool = False):
     obj = _wire_object(obj, "响应", allow_null=False)
     # 真值判断而非 "error" in obj：该端点的 Proto JSON 会序列化默认空值
     # （同文件 thoughtSignature/functionCall 的空值过滤同理），若某个块
@@ -244,7 +244,12 @@ def extract_events(obj: dict):
                 text = part.get("text", "")
                 if text is not None and not isinstance(text, str):
                     raise IncompleteResponseError("上游 part.text 必须是字符串。")
+                native_part = {}
                 if text:
+                    native_part["text"] = text
+                    if is_thought_part(part):
+                        native_part["thought"] = True
+                if text and not preserve_parts:
                     if is_thought_part(part):
                         yield ("thought", text)
                     else:
@@ -260,15 +265,17 @@ def extract_events(obj: dict):
                 if name and name.strip():
                     args = function_call.get("args")
                     args = _wire_object(args, "functionCall.args")
-                    yield (
-                        "function_call",
-                        {
-                            "name": name,
-                            "args": args,
-                            "thought_signature": part.get("thoughtSignature") or None,
-                        },
-                    )
-                elif part.get("thoughtSignature"):
+                    native_part["functionCall"] = {"name": name, "args": args}
+                    if not preserve_parts:
+                        yield (
+                            "function_call",
+                            {
+                                "name": name,
+                                "args": args,
+                                "thought_signature": part.get("thoughtSignature") or None,
+                            },
+                        )
+                elif part.get("thoughtSignature") and not preserve_parts:
                     yield (
                         "thought_signature",
                         {
@@ -286,8 +293,19 @@ def extract_events(obj: dict):
                     if not isinstance(mime_type, str) or not isinstance(b64, str):
                         raise IncompleteResponseError("上游 inlineData 的 mimeType / data 必须是字符串。")
                     if mime_type and b64:
-                        image_md = f"![Generated Image](data:{mime_type};base64,{b64})"
-                        yield ("image", image_md)
+                        native_part["inlineData"] = {"mimeType": mime_type, "data": b64}
+                        if not preserve_parts:
+                            image_md = f"![Generated Image](data:{mime_type};base64,{b64})"
+                            yield ("image", image_md)
+
+                if preserve_parts:
+                    signature = part.get("thoughtSignature")
+                    if signature:
+                        if not isinstance(signature, str):
+                            raise IncompleteResponseError("上游 thoughtSignature 必须是字符串。")
+                        native_part["thoughtSignature"] = signature
+                    if native_part:
+                        yield "native_part", native_part
 
             # finishReason 全量透出（含 SAFETY/PROHIBITED_CONTENT 等），由消费方统一映射；
             # 旧实现只认 STOP/MAX_TOKENS/SAFETY 白名单，其余被静默吞掉，导致“无正文”无从排查。

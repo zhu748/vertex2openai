@@ -14,6 +14,7 @@ def main() -> int:
         ("语法", ["-m", "compileall", "-q", "app", "tests", "scripts", ".github/scripts"]),
         ("静态检查", ["-m", "ruff", "check", "app", "tests", "scripts", "--select", "E9,F63,F7,F82,B012,F401,F811,F841"]),
         ("工作流", [".github/scripts/check_workflows.py"]),
+        ("模块边界", ["scripts/check_architecture.py"]),
     ]
     checks.extend((path.name, [str(path.relative_to(ROOT))])
                   for path in sorted((ROOT / "tests").glob("test_*.py")))

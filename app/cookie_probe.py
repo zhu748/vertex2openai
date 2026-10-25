@@ -25,7 +25,7 @@ _probe_semaphore = asyncio.Semaphore(MAX_CONCURRENT_PROBES)
 
 async def probe_account(record: dict) -> dict:
     """Use a nonexistent model; reject ambiguous responses without quarantining."""
-    from upstreams.cookie_proxy import _grpc_status_code, _is_cookie_expired_error
+    from upstreams.cookie_transport import grpc_status_code, is_cookie_expired_error
 
     started = time.monotonic()
     account_id = record.get("id", "")
@@ -87,9 +87,9 @@ async def probe_account(record: dict) -> dict:
                         raise ValueError("探测返回无效的 errors 记录")
                     errors.append(error)
         # Evaluate all errors: a later NOT_FOUND cannot hide an auth rejection.
-        codes = {_grpc_status_code(error) for error in errors}
+        codes = {grpc_status_code(error) for error in errors}
         detail = next((str(error["message"]) for error in errors if error.get("message")), "")
-        if codes & {7, 16} or any(_is_cookie_expired_error(str(e.get("message", ""))) for e in errors):
+        if codes & {7, 16} or any(is_cookie_expired_error(str(e.get("message", ""))) for e in errors):
             return done("invalid", f"鉴权失败：{detail or 'permission/unauthenticated'}")
         if codes & {3, 5, 8}:
             return done("valid", f"会话有效：{detail or '模型不存在属预期'}")

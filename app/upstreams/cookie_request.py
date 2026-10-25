@@ -1,6 +1,5 @@
 """Cookie batchGraphql 请求构造：消息、工具、模型参数与协议字段。"""
 
-import asyncio
 import json
 import time
 import uuid
@@ -13,6 +12,7 @@ from cookie_auth import (
     get_client_version,
     get_stream_query_signature,
 )
+from media_tasks import run_media_task
 from message_processing import _coerce_tool_response, openai_content_to_wire_parts
 from models import OpenAIRequest, normalize_content_part
 from runtime_state import app_state
@@ -219,6 +219,11 @@ _SCHEMA_TYPES = {
 
 
 def _cookie_ui_schema(schema: Any) -> Any:
+    # Resolve references against the complete root before recursing into fields.
+    return _cookie_ui_schema_node(sanitize_for_gemini(schema))
+
+
+def _cookie_ui_schema_node(schema: Any) -> Any:
     """OpenAI JSON Schema -> Studio private UI Schema.
 
     The private batchGraphql input uses upper-case scalar names and encodes an
@@ -230,11 +235,6 @@ def _cookie_ui_schema(schema: Any) -> Any:
 
     out = {}
     raw_type = schema.get("type")
-    if isinstance(raw_type, list):
-        non_null = [t for t in raw_type if str(t).lower() != "null"]
-        raw_type = non_null[0] if non_null else "null"
-        if len(non_null) != len(schema.get("type") or []):
-            out["nullable"] = True
     if not raw_type:
         if isinstance(schema.get("properties"), dict):
             raw_type = "object"
@@ -247,11 +247,11 @@ def _cookie_ui_schema(schema: Any) -> Any:
         if key == "type":
             continue
         if key == "properties" and isinstance(value, dict):
-            out[key] = [{"key": name, "value": _cookie_ui_schema(child)} for name, child in value.items()]
+            out[key] = [{"key": name, "value": _cookie_ui_schema_node(child)} for name, child in value.items()]
         elif key in {"items", "additionalProperties", "not"} and isinstance(value, dict):
-            out[key] = _cookie_ui_schema(value)
+            out[key] = _cookie_ui_schema_node(value)
         elif key in {"oneOf", "anyOf", "allOf", "prefixItems"} and isinstance(value, list):
-            out[key] = [_cookie_ui_schema(item) for item in value]
+            out[key] = [_cookie_ui_schema_node(item) for item in value]
         else:
             out[key] = value
     return out
@@ -564,7 +564,7 @@ async def build_request_body_async(
     native_tools: bool = True,
 ) -> dict:
     """在线程里构建请求体：内部有远程图片下载与 PIL 压缩，不能阻塞事件循环（P1-2）。"""
-    return await asyncio.to_thread(
+    return await run_media_task(
         build_request_body, project_id, model_name, request, prefill_active, force_search, native_tools
     )
 

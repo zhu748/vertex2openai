@@ -8,8 +8,8 @@ Express 通道可以字节级透传原生 REST 请求；Cookie 通道的私有 G
           requestContext/querySignature 信封）。
   响应侧：extract_events 的事件流（text/thought/image/function_call/finish…）
           → 重组回 Gemini 原生形状（candidates.content.parts / finishReason /
-          usageMetadata / promptFeedback.blockReason），SSE 与整包 JSON 两种
-          交付形态都按原生客户端预期输出。
+          usageMetadata / promptFeedback.blockReason），支持 SSE、JSON 数组流
+          与非流式 JSON，保留每个 part 的签名。
 
 传输层完全复用 Cookie 通道基建：SAPISIDHASH 认证、curl_cffi 伪装、代理链
 故障转移、首回复窗口、429 退避重试、账号健康隔离。
@@ -28,6 +28,8 @@ Express 通道可以字节级透传原生 REST 请求；Cookie 通道的私有 G
 import asyncio
 import json
 import re
+import time
+from contextlib import aclosing
 from typing import Any, Optional
 
 import httpx
@@ -36,6 +38,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 import config as app_config
 import model_capabilities as mc
+from admission import GenerationCapacityError, limit_generation
 from cookie_auth import (
     STREAM_GENERATE_OPERATION_NAME,
     build_headers,
@@ -46,14 +49,15 @@ from impersonate import open_upstream_client
 from logger import stats
 from proxy_failover import ProxyChain
 from response_validation import IncompleteResponseError
+from resumable import request_timeout_seconds
 from retry_policy import get_retry_settings, retry_delay
 from runtime_state import app_state
 from schema_validation import SchemaValidationError
-from streaming import HEARTBEAT_FRAME
-from upstreams.cookie_proxy import (
-    RawSampler,
-    _execute_stream_request_generator,
-    _sleep_with_heartbeat,
+from streaming import HEARTBEAT, HEARTBEAT_FRAME, with_heartbeats
+from upstreams.cookie_response import RawSampler
+from upstreams.cookie_transport import (
+    stream_events,
+    retry_heartbeats,
 )
 from upstreams.cookie_request import (
     COOKIE_STRUCTURED_OUTPUT_DISABLED_MESSAGE,
@@ -64,6 +68,8 @@ from upstreams.cookie_request import (
 )
 
 # 生图 markdown（extract_events 的 image 事件载荷）→ inlineData 反解
+MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+
 _IMAGE_MD_RE = re.compile(r"^!\[.*?\]\(data:([^;,]+);base64,([A-Za-z0-9+/=]+)\)$", re.S)
 
 # 原生请求里上游 GraphQL 无法承载、需要静默丢弃的字段（丢弃时打一条日志）
@@ -331,9 +337,12 @@ class NativeAssembler:
     非流式：collect 同样喂事件，payload 一次性出整包。
     """
 
-    def __init__(self, model_version: str):
+    def __init__(self, model_version: str, *, retain_parts: bool = True):
         self.model_version = model_version
         self.parts: list[dict] = []
+        self.retain_parts = retain_parts
+        self.part_count = 0
+        self.response_bytes = 0
         self.finish: Optional[str] = None
         self.usage: Optional[dict] = None
         self.safety: Any = None
@@ -344,7 +353,9 @@ class NativeAssembler:
     def feed(self, kind: str, data) -> Optional[dict]:
         """处理一个事件；返回需立即下发的新增 part（流式用），None 表示不发。"""
         part: Optional[dict] = None
-        if kind == "text":
+        if kind == "native_part":
+            part = data
+        elif kind == "text":
             part = {"text": data}
         elif kind == "thought":
             part = {"text": data, "thought": True}
@@ -370,7 +381,13 @@ class NativeAssembler:
         elif kind == "blocked":
             self.blocked = str(data).split("（")[0].split("(")[0].strip() or "BLOCKED"
         if part is not None:
-            self.parts.append(part)
+            size = len(json.dumps(part, ensure_ascii=False).encode("utf-8"))
+            self.response_bytes = self.response_bytes + size if self.retain_parts else size
+            if self.response_bytes > MAX_RESPONSE_BYTES:
+                raise NativeBridgeError(502, "上游响应超过允许的大小。")
+            if self.retain_parts:
+                self.parts.append(part)
+            self.part_count += 1
             self.has_content = True
         return part
 
@@ -386,7 +403,7 @@ class NativeAssembler:
 
     def terminal(self) -> Optional[dict]:
         """流式收尾帧：无任何可交付内容时返回 None（由调用方决定报错文案）。"""
-        if self.blocked and not self.parts:
+        if self.blocked and not self.has_content:
             payload: dict[str, Any] = {"promptFeedback": {"blockReason": self.blocked}}
             if self.usage:
                 payload["usageMetadata"] = self.usage
@@ -402,7 +419,7 @@ class NativeAssembler:
 
     def payload(self) -> dict:
         """非流式整包。"""
-        if self.blocked and not self.parts:
+        if self.blocked and not self.has_content:
             result: dict[str, Any] = {"promptFeedback": {"blockReason": self.blocked}}
             if self.usage:
                 result["usageMetadata"] = self.usage
@@ -457,17 +474,17 @@ async def _events_with_retry(fastapi_request: Request, record: dict, body: dict,
             has_content = False
             retry_now: Any = None
             sampler = RawSampler()
-            events = _execute_stream_request_generator(
-                client, req_headers, body, sampler=sampler, model=model_name)
+            events = stream_events(
+                client, req_headers, body, sampler=sampler, model=model_name, preserve_parts=True)
             try:
                 async for status, data in events:
-                    if status in ("text", "thought", "image", "function_call", "thought_signature"):
+                    if status in ("text", "thought", "image", "function_call", "thought_signature", "native_part"):
                         has_content = True
                         yield status, data
                     elif status in ("finish", "usage", "blocked", "safety"):
                         yield status, data
                     elif status == "cookie_error":
-                        credential_manager.record_cookie_auth_failure(account_id)
+                        credential_manager.record_cookie_auth_failure(account_id, credential=record)
                         raise NativeBridgeError(
                             getattr(data, "status_code", None) or 403, str(data)[:1024])
                     elif status in ("retryable_error", "fatal_error"):
@@ -484,7 +501,7 @@ async def _events_with_retry(fastapi_request: Request, record: dict, body: dict,
             if retry_now is None:
                 return
             # 退避等待期间吐心跳保活（SSE 消费方转成 : keep-alive）。
-            async for _hb in _sleep_with_heartbeat(
+            async for _hb in retry_heartbeats(
                     retry_delay(getattr(retry_now, "retry_after", None),
                                 backoff_sec, attempt, jitter_sec, error=str(retry_now)),
                     request=fastapi_request):
@@ -497,16 +514,50 @@ async def _events_with_retry(fastapi_request: Request, record: dict, body: dict,
 # ============================================================
 # 端点入口（由 routes/gemini_native.py 调用）
 # ============================================================
+async def _timed_events(request, record, body, model, deadline):
+    """A single wall-clock budget covers retries, setup and all response chunks."""
+    source = _events_with_retry(request, record, body, model)
+    async with aclosing(with_heartbeats(source, request)) as events:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise NativeBridgeError(504, "请求超过总超时时间。")
+            try:
+                # Never keep an asyncio timeout scope open across a yield:
+                # StreamingResponse may read/close us from a different task.
+                async with asyncio.timeout(remaining):
+                    item = await anext(events)
+            except StopAsyncIteration:
+                return
+            except TimeoutError:
+                raise NativeBridgeError(504, "请求超过总超时时间。") from None
+            yield ("heartbeat", None) if item is HEARTBEAT else item
+
+
 async def handle_native_request(fastapi_request: Request, model: str, action: str,
                                 parsed: dict, *, requested_model: str = ""):
-    """Gemini 原生请求走 Cookie 通道桥接。返回 JSONResponse / StreamingResponse。"""
-    if action not in ("generateContent", "streamGenerateContent"):
-        return _native_error(
-            400,
-            f"Cookie 通道暂不支持 :{action}（上游 batchGraphql 无对应操作），"
-            "请配置 Express API Key 使用该操作。",
-            "INVALID_ARGUMENT")
+    """Apply the same admission and lifetime rules as the Express adapter."""
+    resume = (fastapi_request.headers.get("x-resumable", "").lower() in ("1", "true", "yes")
+              or fastapi_request.headers.get("x-resume-id")
+              or fastapi_request.headers.get("last-event-id", "").strip()
+              or fastapi_request.query_params.get("resume_from", "").strip())
+    if resume:
+        return _native_error(400, "Cookie 原生通道暂不支持断点续传，请配置 Express API Key。", "INVALID_ARGUMENT")
+    if fastapi_request.query_params.get("alt", "json") not in ("sse", "json"):
+        return _native_error(400, "alt 仅支持 sse 或 json。", "INVALID_ARGUMENT")
+    try:
+        return await _handle_native_request(fastapi_request, model, action, parsed,
+                                            requested_model=requested_model,
+                                            deadline=time.monotonic() + request_timeout_seconds())
+    except GenerationCapacityError as exc:
+        return _native_error(503, str(exc), "RESOURCE_EXHAUSTED")
 
+
+@limit_generation
+async def _handle_native_request(fastapi_request: Request, model: str, action: str,
+                                 parsed: dict, *, requested_model: str, deadline: float):
+    if action not in ("generateContent", "streamGenerateContent"):
+        return _native_error(400, f"Cookie 通道暂不支持 :{action}，请配置 Express API Key。", "INVALID_ARGUMENT")
     record = credential_manager.get_cookie_record()
     if record is None:
         return _native_error(403, "未配置任何启用的 Cookie 账号。", "PERMISSION_DENIED")
@@ -516,73 +567,77 @@ async def handle_native_request(fastapi_request: Request, model: str, action: st
     if build_headers(record.get("cookie", "")) is None:
         return _native_error(401, "Cookie 中未找到 SAPISID，无法计算认证头。")
     account_id = record.get("id", "")
-
     try:
         body = build_native_body(parsed, model, project_id)
     except SchemaValidationError as exc:
         return _native_error(400, str(exc), "INVALID_ARGUMENT")
 
     is_stream = action == "streamGenerateContent"
+    use_sse = fastapi_request.query_params.get("alt") == "sse"
     print(f"🍪 [Cookie 原生桥] {requested_model or model}:{action} | "
-          f"{'流式 SSE' if is_stream else '非流式'} | 协议转码（非字节级透传）")
+          f"{'SSE' if use_sse and is_stream else 'JSON'} | 协议转码")
 
     if is_stream:
-        async def sse():
-            assembler = NativeAssembler(requested_model or model)
-            yield HEARTBEAT_FRAME
+        async def stream():
+            assembler = NativeAssembler(requested_model or model, retain_parts=False)
+            first = True
+
+            def encode(payload):
+                nonlocal first
+                data = json.dumps(payload, ensure_ascii=False)
+                if use_sse:
+                    return "data: " + data + "\n\n"
+                prefix = "" if first else ","
+                first = False
+                return prefix + data
+
+            yield HEARTBEAT_FRAME if use_sse else "["
             try:
-                async for kind, data in _events_with_retry(fastapi_request, record, body, model):
-                    if kind == "heartbeat":
-                        yield HEARTBEAT_FRAME
-                        continue
-                    part = assembler.stream_event(kind, data)
-                    if part is not None:
-                        yield "data: " + json.dumps({
-                            "candidates": [{"content": {"role": "model", "parts": [part]}, "index": 0}],
-                        }, ensure_ascii=False) + "\n\n"
-                terminal = assembler.terminal()
-                yield "data: " + json.dumps(terminal, ensure_ascii=False) + "\n\n"
+                async with aclosing(_timed_events(fastapi_request, record, body, model, deadline)) as events:
+                    async for kind, data in events:
+                        if kind == "heartbeat":
+                            yield HEARTBEAT_FRAME if use_sse else " "
+                            continue
+                        part = assembler.stream_event(kind, data)
+                        if part is not None:
+                            yield encode({"candidates": [{"content": {"role": "model", "parts": [part]}, "index": 0}]})
+                yield encode(assembler.terminal())
                 stats.add_success()
-                credential_manager.record_cookie_success(account_id)
-                print(f"✅ [Cookie 原生桥] {model} | 流式完成 | {len(assembler.parts)} parts")
+                credential_manager.record_cookie_success(account_id, credential=record)
+                print(f"✅ [Cookie 原生桥] {model} | 流式完成 | {assembler.part_count} parts")
             except asyncio.CancelledError:
                 raise
             except NativeBridgeError as exc:
                 if exc.code == 499:
                     return
                 stats.add_error()
-                yield "data: " + json.dumps(
-                    _google_error_body(exc.code, exc.message), ensure_ascii=False) + "\n\n"
+                yield encode(_google_error_body(exc.code, exc.message))
             except IncompleteResponseError as exc:
                 stats.add_error()
-                yield "data: " + json.dumps(
-                    _google_error_body(502, str(exc), "UNAVAILABLE"), ensure_ascii=False) + "\n\n"
-            except Exception as exc:  # 兜底：SSE 已 200 建流，只能以错误帧收尾
+                yield encode(_google_error_body(502, str(exc), "UNAVAILABLE"))
+            except Exception as exc:
                 stats.add_error()
-                yield "data: " + json.dumps(
-                    _google_error_body(502, f"Cookie 通道桥接异常：{type(exc).__name__}: {exc}"[:1024],
-                                       "UNAVAILABLE"), ensure_ascii=False) + "\n\n"
+                yield encode(_google_error_body(502, f"Cookie 通道桥接异常：{type(exc).__name__}: {exc}"[:1024],
+                                                "UNAVAILABLE"))
+            if not use_sse:
+                yield "]"
 
-        return StreamingResponse(sse(), media_type="text/event-stream",
-                                 headers={"Cache-Control": "no-store, no-transform",
-                                          "X-Accel-Buffering": "no"})
+        return StreamingResponse(stream(), media_type="text/event-stream" if use_sse else "application/json",
+                                 headers={"Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no"})
 
-    # 非流式：整包收集后一次返回
     assembler = NativeAssembler(requested_model or model)
     try:
-        async for kind, data in _events_with_retry(fastapi_request, record, body, model):
-            assembler.feed(kind, data)
+        async with aclosing(_timed_events(fastapi_request, record, body, model, deadline)) as events:
+            async for kind, data in events:
+                assembler.feed(kind, data)
         payload = assembler.payload()
     except NativeBridgeError as exc:
         stats.add_error()
-        if exc.code == 499:
-            return JSONResponse(status_code=499, content=_google_error_body(499, exc.message))
-        return JSONResponse(status_code=exc.code, content=_google_error_body(exc.code, exc.message))
-    except IncompleteResponseError as exc:
+        return _native_error(exc.code, exc.message)
+    except Exception as exc:
         stats.add_error()
-        return JSONResponse(status_code=502, content=_google_error_body(502, str(exc), "UNAVAILABLE"))
-
+        return _native_error(502, str(exc)[:1024], "UNAVAILABLE")
     stats.add_success()
-    credential_manager.record_cookie_success(account_id)
-    print(f"✅ [Cookie 原生桥] {model} | 非流式完成 | {len(assembler.parts)} parts")
+    credential_manager.record_cookie_success(account_id, credential=record)
+    print(f"✅ [Cookie 原生桥] {model} | 非流式完成 | {assembler.part_count} parts")
     return JSONResponse(content=payload)

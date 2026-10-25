@@ -17,7 +17,7 @@ from cookie_refresh import RefreshInProgressError, refresh_once as refresh_cooki
 from lifecycle import start_background_task
 from proxy_resolver import validate_proxy_uri
 from proxy_config import ProxyFormatError, parse_proxy_list
-from runtime_state import CookieAccountConflictError, app_state
+from runtime_state import CookieAccountConflictError, CredentialRevisionConflictError, app_state
 
 
 router = APIRouter()
@@ -25,6 +25,7 @@ router = APIRouter()
 
 class ExpressKeysBody(BaseModel):
     keys: list = []
+    revision: str | None = None
 
 
 class ProbeBody(BaseModel):
@@ -40,8 +41,9 @@ class KeyProjectBody(BaseModel):
 
 def _express_keys_payload() -> dict:
     """控制台按用户要求**明文**返回 Key（控制台本身有密码保护）；日志里仍打掩码。"""
-    records = app_state.get_express_keys()
+    records, revision = app_state.credential_snapshot("keys")
     return {
+        "revision": revision,
         "keys": records,
         "total": len(records),
         "enabled": sum(1 for r in records if r.get("enabled", True)),
@@ -101,7 +103,10 @@ async def save_express_keys(body: ExpressKeysBody, request: Request, _auth: bool
                     "error": f"第 {idx + 1} 个 Key（{masked}）的专属代理格式不合法：{err}",
                 },
             )
-    saved = await asyncio.to_thread(app_state.set_express_keys, body.keys)
+    try:
+        saved = await asyncio.to_thread(app_state.set_express_keys, body.keys, expected_revision=body.revision)
+    except CredentialRevisionConflictError as exc:
+        return JSONResponse(status_code=409, content={"error": str(exc)}, headers={"Cache-Control": "no-store"})
     request.app.state.express_key_manager.refresh_keys()
     # 新加进来、还没有 Project ID 的 Key 立刻在后台探一次
     pending = [r["key"] for r in saved if r.get("enabled", True) and not r.get("project_id")]
@@ -114,18 +119,19 @@ async def save_express_keys(body: ExpressKeysBody, request: Request, _auth: bool
 
 class CookieAccountsBody(BaseModel):
     accounts: list = []
+    revision: str | None = None
 
 
 def _cookie_accounts_payload():
     from routes.settings_api import mask_cookie
     from credential_manager import credential_manager
-    records = app_state.get_cookie_accounts()
+    records, revision = app_state.credential_snapshot("cookies")
     health = credential_manager.cookie_health_snapshot()
     accounts = [{**{k: v for k, v in rec.items() if k != "cookie"},
                  "cookie_configured": bool(rec["cookie"]), "cookie_preview": mask_cookie(rec["cookie"]),
                  "health": health.get(rec["id"], {"cooldown_remaining": 0.0, "failures": 0})}
                 for rec in records]
-    return {"accounts": accounts, "total": len(accounts), "enabled": sum(r["enabled"] for r in accounts)}
+    return {"revision": revision, "accounts": accounts, "total": len(accounts), "enabled": sum(r["enabled"] for r in accounts)}
 
 
 @router.get("/api/cookie-accounts")
@@ -178,8 +184,9 @@ async def save_cookie_accounts(body: CookieAccountsBody, _auth: bool = Depends(r
         record.update(cookie=cookie, project_id=project)
         clean.append(record)
     try:
-        await asyncio.to_thread(app_state.set_cookie_accounts, clean, preserve_cookie_ids=preserve_cookie_ids)
-    except CookieAccountConflictError as exc:
+        await asyncio.to_thread(app_state.set_cookie_accounts, clean, preserve_cookie_ids=preserve_cookie_ids,
+                                expected_revision=body.revision)
+    except (CookieAccountConflictError, CredentialRevisionConflictError) as exc:
         return JSONResponse(status_code=409, content={"error": str(exc)}, headers={"Cache-Control": "no-store"})
     return JSONResponse(content={"status": "success", **_cookie_accounts_payload()},
                         headers={"Cache-Control": "no-store"})
@@ -218,6 +225,10 @@ async def test_cookie_accounts(body: CookieTestBody, _auth: bool = Depends(requi
     if not accounts:
         return JSONResponse(status_code=404, content={"error": "没有匹配的启用 Cookie 账号。"})
     results = await probe_cookie_accounts(accounts)
+    from credential_manager import credential_manager
+    health = credential_manager.cookie_health_snapshot()
+    for result in results:
+        result["health"] = health.get(result["id"], {"cooldown_remaining": 0.0, "failures": 0})
     valid = sum(1 for r in results if r["status"] == "valid")
     return JSONResponse(content={
         "results": results, "total": len(results), "valid": valid,

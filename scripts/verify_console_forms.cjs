@@ -55,7 +55,7 @@ async function main(){
  function edit(id,value){const input=el(id);if(input.type==='checkbox')input.checked=value;else input.value=value;input.dispatchEvent(new w.Event('input',{bubbles:true}));input.dispatchEvent(new w.Event('change',{bubbles:true}));}
  async function save(id){el(id).click();await tick();}
  try{
-  for(const name of ['channel-config.js','dashboard.js','console-forms.js','request-monitor.js'])require('node:vm').runInContext(fs.readFileSync(path.join(root,'app/static',name),'utf8'),dom.getInternalVMContext(),{filename:name});
+  for(const name of [...d.querySelectorAll('script[src]')].map(script=>new URL(script.src).pathname).filter(src=>src.startsWith('/static/')&&src.endsWith('.js')).map(src=>path.basename(src)))require('node:vm').runInContext(fs.readFileSync(path.join(root,'app/static',name),'utf8'),dom.getInternalVMContext(),{filename:name});
   await tick();
   assert.deepEqual(errors,[]);
   assert.equal(w.consoleForms.dirty(),false);
@@ -216,6 +216,29 @@ async function main(){
   w.addKeyRow();assert.equal(w.consoleForms.dirty(),true);w.consoleForms.discard('keys');
   console.log('✓ Persisted probe results rebase saved state without swallowing credential drafts');
 
+  transport=target=>{if(target.pathname==='/api/express-keys'){transport=null;return new Response(JSON.stringify({keys,revision:'r1'}));}};
+  await w.loadExpressKeys();
+  let latest=keys.map(rec=>({...rec,project_id:'revision-project',project_source:'auto',detected_at:123}));
+  w.mergeProbeResults([{key:latest[0].key,ok:true,project_id:'revision-project'}],latest,'r2');
+  edit('key-note-0','保存探测后的修改');
+  transport=(target,options)=>{if(target.pathname==='/api/express-keys'){
+    transport=null;const body=JSON.parse(options.body);assert.equal(body.revision,'r2');keys=body.keys;
+    return new Response(JSON.stringify({keys,revision:'r3'}));
+  }};
+  await w.saveExpressKeys();
+  edit('key-note-0','冲突时保留的草稿');
+  latest=keys.map(rec=>({...rec,note:'另一标签页的备注',project_id:'remote-probed-project',project_source:'auto',detected_at:456}));
+  for(let i=0;i<2;i++)w.mergeProbeResults([{key:latest[0].key,ok:true,project_id:'remote-probed-project'}],latest,'r4');
+  transport=(target,options)=>{if(target.pathname==='/api/express-keys'){
+    transport=null;assert.equal(JSON.parse(options.body).revision,'r3');
+    return new Response(JSON.stringify({error:'服务器凭证列表已更新，当前草稿已保留。'}),{status:409});
+  }};
+  await w.saveExpressKeys();
+  assert.equal(el('key-note-0').value,'冲突时保留的草稿');assert.equal(w.consoleForms.dirty(),true);
+  assert(el('channel-load-error').textContent.includes('草稿已保留'));
+  await w.loadExpressKeys();
+  console.log('✓ Probe revisions rebase expected metadata only; repeated probes cannot bypass conflicts or discard drafts');
+
   let resolveOldProxy;
   transport=target=>{if(target.pathname==='/api/proxy/test'){transport=null;return new Promise(resolve=>{resolveOldProxy=resolve;});}};
   w.consoleChannels.open('global');const oldProxyJob=w.testAllEditorProxies();await tick();
@@ -267,7 +290,7 @@ async function main(){
   const ids=[...d.querySelectorAll('[id]')].map(e=>e.id);assert.equal(new Set(ids).size,ids.length);
   assert.deepEqual(errors,[]);
   console.log('✓ Stable request rows, pause/resume, pagination and unique DOM IDs');
-  console.log('14 groups of console DOM checks passed. Layout requires the browser suite.');
+  console.log('15 groups of console DOM checks passed. Layout requires the browser suite.');
  }finally{dom.window.close();}
 }
 main().catch(error=>{console.error(error);process.exitCode=1;});

@@ -30,50 +30,50 @@ from cookie_auth import (  # noqa: E402
 
 class GrpcStatusMappingTests(unittest.TestCase):
     def test_grpc_resource_exhausted_maps_to_429(self):
-        from upstreams.cookie_proxy import _api_error_details
+        from upstreams.cookie_transport import api_error_details
         data = {"message": "Resource exhausted.",
                 "extensions": {"status": {"code": 8, "message": "Resource exhausted."}}}
-        code, message = _api_error_details(data)
+        code, message = api_error_details(data)
         self.assertEqual(code, 429)
         self.assertEqual(message, "Resource exhausted.")
 
     def test_grpc_permission_denied_maps_to_403(self):
-        from upstreams.cookie_proxy import _api_error_details
+        from upstreams.cookie_transport import api_error_details
         data = {"message": "Permission denied.",
                 "extensions": {"status": {"code": 7}}}
-        code, _ = _api_error_details(data)
+        code, _ = api_error_details(data)
         self.assertEqual(code, 403)
 
     def test_grpc_unauthenticated_maps_to_401(self):
-        from upstreams.cookie_proxy import _api_error_details
-        code, _ = _api_error_details({"message": "x", "extensions": {"status": {"code": 16}}})
+        from upstreams.cookie_transport import api_error_details
+        code, _ = api_error_details({"message": "x", "extensions": {"status": {"code": 16}}})
         self.assertEqual(code, 401)
 
     def test_top_level_code_wins_over_grpc(self):
-        from upstreams.cookie_proxy import _api_error_details
-        code, _ = _api_error_details({"message": "x", "code": 503, "extensions": {"status": {"code": 8}}})
+        from upstreams.cookie_transport import api_error_details
+        code, _ = api_error_details({"message": "x", "code": 503, "extensions": {"status": {"code": 8}}})
         self.assertEqual(code, 503)
 
     def test_text_fallback_when_no_structured_code(self):
-        from upstreams.cookie_proxy import _api_error_details
-        code, _ = _api_error_details({"message": "Too many requests, please retry."})
+        from upstreams.cookie_transport import api_error_details
+        code, _ = api_error_details({"message": "Too many requests, please retry."})
         self.assertEqual(code, 429)
-        code, _ = _api_error_details({"message": "something odd"})
+        code, _ = api_error_details({"message": "something odd"})
         self.assertEqual(code, 502)
 
 
 class CookieKeywordNarrowingTests(unittest.TestCase):
     def test_safety_denial_text_not_cookie_expired(self):
-        from upstreams.cookie_proxy import _is_cookie_expired_error
-        self.assertFalse(_is_cookie_expired_error("Request denied by safety system"))
-        self.assertFalse(_is_cookie_expired_error("permission scope too broad"))
+        from upstreams.cookie_transport import is_cookie_expired_error
+        self.assertFalse(is_cookie_expired_error("Request denied by safety system"))
+        self.assertFalse(is_cookie_expired_error("permission scope too broad"))
 
     def test_real_auth_failures_still_detected(self):
-        from upstreams.cookie_proxy import _is_cookie_expired_error
-        self.assertTrue(_is_cookie_expired_error("Permission denied on resource"))
-        self.assertTrue(_is_cookie_expired_error("Login Required"))
-        self.assertTrue(_is_cookie_expired_error("session expired"))
-        self.assertTrue(_is_cookie_expired_error("Request had invalid credentials"))
+        from upstreams.cookie_transport import is_cookie_expired_error
+        self.assertTrue(is_cookie_expired_error("Permission denied on resource"))
+        self.assertTrue(is_cookie_expired_error("Login Required"))
+        self.assertTrue(is_cookie_expired_error("session expired"))
+        self.assertTrue(is_cookie_expired_error("Request had invalid credentials"))
 
 
 class HotConfigTests(unittest.TestCase):

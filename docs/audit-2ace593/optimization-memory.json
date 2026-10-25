@@ -1,0 +1,16 @@
+{
+  "retained_assembly": {
+    "parts": 10000,
+    "retained_parts": 10000,
+    "retained_bytes": 12625114,
+    "peak_bytes": 12628175,
+    "seconds": 0.2986
+  },
+  "streaming_assembly": {
+    "parts": 10000,
+    "retained_parts": 0,
+    "retained_bytes": 1252,
+    "peak_bytes": 5407,
+    "seconds": 0.2638
+  }
+}

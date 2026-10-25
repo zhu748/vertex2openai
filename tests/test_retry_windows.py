@@ -28,7 +28,7 @@ from logger import ProxyStats
 from request_connection import ClientConnection
 from routes import gemini_native
 from settings_validation import validate_settings_patch
-from upstreams import cookie_proxy
+from upstreams import cookie_transport
 
 
 def text_chunk(text="answer", thought=False, finish="STOP"):
@@ -209,14 +209,14 @@ class FirstReplyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cookie_timeout_becomes_retryable_event_and_closes_source(self):
         closed = asyncio.Event()
-        async def source(*args):
+        async def source(*args, **kwargs):
             try:
                 yield "usage", {"promptTokenCount": 1}
                 await asyncio.Event().wait()
             finally:
                 closed.set()
-        with mock.patch.object(cookie_proxy, "_execute_stream_request_generator_raw", side_effect=source):
-            events = [item async for item in cookie_proxy._execute_stream_request_generator(None, {}, {}, model="gemini-test")]
+        with mock.patch.object(cookie_transport, "_execute_stream_request_generator_raw", side_effect=source):
+            events = [item async for item in cookie_transport.stream_events(None, {}, {}, model="gemini-test")]
         self.assertTrue(closed.is_set())
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0][0], 'retryable_error')

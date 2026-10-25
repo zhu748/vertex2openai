@@ -25,7 +25,7 @@ from routes import credentials_api
 from runtime_state import AppState
 from schema_validation import SchemaValidationError
 from request_validation import validate_openai_request
-from upstreams import cookie_proxy, cookie_response
+from upstreams import cookie_transport, cookie_response
 
 
 def wire_response(part=None, *, errors=None):
@@ -41,7 +41,7 @@ class CookieWireAuditTests(unittest.IsolatedAsyncioTestCase):
         def respond(_):
             return httpx.Response(200, json=payload)
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            return [event async for event in cookie_proxy._execute_stream_request_generator_once(client, {}, {})]
+            return [event async for event in cookie_transport._execute_stream_request_generator_once(client, {}, {})]
 
     async def test_empty_graphql_errors_keep_valid_model_output(self):
         for errors in ([], None):

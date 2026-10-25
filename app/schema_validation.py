@@ -1,6 +1,5 @@
 """Defensive validation for client-supplied JSON Schemas."""
 
-import copy
 import json
 from typing import Any
 
@@ -114,6 +113,7 @@ def validate_request_schemas(request: Any) -> None:
         parameters = function.get("parameters")
         if parameters is not None:
             validate_json_schema(parameters, label=f"tools[{index}].function.parameters")
+            sanitize_for_gemini(parameters)
 
     response_format = getattr(request, "response_format", None)
     if isinstance(response_format, dict) and response_format.get("type") == "json_schema":
@@ -122,6 +122,7 @@ def validate_request_schemas(request: Any) -> None:
             raise SchemaValidationError("response_format.json_schema must be an object")
         schema = json_schema.get("schema")
         validate_json_schema(schema, label="response_format.json_schema.schema")
+        sanitize_for_gemini(schema)
 
 
 def _any_value_schema(description: str | None = None) -> dict:
@@ -134,29 +135,52 @@ def _any_value_schema(description: str | None = None) -> dict:
     return node
 
 
-def _sanitize_node(node: Any, depth: int) -> Any:
+class _ExpansionBudget:
+    def __init__(self):
+        self.nodes = 0
+        self.bytes = 0
+
+    def visit(self):
+        self.nodes += 1
+        if self.nodes > MAX_SCHEMA_NODES:
+            raise SchemaValidationError("Schema 展开超过节点数上限。")
+
+    def charge(self, value):
+        self.bytes += len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+        if self.bytes > MAX_SCHEMA_SERIALIZED_BYTES:
+            raise SchemaValidationError("Schema 展开超过字节上限。")
+
+
+def _sanitize_node(node: Any, depth: int, budget: _ExpansionBudget) -> Any:
     """OpenAI 宽松方言 -> Gemini 严格 Schema 方言（生成新树，不改写入参）。
 
     只转换会被服务端/SDK 拒绝的写法，其余键原样透传（含未知键——服务端
     对未知字段宽容，主动剥离反而可能改变既有可用行为）：
     1. 空节点（{} / true / 仅元数据）→ 全类型联合（含 description 保留）；
-    2. type 数组（["string","null"]）→ 首个非 null 类型 + nullable:true
+    2. type 数组 → anyOf；单类型 + null 使用 nullable:true
        （否则 SDK 序列化时直接 AttributeError，请求根本发不出去）；
     3. 缺 type 但有 properties/items/纯字符串 enum → 结构推断（与 Cookie
        通道 _cookie_ui_schema 同口径）；
     4. items 为数组（draft-07 元组形式）→ anyOf 联合（Gemini items 是单
        Schema）；items:true → 全类型联合。
     """
+    budget.visit()
     if node is True:
         return _any_value_schema()
     if not isinstance(node, dict):
         return node
     if depth > MAX_SANITIZE_DEPTH:
-        # 防御：未经 validate_json_schema 的病态输入（如循环引用）兜底。
-        return copy.deepcopy(node)
+        raise SchemaValidationError("Schema 转换超过最大深度。")
 
     raw_type = node.get("type")
     nullable = False
+    if isinstance(raw_type, list):
+        if not raw_type or any(not isinstance(t, str) or t.lower() not in _JSON_SCHEMA_TYPES for t in raw_type):
+            raise SchemaValidationError("Schema.type 包含不支持的类型。")
+        raw_type = [t.lower() for t in raw_type]
+    if isinstance(raw_type, list) and len(set(raw_type) - {"null"}) > 1:
+        return {"anyOf": [_sanitize_node({**node, "type": name}, depth + 1, budget)
+                          for name in dict.fromkeys(raw_type)]}
     if isinstance(raw_type, list):
         non_null = [t for t in raw_type if isinstance(t, str) and t.lower() != "null"]
         nullable = bool(non_null) and len(non_null) != len(raw_type)
@@ -175,7 +199,9 @@ def _sanitize_node(node: Any, depth: int) -> Any:
                                     "minLength", "maxLength", "pattern", "minItems", "maxItems")
         ):
             # 空节点或仅剩 title/default/$comment 等元数据：约束为空 = "any"。
-            return _any_value_schema(node.get("description") if isinstance(node.get("description"), str) else None)
+            description = node.get("description") if isinstance(node.get("description"), str) else None
+            budget.charge(description)
+            return _any_value_schema(description)
 
     out: dict[str, Any] = {}
     if raw_type is not None:
@@ -184,33 +210,97 @@ def _sanitize_node(node: Any, depth: int) -> Any:
         out["nullable"] = True
 
     for key, value in node.items():
+        budget.charge(key)
         if key in ("type", "nullable"):
             continue
         if key == "properties" and isinstance(value, dict):
-            out["properties"] = {name: _sanitize_node(child, depth + 1) for name, child in value.items()}
+            out["properties"] = {}
+            for name, child in value.items():
+                budget.charge(name)
+                out["properties"][name] = _sanitize_node(child, depth + 1, budget)
         elif key == "items":
             if isinstance(value, list):
-                out["items"] = {"anyOf": [_sanitize_node(member, depth + 1) for member in value]}
+                out["items"] = {"anyOf": [_sanitize_node(member, depth + 1, budget) for member in value]}
             elif value is True:
                 out["items"] = _any_value_schema()
             elif isinstance(value, dict):
-                out["items"] = _sanitize_node(value, depth + 1)
+                out["items"] = _sanitize_node(value, depth + 1, budget)
             elif value is False or value is None:
                 continue
             else:
                 out["items"] = value
         elif key in ("anyOf", "oneOf") and isinstance(value, list):
-            out[key] = [_sanitize_node(member, depth + 1) for member in value]
+            out[key] = [_sanitize_node(member, depth + 1, budget) for member in value]
         else:
+            budget.charge(value)
             out[key] = value
     return out
 
 
-def sanitize_for_gemini(schema: Any) -> Any:
-    """把客户端 JSON Schema 规范成 Gemini 严格方言（幂等，不改写入参）。
+def _resolve_schema_references(schema: dict) -> dict:
+    """Resolve local JSON pointers with bounded expansion; never discard constraints."""
+    budget = _ExpansionBudget()
 
-    背景：Express 通道原样透传 OpenAI 方言 schema，json_patch 类"value 可为
-    任意 JSON"的递归展开在底层留空节点（{}），Gemini 服务端 proto 校验以
-    400 INVALID_ARGUMENT "missing field" 拒绝整份请求。
-    """
-    return _sanitize_node(schema, 0)
+    def expand(node, depth, refs):
+        budget.visit()
+        if depth > MAX_SCHEMA_DEPTH:
+            raise SchemaValidationError("Schema 引用展开超过深度或节点数上限。")
+        if not isinstance(node, dict):
+            return node
+        if "allOf" in node:
+            raise SchemaValidationError("Gemini Schema 暂不支持 allOf，请合并约束后再提交。")
+        if "$ref" in node:
+            ref = node["$ref"]
+            if not isinstance(ref, str) or not ref.startswith("#/"):
+                raise SchemaValidationError("Schema 仅支持本地 JSON Pointer 引用（#/...）。")
+            if ref in refs:
+                raise SchemaValidationError("Gemini Schema 暂不支持递归 $ref。")
+            siblings = set(node) - {"$ref", "$defs", "definitions", "$schema", "description", "title", "default", "example"}
+            if siblings:
+                raise SchemaValidationError("$ref 的同级约束暂不支持，请将约束放入引用定义。")
+            target = schema
+            try:
+                for token in ref[2:].split("/"):
+                    token = token.replace("~1", "/").replace("~0", "~")
+                    target = target[token] if isinstance(target, dict) else target[int(token)]
+            except (KeyError, IndexError, TypeError, ValueError):
+                raise SchemaValidationError(f"Schema 引用不存在：{ref}") from None
+            if not isinstance(target, dict):
+                raise SchemaValidationError(f"Schema 引用目标必须是对象：{ref}")
+            resolved = expand(target, depth + 1, refs | {ref})
+            for key in {"description", "title", "default", "example"} & node.keys():
+                budget.charge(key)
+                budget.charge(node[key])
+                resolved[key] = node[key]
+            return resolved
+        out = {}
+        for key, value in node.items():
+            budget.charge(key)
+            if key in {"$defs", "definitions", "$schema"}:
+                continue
+            if key in _SCHEMA_MAP_KEYS and isinstance(value, dict):
+                out[key] = {}
+                for name, child in value.items():
+                    budget.charge(name)
+                    out[key][name] = expand(child, depth + 1, refs)
+            elif key in _SCHEMA_SINGLE_KEYS and isinstance(value, dict):
+                out[key] = expand(value, depth + 1, refs)
+            elif (key in _SCHEMA_LIST_KEYS or key == "items") and isinstance(value, list):
+                out[key] = [expand(child, depth + 1, refs) for child in value]
+            else:
+                budget.charge(value)
+                out[key] = value
+        return out
+
+    return expand(schema, 0, set())
+
+
+def sanitize_for_gemini(schema: Any) -> Any:
+    """Convert OpenAI schemas without mutating input or weakening refs/unions."""
+    if isinstance(schema, dict):
+        schema = _resolve_schema_references(schema)
+    result = _sanitize_node(schema, 0, _ExpansionBudget())
+    # Include structural overhead/expanded unconstrained nodes in the final cap.
+    if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) > MAX_SCHEMA_SERIALIZED_BYTES:
+        raise SchemaValidationError("Schema 转换结果超过字节上限。")
+    return result

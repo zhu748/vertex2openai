@@ -7,6 +7,7 @@ on:
       - 'app/**'
       - 'scripts/**'
       - 'package*.json'
+      - '.prettierrc.json'
       - 'requirements-dev.txt'
       - '.github/workflows/console-ui.yml'
   pull_request:
@@ -14,6 +15,7 @@ on:
       - 'app/**'
       - 'scripts/**'
       - 'package*.json'
+      - '.prettierrc.json'
       - 'requirements-dev.txt'
       - '.github/workflows/console-ui.yml'
   workflow_dispatch:
@@ -49,6 +51,8 @@ jobs:
         run: |
           pip install -r requirements-dev.txt
           npm ci
+      - name: Check JavaScript formatting
+        run: npm run check:format
       - name: DOM interaction regression
         run: npm run test:console
       - name: Verify generated styles

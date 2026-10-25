@@ -3,10 +3,12 @@
 import base64
 import io
 import re
+import time
 from typing import Optional, Tuple
 
 import config as app_config
 import httpx
+from media_tasks import check_media_budget
 from proxy_tls import build_httpx_proxy
 from runtime_state import app_state, get_effective_proxy_url, get_effective_proxy_urls
 
@@ -21,6 +23,7 @@ def optimize_image_bytes(
 ) -> Tuple[bytes, str]:
     """输入图片压缩引擎：可在控制台配置开关/边长/质量/体积阈值。
     超过阈值的图会限制最长边并重采样，避免多轮修图卡死。"""
+    check_media_budget()
     if Image is None:
         return image_data, original_mime
 
@@ -185,23 +188,33 @@ def fetch_remote_image(url: str, timeout: float = 10.0) -> Optional[Tuple[bytes,
     if chain is None:
         candidates = get_effective_proxy_urls() or [get_effective_proxy_url()]
         chain = ProxyChain(candidates=candidates)
+    deadline = time.monotonic() + min(timeout, check_media_budget())
     try:
-        return chain.run_sync(lambda raw, resolved: _fetch_remote_image_once(url, timeout, resolved))
+        return chain.run_sync(lambda raw, resolved: _fetch_remote_image_once(url, timeout, resolved, deadline=deadline))
     except Exception as exc:
         print(f"⚠️ [图片处理] 获取远程图片失败，已跳过：{url[:120]}，原因：{type(exc).__name__}")
         return None
 
 
-def _fetch_remote_image_once(url, timeout, proxy_url):
+def _fetch_remote_image_once(url, timeout, proxy_url, *, deadline=None):
     from urllib.parse import urlparse
 
+    deadline = deadline if deadline is not None else time.monotonic() + timeout
+
+    def remaining():
+        budget = min(deadline - time.monotonic(), check_media_budget())
+        if budget <= 0:
+            raise TimeoutError("远程图片下载超过总超时时间。")
+        return budget
+
+    remaining()
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         raise ValueError(f"不支持的 URL 协议：{parsed.scheme or '(空)'}")
     if _is_blocked_host(parsed.hostname or ""):
         raise ValueError("目标地址指向内网/环回/链路本地，已拒绝")
 
-    client_args = {"timeout": timeout, "follow_redirects": False, "trust_env": False}
+    client_args = {"timeout": remaining(), "follow_redirects": False, "trust_env": False}
     if proxy_url:
         client_args["proxy"] = build_httpx_proxy(proxy_url, verify=app_config.SSL_CERT_FILE or True)
     if getattr(app_config, "SSL_CERT_FILE", None):
@@ -223,6 +236,7 @@ def _fetch_remote_image_once(url, timeout, proxy_url):
                 "GET",
                 pinned_url,
                 headers=image_headers,
+                timeout=remaining(),
                 extensions={"sni_hostname": original_url.raw_host.decode("ascii")},
             ) as resp:
                 if resp.is_redirect:
@@ -241,9 +255,11 @@ def _fetch_remote_image_once(url, timeout, proxy_url):
                 if mime and not mime.startswith("image/"):
                     raise ValueError(f"响应不是图片（content-type={mime}）")
                 data = bytearray()
-                for chunk in resp.iter_bytes(chunk_size=64 * 1024):
+                for chunk in resp.iter_bytes():
+                    remaining()
                     if len(data) + len(chunk) > MAX_REMOTE_IMAGE_BYTES:
                         raise ValueError(f"图片超过 {MAX_REMOTE_IMAGE_BYTES // (1024 * 1024)}MB 上限")
                     data.extend(chunk)
+                remaining()
                 return bytes(data), mime or "image/jpeg"
         raise ValueError("重定向次数过多")

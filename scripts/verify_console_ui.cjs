@@ -1079,6 +1079,41 @@ async function main() {
     assert.equal(await failedPage.locator('#scope-draft-state').isVisible(),false);
     check('参数分区链接在直接打开及刷新后定位正确，本页草稿不会跨刷新残留');
     await page.bringToFront();
+    // Two real editors share an initial snapshot; the stale editor must not
+    // undo a newer enable/disable change or lose its unsaved note.
+    for(const [endpoint,field,kind,prefix,saveName] of [
+      ['express-keys','keys','key','k','saveExpressKeys'],
+      ['cookie-accounts','accounts','cookie','c','saveCookieAccounts']
+    ]){
+      const initial=await (await page.request.get(origin+'/api/'+endpoint)).json();
+      const editorA=await context.newPage(), editorB=await context.newPage();
+      for(const editor of [editorA,editorB]){
+        await editor.goto(origin+'/#channel');
+        await editor.waitForFunction(()=>keysLoaded && document.querySelectorAll('[data-cookie-index]').length===2);
+        await editor.evaluate(kind=>consoleForms.openAccount(kind,0),kind);
+      }
+      const toggle=editorA.locator('.'+prefix+'-enabled').first();
+      const enabled=await toggle.isChecked();
+      await toggle.setChecked(!enabled);
+      let save=editorA.waitForResponse(r=>new URL(r.url()).pathname==='/api/'+endpoint && r.request().method()==='POST');
+      await editorA.locator('button[onclick*="'+saveName+'"]').click();
+      assert.equal((await save).status(),200);
+      const note='stale editor draft '+kind;
+      await editorB.locator('.'+prefix+'-note').first().fill(note);
+      save=editorB.waitForResponse(r=>new URL(r.url()).pathname==='/api/'+endpoint && r.request().method()==='POST');
+      await editorB.locator('button[onclick*="'+saveName+'"]').click();
+      assert.equal((await save).status(),409);
+      await editorB.waitForFunction(()=>document.querySelector('#channel-load-error').textContent.includes('草稿已保留'));
+      assert.equal(await editorB.locator('.'+prefix+'-note').first().inputValue(),note);
+      assert.equal(await editorB.evaluate(()=>consoleForms.dirty()),true);
+      const latest=await (await page.request.get(origin+'/api/'+endpoint)).json();
+      assert.equal(latest[field][0].enabled,!enabled);
+      assert.notEqual(latest[field][0].note,note);
+      assert.equal((await page.request.post(origin+'/api/'+endpoint,{data:{[field]:initial[field],revision:latest.revision}})).status(),200);
+      await editorA.close();await editorB.close();
+      check(kind+' 跨标签页保存冲突返回 409，保留草稿及服务器新状态');
+    }
+    await page.bringToFront();
     const beforeLogout=page.url();
     await page.route('**/api/logout',route=>route.fulfill({status:503,json:{error:'测试退出失败'}}));
     pending=responseFor('/api/logout');

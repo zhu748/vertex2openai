@@ -28,7 +28,7 @@ from express_key_manager import ExpressKeyManager
 from logger import ProxyStats
 from retry_policy import retry_delay
 from upstreams import express_sdk
-from upstreams import cookie_proxy
+from upstreams import cookie_transport, cookie_proxy
 from http_options import get_http_options
 
 
@@ -421,7 +421,7 @@ class CookieRetryTests(unittest.IsolatedAsyncioTestCase):
             async with httpx.AsyncClient(transport=httpx.MockTransport(
                     lambda request: httpx.Response(code, headers={"retry-after": "2.5"},
                                                    json={"error": "quota model-429"}))) as client:
-                events = [event async for event in cookie_proxy._execute_stream_request_generator_once(client, {}, {})]
+                events = [event async for event in cookie_transport._execute_stream_request_generator_once(client, {}, {})]
             self.assertEqual(events[0][0], expected)
             self.assertEqual(events[0][1].retry_after, "2.5")
 
@@ -431,7 +431,7 @@ class CookieRetryTests(unittest.IsolatedAsyncioTestCase):
             yield "api_error_text", "connection interrupted"
 
         obj = api_helpers.OpenAIRequest(model="gemini-3.6-flash", messages=[], stream=True)
-        with mock.patch.object(cookie_proxy, "_execute_stream_request_generator", side_effect=events):
+        with mock.patch.object(cookie_proxy, "stream_events", side_effect=events):
             response = await cookie_proxy.CookieProxyUpstream().chat_completions(obj, self.request)
             body = "".join([chunk async for chunk in response.body_iterator])
         self.assertIn('"error"', body)

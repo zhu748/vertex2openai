@@ -32,7 +32,7 @@ import request_tracking
 from request_tracking import attempt_started_at, upstream_attempt
 from express_key_manager import ExpressKeyManager
 from routes import gemini_native
-from upstreams import cookie_proxy
+from upstreams import cookie_transport, cookie_proxy
 
 
 class FormatTests(unittest.TestCase):
@@ -563,10 +563,10 @@ class LoopbackTests(unittest.IsolatedAsyncioTestCase):
             app_state.update_settings({"cookie_impersonate": "off", "retry_max": 0})
             chain = ProxyChain({"proxies": [proxy]})
             with self.subTest(clean_eof=clean_eof), \
-                 mock.patch.object(cookie_proxy, "BATCH_GRAPHQL_URL", "http://unused.invalid/test"):
+                 mock.patch.object(cookie_transport, "BATCH_GRAPHQL_URL", "http://unused.invalid/test"):
                 async with open_upstream_client({"timeout": httpx.Timeout(2), "trust_env": False,
                                                  "_proxy_chain": chain}) as client:
-                    events = [item async for item in cookie_proxy._execute_stream_request_generator(
+                    events = [item async for item in cookie_proxy.stream_events(
                         client, {}, {}, model="gemini-test")]
             self.assertIn(("text", "answer"), events)
             self.assertNotIn("fatal_error", [status for status, _ in events])

@@ -8,7 +8,7 @@ toggle.addEventListener('click', () => {
   toggle.setAttribute('aria-label', visible ? '隐藏密码' : '显示密码');
   toggle.setAttribute('aria-pressed', String(visible));
 });
-document.getElementById('login-form').addEventListener('submit', async event => {
+document.getElementById('login-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const button = document.getElementById('login-submit');
   const error = document.getElementById('err');
@@ -23,20 +23,25 @@ document.getElementById('login-form').addEventListener('submit', async event => 
   try {
     const response = await fetch('/api/login', {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({password: password.value}),
-      signal: AbortSignal.timeout(15000),
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: password.value }),
+      signal: AbortSignal.timeout(15000)
     });
-    if (response.ok) { location.assign('/'); return; }
+    if (response.ok) {
+      location.assign('/');
+      return;
+    }
     const result = await response.json().catch(() => ({}));
-    error.textContent = result.error || (response.status === 429 ? '尝试过于频繁，请稍后再试' : '登录失败，请重试');
+    error.textContent =
+      result.error || (response.status === 429 ? '尝试过于频繁，请稍后再试' : '登录失败，请重试');
     if (response.status === 401) {
       password.setAttribute('aria-invalid', 'true');
       password.focus();
       password.select();
     }
   } catch (err) {
-    error.textContent = err.name === 'TimeoutError' ? '连接超时，请稍后再试' : '无法连接服务，请检查网络后重试';
+    error.textContent =
+      err.name === 'TimeoutError' ? '连接超时，请稍后再试' : '无法连接服务，请检查网络后重试';
   } finally {
     button.disabled = false;
     const label = button.firstChild;

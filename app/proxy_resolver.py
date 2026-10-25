@@ -1,44 +1,15 @@
-"""出站代理解析与协议转换（多协议代理支持层）。
+"""Resolve proxy routes and own the lifecycle of local conversion processes.
 
-背景：项目所有上游请求都走 httpx / curl_cffi，它们原生只认
-  http:// https:// socks5:// socks5h://
-四种代理 URL。而现实中大量用户手里是 vless:// vmess:// trojan:// ss://
-socks4:// hysteria2:// tuic:// 等分享链接——这些协议 httpx 无法直接消费。
-
-本模块的职责（三层）：
-  1. 解析层：把各种代理分享 URI 解析成 sing-box 的 outbound JSON 片段；
-  2. 运行层：SingboxManager 为每个「sing-box 系协议」的 URI 惰性启动一个
-     sing-box 子进程（本地 127.0.0.1:{动态端口} 的 socks5 入站 → 远端 outbound），
-     Python 侧统一连本地 socks5，对 httpx/curl_cffi 完全透明；
-  3. 统一入口 resolve_proxy_uri()：
-       http/https/socks5/socks5h → 原样返回（零开销，不经 sing-box）；
-       socks4/socks4a/vless/vmess/trojan/ss/hysteria2/tuic → 本地 socks5 URL；
-       turn/turns/sstp → 独立转换器提供的本地 socks5 URL；
-       direct/none/直连 → 空串（强制直连）；空串 → 空串。
-
-设计决策（与用户确认过）：
-  - sing-box 二进制：Docker 镜像内置；非 Docker 运行时自动探测
-    （环境变量 SINGBOX_BIN → 常见路径 → PATH）；
-  - 环境缺失 sing-box 时**明确报错**（ProxyResolveError），绝不静默直连，
-    防止真实服务器 IP 意外泄露；
-  - 同一 URI 全进程只起一个 sing-box 实例（端口稳定复用，池签名不抖动）；
-    空闲超时自动回收（SINGBOX_IDLE_MINUTES，默认 30，0 = 不回收）。
-
-sing-box 配置模板（每个实例一份）：
-  { "log": {"level": "warn"},
-    "inbounds": [{"type": "socks", "tag": "in", "listen": "127.0.0.1",
-                  "listen_port": PORT}],
-    "outbounds": [OB({"tag": "proxy"}), {"type": "direct", "tag": "direct"}],
-    "route": {"final": "proxy"} }
-
-sing-box 的 socks5 入站不开启 sniff：上游域名交给该节点解析。
-TURN / SSTP 转换器需要目标 IP，使用本机 DNS；见 docs/proxy-turn-sstp.md。
+URI parsing, validation and redaction live in proxies.protocols; the existing
+public helper imports remain available here for callers. Native proxies pass
+through unchanged. sing-box and TURN/SSTP routes use retained, reusable local
+SOCKS listeners, and conversion failure never falls back to direct access.
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
+import atexit
 import glob
 import hashlib
 import json
@@ -48,29 +19,43 @@ import socket
 import subprocess
 import threading
 import time
-import atexit
 import weakref
 from contextvars import ContextVar
-from typing import Any, Optional
-from urllib.parse import unquote, parse_qs, urlsplit, urlunsplit
-from proxy_config import (BRIDGE_PROXY_SCHEMES, DIRECT_TOKENS, ProxyFormatError,
-                          build_proxy_uri, normalize_proxy_uri, parse_bridge_proxy_uri)
+from typing import Optional
 
-
-class ProxyResolveError(Exception):
-    """代理解析/转换失败。消息面向最终用户，须给出可操作的指引。"""
-    code = 502
-
-    def __init__(self, message, *, retry_new_port=True):
-        super().__init__(message)
-        self.retry_new_port = retry_new_port
-
+from proxies.protocols import (
+    ALL_PROXY_SCHEMES,
+    _uri_scheme,
+)
+from proxies.protocols import (
+    ProxyResolveError as ProxyResolveError,
+)
+from proxies.protocols import (
+    classify_proxy_uri as classify_proxy_uri,
+)
+from proxies.protocols import (
+    mask_proxy_uri as mask_proxy_uri,
+)
+from proxies.protocols import (
+    parse_share_uri_to_outbound as parse_share_uri_to_outbound,
+)
+from proxies.protocols import (
+    validate_proxy_uri as validate_proxy_uri,
+)
+from proxy_config import (
+    DIRECT_TOKENS,
+    ProxyFormatError,
+    build_proxy_uri,
+    normalize_proxy_uri,
+    parse_bridge_proxy_uri,
+)
 
 current_proxy_usage = ContextVar("current_proxy_usage", default=None)
 
 
 class ProxyUsage:
     """Keep every proxy touched by a generation alive until its stream closes."""
+
     def __init__(self, *, temporary=False):
         self._entries = set()
         self._temporary_entries = set()
@@ -109,493 +94,6 @@ class ProxyUsage:
 
 
 # ============================================================
-# 协议分类
-# ============================================================
-
-# httpx[socks] / curl_cffi 原生支持：原样透传，不经过 sing-box
-NATIVE_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
-
-# 需要 sing-box 转换的协议（scheme 小写）
-SINGBOX_PROXY_SCHEMES = {
-    "socks4", "socks4a",
-    "vless", "vmess", "trojan",
-    "ss", "hysteria2", "hy2", "tuic",
-}
-
-# 「强制直连」哨兵值（Key 级代理里最常用，全局代理里等价于留空）
-ALL_PROXY_SCHEMES = NATIVE_PROXY_SCHEMES | SINGBOX_PROXY_SCHEMES | BRIDGE_PROXY_SCHEMES
-
-
-def _uri_scheme(uri: str) -> str:
-    try:
-        return (urlsplit(uri).scheme or "").strip().lower()
-    except Exception:
-        return ""
-
-
-def classify_proxy_uri(uri: str) -> str:
-    """分类代理 URI：native / singbox / bridge / direct / invalid。"""
-    try:
-        value = normalize_proxy_uri(str(uri or ""))
-    except ProxyFormatError:
-        return "invalid"
-    if not value:
-        return "direct"
-    if value.lower() in DIRECT_TOKENS:
-        return "direct"
-    scheme = _uri_scheme(value)
-    if scheme in NATIVE_PROXY_SCHEMES:
-        return "native"
-    if scheme in SINGBOX_PROXY_SCHEMES:
-        return "singbox"
-    if scheme in BRIDGE_PROXY_SCHEMES:
-        return "bridge"
-    return "invalid"
-
-
-# ============================================================
-# 基础工具
-# ============================================================
-
-def _b64decode_text(s: str) -> str:
-    """宽容的 base64 解码：去空白（链接常被折行复制）+ urlsafe 归一 + 补 padding + utf-8。"""
-    s = "".join(str(s or "").split()).replace("-", "+").replace("_", "/")
-    s += "=" * (-len(s) % 4)
-    return base64.b64decode(s).decode("utf-8", errors="strict")
-
-
-def _to_port(text: Any, uri: str) -> int:
-    """端口文本 → int；非数字/越界统一报 ProxyResolveError（否则会以裸
-    ValueError 冒出去，错误信息晦涩且消费方难归类）。"""
-    try:
-        port = int(str(text).strip())
-    except (TypeError, ValueError):
-        raise ProxyResolveError("代理节点端口不是数字。") from None
-    if not (1 <= port <= 65535):
-        raise ProxyResolveError("代理节点端口超出 1–65535。")
-    return port
-
-
-def _parse_host_port(hostport: str, uri: str) -> tuple[str, int]:
-    """'host:port'（兼容 IPv6 [::1]:443 与 SIP002 尾斜杠）→ (host, port)。"""
-    hostport = (hostport or "").strip().rstrip("/")
-    if not hostport:
-        raise ProxyResolveError("代理节点缺少主机与端口。")
-    if hostport.startswith("["):                      # IPv6 字面量
-        end = hostport.find("]")
-        if end < 0:
-            raise ProxyResolveError("代理节点 IPv6 地址格式不完整。")
-        host = hostport[1:end]
-        rest = hostport[end + 1:]
-        if not rest.startswith(":"):
-            raise ProxyResolveError("代理节点缺少端口。")
-        port = _to_port(rest[1:], uri)
-    else:
-        if ":" not in hostport:
-            raise ProxyResolveError("代理节点缺少端口（正确形态 host:port）。")
-        host, _, port_s = hostport.rpartition(":")
-        port = _to_port(port_s, uri)
-    if not host:
-        raise ProxyResolveError("代理节点缺少服务器地址。")
-    return host, port
-
-
-def _qs(query: str) -> dict[str, str]:
-    """查询串 → 单值 dict（重复键取首个；同名不同值时告警）。"""
-    try:
-        parsed = parse_qs(query or "", keep_blank_values=True)
-    except Exception:
-        return {}
-    for key, values in parsed.items():
-        # 同名不同值的重复参数（如 path=/a&path=/b）静默取首个会掩盖节点真实
-        # 配置（与 bridge URI 的严格重复检测不对齐）；值不打到日志防泄露。
-        if len(values) > 1 and len(set(values)) > 1:
-            print(f"⚠️ [代理] 链接参数 {key!r} 重复出现且取值不同，已采用首个值。")
-    return {k: v[0] for k, v in parsed.items()}
-
-
-def _truthy(v: str) -> bool:
-    return str(v or "").strip().lower() in ("1", "true", "yes")
-
-
-# ============================================================
-# TLS / transport 公共构造（vless / vmess / trojan 共用）
-# ============================================================
-
-def _build_tls(q: dict, *, default_sni: str = "", force: bool = False,
-               allow_insecure_param: bool = True) -> Optional[dict]:
-    """从查询参数构造 sing-box tls 对象。
-
-    security: tls / reality（vless 用）；trojan/vmess 由调用方决定 force。
-    utls 指纹（fp=chrome 等）一并挂上——分享链接几乎都带，sing-box 全支持。
-    """
-    security = str(q.get("security") or "").strip().lower()
-    if security not in ("", "none", "tls", "reality"):
-        raise ProxyResolveError("不支持该 TLS security 类型，不能自动改为未加密连接。")
-    enabled = force or security in ("tls", "reality")
-    if not enabled:
-        return None
-    tls: dict[str, Any] = {"enabled": True}
-    sni = str(q.get("sni") or q.get("peer") or "").strip() or default_sni
-    if sni:
-        tls["server_name"] = sni
-    alpn = str(q.get("alpn") or "").strip()
-    if alpn:
-        tls["alpn"] = [a for a in alpn.split(",") if a.strip()]
-    fp = str(q.get("fp") or "").strip()
-    if fp:
-        tls["utls"] = {"enabled": True, "fingerprint": fp}
-    if allow_insecure_param and (_truthy(q.get("allowInsecure")) or _truthy(q.get("insecure"))):
-        tls["insecure"] = True
-    if security == "reality":
-        # sing-box 要求 REALITY 必须带 uTLS 指纹；分享链接偶有漏带 fp 的，
-        # 缺省会直接拒启（"missing uTLS fingerprint"），这里补最常见的 chrome。
-        if not fp:
-            tls["utls"] = {"enabled": True, "fingerprint": "chrome"}
-        reality: dict[str, Any] = {"enabled": True, "public_key": str(q.get("pbk") or "")}
-        sid = str(q.get("sid") or "").strip()
-        if sid:
-            reality["short_id"] = sid
-        tls["reality"] = reality
-    return tls
-
-
-def _build_transport(net: str, q: dict) -> Optional[dict]:
-    """从查询参数构造 sing-box transport 对象，未知类型明确拒绝。
-
-    vless/trojan 用 type= 参数；vmess 用 net= 字段（值域相同，调用方归一后传入）。
-    tcp / 无值 → 返回 None（不设 transport）。
-    """
-    net = (net or "tcp").strip().lower()
-    if net in ("", "tcp", "raw", "none"):
-        if str(q.get("headerType") or "none").strip().lower() != "none":
-            raise ProxyResolveError("当前转换不支持 TCP 伪装头，不能忽略伪装要求改用普通 TCP。")
-        return None
-    if net == "ws":
-        tr: dict[str, Any] = {"type": "ws"}
-        # 注意：_qs/parse_qs 已做过一次百分号解码，这里**不再** unquote——
-        # 否则 path=%252F 这类字面量 "(%2F)" 会被二次解码成 "/"，改掉真实路径。
-        path = str(q.get("path") or "").strip()
-        if path:
-            tr["path"] = path
-        host = str(q.get("host") or "").strip()
-        if host:
-            tr["headers"] = {"Host": host}
-        ed = str(q.get("ed") or "").strip()          # WebSocket 0-RTT（SFM/V2Ray 分支）
-        if ed.isdigit():
-            tr["max_early_data"] = int(ed)
-            tr["early_data_header_name"] = "Sec-WebSocket-Protocol"
-        return tr
-    if net == "grpc":
-        tr = {"type": "grpc"}
-        service = str(q.get("serviceName") or q.get("servicename") or "").strip()
-        if service:
-            tr["service_name"] = service
-        return tr
-    if net in ("http", "h2"):
-        tr = {"type": "http"}
-        host = str(q.get("host") or "").strip()
-        if host:
-            tr["host"] = [h for h in host.split(",") if h.strip()]
-        path = str(q.get("path") or "").strip()
-        if path:
-            tr["path"] = path          # 同上：parse_qs 已解码，不二次 unquote
-        return tr
-    if net == "httpupgrade":
-        tr = {"type": "httpupgrade"}
-        for field in ("host", "path"):
-            if q.get(field):
-                tr[field] = str(q[field])
-        return tr
-    if net == "quic":
-        if (str(q.get("quicSecurity") or "none").lower() != "none"
-                or q.get("key") or str(q.get("headerType") or "none").lower() != "none"):
-            raise ProxyResolveError("QUIC 传输不支持额外加密、密钥或伪装头，不能转换为普通 QUIC。")
-        return {"type": "quic"}
-    raise ProxyResolveError("不支持该传输类型；可用 tcp/ws/grpc/http/h2/httpupgrade/quic，不能自动改为 TCP。")
-
-
-# ============================================================
-# 各协议 URI → sing-box outbound
-# ============================================================
-
-def _require_port(parts, scheme: str, *, default: int | None = None) -> int:
-    """从 urlsplit 结果取端口；缺失/非法/越界直接报错（sing-box 配置不允许）。"""
-    try:
-        port = parts.port
-    except ValueError as e:
-        raise ProxyResolveError(f"{scheme} 链接端口不合法：{e}")
-    if port is None:
-        if default is not None:
-            return default
-        raise ProxyResolveError(f"{scheme} 链接缺少端口（正确形态 {scheme}://…@host:port）。")
-    if port < 1:
-        raise ProxyResolveError(f"{scheme} 链接端口必须在 1–65535 范围内（收到 {port}）。")
-    return port
-
-
-def _parse_vless(uri: str) -> dict:
-    """vless://uuid@host:port?encryption=none&security=tls&sni=..&type=ws&path=..&fp=..#name"""
-    parts = urlsplit(uri)
-    uuid = unquote(parts.username or "")
-    if not uuid:
-        raise ProxyResolveError("vless 链接缺少 UUID（正确形态 vless://uuid@host:port?…）。")
-    server = parts.hostname or ""
-    if not server:
-        raise ProxyResolveError("vless 链接缺少服务器地址。")
-    port = _require_port(parts, "vless")
-    ob: dict[str, Any] = {"type": "vless", "server": server, "server_port": port, "uuid": uuid}
-    q = _qs(parts.query)
-    if str(q.get("encryption") or "none").strip().lower() != "none":
-        raise ProxyResolveError("当前 VLESS 转换仅支持 encryption=none，不能忽略额外加密要求。")
-    flow = str(q.get("flow") or "").strip()
-    tls = _build_tls(q)
-    if flow:
-        if tls is None:
-            raise ProxyResolveError("VLESS flow 需要 TLS 或 REALITY，不能忽略 flow 改用普通 VLESS。")
-        ob["flow"] = flow
-    if tls:
-        ob["tls"] = tls
-    tr = _build_transport(str(q.get("type") or ""), q)
-    if tr:
-        ob["transport"] = tr
-    return ob
-
-
-def _parse_vmess(uri: str) -> dict:
-    """vmess://base64(json)。json 字段：add/port/id/aid/scy/net/tls/sni/host/path/type。"""
-    payload = uri[len("vmess://"):]
-    try:
-        data = json.loads(_b64decode_text(payload))
-    except Exception as e:
-        raise ProxyResolveError(f"vmess 链接的 base64/JSON 无法解码：{e}")
-    if not isinstance(data, dict):
-        raise ProxyResolveError("vmess 链接解码后不是 JSON 对象。")
-    server = str(data.get("add") or "").strip()
-    if not server:
-        raise ProxyResolveError("vmess 链接缺少服务器地址（add 字段）。")
-    try:
-        port = int(data.get("port"))
-    except (TypeError, ValueError):
-        raise ProxyResolveError("vmess 链接缺少有效端口（port 字段）。")
-    if not (1 <= port <= 65535):
-        raise ProxyResolveError(f"vmess 链接端口必须在 1–65535 范围内（收到 {port}）。")
-    uuid = str(data.get("id") or "").strip()
-    if not uuid:
-        raise ProxyResolveError("vmess 链接缺少用户 ID（id 字段）。")
-    ob: dict[str, Any] = {
-        "type": "vmess", "server": server, "server_port": port, "uuid": uuid,
-        "security": str(data.get("scy") or "auto"),
-    }
-    try:
-        ob["alter_id"] = int(data.get("aid") or 0)
-    except (TypeError, ValueError):
-        pass
-    tls_mode = str(data.get("tls", "")).strip().lower()
-    if tls_mode not in ("", "none", "0", "false", "tls", "1", "true"):
-        raise ProxyResolveError("vmess 链接使用了不支持的 TLS 类型，不能自动改为未加密连接。")
-    if tls_mode in ("tls", "1", "true"):
-        q = {
-            "sni": data.get("sni"), "alpn": data.get("alpn"),
-            "fp": data.get("fp"),
-            "allowInsecure": data.get("allowInsecure"),
-        }
-        tls = _build_tls({k: v for k, v in q.items() if v}, force=True, default_sni=server)
-        if tls:
-            ob["tls"] = tls
-    tr = _build_transport(str(data.get("net") or ""), {
-        "path": data.get("path"), "host": data.get("host"),
-        "headerType": data.get("type"),
-        "serviceName": data.get("path") if str(data.get("net") or "").lower() == "grpc" else "",
-        **({"quicSecurity": data.get("host"), "key": data.get("path"), "headerType": data.get("type")}
-           if str(data.get("net") or "").lower() == "quic" else {}),
-    })
-    if tr:
-        ob["transport"] = tr
-    return ob
-
-
-def _parse_trojan(uri: str) -> dict:
-    """trojan://password@host:port?sni=..&type=ws&path=..&fp=..#name（TLS 强制开启）"""
-    parts = urlsplit(uri)
-    password = unquote(parts.username or "")
-    if parts.password is not None:
-        # 密码含未编码冒号：urlsplit 把 userinfo 切成 username:password 两段，
-        # 旧实现静默丢弃后者导致连错密码（握手失败无提示指向截断）。Trojan 的
-        # userinfo 整体即密码，拼回完整值；规范写法应把冒号编码为 %3A。
-        password = unquote(parts.username or "") + ":" + unquote(parts.password)
-        print("⚠️ [代理] trojan 密码含未编码的冒号，已按原样拼接；建议改为 %3A 编码以避免歧义。")
-    if not password:
-        raise ProxyResolveError("trojan 链接缺少密码（userinfo 部分）。")
-    server = parts.hostname or ""
-    if not server:
-        raise ProxyResolveError("trojan 链接缺少服务器地址。")
-    port = _require_port(parts, "trojan")
-    ob: dict[str, Any] = {"type": "trojan", "server": server, "server_port": port,
-                          "password": password}
-    q = _qs(parts.query)
-    tls = _build_tls(q, force=True, default_sni=server)
-    if tls:
-        ob["tls"] = tls
-    tr = _build_transport(str(q.get("type") or ""), q)
-    if tr:
-        ob["transport"] = tr
-    return ob
-
-
-def _parse_ss(uri: str) -> dict:
-    """ss://（三种形态：SIP002 base64 userinfo / SIP002 明文 / 旧式整体 base64）。"""
-    body = uri[len("ss://"):]
-    if "#" in body:
-        body = body.split("#", 1)[0]
-    if "?" in body:
-        body, _, query = body.partition("?")
-        if _qs(query).get("plugin"):
-            # SIP003 plugin（v2ray-plugin/obfs 等）需要额外外部程序配合，
-            # 静默忽略会产出一个永远连不上的代理、错误还难排查——明确拒绝。
-            raise ProxyResolveError(
-                "ss 链接启用了 SIP003 plugin（如 v2ray-plugin/obfs），本项目暂不支持："
-                "请换不带 plugin 的节点，或改用 vless/trojan/vmess 等协议的分享链接。")
-    userinfo: str
-    percent_encoded = False
-    if "@" in body:
-        userinfo_raw, hostport = body.rsplit("@", 1)
-        userinfo = userinfo_raw
-        if ":" not in userinfo:                       # base64(method:password)
-            try:
-                userinfo = _b64decode_text(userinfo_raw)
-            except Exception:
-                raise ProxyResolveError("ss 链接的 userinfo 无法解码（应为 base64(method:password)）。")
-        else:
-            percent_encoded = True
-    else:                                             # 旧式：整体 base64(method:pass@host:port)
-        try:
-            decoded = _b64decode_text(body)
-        except Exception as e:
-            raise ProxyResolveError(f"ss 链接无法解码：{e}")
-        if "@" not in decoded:
-            raise ProxyResolveError("ss 链接格式不认识（既非 SIP002 也非旧式 base64）。")
-        userinfo, _, hostport = decoded.rpartition("@")
-    method, _, password = userinfo.partition(":")
-    if percent_encoded:
-        method, password = unquote(method), unquote(password)
-    if not method or not password:
-        raise ProxyResolveError("ss 链接缺少 method:password（userinfo 解析失败）。")
-    host, port = _parse_host_port(hostport, uri)
-    return {"type": "shadowsocks", "server": host, "server_port": port,
-            "method": method, "password": password}
-
-
-def _parse_socks4(uri: str, version: str = "4") -> dict:
-    """socks4://[user@]host:port → sing-box socks outbound（version 4 / 4a）。"""
-    parts = urlsplit(uri)
-    server = parts.hostname or ""
-    if not server:
-        raise ProxyResolveError("socks4 链接缺少服务器地址。")
-    port = _require_port(parts, "socks4")
-    ob: dict[str, Any] = {"type": "socks", "server": server, "server_port": port,
-                          "version": version}
-    user = unquote(parts.username or "")
-    if user:
-        ob["username"] = user
-    return ob
-
-
-def _parse_hysteria2(uri: str) -> dict:
-    """hysteria2://auth@host:port?sni=..&insecure=1&obfs=salamander&obfs-password=..#name"""
-    parts = urlsplit(uri)
-    auth = unquote(parts.username or "")
-    if parts.password is not None:
-        auth += ":" + unquote(parts.password)
-    if not auth:
-        raise ProxyResolveError("hysteria2 链接缺少认证密码（userinfo 部分）。")
-    server = parts.hostname or ""
-    if not server:
-        raise ProxyResolveError("hysteria2 链接缺少服务器地址。")
-    port = _require_port(parts, "hysteria2", default=443)
-    ob: dict[str, Any] = {"type": "hysteria2", "server": server, "server_port": port,
-                          "password": auth}
-    q = _qs(parts.query)
-    if q.get("mport"):
-        # 端口跳跃（mport=443,8443 或 443-8443）无法等价转换为单端口出站；
-        # 旧实现静默忽略会只连基础端口、高峰期实际不可用，与 docs 声明的
-        # 「多端口列表会被拒绝」直接矛盾——按 fail-closed 原则明确拒绝。
-        raise ProxyResolveError(
-            "当前 Hysteria2 转换不支持端口跳跃参数 mport（多端口/端口范围无法"
-            "等价转换为单端口出站）：请使用不带 mport 的节点，或改用原生客户端。")
-    if q.get("pinSHA256") or q.get("ech"):
-        raise ProxyResolveError("当前 Hysteria2 转换不支持 pinSHA256 或 ECH，不能忽略这些 TLS 校验参数。")
-    if q.get("up") or q.get("down"):
-        # 带宽参数只影响速度控制不影响连通性，丢弃可接受，但不再静默。
-        print("ℹ️ [代理] hysteria2 的 up/down 带宽参数已忽略（不影响连通性，仅放弃限速）。")
-    tls: dict[str, Any] = {"enabled": True, "alpn": ["h3"]}
-    sni = str(q.get("sni") or "").strip()
-    if sni:
-        tls["server_name"] = sni
-    if _truthy(q.get("insecure")):
-        tls["insecure"] = True
-    ob["tls"] = tls
-    obfs = str(q.get("obfs") or "").strip().lower()
-    if obfs == "salamander":
-        ob["obfs"] = {"type": "salamander", "password": str(q.get("obfs-password") or "")}
-    elif obfs:
-        raise ProxyResolveError(f"hysteria2 不支持的混淆类型：{obfs}（仅 salamander）。")
-    return ob
-
-
-def _parse_tuic(uri: str) -> dict:
-    """tuic://uuid:password@host:port?congestion_control=bbr&alpn=h3&sni=..#name"""
-    parts = urlsplit(uri)
-    user = unquote(parts.username or "")
-    password = unquote(parts.password or "")
-    if not user:
-        raise ProxyResolveError("tuic 链接缺少 UUID（userinfo 部分）。")
-    server = parts.hostname or ""
-    if not server:
-        raise ProxyResolveError("tuic 链接缺少服务器地址。")
-    port = _require_port(parts, "tuic")
-    q = _qs(parts.query)
-    ob: dict[str, Any] = {"type": "tuic", "server": server, "server_port": port,
-                          "uuid": user, "password": password,
-                          "congestion_control": str(q.get("congestion_control") or "bbr")}
-    tls: dict[str, Any] = {"enabled": True}
-    sni = str(q.get("sni") or "").strip()
-    if sni:
-        tls["server_name"] = sni
-    alpn = str(q.get("alpn") or "h3").strip()
-    if alpn:
-        tls["alpn"] = [a for a in alpn.split(",") if a.strip()]
-    if _truthy(q.get("allow_insecure")) or _truthy(q.get("insecure")):
-        tls["insecure"] = True
-    ob["tls"] = tls
-    return ob
-
-
-def parse_share_uri_to_outbound(uri: str) -> dict:
-    """代理分享 URI → sing-box outbound JSON（dict）。只接受 sing-box 系协议。"""
-    scheme = _uri_scheme(uri)
-    if scheme == "vless":
-        return _parse_vless(uri)
-    if scheme == "vmess":
-        return _parse_vmess(uri)
-    if scheme == "trojan":
-        return _parse_trojan(uri)
-    if scheme == "ss":
-        return _parse_ss(uri)
-    if scheme == "socks4":
-        return _parse_socks4(uri, "4")
-    if scheme == "socks4a":
-        return _parse_socks4(uri, "4a")
-    if scheme in ("hysteria2", "hy2"):
-        return _parse_hysteria2(uri)
-    if scheme == "tuic":
-        return _parse_tuic(uri)
-    raise ProxyResolveError(
-        f"协议「{scheme or '（空）'}」不是 sing-box 转换协议"
-        f"（支持：{'/'.join(sorted(SINGBOX_PROXY_SCHEMES))}）。")
-
-
-# ============================================================
 # sing-box 二进制探测
 # ============================================================
 
@@ -605,7 +103,9 @@ _SINGBOX_CANDIDATE_PATHS = (
     "/opt/sing-box/sing-box",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin", "sing-box"),
     # 仓库根 bin/（非 Docker 部署时把二进制放进项目根 bin/ 的约定位置）
-    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin", "sing-box"),
+    os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin", "sing-box"
+    ),
 )
 
 
@@ -655,8 +155,9 @@ def singbox_version() -> str:
         _SINGBOX_VERSION_CACHE = ""
         return ""
     try:
-        out = subprocess.run([binary, "version"], capture_output=True, text=True,
-                             timeout=10)
+        out = subprocess.run(
+            [binary, "version"], capture_output=True, text=True, timeout=10
+        )
         first = (out.stdout or out.stderr or "").strip().splitlines()
         _SINGBOX_VERSION_CACHE = first[0].strip() if first else ""
     except Exception:
@@ -667,6 +168,7 @@ def singbox_version() -> str:
 # ============================================================
 # sing-box 实例管理器
 # ============================================================
+
 
 def _idle_minutes() -> float:
     try:
@@ -685,7 +187,15 @@ def _state_dir() -> str:
 
 
 class _SingboxInstance:
-    __slots__ = ("uri", "port", "process", "config_path", "log_path", "started_at", "last_used")
+    __slots__ = (
+        "uri",
+        "port",
+        "process",
+        "config_path",
+        "log_path",
+        "started_at",
+        "last_used",
+    )
 
     def __init__(self, uri: str, port: int, process, config_path: str, log_path: str):
         self.uri = uri
@@ -721,7 +231,9 @@ def _find_free_port() -> int:
         return s.getsockname()[1]
 
 
-def _wait_socks5_ready(port: int, timeout: float = 10.0, process=None, cancelled=None) -> bool:
+def _wait_socks5_ready(
+    port: int, timeout: float = 10.0, process=None, cancelled=None
+) -> bool:
     """轮询本地端口直到 sing-box 的 socks5 入站完成握手应答。
 
     只 TCP connect 成功不算就绪——端口可能被其他进程占着（崩溃复活场景：
@@ -735,11 +247,11 @@ def _wait_socks5_ready(port: int, timeout: float = 10.0, process=None, cancelled
         if cancelled is not None and cancelled():
             return False
         if process is not None and process.poll() is not None:
-            return False                      # 进程已退出，不用再等
+            return False  # 进程已退出，不用再等
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.4) as s:
                 s.settimeout(0.5)
-                s.sendall(b"\x05\x01\x00")    # SOCKS5 greeting：支持无认证
+                s.sendall(b"\x05\x01\x00")  # SOCKS5 greeting：支持无认证
                 # TCP may split even a two-byte greeting across packets.
                 reply = bytearray()
                 while len(reply) < 2:
@@ -777,7 +289,7 @@ class ProxyProcessManager:
     engine_name = "代理转换器"
 
     def __init__(self):
-        self._lock = threading.Lock()          # 保护实例、启动锁和使用计数
+        self._lock = threading.Lock()  # 保护实例、启动锁和使用计数
         self._instances: dict[str, _SingboxInstance] = {}
         self._uri_locks = weakref.WeakValueDictionary()
         self._active_uses: dict[str, int] = {}
@@ -821,14 +333,18 @@ class ProxyProcessManager:
         if usage is not None:
             usage.include(self, uri)
         if self._startup_cancelled(uri):
-            raise ProxyResolveError("请求已结束或服务正在退出，已取消代理启动。", retry_new_port=False)
+            raise ProxyResolveError(
+                "请求已结束或服务正在退出，已取消代理启动。", retry_new_port=False
+            )
         cached = self._cached_local_socks5(uri)
         if cached is not None:
             return cached
 
-        with self._uri_lock(uri):           # 按 URI 串行：不同代理的启动互不阻塞
+        with self._uri_lock(uri):  # 按 URI 串行：不同代理的启动互不阻塞
             if self._startup_cancelled(uri):
-                raise ProxyResolveError("请求已结束或服务正在退出，已取消代理启动。", retry_new_port=False)
+                raise ProxyResolveError(
+                    "请求已结束或服务正在退出，已取消代理启动。", retry_new_port=False
+                )
             cached = self._cached_local_socks5(uri)
             if cached is not None:
                 return cached
@@ -836,7 +352,9 @@ class ProxyProcessManager:
                 inst = self._instances.get(uri)
             stale_port = inst.port if inst is not None else None
             try:
-                inst = self._launch(uri, stale_port if stale_port else _find_free_port())
+                inst = self._launch(
+                    uri, stale_port if stale_port else _find_free_port()
+                )
             except ProxyResolveError as exc:
                 if stale_port is None or not exc.retry_new_port:
                     raise
@@ -852,12 +370,16 @@ class ProxyProcessManager:
                     raise
             request_closed = usage is not None and usage.closed
             with self._lock:
-                closed = self._closed or (request_closed and not self._active_uses.get(uri))
+                closed = self._closed or (
+                    request_closed and not self._active_uses.get(uri)
+                )
                 if not closed:
                     self._instances[uri] = inst
             if closed:  # Do not hold the shared lock while waiting for a process.
                 self._terminate(inst)
-                raise ProxyResolveError("请求已结束或服务正在退出，已取消代理启动。", retry_new_port=False)
+                raise ProxyResolveError(
+                    "请求已结束或服务正在退出，已取消代理启动。", retry_new_port=False
+                )
             return f"socks5://127.0.0.1:{inst.port}"
 
     def _cached_local_socks5(self, uri):
@@ -898,7 +420,7 @@ class ProxyProcessManager:
             self._instances.clear()
             self._probe_only.clear()
         for inst in instances:
-            self._terminate(inst)           # 锁外终止：terminate+kill 最多 6s，不阻塞取用
+            self._terminate(inst)  # 锁外终止：terminate+kill 最多 6s，不阻塞取用
 
     def reopen(self) -> None:
         """停机后重新启用管理器（测试隔离 / 运行时重启场景）。
@@ -929,7 +451,9 @@ class ProxyProcessManager:
                     inst = self._instances.get(uri)
                     if inst is None or self._active_uses.get(uri):
                         continue
-                    if inst.alive() and (idle_seconds <= 0 or now - inst.last_used <= idle_seconds):
+                    if inst.alive() and (
+                        idle_seconds <= 0 or now - inst.last_used <= idle_seconds
+                    ):
                         continue
                     self._instances.pop(uri)
                     self._probe_only.discard(uri)
@@ -964,8 +488,12 @@ class ProxyProcessManager:
         return {
             **self._runtime_info(),
             "instances": [
-                {"port": i.port, "uri": mask_proxy_uri(i.uri),
-                 "alive": i.alive(), "started_at": int(i.started_at)}
+                {
+                    "port": i.port,
+                    "uri": mask_proxy_uri(i.uri),
+                    "alive": i.alive(),
+                    "started_at": int(i.started_at),
+                }
                 for i in items
             ],
         }
@@ -1002,8 +530,11 @@ class SingboxManager(ProxyProcessManager):
     engine_name = "sing-box"
 
     def _runtime_info(self):
-        return {"available": singbox_available(), "binary": find_singbox_binary() or "",
-                "version": singbox_version()}
+        return {
+            "available": singbox_available(),
+            "binary": find_singbox_binary() or "",
+            "version": singbox_version(),
+        }
 
     def _launch(self, uri: str, port: int) -> _SingboxInstance:
         binary = find_singbox_binary()
@@ -1037,10 +568,14 @@ class SingboxManager(ProxyProcessManager):
 
         config = {
             "log": {"level": "warn", "timestamp": True},
-            "inbounds": [{
-                "type": "socks", "tag": "in",
-                "listen": "127.0.0.1", "listen_port": port,
-            }],
+            "inbounds": [
+                {
+                    "type": "socks",
+                    "tag": "in",
+                    "listen": "127.0.0.1",
+                    "listen_port": port,
+                }
+            ],
             "outbounds": [outbound, {"type": "direct", "tag": "direct"}],
             "route": {"final": "proxy"},
         }
@@ -1072,9 +607,10 @@ class SingboxManager(ProxyProcessManager):
         try:
             process = subprocess.Popen(
                 [binary, "run", "-c", config_path, "-D", directory],
-                stdout=log_file, stderr=subprocess.STDOUT,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
-                start_new_session=True,          # 进程组独立，Ctrl+C 不误杀
+                start_new_session=True,  # 进程组独立，Ctrl+C 不误杀
             )
         except OSError as e:
             raise ProxyResolveError(f"启动 sing-box 失败（{binary}）：{e}")
@@ -1084,14 +620,20 @@ class SingboxManager(ProxyProcessManager):
 
         inst = _SingboxInstance(uri, port, process, config_path, log_path)
         # 协议级就绪检查：SOCKS5 握手应答 + 进程存活双条件（见函数 docstring）
-        ready = _wait_socks5_ready(port, timeout=10.0, process=process,
-                                   cancelled=lambda: self._startup_cancelled(uri))
+        ready = _wait_socks5_ready(
+            port,
+            timeout=10.0,
+            process=process,
+            cancelled=lambda: self._startup_cancelled(uri),
+        )
         alive = process.poll() is None
         if not (ready and alive):
             tail = inst.log_tail()
             self._terminate(inst)
             if self._startup_cancelled(uri):
-                raise ProxyResolveError("请求已结束或服务正在退出，已取消代理启动。", retry_new_port=False)
+                raise ProxyResolveError(
+                    "请求已结束或服务正在退出，已取消代理启动。", retry_new_port=False
+                )
             if not alive:
                 detail = f"sing-box 启动后即退出（配置或节点参数大概率有误）。日志尾部：{tail or '（无输出）'}"
             else:
@@ -1102,12 +644,22 @@ class SingboxManager(ProxyProcessManager):
 
 
 def find_bridge_binary() -> Optional[str]:
-    candidates = [os.environ.get("PROXY_BRIDGE_BIN", ""),
-                  "/usr/local/bin/vertex-proxy-bridge",
-                  os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "bin", "vertex-proxy-bridge")),
-                  shutil.which("vertex-proxy-bridge") or ""]
-    return next((os.path.abspath(path) for path in candidates
-                 if path and os.path.isfile(path) and os.access(path, os.X_OK)), None)
+    candidates = [
+        os.environ.get("PROXY_BRIDGE_BIN", ""),
+        "/usr/local/bin/vertex-proxy-bridge",
+        os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "bin", "vertex-proxy-bridge")
+        ),
+        shutil.which("vertex-proxy-bridge") or "",
+    ]
+    return next(
+        (
+            os.path.abspath(path)
+            for path in candidates
+            if path and os.path.isfile(path) and os.access(path, os.X_OK)
+        ),
+        None,
+    )
 
 
 def _wait_bridge_ready(instance, ready_file, timeout, cancelled=None):
@@ -1126,8 +678,12 @@ def _wait_bridge_ready(instance, ready_file, timeout, cancelled=None):
         except OSError:
             ready = False
         if ready:
-            return _wait_socks5_ready(instance.port, timeout=max(0.1, deadline - time.monotonic()),
-                                      process=instance.process, cancelled=cancelled)
+            return _wait_socks5_ready(
+                instance.port,
+                timeout=max(0.1, deadline - time.monotonic()),
+                process=instance.process,
+                cancelled=cancelled,
+            )
         time.sleep(0.05)
     return False
 
@@ -1142,7 +698,11 @@ class ProxyBridgeManager(ProxyProcessManager):
 
     def _runtime_info(self):
         binary = find_bridge_binary()
-        return {"available": bool(binary), "binary": binary or "", "version": "1" if binary else ""}
+        return {
+            "available": bool(binary),
+            "binary": binary or "",
+            "version": "1" if binary else "",
+        }
 
     def _sweep_orphan_files(self, directory: str) -> None:
         """Delete bridge state files whose owning process is gone.
@@ -1202,8 +762,14 @@ class ProxyBridgeManager(ProxyProcessManager):
             options["realm"] = cfg["realm"]
         if cfg["scheme"] == "sstp" and cfg["mtu"] < 1400:
             options["mtu"] = cfg["mtu"]
-        return build_proxy_uri(cfg["scheme"], cfg["server"], cfg["server_port"],
-                               cfg["username"], cfg["password"], options=options)
+        return build_proxy_uri(
+            cfg["scheme"],
+            cfg["server"],
+            cfg["server_port"],
+            cfg["username"],
+            cfg["password"],
+            options=options,
+        )
 
     def _idle_minutes(self):
         try:
@@ -1221,10 +787,14 @@ class ProxyBridgeManager(ProxyProcessManager):
             raise ProxyResolveError(
                 "未找到 TURN/SSTP 转换器 vertex-proxy-bridge。请使用包含该组件的新版本 Docker 镜像，"
                 "或在 proxybridge/ 目录执行 go build -o ../bin/vertex-proxy-bridge .；"
-                "也可通过 PROXY_BRIDGE_BIN 指定可执行文件。不会降级直连。", retry_new_port=False)
+                "也可通过 PROXY_BRIDGE_BIN 指定可执行文件。不会降级直连。",
+                retry_new_port=False,
+            )
         config.pop("options", None)
         config["listen_port"] = port
-        directory = os.path.abspath(os.path.join(os.environ.get("STATE_DIR", "."), "proxy-bridge"))
+        directory = os.path.abspath(
+            os.path.join(os.environ.get("STATE_DIR", "."), "proxy-bridge")
+        )
         digest = hashlib.sha256(uri.encode()).hexdigest()[:16]
         prefix = f"bridge-{os.getpid()}-{self._file_namespace}-{digest}-"
         config_path = os.path.join(directory, f"{prefix}{port}.json")
@@ -1243,16 +813,30 @@ class ProxyBridgeManager(ProxyProcessManager):
                 json.dump(config, file)
             log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(log_fd, "ab", buffering=0) as log_file:
-                process = subprocess.Popen([binary, "-config", config_path],
-                                           stdout=log_file, stderr=subprocess.STDOUT,
-                                           stdin=subprocess.DEVNULL, start_new_session=True)
+                process = subprocess.Popen(
+                    [binary, "-config", config_path],
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
             inst = _SingboxInstance(uri, port, process, config_path, log_path)
             timeout = 35.0 if config["scheme"] == "sstp" else 10.0
-            if not _wait_bridge_ready(inst, ready_path, timeout,
-                                      cancelled=lambda: self._startup_cancelled(uri)) or not inst.alive():
+            if (
+                not _wait_bridge_ready(
+                    inst,
+                    ready_path,
+                    timeout,
+                    cancelled=lambda: self._startup_cancelled(uri),
+                )
+                or not inst.alive()
+            ):
                 self._terminate(inst)
                 if self._startup_cancelled(uri):
-                    raise ProxyResolveError("请求已结束或服务正在退出，已取消代理启动。", retry_new_port=False)
+                    raise ProxyResolveError(
+                        "请求已结束或服务正在退出，已取消代理启动。",
+                        retry_new_port=False,
+                    )
                 # Never forward arbitrary child-process output: custom helpers or
                 # malformed peers could echo credentials in an error message.
                 known = {
@@ -1269,17 +853,26 @@ class ProxyBridgeManager(ProxyProcessManager):
                     "ready_write_failed": "无法写入转换器就绪标记",
                     "invalid_config": "转换器配置无效",
                 }
-                code = next((line.strip() for line in reversed(inst.log_tail().splitlines())
-                             if line.strip() in known), "")
+                code = next(
+                    (
+                        line.strip()
+                        for line in reversed(inst.log_tail().splitlines())
+                        if line.strip() in known
+                    ),
+                    "",
+                )
                 detail = known.get(code, "启动超时或子进程退出")
                 raise ProxyResolveError(
                     f"{config['scheme'].upper()} 转换失败：{detail}。"
                     "请检查服务器连通性、账号密码、TLS 证书，以及 TURN RFC6062 / SSTP MS-CHAPv2 支持。",
-                    retry_new_port=code == "listen_failed")
+                    retry_new_port=code == "listen_failed",
+                )
         except OSError:
             if inst is not None:
                 self._terminate(inst)
-            raise ProxyResolveError("无法创建或启动 TURN/SSTP 转换器，请检查状态目录权限和可执行文件。") from None
+            raise ProxyResolveError(
+                "无法创建或启动 TURN/SSTP 转换器，请检查状态目录权限和可执行文件。"
+            ) from None
         finally:
             # The helper reads the private configuration once. Remove credentials
             # from transient files after startup, on both success and failure.
@@ -1288,7 +881,9 @@ class ProxyBridgeManager(ProxyProcessManager):
                     os.unlink(path)
                 except OSError:
                     pass
-        print(f"🛰️ [代理转换] {config['scheme'].upper()} 已启动：{mask_proxy_uri(uri)} → 127.0.0.1:{port}")
+        print(
+            f"🛰️ [代理转换] {config['scheme'].upper()} 已启动：{mask_proxy_uri(uri)} → 127.0.0.1:{port}"
+        )
         return inst
 
 
@@ -1304,10 +899,14 @@ def _reaper_loop() -> None:
             try:
                 n = manager.reap_idle()
                 if n:
-                    print(f"♻️ [代理转换] 已回收 {n} 个空闲/已退出的 {manager.engine_name} 实例。")
+                    print(
+                        f"♻️ [代理转换] 已回收 {n} 个空闲/已退出的 {manager.engine_name} 实例。"
+                    )
             except Exception as e:
-                print(f"⚠️ [代理转换] {manager.engine_name} 空闲回收异常（已忽略）："
-                      f"{type(e).__name__}: {e}")
+                print(
+                    f"⚠️ [代理转换] {manager.engine_name} 空闲回收异常（已忽略）："
+                    f"{type(e).__name__}: {e}"
+                )
 
 
 _reaper_started = False
@@ -1321,8 +920,9 @@ def ensure_reaper() -> None:
         if _reaper_started:
             return
         _reaper_started = True
-        threading.Thread(target=_reaper_loop, daemon=True,
-                         name="singbox-reaper").start()
+        threading.Thread(
+            target=_reaper_loop, daemon=True, name="singbox-reaper"
+        ).start()
 
 
 atexit.register(singbox_manager.shutdown_all)
@@ -1332,6 +932,7 @@ atexit.register(bridge_manager.shutdown_all)
 # ============================================================
 # 统一入口：resolve / validate / mask
 # ============================================================
+
 
 def resolve_proxy_uri(uri: Optional[str]) -> str:
     """任意代理 URI → httpx / curl_cffi 可直接使用的代理 URL。
@@ -1366,7 +967,8 @@ def resolve_proxy_uri(uri: Optional[str]) -> str:
     raise ProxyResolveError(
         f"不支持的代理协议「{scheme or '（无协议）'}」。"
         f"支持：{'/'.join(sorted(ALL_PROXY_SCHEMES))} 或 direct（强制直连）。"
-        f"收到的是：{mask_proxy_uri(value)}")
+        f"收到的是：{mask_proxy_uri(value)}"
+    )
 
 
 async def resolve_proxy_uri_async(uri: Optional[str]) -> str:
@@ -1385,99 +987,10 @@ async def resolve_proxy_uri_async(uri: Optional[str]) -> str:
     if usage is not None:
         usage.include(manager, value)
     if manager._startup_cancelled(value):
-        raise ProxyResolveError("请求已结束或服务正在退出，已取消代理启动。", retry_new_port=False)
+        raise ProxyResolveError(
+            "请求已结束或服务正在退出，已取消代理启动。", retry_new_port=False
+        )
     cached = manager._cached_local_socks5(value)
     if cached is not None:
         return cached
     return await asyncio.to_thread(resolve_proxy_uri, value)
-
-
-def validate_proxy_uri(uri: str) -> str:
-    """静态校验代理 URI，返回错误消息（空串 = 合法）。不启动转换进程、不发包。
-
-    合法性 = 能解析出该协议的必要字段；连通性请走 /api/proxy/test。
-    """
-    try:
-        value = normalize_proxy_uri(uri)
-    except ProxyFormatError as exc:
-        return str(exc)
-    if not value or value.lower() in DIRECT_TOKENS:
-        return ""
-    kind = classify_proxy_uri(value)
-    if kind == "native":
-        try:
-            parts = urlsplit(value)
-            if not parts.hostname:
-                return "缺少主机地址，正确格式：协议://用户名:密码@主机:端口"
-            if parts.port is not None and parts.port < 1:
-                return "代理端口必须在 1–65535 范围内。"
-            return ""
-        except Exception:
-            return "无法解析的代理地址，正确格式：协议://用户名:密码@主机:端口"
-    if kind == "singbox":
-        try:
-            parse_share_uri_to_outbound(value)
-            return ""
-        except ProxyResolveError as e:
-            return str(e)
-        except Exception as e:
-            return f"解析失败：{type(e).__name__}: {e}"
-    if kind == "bridge":
-        try:
-            parse_bridge_proxy_uri(value)
-            return ""
-        except ProxyFormatError as exc:
-            return str(exc)
-    scheme = _uri_scheme(value)
-    return (f"协议必须是 {'/'.join(sorted(ALL_PROXY_SCHEMES))} 之一"
-            f"（或 direct = 强制直连），收到的是「{scheme or '（无协议）'}」")
-
-
-def mask_proxy_uri(uri: str) -> str:
-    """代理 URI 脱敏：保留协议与 host:port，凭据（密码/UUID/base64）整体打码。
-
-    同时覆盖原生 URL 与 sing-box 分享链接两种形态；解析失败时退回哈希指纹，
-    保证日志/healthz 里绝不泄露凭据。
-    """
-    value = str(uri or "").strip()
-    try:
-        value = normalize_proxy_uri(value)
-    except ProxyFormatError:
-        digest = hashlib.sha1(value.encode("utf-8")).hexdigest()[:8]
-        return f"proxy:{digest}(格式无法解析)"
-    if not value:
-        return ""
-    if value.lower() in DIRECT_TOKENS:
-        return "direct（强制直连）"
-    scheme = _uri_scheme(value)
-    try:
-        if scheme in BRIDGE_PROXY_SCHEMES:
-            config = parse_bridge_proxy_uri(value)
-            host = config["server"]
-            if ":" in host:
-                host = f"[{host}]"
-            # 匿名分配 TURN 节点可以没有凭据，此时不显示 ***@ 占位
-            if config["username"] or config["password"]:
-                return f"{scheme}://***@{host}:{config['server_port']}"
-            return f"{scheme}://{host}:{config['server_port']}"
-        if scheme == "vmess":
-            # vmess 整体是 base64，没有可提取的 host:port，只报长度
-            return f"vmess://***({len(value)} 字符)"
-        parts = urlsplit(value)
-        if scheme == "ss" and "@" not in parts.netloc:
-            # Legacy SS embeds credentials and the endpoint in one base64
-            # authority. urlsplit can mistake that payload for a hostname.
-            return f"ss://***({len(value)} 字符)"
-        host = parts.hostname or ""
-        if not host:
-            raise ValueError
-        port = f":{parts.port}" if parts.port else ""
-        if ":" in host:
-            host = f"[{host}]"
-        cred = parts.username or parts.password
-        masked_netloc = f"***@{host}{port}" if cred else f"{host}{port}"
-        # ss 旧式整体 base64 无 @：host 解析不出来，落到 except
-        return urlunsplit((scheme or "proxy", masked_netloc, "", "", ""))
-    except Exception:
-        digest = hashlib.sha1(value.encode("utf-8")).hexdigest()[:8]
-        return f"proxy:{digest}(已配置，格式无法解析)"

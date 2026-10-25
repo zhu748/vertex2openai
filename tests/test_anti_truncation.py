@@ -623,7 +623,7 @@ class ChannelTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(cookie_proxy, "_get_cookie_string", return_value="SAPISID=test"), \
              mock.patch.object(cookie_proxy, "_get_project_id", return_value="test-project"), \
              mock.patch.object(cookie_proxy, "open_upstream_client", open_client), \
-             mock.patch.object(cookie_proxy, "_execute_stream_request_generator", events):
+             mock.patch.object(cookie_proxy, "stream_events", events):
             result = await cookie_proxy.CookieProxyUpstream().chat_completions(req, self.http_request)
             body = await self.body(result) if hasattr(result, "body_iterator") else result.body.decode()
         self.assertNotIn("antitruncation", seen[-1]["variables"]["model"])

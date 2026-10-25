@@ -33,6 +33,7 @@ Cherry Studio 等说 Claude 协议的客户端）说的是另一套协议：
 
 import asyncio
 import json
+import threading
 import time
 from typing import Optional
 
@@ -61,9 +62,11 @@ from config import API_KEY
 from express_endpoint import resolve_express_model_path
 from generation_config import _function_tools, _system_instruction
 from logger import stats
+from media_tasks import run_media_task
 from message_processing import create_gemini_prompt
 from model_loader import get_express_models
 from proxy_failover import FailoverSDKClient, ProxyChain, ProxyResolveError
+from proxy_resolver import ProxyUsage, current_proxy_usage
 from client_pool import get_pooled_express_client
 from request_tracking import configure as track_configure
 from request_connection import BodyTooLargeError
@@ -206,8 +209,9 @@ def _claude_stream_response(response: StreamingResponse, display_model: str, *,
             raise
         except Exception as exc:
             await frame_queue.put(exc)
-        finally:
-            await frame_queue.put(_END)
+        # Cancellation means the consumer has gone away. Never enqueue a
+        # sentinel in finally: a full queue would block cancellation forever.
+        await frame_queue.put(_END)
 
     async def event_stream():
         failed = False
@@ -420,8 +424,31 @@ async def claude_count_tokens_method_guard(fastapi_request: Request):
 # count_tokens：POST /v1/messages/count_tokens
 # ============================================================
 
+COUNT_TOKENS_TIMEOUT_SECONDS = 15.0
+_count_tokens_slots = threading.BoundedSemaphore(4)
+
+
 async def _express_exact_input_tokens(request_obj, fastapi_request: Request,
                                       raw_internal_model: str) -> Optional[int]:
+    # Auxiliary requests have their own small, fail-fast budget. Saturation and
+    # timeouts fall back to estimation; cancellation always propagates.
+    if not _count_tokens_slots.acquire(blocking=False):
+        return None
+    usage = ProxyUsage()
+    token = current_proxy_usage.set(usage)
+    try:
+        async with asyncio.timeout(COUNT_TOKENS_TIMEOUT_SECONDS):
+            return await _count_exact_input_tokens(request_obj, fastapi_request, raw_internal_model)
+    except TimeoutError:
+        return None
+    finally:
+        current_proxy_usage.reset(token)
+        usage.close()
+        _count_tokens_slots.release()
+
+
+async def _count_exact_input_tokens(request_obj, fastapi_request: Request,
+                                    raw_internal_model: str) -> Optional[int]:
     """Express 通道模型侧精确计数（vertex-master CountTokensExact 的对应物）。
 
     计数口径：协议转换后的客户端请求本身（消息 contents + system_instruction
@@ -458,7 +485,7 @@ async def _express_exact_input_tokens(request_obj, fastapi_request: Request,
         # 压缩——Express 主路径（api_helpers）与 Cookie 路径（cookie_request）
         # 都已线程化，唯独此处曾在事件循环上直跑：多模态 count_tokens 可把
         # 整个服务冻结 10~40s，所有并发流的心跳集体停摆（2026-10 修复）。
-        contents = await asyncio.to_thread(create_gemini_prompt, request_obj.messages, base_model)
+        contents = await run_media_task(create_gemini_prompt, request_obj.messages, base_model)
     except Exception:
         return None
     if not contents:
@@ -486,7 +513,7 @@ async def _express_exact_input_tokens(request_obj, fastapi_request: Request,
         if isinstance(total, bool) or not isinstance(total, int) or total < 0:
             return None
         return total
-    except (asyncio.CancelledError, ProxyResolveError):
+    except ProxyResolveError:
         return None
     except Exception as exc:
         print(f"⚠️ [Claude] count_tokens 精确计数失败，回退启发式估算：{type(exc).__name__}: {exc}")
@@ -538,15 +565,18 @@ async def claude_count_tokens(fastapi_request: Request, api_key: str = Depends(g
 # Claude Code 网关探测：GET /api/hello
 # ============================================================
 
-@router.get("/api/hello")
-async def claude_hello():
+@router.api_route("/api/hello", methods=["GET", "HEAD"])
+async def claude_hello(fastapi_request: Request):
     """Claude Code 启动时对自定义网关的可达性探测（不鉴权、不泄露信息）。"""
-    return JSONResponse(content={"status": "ok"})
+    response = JSONResponse(content={"status": "ok"})
+    if fastapi_request.method == "HEAD":
+        response.body = b""
+    return response
 
 
 @router.api_route("/api/hello", methods=["POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def claude_hello_method_guard(fastapi_request: Request):
-    """对齐 vertex-master：/api/hello 仅 GET/HEAD（HEAD 由 Starlette 随 GET 自动处理）。"""
+    """Claude Code 网关探测仅接受 GET/HEAD。"""
     return claude_error(405, "invalid_request_error", "method not allowed: use GET")
 
 

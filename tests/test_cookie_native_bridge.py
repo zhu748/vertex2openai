@@ -277,7 +277,7 @@ class RetryPumpTests(unittest.TestCase):
 
         calls = {"n": 0}
 
-        async def fake_events(client, headers, body, sampler=None, fallback_body=None, *, model=""):
+        async def fake_events(client, headers, body, sampler=None, fallback_body=None, *, model="", preserve_parts=False):
             calls["n"] += 1
             if calls["n"] == 1:
                 yield "retryable_error", err
@@ -287,8 +287,8 @@ class RetryPumpTests(unittest.TestCase):
 
         with mock.patch.object(cookie_native, "build_headers", return_value={"authorization": "x"}), \
              mock.patch.object(cookie_native, "open_upstream_client", new=_fake_client_ctx), \
-             mock.patch.object(cookie_native, "_execute_stream_request_generator", fake_events), \
-             mock.patch.object(cookie_native, "_sleep_with_heartbeat", new=_no_wait_heartbeat), \
+             mock.patch.object(cookie_native, "stream_events", fake_events), \
+             mock.patch.object(cookie_native, "retry_heartbeats", new=_no_wait_heartbeat), \
              mock.patch.object(cookie_native, "ProxyChain", return_value=SimpleNamespace(
                  current="", bind_to_generation=lambda self=None: None)), \
              mock.patch.object(cookie_native, "get_retry_settings", return_value=(3, 0.0, 0.0)):
@@ -303,12 +303,12 @@ class RetryPumpTests(unittest.TestCase):
         record = {"cookie": "SAPISID=x; SID=y", "project_id": "p", "id": "a1", "enabled": True}
         request = SimpleNamespace(is_disconnected=mock.AsyncMock(return_value=False))
 
-        async def fake_events(client, headers, body, sampler=None, fallback_body=None, *, model=""):
+        async def fake_events(client, headers, body, sampler=None, fallback_body=None, *, model="", preserve_parts=False):
             yield "cookie_error", _StreamRequestErrorSafe("Login Required", status_code=401)
 
         with mock.patch.object(cookie_native, "build_headers", return_value={"authorization": "x"}), \
              mock.patch.object(cookie_native, "open_upstream_client", new=_fake_client_ctx), \
-             mock.patch.object(cookie_native, "_execute_stream_request_generator", fake_events), \
+             mock.patch.object(cookie_native, "stream_events", fake_events), \
              mock.patch.object(cookie_native, "ProxyChain", return_value=SimpleNamespace(
                  current="", bind_to_generation=lambda self=None: None)), \
              mock.patch.object(cookie_native.credential_manager, "record_cookie_auth_failure") as fail:
@@ -320,7 +320,7 @@ class RetryPumpTests(unittest.TestCase):
                     return exc
             exc = asyncio.run(run())
         self.assertEqual(exc.code, 401)
-        fail.assert_called_once_with("a1")
+        fail.assert_called_once_with("a1", credential=record)
 
 
 # —— 测试夹具 ——————————————————————————————
