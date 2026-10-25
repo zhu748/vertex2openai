@@ -868,6 +868,17 @@ async function main() {
         assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), `${width}px ${tab}: horizontal overflow`);
         if (width === 390 || width === 1440) await screenshot(`${tab}-${width}`);
         if(tab==='channel'){await page.locator('.account-editor').evaluateAll(items=>items.forEach(el=>el.open=false));assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));}
+        if(tab==='params'||tab==='runtime'){
+          const target=tab==='params'?'model-instructions':'runtime-compatibility';
+          await page.click(`#view-${tab} .settings-jump a[href="#${target}"]`);
+          await page.waitForFunction(id=>{
+            const nav=[...document.querySelectorAll('.tab-bar,.mobile-navigation')].find(el=>el.getClientRects().length);
+            const scope=document.querySelector('#model-scope');
+            const scopeBottom=scope.getClientRects().length&&getComputedStyle(scope).position==='sticky'?scope.getBoundingClientRect().bottom:0;
+            const top=document.getElementById(id).getBoundingClientRect().top;
+            return top>=Math.max(nav?.getBoundingClientRect().bottom||0,scopeBottom)-1&&top<innerHeight;
+          },target);
+        }
       }
       await openTab('requests');
       await page.locator('#request-rows tr[data-request]').first().click();
@@ -909,7 +920,7 @@ async function main() {
       if(await page.locator('#proxy-close-prompt').isVisible()) await page.locator('#proxy-close-prompt').getByRole('button',{name:'放弃并关闭',exact:true}).click();
       assert.equal(await page.locator('#proxy-dialog').evaluate(el=>el.open),false);
     }
-    check('六个页面及长请求详情通过 320 / 390 / 768 / 1024 / 1440px 宽度检查');
+    check('六个页面、分区跳转遮挡及长请求详情通过 320 / 390 / 768 / 1024 / 1440px 宽度检查');
 
     await openTab('logs');
     await page.waitForSelector('.log-line.error');

@@ -502,14 +502,11 @@
       <button class="btn-ghost" onclick="runAction(this,async()=&gt;{loadNotice('params','');await loadParams();})">重新加载配置</button>
      </div>
      <nav aria-label="参数分区" class="settings-jump">
-      <a href="#model-scope">
-       模型参数
-       <span>按所选对象保存</span>
-      </a>
-      <a href="#global-settings">
-       全局运行设置
-       <span>对所有模型生效</span>
-      </a>
+      <a href="#model-thinking">思考强度</a>
+      <a href="#image-settings">生图</a>
+      <a href="#model-sampling">采样</a>
+      <a href="#model-transport">超时与抗截断</a>
+      <a href="#model-instructions">注入与续写</a>
      </nav>
      <fieldset class="model-scope-section">
       <legend class="visually-hidden">模型行为参数</legend>
@@ -544,8 +541,8 @@
       </div>
       <div class="settings-grid model-settings-grid">
        <!-- 思考 -->
-       <div class="card settings-card">
-        <div class="text-sm font-semibold mb-3">思考强度</div>
+       <div class="card settings-card" id="model-thinking">
+        <h3 class="settings-card-title">思考强度</h3>
         <div class="mb-3" id="wrap-g3level">
          <label class="lbl mb-1" for="thinking_g3_level">Gemini 3.x 思考档位（thinking_level）</label>
          <select class="inp" id="thinking_g3_level">
@@ -619,7 +616,7 @@
        <!-- 生图 -->
        <div class="card settings-card" id="image-settings">
         <div id="image-applicability" hidden><p>当前模型不使用生图设置。</p><label><input type="checkbox" id="show-image-settings" data-local onchange="updateModelCapabilities()">查看不适用的参数</label></div><div id="image-controls">
-        <div class="text-sm font-semibold mb-3">生图</div>
+        <h3 class="settings-card-title">生图</h3>
         <div class="mb-3">
          <label class="lbl mb-1" for="image_size">默认分辨率（image_size）</label>
          <select class="inp" id="image_size">
@@ -709,11 +706,11 @@
        </div>
        </div>
        <!-- 采样默认 -->
-       <div class="card settings-card">
-        <div class="text-sm font-semibold mb-3">
+       <div class="card settings-card" id="model-sampling">
+        <h3 class="settings-card-title">
          采样默认值
          <span class="text-xs font-normal text-neutral-400">（留空=不注入，交给模型默认）</span>
-        </div>
+        </h3>
         <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
          <div>
           <label class="lbl mb-1.5" for="default_temperature">temperature</label>
@@ -778,12 +775,12 @@
         </p>
        </div>
        <!-- 合成函数正文传输（可按模型覆盖） -->
-       <div class="card settings-card">
+       <div class="card settings-card" id="model-transport">
         <div class="flex items-center justify-between gap-3">
-         <span class="text-sm font-semibold">
+         <h3 class="settings-card-title">
           超时与抗截断传输
           <button aria-controls="h_at" aria-expanded="false" aria-label="展开说明" class="helpq" onclick="hlp(this,'h_at')" type="button">?</button>
-         </span>
+         </h3>
          <select aria-label="anti_truncation_mode" class="inp" id="anti_truncation_mode" style="max-width:190px">
           <option value="off">不显示抗截断后缀</option>
           <option value="both">显示两种抗截断后缀</option>
@@ -845,11 +842,11 @@
         </div>
        </div>
        <!-- 控制台注入（可按模型覆盖） -->
-       <div class="card settings-card settings-wide">
-        <div class="text-sm font-semibold mb-3">
+       <div class="card settings-card settings-wide" id="model-instructions">
+        <h3 class="settings-card-title">
          注入与续写
          <span class="text-xs font-normal text-neutral-400">（留空＝不启用 / 用内置默认；均支持按模型专属）</span>
-        </div>
+        </h3>
         <div class="space-y-3">
          <div>
           <label class="lbl mb-1" for="inject_system_instruction">
@@ -1010,7 +1007,7 @@
     <section aria-labelledby="tab-runtime" class="view hidden" id="view-runtime" role="tabpanel" tabindex="0">
      <div class="page-heading"><div><p class="eyebrow">WORKSPACE / RUNTIME</p><h2>运行设置</h2><p>按任务配置超时、交付与资源限制。修改后统一保存，对所有模型生效。</p></div></div>
      <div class="inline-notice hidden" id="runtime-load-error" role="alert"><span></span><button class="btn-ghost" onclick="runAction(this,loadParams)">重新加载配置</button></div>
-     <nav class="settings-jump" aria-label="运行设置分区"><a href="#runtime-network">网络与超时</a><a href="#runtime-delivery">交付与续传</a><a href="#runtime-resources">图片与保活</a></nav>
+     <nav class="settings-jump" aria-label="运行设置分区"><a href="#runtime-network">上游区域</a><a href="#runtime-retry">重试</a><a href="#runtime-transport">超时与续传</a><a href="#runtime-delivery">交付开关</a><a href="#runtime-resources">图片压缩</a><a href="#runtime-keepalive">保活</a><a href="#runtime-compatibility">预填充兼容</a></nav>
      <div class="settings-divider" id="global-settings">
       <div>
        <h3>全局运行设置</h3>
@@ -1137,8 +1134,8 @@
          ，并在运行日志说明怎么修——所以这个设置不会让原本能用的配置变得不能用。
         </div>
        </div>
-<div class="card settings-card">
-        <div class="text-sm font-semibold mb-3">重试与退避</div>
+<div class="card settings-card" id="runtime-retry">
+        <h3 class="settings-card-title">重试与退避</h3>
         <div class="grid grid-cols-3 gap-3">
          <div>
           <label class="lbl mb-1" for="retry_max">最大重试次数</label>
@@ -1166,8 +1163,8 @@
         <div class="helpbox" id="h_ccf" hidden="">主通道（Express 或 Cookie）在尚未输出任何内容前遇 429 拥堵、401/403 凭证问题或 5xx 服务端错误时，自动切换另一通道接力完成回复；已输出内容绝不切换，避免半截答案重发。结构化输出在未开启 Cookie 结构化支持时仍锁定 Express。鉴权失败或欠费的 Key / Cookie 会在本轮请求内自动隔离并跳过。</div>
         <div class="text-xs opacity-60 mt-2">实际等待 = 重试间隔 ± 抖动幅度/2（固定不变，不随重试次数增长；上游 Retry-After 更短时采纳其提示）</div>
        </div>
-<div class="card settings-card">
-        <div class="text-sm font-semibold mb-3">超时、并发与续传缓冲</div>
+<div class="card settings-card" id="runtime-transport">
+        <h3 class="settings-card-title">超时、并发与续传缓冲</h3>
 <div class="delivery-controls"><div>
           <div class="flex items-center justify-between">
            <span class="text-sm">
@@ -1234,7 +1231,7 @@
         <p class="text-xs text-neutral-500 mt-2">最后一个客户端断开后，窗口内相同请求续接；超过窗口再发时取消旧任务并重新生成。0=断开后不再复用。有其他客户端连接时继续共享。</p>
        </div>
 <div class="card settings-card settings-wide" id="runtime-delivery">
-        <div class="text-sm font-semibold mb-3">交付与运行开关</div>
+        <h3 class="settings-card-title">交付与运行开关</h3>
         <div class="space-y-3">
          <div class="flex items-center justify-between">
           <span class="text-sm">假流式（fake streaming）</span>
@@ -1393,8 +1390,8 @@
          </div>
         </div>
        </div>
-<div class="card settings-card">
-        <div class="text-sm font-semibold mb-3">保活（Keep-Alive）</div>
+<div class="card settings-card" id="runtime-keepalive">
+        <h3 class="settings-card-title">保活（Keep-Alive）</h3>
         <div class="grid grid-cols-3 gap-3">
          <div style="grid-column:span 2">
           <label class="lbl mb-1" for="keepalive_url">保活 URL</label>
@@ -1407,7 +1404,7 @@
         </div>
         <p class="text-xs text-neutral-500 mt-2">定期 GET 该 URL（默认 60 秒一次）：填自己的 <code>/healthz</code> 可防止免费托管平台冻结闲置实例，也可驱动外部监控。留空 = 关闭。请求直连出站、不走出站代理；保存后立即生效，无需重启。环境变量 <code>KEEPALIVE_URL</code> / <code>KEEPALIVE_INTERVAL</code> 仅作初始值。</p>
        </div>
-<div class="card settings-card">
+<div class="card settings-card" id="runtime-compatibility">
         <h3 class="settings-card-title">预填充兼容</h3>
         <div class="space-y-3">
          <div>

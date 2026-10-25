@@ -1,12 +1,13 @@
 const $ = id => document.getElementById(id);
 let CAPS = {}, curAR = "";
 let GLOBAL_SETTINGS = {}, OVERRIDES = {}, SAVED_MODEL_OVERRIDES = {}, BUILTIN_OVERRIDES = {};
-let modelEdits=new Set(), modelInherit=new Set();
+let modelEdits=new Set(), modelInherit=new Set(), modelPins=new Set();
 let settingsLoaded=false, capabilitiesLoaded=false, keysLoaded=false, runtimeLoaded=false;
 const PER_MODEL_KEYS = ['first_reply_timeout_seconds','anti_truncation_mode','native_thinking_mode','thinking_g3_level','image_size','image_aspect_ratio','default_temperature','default_top_p','default_max_tokens','inject_system_instruction','inject_prefill','prefill_instruction','image_system_instruction','inject_prefill_for_image','sampling_policy','prefill_cot_guard'];
 const COMMON_ARS = ["1:1","3:2","2:3","3:4","4:3","4:5","5:4","9:16","16:9","21:9","1:4","4:1","1:8","8:1","9:21"];
 const MODEL_DRAFTS = new Map();
 let renderedModel=null, modelSnapshot=null;
+const viewScroll=new Map();
 
 let toastTimer;
 function toast(m){ const t=$('toast'); clearTimeout(toastTimer); t.textContent=m; t.classList.add('show'); toastTimer=setTimeout(()=>t.classList.remove('show'),4000); }
@@ -46,7 +47,9 @@ async function responseError(response,fallback='保存失败',result=null){
 
 function switchTab(t, updateHash=true){
   if(!['overview','channel','params','runtime','requests','logs'].includes(t)) return;
-  const changed=document.querySelector('.tab.active')?.dataset.tab!==t;
+  const previous=document.querySelector('.tab.active')?.dataset.tab;
+  const changed=previous!==t;
+  if(changed&&previous) viewScroll.set(previous,window.scrollY);
   document.querySelectorAll('.tab').forEach(e=>{
     const active=e.dataset.tab===t;
     e.classList.toggle('active', active);
@@ -57,8 +60,8 @@ function switchTab(t, updateHash=true){
   if(updateHash) history.replaceState(null,'','#'+t);
   $('mobile-nav').value=t;
   document.body.dataset.view=t;
-  if(changed) window.scrollTo({top:0,behavior:'instant'});
-  $('tab-'+t).scrollIntoView({block:'nearest',inline:'nearest'});
+  window.consoleForms?.layout();
+  if(changed) window.scrollTo({top:viewScroll.get(t)||0,behavior:'instant'});
   if(t==='overview') queueMicrotask(fetchRecentMetrics);
   if(t==='requests') window.requestMonitor?.refresh();
   if(t==='logs' && autoscroll) logwin.scrollTop=logwin.scrollHeight;
@@ -74,10 +77,12 @@ document.querySelector('.tab-bar').addEventListener('keydown',event=>{
   tabs[next].focus();switchTab(tabs[next].dataset.tab);
 });
 function navigateHash(){
-  const target=location.hash.slice(1);
-  if(['model-scope','global-settings','runtime-network','runtime-delivery','runtime-resources'].includes(target)){
-    switchTab(target==='model-scope'?'params':'runtime',false);
-    requestAnimationFrame(()=>$(target).scrollIntoView({block:'start'}));
+  let target;try{target=decodeURIComponent(location.hash.slice(1));}catch{target='';}
+  if(target==='main-content') return;
+  const anchor=$(target),view=anchor?.closest('.view');
+  if(view&&anchor!==view){
+    switchTab(view.id.slice(5),false);
+    requestAnimationFrame(()=>{window.consoleForms?.layout();anchor.scrollIntoView({block:'start'});});
   }else switchTab(['overview','channel','params','runtime','requests','logs'].includes(target)?target:'overview',false);
 }
 window.addEventListener('hashchange',navigateHash);
@@ -411,7 +416,14 @@ async function saveExpressUa(){
 }
 
 /* ---------- Params ---------- */
-function setV(id,v){ const el=$(id); if(!el) return; window.consoleForms?.clearError(el); el.removeAttribute('aria-invalid'); if(el.type==='checkbox') el.checked=!!v; else el.value=(v===null||v===undefined)?'':v; }
+function setV(id,v){
+  const el=$(id);if(!el)return;
+  window.consoleForms?.clearError(el);el.removeAttribute('aria-invalid');
+  if(id==='image_aspect_ratio'&&v&&![...el.options].some(option=>option.value===v)){
+    const option=document.createElement('option');option.value=v;option.textContent=v+'（当前模型不支持）';option.disabled=true;el.add(option);
+  }
+  if(el.type==='checkbox')el.checked=!!v;else el.value=(v===null||v===undefined)?'':v;
+}
 async function loadParams(){
   captureModelDraft();
   const selected=$('model-sel').value;
@@ -462,9 +474,12 @@ function readModelFields(){
 function captureModelDraft(){
   if(!renderedModel || modelSnapshot===null) return;
   const values=readModelFields(), baseline=JSON.parse(modelSnapshot);
-  for(const key of PER_MODEL_KEYS) if(values[key]!==baseline[key] && !modelInherit.has(key)) modelEdits.add(key);
+  for(const key of PER_MODEL_KEYS){
+    if(!modelInherit.has(key)&&(values[key]!==baseline[key]||modelPins.has(key))) modelEdits.add(key);
+    else modelEdits.delete(key);
+  }
   const dirty=renderedModel==='__global__'?JSON.stringify(values)!==modelSnapshot:modelEdits.size>0||modelInherit.size>0;
-  if(dirty) MODEL_DRAFTS.set(renderedModel,{values,edited:[...modelEdits],inherit:[...modelInherit]});
+  if(dirty) MODEL_DRAFTS.set(renderedModel,{values,edited:[...modelEdits],inherit:[...modelInherit],pinned:[...modelPins]});
   else MODEL_DRAFTS.delete(renderedModel);
   $('scope-draft-state').classList.toggle('hidden',!dirty);
   refreshModelSelStars();
@@ -472,13 +487,13 @@ function captureModelDraft(){
 }
 function finishModelRender(model){
   modelSnapshot=JSON.stringify(readModelFields());
-  modelEdits=new Set();modelInherit=new Set();
+  modelEdits=new Set();modelInherit=new Set();modelPins=new Set();
   const draft=MODEL_DRAFTS.get(model);
   if(draft){
     // Reapply only edited fields: inherited values must follow newer defaults.
     for(const key of draft.edited) setV(key,draft.values[key]);
-    for(const key of draft.inherit) setV(key,BUILTIN_OVERRIDES[model]?.[key] ?? (key==='anti_truncation_mode'?'off':GLOBAL_SETTINGS[key]));
-    modelEdits=new Set(draft.edited);modelInherit=new Set(draft.inherit);
+    for(const key of draft.inherit) setV(key,inheritedModelValue(model,key));
+    modelEdits=new Set(draft.edited);modelInherit=new Set(draft.inherit);modelPins=new Set(draft.pinned||[]);
   }
   curAR=$('image_aspect_ratio').value;
   renderedModel=model;
@@ -489,12 +504,17 @@ function finishModelRender(model){
 function discardModelDraft(){
   MODEL_DRAFTS.delete($('model-sel').value);renderCaps(false);
 }
+function inheritedModelValue(model,key){
+  const builtin=BUILTIN_OVERRIDES[model]||{};
+  return Object.hasOwn(builtin,key)?builtin[key]:key==='anti_truncation_mode'?'off':GLOBAL_SETTINGS[key];
+}
 function setFieldInheritance(key,inherit){
   if(!PER_MODEL_KEYS.includes(key)||renderedModel==='__global__') return;
   if(inherit){
-    modelEdits.delete(key);modelInherit.add(key);
-    setV(key,BUILTIN_OVERRIDES[renderedModel]?.[key] ?? (key==='anti_truncation_mode'?'off':GLOBAL_SETTINGS[key]));
-  }else{modelInherit.delete(key);modelEdits.add(key);}
+    modelEdits.delete(key);modelPins.delete(key);
+    if(Object.hasOwn(SAVED_MODEL_OVERRIDES[renderedModel]||{},key)) modelInherit.add(key);else modelInherit.delete(key);
+    setV(key,inheritedModelValue(renderedModel,key));
+  }else{if($(key).disabled)return;modelInherit.delete(key);modelPins.add(key);}
   captureModelDraft();updateModelCapabilities();
 }
 function renderFieldSources(){
@@ -505,7 +525,7 @@ function renderFieldSources(){
     const global=renderedModel==='__global__';
     const own=!global&&!modelInherit.has(key)&&(modelEdits.has(key)||Object.hasOwn(SAVED_MODEL_OVERRIDES[renderedModel]||{},key));
     const builtin=Object.hasOwn(BUILTIN_OVERRIDES[renderedModel]||{},key);
-    row.innerHTML=global?'':`<span>${own?'模型专属':builtin?'继承内置默认':'继承全局默认'}${modelEdits.has(key)||modelInherit.has(key)?' · 未保存':''}</span><button type="button" data-inherit="${key}" data-value="${own}" ${el.disabled?'disabled':''}>${own?'恢复继承':'设为专属'}</button>`;
+    row.innerHTML=global?'':`<span>${own?'模型专属':builtin?'继承内置默认':key==='anti_truncation_mode'?'继承模型默认':'继承全局默认'}${modelEdits.has(key)||modelInherit.has(key)?' · 未保存':''}</span><button type="button" data-inherit="${key}" data-value="${own}" ${el.disabled&&!own?'disabled':''}>${own?'恢复继承':'设为专属'}</button>`;
     row.hidden=global;
   }
 }
@@ -612,9 +632,10 @@ function refreshModelSelStars(){
 function chip(t, accent,sampling=false){ return `<span class="pill${accent?' pill-accent':''}"${sampling?' data-sampling':''}>${esc(t)}</span>`; }
 function fillARFor(cap){
   const sel=$('image_aspect_ratio');
-  const list = (cap && cap.is_image && cap.image_aspect_ratios.length) ? cap.image_aspect_ratios : COMMON_ARS;
+  const list = cap?.is_image && cap.image_aspect_ratios?.length ? cap.image_aspect_ratios : COMMON_ARS;
   sel.innerHTML='<option value="">自动</option>' + list.map(a=>`<option value="${esc(a)}">${esc(a)}</option>`).join('');
-  sel.value = (curAR && list.includes(curAR)) ? curAR : "";
+  if(curAR&&!list.includes(curAR)) sel.insertAdjacentHTML('beforeend',`<option value="${esc(curAR)}" disabled>${esc(curAR)}（当前模型不支持）</option>`);
+  sel.value=curAR||'';
 }
 function renderCaps(capture=true){
   if(capture) captureModelDraft();

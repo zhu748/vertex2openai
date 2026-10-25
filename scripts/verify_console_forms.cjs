@@ -18,11 +18,14 @@ async function main(){
  const cap={family:'3',thinking:{kind:'level',levels:['low','medium','high']},supports_anti_truncation:true,supports_search:true,image_sizes:['1K','2K','4K'],image_aspect_ratios:['1:1','16:9']};
  const summary={connections:1,generations:1,background:0,retry_wait:0,active:1};
  const record={id:'trace-1234567890abcdef',model:'text',protocol:'openai',channel:'express',mode:'stream',phase:'streaming',status:'running',connection:'open',created_at:Date.now()/1000,duration_ms:1000,timings:{},attempts:1,retries:0,finish_reasons:[],usage:{},events:[],logs:[]};
- w.AbortSignal=AbortSignal;w.AbortController=AbortController;w.matchMedia=()=>({matches:false});w.scrollTo=()=>{};w.HTMLElement.prototype.scrollIntoView=()=>{};w.confirm=()=>true;
+ let scrollPosition=0,transport=null,requestTotal=1;
+ Object.defineProperty(w,'scrollY',{get:()=>scrollPosition});
+ w.AbortSignal=AbortSignal;w.AbortController=AbortController;w.matchMedia=()=>({matches:false});w.scrollTo=({top})=>{scrollPosition=top;};w.HTMLElement.prototype.scrollIntoView=()=>{};w.confirm=()=>true;
  w.CSS={escape:s=>s};w.HTMLDialogElement.prototype.showModal=function(){this.open=true;};w.HTMLDialogElement.prototype.close=function(){this.open=false;this.dispatchEvent(new w.Event('close'));};
  w.EventSource=class {close(){}};
  w.fetch=async(url,options={})=>{
-  const target=new URL(url,w.location.href),method=options.method||'GET',body=options.body?JSON.parse(options.body):null;requests.push({path:target.pathname,method,body});
+  const target=new URL(url,w.location.href),method=options.method||'GET',body=options.body?JSON.parse(options.body):null;requests.push({path:target.pathname,query:target.search,method,body});
+  const intercepted=transport?.(target,options);if(intercepted!==undefined)return intercepted;
   let result={};
   if(target.pathname==='/api/settings/runtime')result={mode:'mixed'};
   else if(target.pathname==='/api/settings'){if(body)Object.assign(settings,body);result={...settings};}
@@ -32,8 +35,11 @@ async function main(){
   else if(target.pathname==='/api/cookie-accounts'){if(body)cookies=body.accounts;result={accounts:cookies};}
   else if(target.pathname==='/api/stats')result={total:3,success:1,error:1,retries:0,requests:summary,prompt_tokens:100,completion_tokens:200,uptime:50};
   else if(target.pathname==='/api/recent-metrics')result={sample_count:3,success:1,error:1,active:1,reply_samples:2,first_reply_p50_ms:100,first_reply_p95_ms:900,channels:{express:{success:1,error:1,active:1}}};
-  else if(target.pathname==='/api/requests')result={summary,total:1,items:[record]};
-  else if(target.pathname.startsWith('/api/requests/'))result=record;
+  else if(target.pathname==='/api/requests'){
+   const offset=Number(target.searchParams.get('offset')||0),limit=Number(target.searchParams.get('limit')||25);
+   result={summary,total:requestTotal,items:Array.from({length:Math.max(0,Math.min(limit,requestTotal-offset))},(_,i)=>({...record,id:requestTotal===1?record.id:record.id+'-'+(offset+i)}))};
+  }
+  else if(target.pathname.startsWith('/api/requests/'))result={...record,id:decodeURIComponent(target.pathname.split('/').pop())};
   else if(target.pathname==='/api/proxy/parse')result={proxies:[]};
   else if(target.pathname==='/api/settings/mode')result={status:'success'};
   else throw Error('Unexpected endpoint '+target.pathname);
@@ -54,6 +60,18 @@ async function main(){
   assert.equal(el('key-0').type,'password');
   console.log('✓ Navigation, initial clean state, account masking/collapse, recent metrics');
 
+  for(const link of d.querySelectorAll('.settings-jump a')){
+   w.history.replaceState(null,'',link.href);w.navigateHash();
+   const panel=el(link.hash.slice(1)).closest('.view');
+   assert.equal(panel.classList.contains('hidden'),false);assert.equal(el('mobile-nav').value,panel.id.slice(5));
+  }
+  w.switchTab('params');w.scrollTo({top:420});w.switchTab('runtime');w.scrollTo({top:180});
+  w.switchTab('params');assert.equal(w.scrollY,420);w.switchTab('runtime');assert.equal(w.scrollY,180);
+  w.history.replaceState(null,'','#main-content');w.navigateHash();assert.equal(el('mobile-nav').value,'runtime');
+  w.history.replaceState(null,'','#global-settings');w.navigateHash();assert.equal(el('mobile-nav').value,'runtime');
+  await tick();
+  console.log('✓ Section deep links, mobile navigation, page scroll restoration and skip link');
+
   w.switchTab('params');edit('model-sel','text');edit('first_reply_timeout_seconds','35');await save('btn-scope-save');
   const first=requests.filter(r=>r.path==='/api/model-overrides/text').at(-1).body;
   assert.deepEqual(first,{first_reply_timeout_seconds:35});
@@ -70,6 +88,30 @@ async function main(){
   assert.equal(el('image-controls').hidden,true);
   assert.equal(el('thinking_g3_level').querySelector('[value=minimal]').disabled,true);
   console.log('✓ Sparse model save, per-field inheritance, capability options and model drafts');
+
+  edit('first_reply_timeout_seconds','25');edit('first_reply_timeout_seconds','15');
+  assert.equal(w.consoleForms.dirty(),false);
+  w.setFieldInheritance('first_reply_timeout_seconds',false);assert.equal(w.consoleForms.dirty(),true);
+  edit('model-sel','image');edit('model-sel','text');
+  await save('btn-scope-save');
+  assert.deepEqual(requests.filter(r=>r.path==='/api/model-overrides/text').at(-1).body,{first_reply_timeout_seconds:15});
+  w.setFieldInheritance('first_reply_timeout_seconds',true);await save('btn-scope-save');
+  edit('first_reply_timeout_seconds','25');w.setFieldInheritance('first_reply_timeout_seconds',true);
+  assert.equal(w.consoleForms.dirty(),false);
+  overrides.text.image_size='1K';overrides.image={image_aspect_ratio:'1:1'};settings.image_aspect_ratio='21:9';
+  await w.loadParams();edit('show-image-settings',true);
+  assert.equal(el('image_size').disabled,true);assert.equal(el('source-image_size').querySelector('button').disabled,false);
+  w.setFieldInheritance('image_size',true);await save('btn-scope-save');assert.equal(Object.hasOwn(overrides.text,'image_size'),false);
+  edit('model-sel','image');w.setFieldInheritance('image_aspect_ratio',true);
+  assert.equal(el('image_aspect_ratio').value,'21:9');assert.equal(el('image_aspect_ratio').selectedOptions[0].disabled,true);
+  await save('btn-scope-save');edit('default_max_tokens','512');await save('btn-scope-save');
+  assert.deepEqual(requests.filter(r=>r.path==='/api/model-overrides/image').at(-1).body,{default_max_tokens:512});
+  builtins.text.default_top_p=null;settings.default_top_p=0.8;await w.loadParams();edit('model-sel','text');
+  assert.equal(el('default_top_p').value,'');edit('default_top_p','0.5');await save('btn-scope-save');
+  w.setFieldInheritance('default_top_p',true);assert.equal(el('default_top_p').value,'');await save('btn-scope-save');
+  delete builtins.text.default_top_p;delete overrides.image;settings.image_aspect_ratio='16:9';settings.default_top_p=null;
+  await w.loadParams();
+  console.log('✓ Reverted edits, deliberate pins, obsolete override cleanup and exact inherited values');
 
   edit('model-sel','__global__');edit('default_top_p','2');await save('btn-scope-save');
   assert.equal(el('default_top_p').getAttribute('aria-invalid'),'true');
@@ -100,10 +142,36 @@ async function main(){
   el('request-pause').click();const count=requests.length;await w.requestMonitor.refresh(false);assert.equal(requests.length,count);
   assert.equal(el('request-pause').getAttribute('aria-pressed'),'true');el('request-pause').click();await tick();
   edit('request-page-size','10');await tick();assert.equal(el('request-page-size').value,'10');
+
+  requestTotal=52;edit('request-page-size','25');await tick();
+  el('request-next').click();await tick();el('request-next').click();await tick();
+  assert.equal(el('request-page-info').textContent,'51–52 / 52 条');
+  requestTotal=30;await w.requestMonitor.refresh();assert.equal(el('request-page-info').textContent,'26–30 / 30 条');
+  assert.equal(new URLSearchParams(requests.filter(r=>r.path==='/api/requests').at(-1).query).get('offset'),'25');
+  let rejectOld;
+  transport=target=>{if(target.pathname==='/api/requests'){transport=null;return new Promise((resolve,reject)=>{rejectOld=reject;});}};
+  const oldRequest=w.requestMonitor.refresh();await w.requestMonitor.refresh();
+  const freshState=el('request-refresh-state').textContent;rejectOld(new Error('outdated list failure'));await oldRequest;
+  assert.equal(el('request-refresh-state').textContent,freshState);assert.equal(el('request-refresh-state').classList.contains('error-message'),false);
+  let resolvePaused;
+  transport=target=>{if(target.pathname==='/api/requests'){transport=null;return new Promise(resolve=>{resolvePaused=resolve;});}};
+  const pausedRequest=w.requestMonitor.refresh();el('request-pause').click();
+  resolvePaused(new Response(JSON.stringify({summary,total:0,items:[]})));await pausedRequest;
+  assert.equal(el('request-page-info').textContent,'26–30 / 30 条');assert.equal(el('request-refresh-state').textContent,'已暂停自动刷新，可手动刷新');
+  transport=target=>{if(target.pathname==='/api/requests'){transport=null;return new Response('{}',{status:500});}};
+  await w.requestMonitor.refresh();assert(el('request-refresh-state').textContent.includes('请手动刷新重试'));
+  el('request-pause').click();await tick();
+  let rejectDetail;
+  transport=target=>{if(target.pathname==='/api/requests/old-record'){transport=null;return new Promise((resolve,reject)=>{rejectDetail=reject;});}};
+  w.requestMonitor.open('old-record');w.requestMonitor.open('new-record');await tick();
+  const detailState=el('request-detail-state').textContent;rejectDetail(new Error('outdated detail failure'));await tick();
+  assert.equal(el('request-detail-id').textContent,'new-record');assert.equal(el('request-detail-state').textContent,detailState);
+  el('request-dialog').close();
+  console.log('✓ Retained-page clamping, stale response isolation and paused retry messages');
   const ids=[...d.querySelectorAll('[id]')].map(e=>e.id);assert.equal(new Set(ids).size,ids.length);
   assert.deepEqual(errors,[]);
   console.log('✓ Stable request rows, pause/resume, pagination and unique DOM IDs');
-  console.log('6 groups of console DOM checks passed. Layout requires the browser suite.');
+  console.log('9 groups of console DOM checks passed. Layout requires the browser suite.');
  }finally{dom.window.close();}
 }
 main().catch(error=>{console.error(error);process.exitCode=1;});

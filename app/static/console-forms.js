@@ -7,11 +7,23 @@
   const value=input=>input.type==='checkbox'?input.checked:input.value;
   const read=el=>controls(el).map(input=>({id:input.id,value:value(input)}));
   const fingerprint=el=>JSON.stringify(read(el));
+  function layout(){
+    const nav=[...document.querySelectorAll('.tab-bar,.mobile-navigation')].find(el=>el.getClientRects().length);
+    const scope=$('model-scope');
+    const scopeHeight=document.body.dataset.view==='params'&&getComputedStyle(scope).position==='sticky'?scope.getBoundingClientRect().height:0;
+    document.documentElement.style.setProperty('--console-nav-height',(nav?.getBoundingClientRect().height||0)+'px');
+    document.documentElement.style.setProperty('--model-scope-height',scopeHeight+'px');
+  }
   function changed(name){const el=group(name);return el&&snapshots.has(name)&&fingerprint(el)!==JSON.stringify(snapshots.get(name));}
-  function refresh(){
-    for(const el of groups()){
+  function refresh(name){
+    const targets=typeof name==='string'?[group(name)].filter(Boolean):groups();
+    for(const el of targets){
       const name=el.dataset.draftGroup,dirty=changed(name),bar=el.querySelector('.draft-toolbar');
       if(!bar)continue;
+      if(!snapshots.has(name)){
+        bar.querySelector('[role=status]').textContent='配置尚未加载';
+        bar.querySelector('[data-discard]').disabled=true;continue;
+      }
       const baseline=snapshots.get(name)||[],current=read(el);
       const count=current.reduce((n,item,i)=>n+(JSON.stringify(item)!==JSON.stringify(baseline[i])),0)+Math.max(0,baseline.length-current.length);
       bar.querySelector('[role=status]').textContent=dirty?`${count} 项修改未保存`:'修改已保存';
@@ -37,7 +49,8 @@
   }
   function fieldError(input,message){
     const id=input.id+'-error';let error=$(id);
-    if(!error){error=document.createElement('p');error.id=id;error.className='field-error';error.setAttribute('role','alert');input.after(error);}
+    if(!error){error=document.createElement('p');error.id=id;error.className='field-error';error.setAttribute('role','alert');
+      const anchor=input.parentElement.classList.contains('flex')?input.parentElement:input;anchor.after(error);}
     error.textContent=message;input.setAttribute('aria-invalid','true');
     const refs=new Set((input.getAttribute('aria-describedby')||'').split(/\s+/).filter(Boolean));refs.add(id);input.setAttribute('aria-describedby',[...refs].join(' '));
     for(let el=input.parentElement;el;el=el.parentElement)if(el.tagName==='DETAILS')el.open=true;
@@ -56,7 +69,7 @@
       if(container.classList.contains('model-scope-section')&&$('model-sel').value!=='__global__'&&!modelEdits.has(input.id))continue;
       if(!input.checkValidity()){fieldError(input,input.validationMessage);first ||= input;}else clearError(input);
     }
-    if(first){first.focus();toast('请修正标出的字段后再保存');return false;}return true;
+    if(first){first.scrollIntoView({block:'center'});first.focus({preventScroll:true});toast('请修正标出的字段后再保存');return false;}return true;
   }
   function filterAccounts(kind){
     const query=$(kind+'-search').value.trim().toLowerCase(),status=$(kind+'-filter').value;let visible=0;
@@ -103,10 +116,13 @@
   }
   $('api-base').value=location.origin+'/v1';
   window.addEventListener('beforeunload',event=>{if(dirty()){event.preventDefault();event.returnValue='';}});
-  document.addEventListener('input',event=>{clearError(event.target);refresh();});
-  document.addEventListener('change',refresh);
+  function refreshEditedGroup(event){const el=event.target.closest('[data-draft-group]');if(el)refresh(el.dataset.draftGroup);}
+  document.addEventListener('input',event=>{clearError(event.target);refreshEditedGroup(event);});
+  document.addEventListener('change',refreshEditedGroup);
   document.addEventListener('click',event=>{if(event.target.closest('.key-actions'))queueMicrotask(refresh);});
-  window.consoleForms={saved,capture,loaded,refresh,dirty,discard,fieldError,clearError,validate,accounts,rememberAccounts,openAccount,filterAccounts,copyBase};
+  window.consoleForms={saved,capture,loaded,refresh,dirty,discard,fieldError,clearError,validate,accounts,rememberAccounts,openAccount,filterAccounts,copyBase,layout};
+  if(window.ResizeObserver){const observer=new ResizeObserver(layout);document.querySelectorAll('.tab-bar,.mobile-navigation,.scope-card').forEach(el=>observer.observe(el));}
+  window.addEventListener('resize',layout);layout();
   // Initialization may already have completed when a cached optional script loads.
   if(settingsLoaded)loaded();if(keysLoaded){accounts('key');saved('keys');}
 })();

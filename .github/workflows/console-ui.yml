@@ -1,0 +1,71 @@
+name: Console UI checks
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'app/**'
+      - 'scripts/**'
+      - 'package*.json'
+      - 'requirements-dev.txt'
+      - '.github/workflows/console-ui.yml'
+  pull_request:
+    paths:
+      - 'app/**'
+      - 'scripts/**'
+      - 'package*.json'
+      - 'requirements-dev.txt'
+      - '.github/workflows/console-ui.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: console-ui-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  console:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            app/requirements.txt
+            requirements-dev.txt
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install dependencies
+        run: |
+          pip install -r requirements-dev.txt
+          npm ci
+      - name: DOM interaction regression
+        run: npm run test:console
+      - name: Verify generated styles
+        run: |
+          npm run build:css
+          git diff --exit-code -- app/static/dashboard.css
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Browser and responsive layout regression
+        run: npm run test:browser
+        env:
+          UI_SCREENSHOT_DIR: artifacts/console-ui
+      - name: Save screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: console-ui-screenshots
+          path: artifacts/console-ui/
+          if-no-files-found: ignore
+          retention-days: 7

@@ -56,10 +56,12 @@
       const response = await fetch('/api/requests?' + query, {signal:AbortSignal.any([controller.signal,AbortSignal.timeout(12000)]), cache:'no-store'});
       if(!response.ok) throw new Error(response.status===401?'登录已过期，请重新登录':'请求列表加载失败');
       const data = await response.json();
-      if(controller !== state.listController) return;
+      if(controller !== state.listController || controller.signal.aborted) return;
       if(!force && !window.getSelection().isCollapsed) return;
       state.total=data.total;
-      if(state.offset >= data.total && state.offset > 0) { state.offset=0; return refresh(); }
+      if(state.offset >= data.total && state.offset > 0) {
+        state.offset=data.total?Math.floor((data.total-1)/state.limit)*state.limit:0;return refresh();
+      }
       summary(data.summary);
       state.loaded=true;
       const focusedRequest=document.activeElement.closest('#request-rows [data-request]')?.dataset.request;
@@ -76,9 +78,9 @@
       $('request-refresh-state').textContent=(state.paused?'已暂停 · 更新于 ':'每 2 秒刷新 · 更新于 ')+new Date().toLocaleTimeString('zh-CN',{hour12:false});
       $('request-refresh-state').classList.remove('error-message');
     } catch(error) {
-      if(error.name!=='AbortError') {
+      if(controller===state.listController&&!controller.signal.aborted&&error.name!=='AbortError') {
         const message=error.name==='TimeoutError'?'请求列表连接超时':error.message;
-        $('request-refresh-state').textContent=message+'，稍后自动重试';
+        $('request-refresh-state').textContent=message+(state.paused?'，请手动刷新重试':'，稍后自动重试');
         $('request-refresh-state').classList.add('error-message');
         if(!state.loaded) $('request-rows').innerHTML=`<tr><td colspan="8" class="table-empty"><span class="empty-title">${esc(message)}</span><span class="empty-description">请检查连接，或点击刷新重试。</span></td></tr>`;
       }
@@ -99,7 +101,7 @@
       const response = await fetch('/api/requests/' + encodeURIComponent(state.selected), {signal:AbortSignal.any([controller.signal,AbortSignal.timeout(12000)]),cache:'no-store'});
       if(!response.ok) throw new Error(response.status===404?'记录不存在或已超过保留期限':response.status===401?'登录已过期':'详情加载失败');
       const r = await response.json();
-      if(controller !== state.detailController) return;
+      if(controller !== state.detailController || controller.signal.aborted) return;
       if(!force && !selection.isCollapsed && $('request-dialog').contains(selection.anchorNode)) return;
       $('request-detail-title').textContent=r.model || '请求详情';
       $('request-detail-id').textContent=r.id;
@@ -141,7 +143,7 @@
       else if(focusId) $(focusId)?.focus({preventScroll:true});
       $('request-dialog').scrollTop=detailScroll;
     } catch(error) {
-      if(error.name!=='AbortError') $('request-detail-state').textContent=(error.name==='TimeoutError'?'详情连接超时':error.message)+'，稍后自动重试';
+      if(controller===state.detailController&&!controller.signal.aborted&&error.name!=='AbortError') $('request-detail-state').textContent=(error.name==='TimeoutError'?'详情连接超时':error.message)+(state.paused?'，请手动刷新重试':'，稍后自动重试');
     } finally {
       if(controller===state.detailController) state.detailLoading=false;
     }
