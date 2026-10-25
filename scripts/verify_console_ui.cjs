@@ -24,8 +24,10 @@ from runtime_state import app_state
 import uvicorn, os
 app_state.set_express_keys([{'key':'ui-fixture-key','project_id':'fixture-project','project_source':'auto','enabled':True}])
 app_state.set_cookie_accounts([])
+# Start disabled so checking the guard below makes a real model-specific edit.
+# Its production default is already enabled; an unchanged value is not posted.
 app_state.update_settings({'image_aspect_ratio':'16:9','express_ua_profile':'custom','express_ua_custom':'fixture-gateway/'+'x'*360,
-                          'hide_thoughts':True,'native_thinking_mode':'request'})
+                          'hide_thoughts':True,'native_thinking_mode':'request','prefill_cot_guard':False})
 stats.total_requests=32
 stats.success_requests=25
 stats.error_requests=5
@@ -150,6 +152,7 @@ async function main() {
     assert.equal(await page.inputValue('#native_thinking_mode'), 'request');
     await page.selectOption('#model-sel', 'gemini-4-argon');
     await page.fill('#first_reply_timeout_seconds', '28.5');
+    assert.equal(await page.locator('#prefill_cot_guard').isChecked(), false);
     await page.check('#prefill_cot_guard');
     let pending = responseFor('/api/model-overrides/gemini-4-argon');
     await page.click('#btn-scope-save');
@@ -158,6 +161,7 @@ async function main() {
     assert.equal(response.request().postDataJSON().prefill_cot_guard, true);
     assert.equal(response.request().postDataJSON().first_reply_timeout_seconds, 28.5);
     assert.deepEqual(Object.keys(response.request().postDataJSON()).sort(),['first_reply_timeout_seconds','prefill_cot_guard']);
+    assert.equal((await response.json()).override.prefill_cot_guard, true);
     await page.waitForFunction(() => !document.querySelector('#btn-scope-save').disabled);
     await openTab('runtime');
     assert.equal(await page.locator('#cross_channel_fallback').isChecked(),false);
