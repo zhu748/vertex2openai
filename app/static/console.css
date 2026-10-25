@@ -525,6 +525,12 @@ body:has(#request-dialog[open]) { overflow: hidden; }
 .account-project { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
 .account-mask { color: var(--muted); font: 12px ui-monospace,monospace; }
 .account-edit-label { margin-left: auto; color: var(--accent); font-size: 13px; }
+.cookie-probe-overview { margin: 0 0 16px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 8px; background: #fafbfe; font-size: 12px; color: var(--muted); line-height: 1.8; }
+.cookie-probe-result { margin: 8px 0 12px; color: var(--muted); font-size: 12px; line-height: 1.8; white-space: pre-wrap; overflow-wrap: anywhere; }
+.cookie-health-badge[data-state=valid] { color: #047857; background: #ecfdf5; }
+.cookie-health-badge[data-state=invalid] { color: #b45309; background: #fffbeb; }
+.cookie-health-badge[data-state=error] { color: #9f3150; background: #fff1f2; }
+.cookie-health-badge[data-state=pending] { color: var(--accent); background: #eeeeff; }
 .account-editor[open] > summary { margin-bottom: 14px; border-bottom: 1px solid var(--border); padding-bottom: 14px; }
 .key-card { background: #fff; }
 .key-head { margin-bottom: 4px; }

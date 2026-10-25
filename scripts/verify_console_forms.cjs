@@ -15,6 +15,7 @@ async function main(){
  const overrides={},builtins={text:{anti_truncation_mode:'both'}};
  let keys=[{key:'ui-fixture-key',project_id:'project-one',note:'主账号',enabled:true,proxies:[],proxy_fallback:true}];
  let cookies=[{id:'cookie-one',project_id:'project-cookie',note:'备用账号',enabled:true,cookie_configured:true,proxies:[],proxy_fallback:true}];
+ let cookieResult={status:'valid',reason:'session_accepted',detail:'会话有效',health:{failures:0,cooldown_remaining:0}};
  const cap={family:'3',thinking:{kind:'level',levels:['low','medium','high']},supports_anti_truncation:true,supports_search:true,image_sizes:['1K','2K','4K'],image_aspect_ratios:['1:1','16:9']};
  const summary={connections:1,generations:1,background:0,retry_wait:0,active:1};
  const record={id:'trace-1234567890abcdef',model:'text',protocol:'openai',channel:'express',mode:'stream',phase:'streaming',status:'running',connection:'open',created_at:Date.now()/1000,duration_ms:1000,timings:{},attempts:1,retries:0,finish_reasons:[],usage:{},events:[],logs:[]};
@@ -32,7 +33,11 @@ async function main(){
   else if(target.pathname==='/api/capabilities')result={models:['text','image'],capabilities:{text:{...cap,is_image:false},image:{...cap,is_image:true}},overrides:{text:{...builtins.text,...overrides.text},...Object.fromEntries(Object.entries(overrides).filter(([m])=>m!=='text'))},saved_overrides:overrides,builtin_overrides:builtins};
   else if(target.pathname.startsWith('/api/model-overrides/')){const model=target.pathname.split('/').pop();if(method==='DELETE')delete overrides[model];else{const current={...overrides[model]};for(const key of body._inherit||[])delete current[key];Object.assign(current,Object.fromEntries(Object.entries(body).filter(([k])=>k!=='_inherit')));overrides[model]=current;}result={override:{...builtins[model],...overrides[model]}};}
   else if(target.pathname==='/api/express-keys'){if(body)keys=body.keys;result={keys};}
-  else if(target.pathname==='/api/cookie-accounts'){if(body)cookies=body.accounts;result={accounts:cookies};}
+  else if(target.pathname==='/api/cookie-accounts'){
+   if(body)cookies=body.accounts.map((item,i)=>{const saved={...item,id:item.id||'saved-cookie-'+i,cookie_configured:true};delete saved.cookie;return saved;});
+   result={accounts:cookies};
+  }
+  else if(target.pathname==='/api/cookie-accounts/test')result={results:[{id:body.id,checked_at:Date.now()/1000,elapsed_ms:120,...cookieResult}]};
   else if(target.pathname==='/api/stats')result={total:3,success:1,error:1,retries:0,requests:summary,prompt_tokens:100,completion_tokens:200,uptime:50};
   else if(target.pathname==='/api/recent-metrics')result={sample_count:3,success:1,error:1,active:1,reply_samples:2,first_reply_p50_ms:100,first_reply_p95_ms:900,channels:{express:{success:1,error:1,active:1}}};
   else if(target.pathname==='/api/requests'){
@@ -137,6 +142,64 @@ async function main(){
   edit('proxy-input','http://proxy.test:80');await w.saveProxy();assert.equal(w.consoleForms.dirty(),false);
   console.log('✓ Credential drafts, filters, add/undo, immediate strategy and proxy save state');
 
+  assert.equal(requests.some(r=>r.path==='/api/cookie-accounts/test'),false);
+  const cookieInput=el('cookie-note-0');edit('cookie-note-0','保留本地备注');cookieInput.focus();
+  cookieResult={status:'valid',detail:'<img src=x onerror="window.injected=true">',health:{failures:0,cooldown_remaining:0}};
+  await w.probeCookieAccounts(0);
+  assert.equal(d.querySelector('.cookie-health-badge').textContent,'会话有效');assert.equal(el('cookie-note-0'),cookieInput);
+  assert.equal(cookieInput.value,'保留本地备注');assert.equal(w.consoleForms.dirty(),true);assert.equal(d.querySelector('.cookie-probe-result img'),null);
+  assert.deepEqual(requests.filter(r=>r.path==='/api/cookie-accounts/test').at(-1).body,{id:'cookie-one'});
+  assert.equal(d.activeElement,cookieInput);
+  cookieResult={status:'invalid',reason:'permission_denied',detail:'访问被拒绝',health:{failures:0,cooldown_remaining:120}};
+  await w.probeCookieAccounts(0);assert.equal(d.querySelector('.cookie-health-badge').textContent,'权限被拒绝');
+  assert(d.querySelector('.cookie-probe-result').textContent.includes('冷却中'));assert.equal(d.querySelector('.c-enabled').checked,true);
+  transport=target=>{if(target.pathname==='/api/cookie-accounts/test'){transport=null;return new Response('{}',{status:503});}};
+  await w.probeCookieAccounts(0);assert.equal(d.querySelector('.cookie-health-badge').textContent,'无法判断');
+  edit('cookie-project-0','unsaved-project');assert.equal(d.querySelector('.cookie-probe-button').disabled,true);
+  const probeCount=requests.filter(r=>r.path==='/api/cookie-accounts/test').length;await w.probeCookieAccounts(0);
+  assert.equal(requests.filter(r=>r.path==='/api/cookie-accounts/test').length,probeCount);
+  edit('cookie-project-0','project-cookie');edit('cookie-0','SAPISID=unsaved');assert.equal(d.querySelector('.cookie-probe-button').disabled,true);
+  edit('cookie-0','');cookieResult={status:'valid',detail:'会话有效',health:{failures:0,cooldown_remaining:0}};
+  await w.probeCookieAccounts(0);assert.equal(d.querySelector('.cookie-probe-result').textContent.includes('冷却中'),false);
+  edit('proxy-input','http://changed-proxy.test:80');await w.saveProxy();w.consoleChannels.sync();
+  assert.equal(d.querySelector('.cookie-health-badge').textContent,'配置已变化');
+  w.consoleForms.discard('cookies');assert.equal(w.consoleForms.dirty(),false);
+  console.log('✓ Cookie single probes, reason labels, cooldown, draft guards and safe result rendering');
+
+  const cookieFixture=(id,enabled=true)=>({id,enabled,cookie_configured:true,project_id:'project',proxies:[],proxy_fallback:true});
+  cookies=Array.from({length:8},(_,i)=>cookieFixture('batch-'+i));cookies.push(cookieFixture('disabled',false));
+  await w.loadCookieAccounts();w.addCookieAccount();edit('cookie-project-1','not-saved');edit('cookie-note-2','备注不丢失');
+  let activeProbes=0,peakProbes=0;
+  transport=target=>{if(target.pathname==='/api/cookie-accounts/test'){
+   activeProbes++;peakProbes=Math.max(peakProbes,activeProbes);
+   const id=requests.at(-1).body.id,kind=Number(id.split('-').at(-1))%3;
+   return new Promise(resolve=>setTimeout(()=>{activeProbes--;resolve(new Response(JSON.stringify({results:[{id,status:['valid','invalid','error'][kind],reason:kind===1?'permission_denied':'network_error',detail:'fixture',elapsed_ms:10,checked_at:Date.now()/1000}]})));},10));
+  }};
+  const batchStart=requests.length,batch=w.probeCookieAccounts();assert.equal(el('cookie-probe-stop').hidden,false);
+  await batch;transport=null;
+  const batchIDs=requests.slice(batchStart).filter(r=>r.path==='/api/cookie-accounts/test').map(r=>r.body.id);
+  assert.equal(batchIDs.length,7);assert.equal(peakProbes,3);assert(!batchIDs.includes('batch-1')&&!batchIDs.includes('disabled'));
+  assert(el('cookie-probe-summary').textContent.includes('已完成 7 / 7'));assert(el('cookie-probe-summary').textContent.includes('无法判断 2'));
+  assert(el('cookie-probe-summary').textContent.includes('跳过 3'));assert.equal(el('cookie-note-2').value,'备注不丢失');
+  assert.equal(el('cookie-project-1').value,'not-saved');assert.equal(w.consoleForms.dirty(),true);
+  console.log('✓ Bounded Cookie batch concurrency, progress, skipped drafts and independent failures');
+
+  cookies=Array.from({length:5},(_,i)=>cookieFixture('cancel-'+i));await w.loadCookieAccounts();
+  const late=[];
+  transport=target=>{if(target.pathname==='/api/cookie-accounts/test'){const id=requests.at(-1).body.id;return new Promise(resolve=>late.push(()=>resolve(new Response(JSON.stringify({results:[{id,status:'invalid',detail:'late failure'}]})))));}};
+  const cancelStart=requests.length,cancelled=w.probeCookieAccounts();assert.equal(late.length,3);
+  w.stopCookieProbes();assert(el('cookie-probe-summary').textContent.includes('已停止'));transport=null;
+  await w.probeCookieAccounts(0);const latestSummary=el('cookie-probe-summary').textContent;
+  late.forEach(resolve=>resolve());await cancelled;
+  assert.equal(el('cookie-probe-summary').textContent,latestSummary);assert.equal(d.querySelector('.cookie-health-badge').textContent,'会话有效');
+  assert.equal(requests.slice(cancelStart).filter(r=>r.path==='/api/cookie-accounts/test').length,4);
+  let completeOld;
+  transport=target=>{if(target.pathname==='/api/cookie-accounts/test'){transport=null;return new Promise(resolve=>{completeOld=()=>resolve(new Response(JSON.stringify({results:[{id:'cancel-0',status:'invalid',detail:'old cookie'}]})));});}};
+  const beforeSave=w.probeCookieAccounts(0);edit('cookie-0','SAPISID=replaced');await w.saveCookieAccounts();
+  completeOld();await beforeSave;
+  assert.equal(d.querySelector('.cookie-health-badge').textContent,'未检测');assert.equal(el('cookie-0').value,'');assert.equal(w.consoleForms.dirty(),false);
+  console.log('✓ Stopping Cookie batches and isolating late results after replacement');
+
   w.switchTab('requests');await tick();const row=el('request-rows').firstElementChild;
   await w.requestMonitor.refresh();assert.equal(el('request-rows').firstElementChild,row);
   el('request-pause').click();const count=requests.length;await w.requestMonitor.refresh(false);assert.equal(requests.length,count);
@@ -171,7 +234,7 @@ async function main(){
   const ids=[...d.querySelectorAll('[id]')].map(e=>e.id);assert.equal(new Set(ids).size,ids.length);
   assert.deepEqual(errors,[]);
   console.log('✓ Stable request rows, pause/resume, pagination and unique DOM IDs');
-  console.log('9 groups of console DOM checks passed. Layout requires the browser suite.');
+  console.log('12 groups of console DOM checks passed. Layout requires the browser suite.');
  }finally{dom.window.close();}
 }
 main().catch(error=>{console.error(error);process.exitCode=1;});

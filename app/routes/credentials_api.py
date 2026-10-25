@@ -185,16 +185,22 @@ class CookieTestBody(BaseModel):
 
 @router.post("/api/cookie-accounts/test")
 async def test_cookie_accounts(body: CookieTestBody, _auth: bool = Depends(require_auth)):
+    from credential_manager import credential_manager
+
     accounts = [rec for rec in app_state.get_cookie_accounts() if rec["enabled"]]
     if body.id.strip():
         accounts = [rec for rec in accounts if rec["id"] == body.id.strip()]
     if not accounts:
         return JSONResponse(status_code=404, content={"error": "没有匹配的启用 Cookie 账号。"})
     results = await probe_cookie_accounts(accounts)
+    health = credential_manager.cookie_health_snapshot()
+    for result in results:
+        result["health"] = health.get(result["id"], {"cooldown_remaining": 0.0, "failures": 0})
     valid = sum(1 for r in results if r["status"] == "valid")
     return JSONResponse(content={
         "results": results, "total": len(results), "valid": valid,
-        "invalid": len(results) - valid,
+        "invalid": sum(1 for r in results if r["status"] == "invalid"),
+        "errors": sum(1 for r in results if r["status"] == "error"),
     }, headers={"Cache-Control": "no-store"})
 
 

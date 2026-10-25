@@ -30,21 +30,22 @@ async def probe_account(record: dict) -> dict:
     started = time.monotonic()
     account_id = record.get("id", "")
 
-    def done(status, detail):
+    def done(status, detail, reason):
         if status == "valid":
             credential_manager.record_cookie_success(account_id, credential=record)
         elif status == "invalid":
             credential_manager.record_cookie_auth_failure(account_id, credential=record)
         return {"id": account_id, "label": record.get("note", "") or account_id,
                 "status": status, "detail": redact(detail)[:600],
+                "reason": reason, "checked_at": time.time(),
                 "elapsed_ms": round((time.monotonic() - started) * 1000)}
 
     headers = build_headers(record.get("cookie", ""))
     if headers is None:
-        return done("invalid", "Cookie 缺少 SAPISID 族字段，无法计算认证头。")
+        return done("invalid", "Cookie 缺少 SAPISID 族字段，无法计算认证头。", "missing_cookie")
     project = (record.get("project_id", "") or app_state.get_project_id() or "").strip()
     if not project:
-        return done("error", "该账号未填写 Project ID，无法构造探测请求。")
+        return done("error", "该账号未填写 Project ID，无法构造探测请求。", "missing_project")
 
     options = {"timeout": httpx.Timeout(connect=15.0, read=30.0, write=15.0, pool=15.0),
                "follow_redirects": False, "trust_env": False,
@@ -59,14 +60,16 @@ async def probe_account(record: dict) -> dict:
                     async with client.stream("POST", BATCH_GRAPHQL_URL, headers=headers,
                                              json=build_probe_body(project)) as response:
                         status_code = response.status_code
-                        if status_code in (401, 403):
-                            return done("invalid", f"HTTP {status_code}：会话已失效或无权访问该 Project。")
+                        if status_code == 401:
+                            return done("invalid", "HTTP 401：会话认证未通过，请检查 Cookie。", "unauthenticated")
+                        if status_code == 403:
+                            return done("invalid", "HTTP 403：访问被拒绝，请检查账号与项目权限；不能仅据此判定 Cookie 过期。", "permission_denied")
                         data = await read_limited_bytes(response, MAX_PROBE_RESPONSE_BYTES)
     except Exception as exc:
-        return done("error", f"网络/代理或响应读取错误：{type(exc).__name__}: {exc}")
+        return done("error", f"网络/代理或响应读取错误：{type(exc).__name__}: {exc}", "network_error")
 
     if status_code >= 500 or status_code == 429 or 300 <= status_code < 400:
-        return done("error", f"上游暂时不可用（HTTP {status_code}），请稍后重试。")
+        return done("error", f"上游暂时不可用（HTTP {status_code}），请稍后重试。", "upstream_unavailable")
 
     try:
         parser = JsonObjects(limit=MAX_PROBE_RESPONSE_BYTES)
@@ -89,15 +92,19 @@ async def probe_account(record: dict) -> dict:
         # Evaluate all errors: a later NOT_FOUND cannot hide an auth rejection.
         codes = {_grpc_status_code(error) for error in errors}
         detail = next((str(error["message"]) for error in errors if error.get("message")), "")
-        if codes & {7, 16} or any(_is_cookie_expired_error(str(e.get("message", ""))) for e in errors):
-            return done("invalid", f"鉴权失败：{detail or 'permission/unauthenticated'}")
+        if 16 in codes:
+            return done("invalid", f"会话认证失败：{detail or 'unauthenticated'}", "unauthenticated")
+        if 7 in codes:
+            return done("invalid", f"项目或账号权限被拒绝：{detail or 'permission denied'}", "permission_denied")
+        if any(_is_cookie_expired_error(str(e.get("message", ""))) for e in errors):
+            return done("invalid", f"鉴权未通过：{detail}", "auth_rejected")
         if codes & {3, 5, 8}:
-            return done("valid", f"会话有效：{detail or '模型不存在属预期'}")
+            return done("valid", f"会话有效：{detail or '模型不存在属预期'}", "session_accepted")
         if status_code == 200 and recognized and not errors:
-            return done("valid", "会话有效（上游 200 且无错误块）。")
-        return done("error", f"无法判定（HTTP {status_code}）：{detail or '未收到预期的探测结果'}")
+            return done("valid", "会话有效（上游 200 且无错误块）。", "session_accepted")
+        return done("error", f"无法判定（HTTP {status_code}）：{detail or '未收到预期的探测结果'}", "unexpected_response")
     except (ValueError, TypeError, AttributeError, RecursionError) as exc:
-        return done("error", f"上游探测响应格式无效：{exc}")
+        return done("error", f"上游探测响应格式无效：{exc}", "unexpected_response")
 
 
 async def probe_all(records: list) -> list:
@@ -113,6 +120,7 @@ async def probe_all(records: list) -> list:
                 results[index] = {"id": record.get("id", ""),
                                   "label": record.get("note", "") or record.get("id", ""),
                                   "status": "error", "detail": redact(f"探测异常：{exc}")[:600],
+                                  "reason": "probe_error", "checked_at": time.time(),
                                   "elapsed_ms": 0}
 
     await asyncio.gather(*(worker() for _ in range(min(MAX_CONCURRENT_PROBES, len(records)))))

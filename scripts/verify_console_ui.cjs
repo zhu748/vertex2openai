@@ -25,7 +25,7 @@ import uvicorn, os
 app_state.set_express_keys([{'key':'ui-fixture-key','project_id':'fixture-project','project_source':'auto','enabled':True}])
 app_state.set_cookie_accounts([])
 app_state.update_settings({'image_aspect_ratio':'16:9','express_ua_profile':'custom','express_ua_custom':'fixture-gateway/'+'x'*360,
-                          'hide_thoughts':True,'native_thinking_mode':'request'})
+                          'hide_thoughts':True,'native_thinking_mode':'request','prefill_cot_guard':False})
 stats.total_requests=32
 stats.success_requests=25
 stats.error_requests=5
@@ -805,6 +805,33 @@ async function main() {
     assert.equal(savedCookies.accounts[0].proxy_fallback,false);
     assert.equal(savedCookies.accounts[0].proxies[0],'socks5://cookie-user:private%3Apassword@cookie-proxy.invalid:1080');
     assert.equal((await (await page.request.get(origin+'/api/settings/runtime')).json()).mode,'mixed');
+    await page.waitForFunction(()=>!document.querySelector('.cookie-probe-button').disabled);
+    assert.equal(await page.locator('.cookie-probe-button').nth(1).isDisabled(),true);
+    let cookieProbeMode='valid';
+    await page.route('**/api/cookie-accounts/test',route=>{
+      if(cookieProbeMode==='network')return route.fulfill({status:503,json:{error:'fixture network failure'}});
+      const id=route.request().postDataJSON().id;
+      return route.fulfill({json:{results:[{id,status:cookieProbeMode,reason:'permission_denied',detail:'fixture <img src=x onerror="window.uiInjected=true">',checked_at:Date.now()/1000,elapsed_ms:125,health:{failures:0,cooldown_remaining:0}}]}});
+    });
+    await page.locator('#cookies-list .account-editor').first().evaluate(el=>el.open=true);
+    await page.locator('.c-note').first().fill('检测期间保留草稿');
+    await page.locator('.c-note').first().evaluate(el=>el.dataset.probeIdentity='retained');
+    await page.locator('.cookie-probe-button').first().click();
+    await page.waitForFunction(()=>document.querySelector('.cookie-health-badge').textContent==='会话有效');
+    assert.equal(await page.locator('.c-note').first().inputValue(),'检测期间保留草稿');
+    assert.equal(await page.locator('.c-note').first().getAttribute('data-probe-identity'),'retained');
+    assert.equal(await page.locator('.cookie-probe-result img').count(),0);
+    cookieProbeMode='invalid';await page.locator('.cookie-probe-button').first().click();
+    await page.waitForFunction(()=>document.querySelector('.cookie-health-badge').textContent==='权限被拒绝');
+    assert.equal(await page.locator('.c-enabled').first().isChecked(),true);
+    cookieProbeMode='network';await page.locator('.cookie-probe-button').first().click();
+    await page.waitForFunction(()=>document.querySelector('.cookie-health-badge').textContent==='无法判断');
+    await page.locator('.c-project').first().fill('not-yet-saved');
+    assert.equal(await page.locator('.cookie-probe-button').first().isDisabled(),true);
+    assert.equal(await page.locator('#cookie-probe-all').isDisabled(),true);
+    await page.evaluate(()=>consoleForms.discard('cookies'));
+    await page.unroute('**/api/cookie-accounts/test');
+    check('Cookie 会话检测、权限与网络区分、草稿保护、未保存配置拦截和结果转义');
     await page.selectOption('#credential-strategy','roundrobin');
     await page.waitForFunction(()=>!document.querySelector('#credential-strategy').disabled);
     assert.equal((await (await page.request.get(origin+'/api/settings')).json()).roundrobin,true);

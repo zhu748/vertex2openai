@@ -5,6 +5,110 @@ if(window.consoleChannels) return;
 let COOKIE_ACCOUNTS=[], SAVED_COOKIES=[], cookiesLoaded=false, proxyEditor=null, proxyEditorInitialized=false;
 // In-memory only: proxy credentials and test results never enter localStorage.
 const proxyResults=new Map();
+const cookieProbeResults=new Map(),cookieHealth=new Map();
+let cookieProbeJob=null;
+
+function cookieProbeContext(){return JSON.stringify(['proxy_urls','proxy_url','cookie_impersonate','cookie_authuser','cookie_query_signature','cookie_client_version'].map(key=>GLOBAL_SETTINGS[key]));}
+function cookieProbeEligibility(index){
+  const record=COOKIE_ACCOUNTS[index],saved=SAVED_COOKIES.find(item=>item.id&&item.id===record?.id);
+  if(!saved?.cookie_configured)return {reason:'请先保存 Cookie 账号，再检测会话。'};
+  const row=$('cookies-list').children[index],read=(selector,fallback)=>row?.querySelector(selector)?.value??fallback;
+  const enabled=row?.querySelector('.c-enabled')?.checked??record.enabled;
+  if(saved.enabled===false||!enabled)return {reason:'账号未启用，启用并保存后可检测。'};
+  if(read('.c-cookie',record.cookie||'').trim()||projectFromInput(read('.c-project',record.project_id))!==saved.project_id
+      ||JSON.stringify(proxyDraft(read('.c-proxy',(record.proxies||[]).join('\n'))))!==JSON.stringify(proxyDraft(saved.proxies??saved.proxy))
+      ||(row?.querySelector('.c-fallback')?.checked??(record.proxy_fallback!==false))!==(saved.proxy_fallback!==false)){
+    return {reason:'Cookie、项目或代理有未保存修改，请先保存后检测。'};
+  }
+  return {saved,reason:''};
+}
+function rememberCookieHealth(records){
+  for(const record of records){const health=record.health||{};cookieHealth.set(record.id,{until:Date.now()+Math.max(0,Number(health.cooldown_remaining)||0)*1000,failures:Number(health.failures)||0});}
+}
+function resetCookieProbes(){
+  if(cookieProbeJob)stopCookieProbes();
+  cookieProbeResults.clear();cookieHealth.clear();rememberCookieHealth(SAVED_COOKIES);
+  $('cookie-probe-summary').textContent='尚未检测。检测使用已保存的账号、代理及指纹配置。';
+}
+function cookieProbeState(record){
+  const result=cookieProbeResults.get(record.id);
+  if(cookieProbeJob?.pending.has(record.id))return {label:'检测中…',state:'pending'};
+  if(cookieProbeJob?.items.some(item=>item.id===record.id)&&!cookieProbeJob.finished.has(record.id))return {label:'等待检测',state:'pending'};
+  if(!result)return {label:'未检测',state:'idle'};
+  if(result.context!==cookieProbeContext())return {label:'配置已变化',state:'idle'};
+  if(result.status==='valid')return {label:'会话有效',state:'valid'};
+  if(result.status==='invalid')return {label:result.reason==='permission_denied'?'权限被拒绝':result.reason==='missing_cookie'?'凭证格式无效':'认证未通过',state:'invalid'};
+  return {label:'无法判断',state:'error'};
+}
+function syncCookieProbes(){
+  const job=cookieProbeJob;
+  let available=0;
+  for(const [index,record] of COOKIE_ACCOUNTS.entries()){
+    const row=$('cookies-list').children[index];if(!row)continue;
+    const eligibility=cookieProbeEligibility(index),state=cookieProbeState(record),result=cookieProbeResults.get(record.id);
+    if(eligibility.saved)available++;
+    const button=row.querySelector('.cookie-probe-button');button.disabled=!!job||!eligibility.saved;button.title=eligibility.reason;
+    const badge=row.querySelector('.cookie-health-badge');badge.textContent=state.label;badge.dataset.state=state.state;
+    const text=[];
+    if(result){
+      const at=new Date(result.checked_at*1000).toLocaleString('zh-CN',{hour12:false});
+      text.push(`已保存配置 · ${at} · ${(result.elapsed_ms/1000).toFixed(1)} 秒：${result.detail}`);
+      if(result.context!==cookieProbeContext())text.push('运行配置已变化，请重新检测。');
+    }
+    if(eligibility.reason)text.push(eligibility.reason);
+    const health=cookieHealth.get(record.id),remaining=health?Math.ceil((health.until-Date.now())/1000):0;
+    if(remaining>0)text.push(`自动冷却中，约剩 ${remaining} 秒。`);
+    else if(health?.failures)text.push(`连续鉴权失败 ${health.failures} 次。`);
+    const detail=row.querySelector('.cookie-probe-result');detail.textContent=text.join(' ');detail.hidden=!text.length;
+  }
+  $('cookie-probe-all').disabled=!!job||!available;
+  $('cookie-probe-stop').hidden=!job;
+}
+function cookieProbeProgress(job,stopped=false){
+  $('cookie-probe-summary').textContent=`${stopped?'已停止':cookieProbeJob===job?'正在检测':'检测完成'} · 已完成 ${job.finished.size} / ${job.items.length} · 会话有效 ${job.valid} · 认证/权限未通过 ${job.invalid} · 无法判断 ${job.errors}`
+    +(job.skipped?`；跳过 ${job.skipped} 个未保存或未启用账号。`:'')
+    +(stopped?'；未完成项未获得本次检测结果。':'');
+}
+function stopCookieProbes(){
+  const job=cookieProbeJob;if(!job)return;
+  cookieProbeJob=null;job.controller.abort();cookieProbeProgress(job,true);syncCookieProbes();
+}
+async function probeCookieAccounts(index=null){
+  if(!cookiesLoaded||cookieProbeJob)return;
+  collectCookieAccounts();
+  const choices=index===null?COOKIE_ACCOUNTS.map((_,i)=>i):[index];
+  const items=choices.map(i=>cookieProbeEligibility(i).saved).filter(Boolean);
+  if(!items.length){toast(index===null?'没有可检测的已保存、已启用账号':cookieProbeEligibility(index).reason);return;}
+  const job=cookieProbeJob={items,context:cookieProbeContext(),controller:new AbortController(),pending:new Set(),finished:new Set(),next:0,valid:0,invalid:0,errors:0,skipped:choices.length-items.length};
+  cookieProbeProgress(job);syncCookieProbes();
+  async function worker(){
+    while(cookieProbeJob===job&&job.next<items.length){
+      const saved=items[job.next++];job.pending.add(saved.id);syncCookieProbes();
+      let result;
+      try{
+        const response=await fetch('/api/cookie-accounts/test',{method:'POST',headers:{'Content-Type':'application/json'},
+          signal:AbortSignal.any([job.controller.signal,AbortSignal.timeout(90000)]),body:JSON.stringify({id:saved.id})});
+        const data=await response.json();
+        if(!response.ok)throw new Error(await responseError(response,'会话检测失败',data));
+        result=data.results?.find(item=>item.id===saved.id);
+        if(!result||!['valid','invalid','error'].includes(result.status))throw new Error('服务端未返回可识别的检测结果');
+      }catch(error){
+        if(job.controller.signal.aborted)return;
+        result={status:'error',detail:error.name==='TimeoutError'?'检测超时，无法判断会话是否有效。':error.message,elapsed_ms:0,checked_at:Date.now()/1000};
+      }
+      if(cookieProbeJob!==job)return;
+      job.pending.delete(saved.id);job.finished.add(saved.id);
+      if(SAVED_COOKIES.includes(saved)&&COOKIE_ACCOUNTS.some(item=>item.id===saved.id)){
+        cookieProbeResults.set(saved.id,{...result,detail:String(result.detail||'').slice(0,600),checked_at:result.checked_at||Date.now()/1000,elapsed_ms:Math.max(0,Number(result.elapsed_ms)||0),context:job.context});
+        if(result.health)rememberCookieHealth([{id:saved.id,health:result.health}]);
+      }
+      if(result.status==='valid')job.valid++;else if(result.status==='invalid')job.invalid++;else job.errors++;
+      cookieProbeProgress(job);syncCookieProbes();
+    }
+  }
+  try{await Promise.all(Array.from({length:Math.min(3,items.length)},worker));}
+  finally{if(cookieProbeJob===job){cookieProbeJob=null;cookieProbeProgress(job);syncCookieProbes();}}
+}
 
 async function updateCredentialStrategy(select){
   if(!settingsLoaded){toast('设置尚未加载，请先重新加载配置');return;}
@@ -24,9 +128,11 @@ function renderCookieAccounts(){
   $('cookies-list').innerHTML=COOKIE_ACCOUNTS.map((rec,index)=>`
     <div class="key-card cookie-card" data-cookie-index="${index}">
       <div class="key-head"><div class="key-title"><span class="pill pill-accent">Cookie ${index+1}</span>
-        <span class="pill">${rec.cookie_configured?'已保存 Cookie':'待填写 Cookie'}</span></div>
+        <span class="pill">${rec.cookie_configured?'已保存 Cookie':'待填写 Cookie'}</span><span class="pill cookie-health-badge" data-state="idle">未检测</span></div>
         <div class="key-actions"><label><input type="checkbox" class="c-enabled" ${rec.enabled===false?'':'checked'} aria-label="启用 Cookie ${index+1}">启用</label>
+          <button type="button" class="cookie-probe-button" onclick="probeCookieAccounts(${index})" aria-label="检测 Cookie ${index+1} 会话">检测会话</button>
           <button type="button" class="danger" onclick="removeCookieAccount(${index})" aria-label="删除 Cookie ${index+1}">删除</button></div></div>
+      <p class="cookie-probe-result" hidden></p>
       <div class="key-fields">
         <div><label for="cookie-${index}">Google Cookie（含 HttpOnly 字段）</label>
           <textarea id="cookie-${index}" class="inp log c-cookie" rows="3" spellcheck="false" autocomplete="off" placeholder="${esc(rec.cookie_configured?'已保存，留空保留原 Cookie；粘贴新值可更新':'粘贴完整 Cookie 头或 Cookie-Editor JSON')}">${esc(rec.cookie||'')}</textarea>
@@ -39,6 +145,7 @@ function renderCookieAccounts(){
   window.consoleForms?.accounts('cookie');
   $('cookies-count').textContent=COOKIE_ACCOUNTS.length+' 个';
   $('cookies-empty').classList.toggle('hidden',COOKIE_ACCOUNTS.length>0);
+  syncCookieProbes();
 }
 function collectCookieAccounts(){
   document.querySelectorAll('[data-cookie-index]').forEach(row=>{
@@ -57,7 +164,7 @@ async function loadCookieAccounts(){
   try{
     const data=await readJSON('/api/cookie-accounts');
     COOKIE_ACCOUNTS=(data.accounts||[]).map(credentialCopy);
-    cookiesLoaded=true;SAVED_COOKIES=COOKIE_ACCOUNTS.map(credentialCopy);renderCookieAccounts();window.consoleForms?.saved('cookies');
+    cookiesLoaded=true;SAVED_COOKIES=COOKIE_ACCOUNTS.map(credentialCopy);resetCookieProbes();renderCookieAccounts();window.consoleForms?.saved('cookies');
   }catch(error){loadNotice('channel','Cookie 账号'+error.message+'。请重新加载配置。');}
 }
 function addCookieAccount(){
@@ -76,7 +183,7 @@ async function saveCookieAccounts(){
     const response=await fetch('/api/cookie-accounts',{method:'POST',signal:AbortSignal.timeout(30000),headers:{'Content-Type':'application/json'},body:JSON.stringify({accounts})});
     const result=await response.json();
     if(!response.ok) throw new Error(await responseError(response,'保存失败',result));
-    COOKIE_ACCOUNTS=result.accounts.map(credentialCopy);SAVED_COOKIES=COOKIE_ACCOUNTS.map(credentialCopy);renderCookieAccounts();window.consoleForms?.saved('cookies');
+    COOKIE_ACCOUNTS=result.accounts.map(credentialCopy);SAVED_COOKIES=COOKIE_ACCOUNTS.map(credentialCopy);resetCookieProbes();renderCookieAccounts();window.consoleForms?.saved('cookies');
     toast('已保存 '+COOKIE_ACCOUNTS.length+' 个 Cookie 账号（已热生效）');
   }catch(error){toast('❌ '+error.message);}
 }
@@ -591,8 +698,10 @@ function initProxyEditor(){
   proxyEditorInitialized=true;
 }
 
-window.consoleChannels={hasDraft:()=>!!proxyEditor&&(JSON.stringify(proxyEditor.initial)!==JSON.stringify(proxyEditor.proxies)||proxyFormDirty()||!!$('proxy-import-text').value.trim()),discard:()=>{COOKIE_ACCOUNTS=SAVED_COOKIES.map(credentialCopy);renderCookieAccounts();},load:loadCookieAccounts,init:initProxyEditor,open:openProxyEditor,sync:updateProxyEditorControls};
-Object.assign(window,{updateCredentialStrategy,loadCookieAccounts,addCookieAccount,removeCookieAccount,saveCookieAccounts,
+for(const event of ['input','change'])document.addEventListener(event,e=>{if(e.target.closest('#cookies-list'))syncCookieProbes();});
+setInterval(()=>{if(!document.hidden&&!$('view-channel').classList.contains('hidden'))syncCookieProbes();},5000);
+window.consoleChannels={hasDraft:()=>!!proxyEditor&&(JSON.stringify(proxyEditor.initial)!==JSON.stringify(proxyEditor.proxies)||proxyFormDirty()||!!$('proxy-import-text').value.trim()),discard:()=>{COOKIE_ACCOUNTS=SAVED_COOKIES.map(credentialCopy);renderCookieAccounts();},load:loadCookieAccounts,init:initProxyEditor,open:openProxyEditor,sync:()=>{updateProxyEditorControls();syncCookieProbes();}};
+Object.assign(window,{updateCredentialStrategy,loadCookieAccounts,addCookieAccount,removeCookieAccount,saveCookieAccounts,probeCookieAccounts,stopCookieProbes,
   closeProxyEditor,moveProxy,deleteProxy,resetProxyForm,proxyTypeChanged,recognizeProxyPaste,editProxy,addProxyDraft,
   applyProxyEditor,testEditorProxy,renderProxyEditor,proxyMissingFields,switchProxyView,proxyTargetChanged,
   stopProxyTests,testAllEditorProxies,previewProxyImport,proxyImportPolicyChanged,testProxyImport,
