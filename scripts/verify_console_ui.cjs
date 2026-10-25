@@ -115,7 +115,14 @@ async function main() {
     const screenshot = async name => {if (screenshots) await page.screenshot({path: path.join(screenshots, name + '.png'), fullPage: false});};
     const openTab = async tab => {
       await page.evaluate(t => switchTab(t), tab);
-      if(tab==='channel') for(const summary of await page.locator('#view-channel .account-editor:not([open]) > summary:visible').all()) await summary.click();
+      if(tab==='channel') {
+        // Keep locator indexes stable as clicks remove the closed state.
+        const summaries = page.locator('#view-channel .account-editor > summary:visible');
+        for(const summary of await summaries.all()) {
+          if(!await summary.evaluate(el => el.parentElement.open)) await summary.click();
+        }
+        assert.equal(await page.locator('#view-channel .account-editor:not([open]) > summary:visible').count(), 0);
+      }
     };
     const openProxyForm = async () => {await page.click('#proxy-tab-form');};
     const finishProxyBatch = async (allowEmpty=false) => {
