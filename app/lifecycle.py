@@ -185,6 +185,19 @@ async def lifespan(app: FastAPI):
     start_background_task(_probe_express_projects_on_startup())
     # 过期缓冲清理器（弱网续传用，见 resumable.py）
     start_background_task(resumable_store.sweeper_loop())
+    # Cookie 短期令牌自动续期（RotateCookies；默认关，控制台/设置 API 可开，
+    # 见 cookie_refresh.py。失败只打日志，绝不影响生成流量。）
+    try:
+        import cookie_refresh
+
+        if cookie_refresh.auto_refresh_enabled():
+            print(
+                f"🔄 [Cookie 续期] 已启用：每 {int(cookie_refresh.refresh_interval_seconds())} 秒"
+                "调用 RotateCookies 续期短期令牌（SIDTS/SIDCC 族），长效凭证不受影响。"
+            )
+        start_background_task(cookie_refresh.refresh_loop())
+    except Exception as e:
+        print(f"⚠️ [Cookie 续期] 后台任务启动失败（不影响服务）：{type(e).__name__} - {e}")
     try:
         yield
     finally:

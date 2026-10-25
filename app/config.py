@@ -234,6 +234,14 @@ DEFAULT_SETTINGS = {
     "cookie_query_signature": "",
     "cookie_client_version": "",
     "cookie_authuser": "0",
+    # ===== Cookie 短期令牌自动续期（RotateCookies，见 cookie_refresh.py）=====
+    # 开启后按账号定期调用 accounts.google.com/RotateCookies（与浏览器同一
+    # 续期端点，实测节奏约 600s 一轮），把响应 Set-Cookie 下发的短期令牌
+    # （__Secure-1/3PSIDTS、SIDCC 族等）合并回存储的 Cookie 并原子落盘。
+    # 只要账号会话未被登出/改密，Cookie 可长期保活，不再隔几天手动重抓。
+    # 长效凭证（SID/SAPISID/OSID 族）绝不会被改动；失败不影响生成流量。
+    "cookie_auto_refresh": False,
+    "cookie_refresh_interval_seconds": 600,   # 下限 300（见 settings_validation 数值范围）
     # ===== Express API Key 通道请求头指纹（热改，见 express_fingerprint.py）=====
     # SDK 通道 TLS 栈换不了（google-genai 强依赖 httpx），但请求头可完整接管：
     #   sdk（默认）= 官方 Python genai SDK 原生形态（SDK 自动管理，零改动）

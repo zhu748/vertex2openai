@@ -501,6 +501,37 @@ class AppState:
         self.set_cookie_accounts(records)
         return len(records)
 
+    def update_cookie_account_cookie(self, account_id: str, new_cookie: str) -> bool:
+        """只更新某个 Cookie 账号的凭证字符串（短期令牌自动续期用）。
+
+        其余字段（project_id/代理/开关/备注）一律不动；其他字段一并改写
+        必须走控制台的整表保存接口。锁内完成内存替换，_save 落盘在锁外
+        （与既有方法口径一致）；账号不存在返回 False，由调用方决定告警。
+        """
+        new_cookie = str(new_cookie or "").strip()
+        if not account_id or not new_cookie:
+            return False
+        with self._lock:
+            records = self._state.get("cookie_accounts")
+            if not isinstance(records, list) or not records:
+                return False
+            hit = False
+            cleaned = []
+            for item in records:
+                rec = self._normalize_cookie_record(item)
+                if not rec:
+                    continue
+                if rec["id"] == account_id:
+                    rec["cookie"] = new_cookie
+                    hit = True
+                cleaned.append(rec)
+            if not hit:
+                return False
+            self._state["cookie_accounts"] = cleaned
+            self._state["cookie_accounts_initialized"] = True
+        self._save()
+        return True
+
     # ---------- 控制台可调设置 ----------
 
     def get_settings(self) -> dict:

@@ -36,6 +36,8 @@ _SETTING_NUMERIC_RANGE = {
     "request_timeout_seconds": (30, 7200),
     "upstream_max_concurrency": (1, 1000),
     "keepalive_interval": (5, 86400),
+    # Cookie 短期令牌轮换间隔：Google 实测节奏 600s，下限 300 防误配成高频打点
+    "cookie_refresh_interval_seconds": (300, 86400),
 }
 # 已有专项校验的键（代理格式 / 指纹档案白名单），通用层跳过避免重复
 _SETTING_SPECIAL_KEYS = {"proxy_url", "proxy_urls", "express_ua_profile", "express_ua_custom", "model_overrides"}
