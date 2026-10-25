@@ -28,14 +28,26 @@ from usage import messages_prompt_text
 
 class RequestStateFallbackTests(unittest.TestCase):
     def setUp(self):
+        # 测试隔离：本类的模式与设置改动必须在收尾时还原。旧版把
+        # web_proxy 模式和 cross_channel_fallback 残留在全局单例里，
+        # 排在其后的 gemini 原生透传测试会被迫走 Cookie 桥接而失败。
+        self._saved_mode = app_state.get_channel_mode()
+        self._saved_settings = app_state.get_settings()
         app_state.update_settings({"cross_channel_fallback": True, "resumable_enabled": False})
         app_state.set_channel_mode("web_proxy")
         self.manager = SimpleNamespace(get_total_keys=lambda: 1)
         patch = mock.patch.object(main.app.state, "express_key_manager", self.manager)
         patch.start()
         self.addCleanup(patch.stop)
+        self.addCleanup(self._restore_state)
         self.client = TestClient(main.app)
         self.addCleanup(self.client.close)
+
+    def _restore_state(self):
+        app_state.set_channel_mode(self._saved_mode)
+        changed = {key: self._saved_settings[key]
+                   for key in ("cross_channel_fallback", "resumable_enabled")}
+        app_state.update_settings(changed)
 
     def test_real_and_detached_requests_use_application_manager(self):
         request = Request({"type": "http", "app": main.app, "state": {"trace_id": "trace"}})
@@ -46,6 +58,9 @@ class RequestStateFallbackTests(unittest.TestCase):
         # Remove the fixture's explicit opt-in: this must test the real default.
         with app_state._lock:
             app_state._state["settings"].pop("cross_channel_fallback", None)
+        saved_keys_before, saved_cookies_before = app_state.get_express_keys(), app_state.get_cookie_accounts()
+        self.addCleanup(lambda: (app_state.set_express_keys(saved_keys_before),
+                                 app_state.set_cookie_accounts(saved_cookies_before)))
         app_state.set_express_keys([{"key": "saved-key", "enabled": True}])
         app_state.set_cookie_accounts([{"cookie": "SAPISID=saved-cookie", "project_id": "p", "enabled": True}])
         saved_keys, saved_cookies = app_state.get_express_keys(), app_state.get_cookie_accounts()

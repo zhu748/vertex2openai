@@ -278,26 +278,30 @@ async function probeOneKey(i){
   if(!SAVED_KEYS.some(x=>x.key===rec.key)){toast('请先保存新增或修改后的 Key，再探测项目');return;}
   toast('正在探测…');
   try{
-    const r=await fetch('/api/express-keys/probe',{signal:AbortSignal.timeout(30000),method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:rec.key,force:true})});
+    // 后端单 Key 探测总预算 45 秒（express_key_probe）+ 余量，避免前端先于后端超时。
+    const r=await fetch('/api/express-keys/probe',{signal:AbortSignal.timeout(60000),method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:rec.key,force:true})});
     const d=await r.json();
     if(!r.ok){ toast('❌ '+(d.error||'探测失败')); return; }
     const res=(d.results||[])[0]||{};
     mergeProbeResults([res.key?res:{...res,key:rec.key}],d.keys||[]);
     toast(res.ok?('项目：'+(res.project_id||'—')):('❌ '+(res.message||'探测失败')));
-  }catch(e){ toast('❌ 网络请求失败'); }
+  }catch(e){ toast('❌ '+(e.name==='TimeoutError'?'探测超时，请在运行日志确认结果':'网络请求失败')); }
 }
 async function probeAllKeys(){
   if(!keysLoaded){toast('凭证列表尚未加载，请先重新加载配置');return;}
   collectKeys();
   toast('正在探测全部 Key…');
   try{
-    const r=await fetch('/api/express-keys/probe',{signal:AbortSignal.timeout(30000),method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({all:true,force:true})});
+    // 后端 4 路并发、单 Key 45 秒总预算：批量按批次数增长，避免前端先于后端超时。
+    const count=Math.max(1,SAVED_KEYS.filter(x=>x.enabled!==false).length);
+    const batches=Math.max(1,Math.ceil(count/4));
+    const r=await fetch('/api/express-keys/probe',{signal:AbortSignal.timeout(15000+batches*46000),method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({all:true,force:true})});
     const d=await r.json();
     if(!r.ok){ toast('❌ '+(d.error||'探测失败')); return; }
     const results=d.results||[];
     mergeProbeResults(results,d.keys||[]);
     toast('探测完成：成功 '+results.filter(x=>x.ok).length+' / '+results.length);
-  }catch(e){ toast('❌ 网络请求失败'); }
+  }catch(e){ toast('❌ '+(e.name==='TimeoutError'?'探测超时，请在运行日志确认结果':'网络请求失败')); }
 }
 
 // Probe responses only update diagnostics/project metadata; preserve unsaved rows and edits.
@@ -913,6 +917,7 @@ async function runAction(button,action){
   const disabled=groups.map(group=>group.disabled);
   groups.forEach(group=>{group.disabled=true;group.setAttribute('aria-busy','true');});
   try{await action();}
+  catch(error){console.error(error);toast('❌ 操作未完成：'+(error&&error.message?error.message:error));}
   finally{button.disabled=false;button.removeAttribute('aria-busy');if(button.textContent==='处理中…') button.textContent=label;groups.forEach((group,i)=>{group.disabled=disabled[i];group.removeAttribute('aria-busy');});window.consoleChannels?.sync?.();}
 }
 document.addEventListener('input',event=>{

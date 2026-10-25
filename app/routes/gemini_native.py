@@ -31,11 +31,13 @@ cachedContent / responseSchema 等字段保持原请求体，兼容性取决于�
   裸模型名重试一次，与 OpenAI 兼容通道的 fallback 行为对齐。
 - 模型列表用内部模型清单映射成 Gemini 原生格式（models/get 也支持）。
 
-通道选择：有 Express Key 时**字节级透传**（上述保真要点全部成立）；没有任何
-Express Key 但配置了 Cookie 账号时，generateContent / streamGenerateContent
-改走 Cookie 通道**协议级桥接**（upstreams/cookie_native.py：原生 JSON →
-batchGraphql 转码、响应重组回原生形状，countTokens / embedContent 不支持）；
-两者皆无时返回明确错误。
+通道选择（尊重控制台的通道模式开关）：api_key / mixed 模式下有 Express Key 时**字节级
+透传**（上述保真要点全部成立）；没有 Key 但配置了 Cookie 账号时，generateContent /
+streamGenerateContent 改走 Cookie 通道**协议级桥接**（upstreams/cookie_native.py：原生
+JSON → batchGraphql 转码、响应重组回原生形状，countTokens / embedContent 不支持）。
+web_proxy（Cookie 模式）下即使同时存在 Express Key，generateContent /
+streamGenerateContent 也优先走 Cookie 桥接（旧实现只看"有没有 Key"，Cookie 模式被
+Key 霸占）；Cookie 桥接不支持的操作在有 Key 时回退 Key 透传。两者皆无时返回明确错误。
 """
 
 import json
@@ -1000,35 +1002,56 @@ def _passthrough_endpoint():
                 print(f"🔎 [Gemini 透传] {model} | -search 变体：已注入 google_search 工具"
                       "（body 最小重组；普通模型仍字节级透传）。")
 
-        # 通道选择：有 Express Key 走字节级透传（最保真）；没有任何 Key 但配了
-        # Cookie 账号时走 Cookie 通道**协议级桥接**（cookie_native：原生 JSON →
-        # batchGraphql 转码，响应重组回原生形状）——旧实现在此直接 403，导致
-        # 仅配 Cookie 的部署无法使用 Gemini 原生生态客户端。
+        # 通道选择（尊重控制台的通道模式开关，与 chat_api 的选路语义对齐）：
+        # - web_proxy（Cookie 模式）：配置了 Cookie 账号就走 Cookie 通道**协议级桥接**
+        #   （cookie_native：原生 JSON → batchGraphql 转码，响应重组回原生形状），
+        #   **即使同时配置了 Express Key 也不再霸占该端点**（旧实现只看"有没有 Key"，
+        #   只要存在任意 Key 就字节级透传，Cookie 模式形同虚设）。Cookie 桥接不支持
+        #   的操作（countTokens 等）在没有更优解时才回退 Key 透传。
+        # - api_key / mixed：有 Key 优先字节级透传（最保真）；没有 Key 但配了
+        #   Cookie 时回退 Cookie 桥接——旧实现在此直接 403，导致仅配 Cookie 的
+        #   部署无法使用 Gemini 原生生态客户端。
         # getattr 防御：单测的 SimpleNamespace 桩可能不带 app（生产 Starlette 必有）。
         express_manager = getattr(getattr(request, "app", None), "state", None)
         manager = getattr(express_manager, "express_key_manager", None)
-        if manager is not None and manager.get_total_keys() == 0:
-            from credential_manager import credential_manager
-            if credential_manager.get_cookie_record() is not None:
-                if action in ("generateContent", "streamGenerateContent"):
-                    from upstreams.cookie_native import handle_native_request
-                    is_stream = action == "streamGenerateContent"
-                    track_configure(model=requested_model, protocol="gemini", channel="cookie",
-                                    stream=is_stream, mode="stream" if is_stream else "json")
-                    return await handle_native_request(
-                        request, model, action, parsed, requested_model=requested_model)
+        from credential_manager import credential_manager
+        if manager is None:
+            # 凭据池不可知（测试桩 / 极早期生命周期）：保持旧行为——不做模式
+            # 改道，直接落到透传路径；否则桩环境会被误判为"无凭据"而 403。
+            has_keys, has_cookie = True, False
+        else:
+            has_keys = manager.get_total_keys() > 0
+            has_cookie = credential_manager.get_cookie_record() is not None
+        mode = app_state.get_channel_mode()
+        cookie_bridgable = has_cookie and action in ("generateContent", "streamGenerateContent")
+
+        if not has_keys or mode == "web_proxy":
+            if cookie_bridgable and (mode == "web_proxy" or not has_keys):
+                from upstreams.cookie_native import handle_native_request
+                is_stream = action == "streamGenerateContent"
+                track_configure(model=requested_model, protocol="gemini", channel="cookie",
+                                stream=is_stream, mode="stream" if is_stream else "json")
+                print(f"🔁 [Gemini 透传] {requested_model}:{action} | {'流式' if is_stream else '非流式'}"
+                      f" | Cookie 通道协议级桥接（{mode} 模式）")
+                return await handle_native_request(
+                    request, model, action, parsed, requested_model=requested_model)
+            if has_cookie and not cookie_bridgable and not has_keys:
+                # Cookie 模式 / 无 Key 部署：桥接不支持的明确报错（不要静默换通道）。
                 return _native_error(
                     400,
                     f"Cookie 通道暂不支持 :{action}（上游 batchGraphql 无对应操作），"
                     "请配置 Express API Key 使用该操作。",
                     "INVALID_ARGUMENT")
-            return _native_error(
-                403,
-                "该端点需要至少一个 Express API Key（字节级透传）或一个启用的 Cookie 账号"
-                "（协议级桥接，仅 generateContent / streamGenerateContent）。"
-                "请在控制台「通道与凭证」页配置，或设环境变量 VERTEX_EXPRESS_API_KEY / GOOGLE_COOKIE。",
-                status_detail="PERMISSION_DENIED",
-            )
+            if not has_keys and not has_cookie:
+                return _native_error(
+                    403,
+                    "该端点需要至少一个 Express API Key（字节级透传）或一个启用的 Cookie 账号"
+                    "（协议级桥接，仅 generateContent / streamGenerateContent）。"
+                    "请在控制台「通道与凭证」页配置，或设环境变量 VERTEX_EXPRESS_API_KEY / GOOGLE_COOKIE。",
+                    status_detail="PERMISSION_DENIED",
+                )
+            # 剩余组合：web_proxy 模式下 Cookie 桥接不支持该操作但有 Key 兜底，
+            # 或 api_key/mixed 模式有 Key——都落到下方 Key 透传。
 
         # 透传 query（alt=sse 等），但剔除本服务鉴权用的 key 参数。
         # query_params 取出的是已解码值，重新下发前必须再编码，否则值里

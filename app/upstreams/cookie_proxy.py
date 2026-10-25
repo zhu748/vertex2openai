@@ -642,36 +642,40 @@ class CookieProxyUpstream(BaseUpstream):
             ):
                 raise SchemaValidationError(COOKIE_STRUCTURED_OUTPUT_DISABLED_MESSAGE)
         except SchemaValidationError as exc:
-            return JSONResponse(status_code=400, content={
-                "error": {"message": str(exc), "type": "invalid_request_error", "code": 400}
-            })
+            # 统一错误形状：message/type/code/param 四字段，与 Express 通道及
+            # OpenAI SDK 重试逻辑的读取口径一致（旧实现缺 code/param）。
+            return JSONResponse(status_code=400,
+                                content=create_openai_error_response(400, str(exc), "invalid_request_error"))
 
         # ===== 1. 验证认证 =====
         record = credential_record or credential_manager.get_cookie_record()
         cookie_str = record["cookie"] if record else _get_cookie_string()
         if not cookie_str:
-            return JSONResponse(status_code=401, content={"error": {"message": (
-                "未配置 Google Cookie。\n"
-                "请在大盘控制台中粘贴 Cookie 和 Project ID，\n"
-                "或设置环境变量 GOOGLE_COOKIE 和 GOOGLE_PROJECT_ID。"
-            ), "type": "auth_error"}})
+            return JSONResponse(status_code=401,
+                                content=create_openai_error_response(401, (
+                                    "未配置 Google Cookie。\n"
+                                    "请在大盘控制台中粘贴 Cookie 和 Project ID，\n"
+                                    "或设置环境变量 GOOGLE_COOKIE 和 GOOGLE_PROJECT_ID。"
+                                ), "auth_error"))
 
         project_id = record["project_id"] if record else _get_project_id()
         track_configure(project_id=project_id)
         if not project_id:
-            return JSONResponse(status_code=400, content={"error": {"message": (
-                "未配置 Google Cloud Project ID。\n"
-                "请在大盘中填写，或设置环境变量 GOOGLE_PROJECT_ID。\n"
-                "可从 Studio URL 中获取：...?project=YOUR_PROJECT_ID"
-            ), "type": "config_error"}})
+            return JSONResponse(status_code=400,
+                                content=create_openai_error_response(400, (
+                                    "未配置 Google Cloud Project ID。\n"
+                                    "请在大盘中填写，或设置环境变量 GOOGLE_PROJECT_ID。\n"
+                                    "可从 Studio URL 中获取：...?project=YOUR_PROJECT_ID"
+                                ), "config_error"))
 
         # ===== 2. 校验认证字段 =====
         # 认证头包含实时时间戳、每次出站都重算；这里只做一次字段校验。
         if not build_headers(cookie_str):
-            return JSONResponse(status_code=401, content={"error": {"message": (
-                "Cookie 中未找到 SAPISID，无法计算认证头。\n"
-                "请确保 Cookie 来自已登录的 console.cloud.google.com 页面。"
-            ), "type": "auth_error"}})
+            return JSONResponse(status_code=401,
+                                content=create_openai_error_response(401, (
+                                    "Cookie 中未找到 SAPISID，无法计算认证头。\n"
+                                    "请确保 Cookie 来自已登录的 console.cloud.google.com 页面。"
+                                ), "auth_error"))
 
         # 账号健康隔离钩子：鉴权类失败累计冷却、成功清零（credential_manager）。
         account_id = (record or {}).get("id", "")
@@ -1113,9 +1117,8 @@ class CookieProxyUpstream(BaseUpstream):
                     # 客户端已断开则立即停止，避免无谓的上游调用与重试
                     if await fastapi_request.is_disconnected():
                         print("ℹ️ [Studio] 客户端已断开连接，停止非流式重试。")
-                        return JSONResponse(status_code=499, content={
-                            "error": {"message": "客户端已断开连接，请求已取消。", "type": "client_closed_request"}
-                        })
+                        return JSONResponse(status_code=499,
+                                            content=create_openai_error_response(499, "客户端已断开连接，请求已取消。", "client_closed_request"))
                     if attempt:
                         stats.add_retry()
                     try:
@@ -1152,15 +1155,15 @@ class CookieProxyUpstream(BaseUpstream):
                                                     error=f"HTTP {response.status_code}: {response.text[:200]}")
                                 print(f"⚠️ [Studio] HTTP {response.status_code} (尝试 {attempt+1}): {response.text[:300]} | {delay:.1f}s 后重试...")
                                 if not await wait_for_retry(fastapi_request, delay):
-                                    return JSONResponse(status_code=499, content={"error": {"message": "客户端已断开连接。"}})
+                                    return JSONResponse(status_code=499, content=create_openai_error_response(499, "客户端已断开连接。", "client_closed_request"))
                                 continue
 
                         if response.status_code != 200:
                             elapsed = time.time() - start_time
                             print(f"❌ [Studio] {base_model_name} | HTTP {response.status_code} | {elapsed:.1f}s")
-                            return JSONResponse(status_code=response.status_code, content={
-                                "error": {"message": response.text[:500], "type": "upstream_error"}
-                            })
+                            return JSONResponse(status_code=response.status_code,
+                                                content=create_openai_error_response(
+                                                    response.status_code, response.text[:500], "upstream_error"))
 
                         full_text = ""
                         reasoning_text = ""
@@ -1230,13 +1233,13 @@ class CookieProxyUpstream(BaseUpstream):
                             wait_sec = retry_delay(None, backoff_sec, attempt, jitter_sec, error=api_error)
                             print(f"⚠️ [Studio] 429/限流 (尝试 {attempt+1}): {api_error[:300]} | {wait_sec:.1f}s 后重试...")
                             if not await wait_for_retry(fastapi_request, wait_sec):
-                                return JSONResponse(status_code=499, content={"error": {"message": "客户端已断开连接。"}})
+                                return JSONResponse(status_code=499, content=create_openai_error_response(499, "客户端已断开连接。", "client_closed_request"))
                             continue
                         if api_error:
                             if api_error_status in (401, 403):
                                 credential_manager.record_cookie_auth_failure(account_id, credential=record)
-                            return JSONResponse(status_code=api_error_status, content={"error": {
-                                "code": api_error_status, "message": api_error, "type": "upstream_error"}})
+                            return JSONResponse(status_code=api_error_status,
+                                                content=create_openai_error_response(api_error_status, api_error, "upstream_error"))
 
                         if text_decoder:
                             text_decoder.validate_end()
@@ -1304,7 +1307,7 @@ class CookieProxyUpstream(BaseUpstream):
                             wait_sec = retry_delay(None, backoff_sec, attempt, jitter_sec, error=err_msg)
                             print(f"⚠️ [Studio] 异常 (尝试 {attempt+1}): {err_msg[:300]} | {wait_sec:.1f}s 后重试...")
                             if not await wait_for_retry(fastapi_request, wait_sec):
-                                return JSONResponse(status_code=499, content={"error": {"message": "客户端已断开连接。"}})
+                                return JSONResponse(status_code=499, content=create_openai_error_response(499, "客户端已断开连接。", "client_closed_request"))
                             continue
 
                         elapsed = time.time() - start_time
@@ -1312,15 +1315,15 @@ class CookieProxyUpstream(BaseUpstream):
                         if not isinstance(e, (AntiTruncationError, IncompleteResponseError)):
                             traceback.print_exc()
                         code, _ = extract_upstream_error(e)
-                        return JSONResponse(status_code=code, content={
-                            "error": {"code": code, "message": f"batchGraphql proxy error: {err_msg}", "type": "proxy_error"}
-                        })
+                        return JSONResponse(status_code=code,
+                                            content=create_openai_error_response(
+                                                code, f"batchGraphql proxy error: {err_msg}", "proxy_error"))
 
                 elapsed = time.time() - start_time
                 print(f"❌ [Studio] {base_model_name} | 重试 {retry_max} 次后仍失败 | {elapsed:.1f}s")
-                return JSONResponse(status_code=429, content={
-                    "error": {"message": "请求被限流，已重试多次仍失败。请稍后再试。", "type": "rate_limit_error"}
-                })
+                return JSONResponse(status_code=429,
+                                    content=create_openai_error_response(
+                                        429, "请求被限流，已重试多次仍失败。请稍后再试。", "rate_limit_error"))
 
             if request_obj.stream:
                 async def result_once():

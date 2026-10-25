@@ -201,11 +201,17 @@ def _parse_host_port(hostport: str, uri: str) -> tuple[str, int]:
 
 
 def _qs(query: str) -> dict[str, str]:
-    """查询串 → 单值 dict（重复键取首个）。"""
+    """查询串 → 单值 dict（重复键取首个；同名不同值时告警）。"""
     try:
-        return {k: v[0] for k, v in parse_qs(query or "", keep_blank_values=True).items()}
+        parsed = parse_qs(query or "", keep_blank_values=True)
     except Exception:
         return {}
+    for key, values in parsed.items():
+        # 同名不同值的重复参数（如 path=/a&path=/b）静默取首个会掩盖节点真实
+        # 配置（与 bridge URI 的严格重复检测不对齐）；值不打到日志防泄露。
+        if len(values) > 1 and len(set(values)) > 1:
+            print(f"⚠️ [代理] 链接参数 {key!r} 重复出现且取值不同，已采用首个值。")
+    return {k: v[0] for k, v in parsed.items()}
 
 
 def _truthy(v: str) -> bool:
@@ -413,6 +419,12 @@ def _parse_trojan(uri: str) -> dict:
     """trojan://password@host:port?sni=..&type=ws&path=..&fp=..#name（TLS 强制开启）"""
     parts = urlsplit(uri)
     password = unquote(parts.username or "")
+    if parts.password is not None:
+        # 密码含未编码冒号：urlsplit 把 userinfo 切成 username:password 两段，
+        # 旧实现静默丢弃后者导致连错密码（握手失败无提示指向截断）。Trojan 的
+        # userinfo 整体即密码，拼回完整值；规范写法应把冒号编码为 %3A。
+        password = unquote(parts.username or "") + ":" + unquote(parts.password)
+        print("⚠️ [代理] trojan 密码含未编码的冒号，已按原样拼接；建议改为 %3A 编码以避免歧义。")
     if not password:
         raise ProxyResolveError("trojan 链接缺少密码（userinfo 部分）。")
     server = parts.hostname or ""
@@ -504,8 +516,18 @@ def _parse_hysteria2(uri: str) -> dict:
     ob: dict[str, Any] = {"type": "hysteria2", "server": server, "server_port": port,
                           "password": auth}
     q = _qs(parts.query)
+    if q.get("mport"):
+        # 端口跳跃（mport=443,8443 或 443-8443）无法等价转换为单端口出站；
+        # 旧实现静默忽略会只连基础端口、高峰期实际不可用，与 docs 声明的
+        # 「多端口列表会被拒绝」直接矛盾——按 fail-closed 原则明确拒绝。
+        raise ProxyResolveError(
+            "当前 Hysteria2 转换不支持端口跳跃参数 mport（多端口/端口范围无法"
+            "等价转换为单端口出站）：请使用不带 mport 的节点，或改用原生客户端。")
     if q.get("pinSHA256") or q.get("ech"):
         raise ProxyResolveError("当前 Hysteria2 转换不支持 pinSHA256 或 ECH，不能忽略这些 TLS 校验参数。")
+    if q.get("up") or q.get("down"):
+        # 带宽参数只影响速度控制不影响连通性，丢弃可接受，但不再静默。
+        print("ℹ️ [代理] hysteria2 的 up/down 带宽参数已忽略（不影响连通性，仅放弃限速）。")
     tls: dict[str, Any] = {"enabled": True, "alpn": ["h3"]}
     sni = str(q.get("sni") or "").strip()
     if sni:

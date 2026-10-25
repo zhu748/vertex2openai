@@ -685,7 +685,14 @@ def build_request_body(
         variables["systemInstruction"] = {"parts": [{"text": system_text}]}
 
     if request.stop and "stop_sequences" in allowed:
-        gen_config["stopSequences"] = request.stop if isinstance(request.stop, list) else [request.stop]
+        # 与 Express 通道（generation_config）同口径：stop=[""]/["a",""] 里的空串
+        # 对 Gemini 是非法入参，成员级过滤后非空才下发，避免两通道行为分叉。
+        if isinstance(request.stop, str):
+            gen_config["stopSequences"] = [request.stop]
+        else:
+            seqs = [s for s in request.stop if s]
+            if seqs:
+                gen_config["stopSequences"] = seqs
 
     # Live batchGraphql verification shows that custom functionDeclarations and
     # googleSearch are each supported, but mixing them in one request is rejected:

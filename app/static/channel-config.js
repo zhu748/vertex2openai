@@ -3,7 +3,7 @@
 (() => {
 if(window.consoleChannels) return;
 let COOKIE_ACCOUNTS=[], SAVED_COOKIES=[], cookiesLoaded=false, proxyEditor=null, proxyEditorInitialized=false;
-let cookieRefreshPending=false;
+let cookieRefreshPending=false, cookieTestPending=false;
 // In-memory only: proxy credentials and test results never enter localStorage.
 const proxyResults=new Map();
 
@@ -20,13 +20,36 @@ async function updateCredentialStrategy(select){
   finally{select.disabled=false;}
 }
 
+/* Cookie 会话探测结果文案：与后端 cookie_probe 的三种状态一一对应。 */
+const COOKIE_TEST_STATUS={
+  valid:{label:'✓ 会话有效',ok:true},
+  invalid:{label:'✕ 会话已失效',ok:false},
+  error:{label:'⚠ 无法判定',ok:false},
+};
+function cookieTestMessage(res){
+  const st=COOKIE_TEST_STATUS[res.status]||{label:res.status,ok:false};
+  const secs=(res.elapsed_ms>0)?` · ${(res.elapsed_ms/1000).toFixed(1)}s`:'';
+  return st.label+(res.detail?' · '+res.detail:'')+secs;
+}
+/* 调度健康 pill：账号被自动冷却隔离或连续失败时才显示，正常状态保持安静。 */
+function cookieHealthPill(rec){
+  const health=rec.health;
+  if(!health) return '';
+  if(Number(health.cooldown_remaining)>0)
+    return `<span class="pill" style="text-transform:none;color:#b45309" title="鉴权失败累计，调度已临时隔离该账号">冷却中 ${Math.ceil(Number(health.cooldown_remaining))}s</span>`;
+  if(Number(health.failures)>0)
+    return `<span class="pill" style="text-transform:none;color:#b45309" title="近期鉴权失败 ${health.failures} 次，再失败可能进入冷却">失败 ${health.failures} 次</span>`;
+  return '';
+}
 function renderCookieAccounts(){
+  if(!$('cookies-list')) return; // 分区尚未随页面就绪时保持静默（缓存旧文档/升级中）
   window.consoleForms?.rememberAccounts('cookie');
   $('cookies-list').innerHTML=COOKIE_ACCOUNTS.map((rec,index)=>`
     <div class="key-card cookie-card" data-cookie-index="${index}">
       <div class="key-head"><div class="key-title"><span class="pill pill-accent">Cookie ${index+1}</span>
-        <span class="pill">${rec.cookie_configured?'已保存 Cookie':'待填写 Cookie'}</span></div>
+        <span class="pill">${rec.cookie_configured?'已保存 Cookie':'待填写 Cookie'}</span>${cookieHealthPill(rec)}</div>
         <div class="key-actions"><label><input type="checkbox" class="c-enabled" ${rec.enabled===false?'':'checked'} aria-label="启用 Cookie ${index+1}">启用</label>
+          <button type="button" ${rec.enabled===false?'disabled title="启用并保存账号后可测试"':(rec.id?'':'disabled title="保存账号后可测试"')} onclick="runAction(this,()=>testCookieAccount(${index}))">测试会话</button>
           <button type="button" ${rec.enabled===false?'disabled title="启用并保存账号后可刷新"':''} onclick="runAction(this,()=>refreshCookies(${index}))">立即刷新</button>
           <button type="button" class="danger" onclick="removeCookieAccount(${index})" aria-label="删除 Cookie ${index+1}">删除</button></div></div>
       <div class="key-fields">
@@ -37,6 +60,7 @@ function renderCookieAccounts(){
           <label class="note-label" for="cookie-note-${index}">备注</label><input id="cookie-note-${index}" class="inp c-note" placeholder="便于区分账号" value="${esc(rec.note)}"></div>
         ${accountProxyFields('cookie',index,rec)}
       </div>
+      ${rec._msg?`<div class="key-meta ${rec._msg_ok===false?'error-message':''}" role="status">${esc(rec._msg)}</div>`:''}
     </div>`).join('');
   window.consoleForms?.accounts('cookie');
   $('cookies-count').textContent=COOKIE_ACCOUNTS.length+' 个';
@@ -45,13 +69,16 @@ function renderCookieAccounts(){
 function collectCookieAccounts(){
   document.querySelectorAll('[data-cookie-index]').forEach(row=>{
     const rec=COOKIE_ACCOUNTS[Number(row.dataset.cookieIndex)];
-    rec.cookie=row.querySelector('.c-cookie').value.trim();
-    rec.project_id=projectFromInput(row.querySelector('.c-project').value);
-    rec.note=row.querySelector('.c-note').value.trim();
-    rec.enabled=row.querySelector('.c-enabled').checked;
-    rec.proxies=proxyDraft(row.querySelector('.c-proxy').value);
-    rec.proxy=rec.proxies[0]||'';
-    rec.proxy_fallback=row.querySelector('.c-fallback').checked;
+    // DOM 与数组失步（多标签页/并发重渲染）时补建记录而不是抛错：
+    // 保存动作必须总能把用户当前看到的内容完整提交。
+    const target=rec||(COOKIE_ACCOUNTS[Number(row.dataset.cookieIndex)]={id:'',cookie_configured:false});
+    target.cookie=row.querySelector('.c-cookie')?.value.trim()??'';
+    target.project_id=projectFromInput(row.querySelector('.c-project')?.value??'');
+    target.note=row.querySelector('.c-note')?.value.trim()??'';
+    target.enabled=row.querySelector('.c-enabled')?.checked??true;
+    target.proxies=proxyDraft(row.querySelector('.c-proxy')?.value??'');
+    target.proxy=target.proxies[0]||'';
+    target.proxy_fallback=row.querySelector('.c-fallback')?.checked??true;
   });
   return COOKIE_ACCOUNTS;
 }
@@ -73,11 +100,14 @@ function addCookieAccount(){
 function removeCookieAccount(index){collectCookieAccounts();COOKIE_ACCOUNTS.splice(index,1);renderCookieAccounts();}
 async function saveCookieAccounts(){
   if(!cookiesLoaded){toast('Cookie 账号尚未加载，请先重新加载配置');return;}
-  const accounts=collectCookieAccounts();
+  let accounts;
+  try{accounts=collectCookieAccounts();}
+  catch(error){toast('❌ 收集账号信息失败：'+error.message);return;}
   try{
     const response=await fetch('/api/cookie-accounts',{method:'POST',signal:AbortSignal.timeout(30000),headers:{'Content-Type':'application/json'},body:JSON.stringify({accounts})});
     const result=await response.json();
     if(!response.ok) throw new Error(await responseError(response,'保存失败',result));
+    if(!Array.isArray(result.accounts)) throw new Error('保存响应缺少账号列表，请刷新面板后重试');
     COOKIE_ACCOUNTS=result.accounts.map(credentialCopy);SAVED_COOKIES=COOKIE_ACCOUNTS.map(credentialCopy);renderCookieAccounts();window.consoleForms?.saved('cookies');
     toast('已保存 '+COOKIE_ACCOUNTS.length+' 个 Cookie 账号（已热生效）');
   }catch(error){toast('❌ '+error.message);}
@@ -113,6 +143,47 @@ async function refreshCookies(index=null){
     const message=error.name==='TimeoutError'?'请求超时，请在运行日志确认刷新结果':error.message;
     show('刷新未完成：'+message);toast('❌ '+message);
   }finally{cookieRefreshPending=false;}
+}
+
+/* ---------- Cookie 会话测试（零配额探测） ----------
+ * 后端 POST /api/cookie-accounts/test 用不存在的模型名调一次 batchGraphql，
+ * 不消耗生成配额，按 gRPC 状态码判定会话有效性（valid/invalid/error）。
+ * 与「立即刷新」（RotateCookies 短期令牌续期）互补：刷新不校验会话，测试不续期。 */
+async function testCookieAccount(index=null){
+  if(!cookiesLoaded){toast('Cookie 账号尚未加载，请先重新加载配置');return;}
+  if(cookieTestPending){toast('Cookie 正在测试，请等待当前任务完成');return;}
+  if(window.consoleForms?.capture()?.cookies){toast('请先保存或撤销 Cookie 列表的修改，再测试已保存凭证');return;}
+  const accounts=SAVED_COOKIES.filter(rec=>rec.enabled!==false && rec.id && (index===null || rec.id===COOKIE_ACCOUNTS[index]?.id));
+  if(!accounts.length){toast(index===null?'没有已保存且启用的 Cookie 账号可测试':'请先保存账号，再测试会话');return;}
+  cookieTestPending=true;
+  toast(index===null?('正在测试 '+accounts.length+' 个已保存账号…'):'正在测试会话…');
+  try{
+    // 后端 4 路并发探测、单账号 45 秒总时限：批量预算按批次数而非账号数增长。
+    const batches=Math.max(1,Math.ceil(accounts.length/4));
+    const response=await fetch('/api/cookie-accounts/test',{method:'POST',
+      signal:AbortSignal.timeout(15000+batches*46000),headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(index===null?{}:{id:accounts[0].id})});
+    const result=await response.json();
+    if(!response.ok)throw new Error(await responseError(response,'测试失败',result));
+    mergeCookieTestResults(result.results||[]);
+    toast(`测试完成：有效 ${result.valid||0} / ${result.total||0}`);
+  }catch(error){
+    const message=error.name==='TimeoutError'?'请求超时，请在运行日志确认测试结果':error.message;
+    toast('❌ '+message);
+  }finally{cookieTestPending=false;}
+}
+function mergeCookieTestResults(results){
+  // 只更新诊断信息与健康 pill；保留未保存的草稿与行内编辑（与 Express mergeProbeResults 同口径）。
+  (Array.isArray(results)?results:[]).forEach(res=>{
+    const hit=COOKIE_ACCOUNTS.find(rec=>rec.id===res.id);
+    if(!hit) return;
+    hit._msg=cookieTestMessage(res);
+    hit._msg_ok=COOKIE_TEST_STATUS[res.status]?.ok===true;
+    // 与后端健康表口径同步：成功清零；失败累计（冷却秒数以下次加载的快照为准）。
+    if(res.status==='valid') hit.health={cooldown_remaining:0,failures:0};
+    else if(res.status!=='error') hit.health={cooldown_remaining:hit.health?.cooldown_remaining||0,failures:(hit.health?.failures||0)+1};
+  });
+  renderCookieAccounts();
 }
 
 /* Proxy editor stores a draft until Apply; account list/global Save persists it. */
@@ -630,8 +701,8 @@ function initProxyEditor(){
   proxyEditorInitialized=true;
 }
 
-window.consoleChannels={hasDraft:()=>!!proxyEditor&&(JSON.stringify(proxyEditor.initial)!==JSON.stringify(proxyEditor.proxies)||proxyFormDirty()||!!$('proxy-import-text').value.trim()),discard:()=>{COOKIE_ACCOUNTS=SAVED_COOKIES.map(credentialCopy);renderCookieAccounts();},load:loadCookieAccounts,refreshCookies,init:initProxyEditor,open:openProxyEditor,sync:updateProxyEditorControls};
-Object.assign(window,{updateCredentialStrategy,loadCookieAccounts,addCookieAccount,removeCookieAccount,saveCookieAccounts,
+window.consoleChannels={hasDraft:()=>!!proxyEditor&&(JSON.stringify(proxyEditor.initial)!==JSON.stringify(proxyEditor.proxies)||proxyFormDirty()||!!$('proxy-import-text').value.trim()),discard:()=>{COOKIE_ACCOUNTS=SAVED_COOKIES.map(credentialCopy);renderCookieAccounts();},load:loadCookieAccounts,refreshCookies,testCookieAccount,init:initProxyEditor,open:openProxyEditor,sync:updateProxyEditorControls};
+Object.assign(window,{updateCredentialStrategy,loadCookieAccounts,addCookieAccount,removeCookieAccount,saveCookieAccounts,refreshCookies,testCookieAccount,
   closeProxyEditor,moveProxy,deleteProxy,resetProxyForm,proxyTypeChanged,recognizeProxyPaste,editProxy,addProxyDraft,
   applyProxyEditor,testEditorProxy,renderProxyEditor,proxyMissingFields,switchProxyView,proxyTargetChanged,
   stopProxyTests,testAllEditorProxies,previewProxyImport,proxyImportPolicyChanged,testProxyImport,

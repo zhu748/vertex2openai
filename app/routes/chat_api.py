@@ -122,7 +122,8 @@ def _sse_frame_kind(frame: str) -> tuple[str, Optional[int]]:
     """解析一帧 SSE：返回 (类型, 错误码)。
 
     类型 ∈ keepalive（注释帧/保活帧）/ done（[DONE]）/ error（错误负载）/
-    content（真实内容：正文、思考、工具调用或结束标记）/ other（role 声明等）。
+    content（真实内容：正文、思考或工具调用增量）/ finish（仅含结束标记、
+    无任何内容增量的空收尾帧）/ other（role 声明等）。
     """
     stripped = frame.strip()
     if not stripped.startswith("data:"):
@@ -149,8 +150,13 @@ def _sse_frame_kind(frame: str) -> tuple[str, Optional[int]]:
         has_payload = bool(
             delta.get("content") or delta.get("reasoning_content") or delta.get("tool_calls")
         )
-        if has_payload or choice.get("finish_reason"):
+        if has_payload:
             return ("content", None)
+        if choice.get("finish_reason"):
+            # 空内容 + 仅结束标记的帧不是真实输出：旧实现把它计入 content，
+            # 会使跨通道兜底误判「已出内容」而放弃切换（错误帧晚于空收尾帧
+            # 到达时被锁死）。独立分类，保持可兜底。
+            return ("finish", None)
     return ("other", None)
 
 

@@ -355,8 +355,14 @@ async def _chunk_openai_response_dict_for_sse(
     for choice_idx, choice in enumerate(choices): 
         message = choice.get("message", {})
         final_finish_reason = choice.get("finish_reason", "stop")
+        # 假流式首帧同样补 role:"assistant"，与真流式/Cookie 通道及 OpenAI
+        # 官方帧序对齐。默认参数绑定避免闭包延迟绑定（B023）。
+        first_delta_pending = {"v": True}
 
-        def _sse(delta):
+        def _sse(delta, _first=first_delta_pending):
+            if _first["v"]:
+                delta = {"role": "assistant", **delta}
+                _first["v"] = False
             payload = {"id": resp_id, "object": "chat.completion.chunk", "created": created_time,
                        "model": model_name, "choices": [{"index": choice_idx, "delta": delta,
                                                            "finish_reason": None}]}
@@ -828,6 +834,10 @@ async def execute_gemini_call(
                         finish_reasons = set()
                         deferred_finishes = []
                         pending_metadata = PendingMetadataGate()
+                        # 按 choice index 追踪首帧：OpenAI 官方帧序的首个 delta
+                        # 携带 role:"assistant"（Cookie 通道同口径；旧实现缺失，
+                        # 严格按官方 SDK 消费流的客户端会识别不出角色）。
+                        roles_sent = set()
 
                         async for chunk_item_call in first_reply.iterate(stream_gen_obj, sdk_has_reply):
                             upstream_chunk()
@@ -866,6 +876,11 @@ async def execute_gemini_call(
                                         continue  # 正文暂存于去重器，跳过空 chunk
                                 choice = (chunk_payload.get("choices") or [{}])[0]
                                 delta = choice.get("delta") or {}
+                                # 首帧补 role（预填充先行帧已自带，不重复注入）。
+                                if not prefill_text and choice.get("index") not in roles_sent:
+                                    choice["delta"] = {"role": "assistant", **delta}
+                                    delta = choice["delta"]
+                                    roles_sent.add(choice.get("index"))
                                 if delta.get("content"):
                                     if not content_chars:
                                         elapsed = time.monotonic() - (attempt_started_at() or attempt_started)

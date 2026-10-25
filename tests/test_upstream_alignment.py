@@ -226,9 +226,22 @@ class SSEFrameKindTests(unittest.TestCase):
             frame = "data: " + json.dumps({"choices": [
                 {"index": 0, "delta": delta, "finish_reason": None}]}, ensure_ascii=False) + "\n\n"
             self.assertEqual(chat_api._sse_frame_kind(frame)[0], "content", delta)
+        # 带内容的结束帧仍是 content（内容已真实输出，兜底线应收紧）。
+        mixed = "data: " + json.dumps({"choices": [
+            {"index": 0, "delta": {"content": "hi"}, "finish_reason": "stop"}]},
+            ensure_ascii=False) + "\n\n"
+        self.assertEqual(chat_api._sse_frame_kind(mixed)[0], "content")
+
+    def test_finish_only_frame_is_not_content(self):
+        # 空内容 + 仅结束标记的帧不是真实输出：旧实现计入 content 会使跨通道
+        # 兜底被空收尾帧误锁死（错误帧晚于空收尾帧到达时无法切换）。
         finish = "data: " + json.dumps({"choices": [
             {"index": 0, "delta": {}, "finish_reason": "stop"}]}, ensure_ascii=False) + "\n\n"
-        self.assertEqual(chat_api._sse_frame_kind(finish)[0], "content")
+        self.assertEqual(chat_api._sse_frame_kind(finish)[0], "finish")
+        empty_content = "data: " + json.dumps({"choices": [
+            {"index": 0, "delta": {"content": ""}, "finish_reason": "length"}]},
+            ensure_ascii=False) + "\n\n"
+        self.assertEqual(chat_api._sse_frame_kind(empty_content)[0], "finish")
 
     def test_role_only_frame_is_not_content(self):
         frame = "data: " + json.dumps({"choices": [
