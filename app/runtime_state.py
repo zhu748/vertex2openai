@@ -594,7 +594,12 @@ class AppState:
         """Model-specific built-ins plus saved field overrides, matching execution/UI."""
         return self.get_settings()["model_overrides"]
 
-    def set_model_override(self, model_name: str, patch: dict) -> dict:
+    def get_saved_model_overrides(self) -> dict:
+        """User-owned fields only; distinguish inheritance from built-in defaults."""
+        with self._lock:
+            return copy.deepcopy((self._state.get("settings") or {}).get("model_overrides") or {})
+
+    def set_model_override(self, model_name: str, patch: dict, *, inherit=()) -> dict:
         model_name = (model_name or "").strip()
         if not model_name or not isinstance(patch, dict):
             return {}
@@ -606,8 +611,15 @@ class AppState:
             overrides = dict(overrides) if isinstance(overrides, dict) else {}
             previous = overrides.get(model_name)
             previous = dict(previous) if isinstance(previous, dict) else {}
+            # Removal is explicit: null remains a valid 'do not inject' value.
+            for key in inherit:
+                if key in app_config.PER_MODEL_KEYS:
+                    previous.pop(key, None)
             previous.update(copy.deepcopy(clean))
-            overrides[model_name] = previous
+            if previous:
+                overrides[model_name] = previous
+            else:
+                overrides.pop(model_name, None)
             settings["model_overrides"] = overrides
             self._state["settings"] = settings
         self._save()

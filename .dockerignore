@@ -27,3 +27,8 @@ proxy-bridge/
 proxybridge/*_test.go
 docs/
 **/*.log
+
+# Frontend checks are development-only
+node_modules/
+package.json
+package-lock.json

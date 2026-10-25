@@ -10,6 +10,7 @@
   <script data-cfasync="false" defer="" src="/static/channel-config.js"></script>
   <script data-cfasync="false" defer="" src="/static/dashboard.js">
   </script>
+  <script data-cfasync="false" defer="" src="/static/console-forms.js"></script>
   <script data-cfasync="false" defer="" src="/static/request-monitor.js">
   </script>
  </head>
@@ -63,12 +64,14 @@
     <button aria-controls="view-overview" aria-selected="true" class="tab active" data-tab="overview" id="tab-overview" onclick="switchTab('overview')" role="tab" tabindex="0" type="button">数据概览</button>
     <button aria-controls="view-channel" aria-selected="false" class="tab" data-tab="channel" id="tab-channel" onclick="switchTab('channel')" role="tab" tabindex="-1" type="button">通道与凭证</button>
     <button aria-controls="view-params" aria-selected="false" class="tab" data-tab="params" id="tab-params" onclick="switchTab('params')" role="tab" tabindex="-1" type="button">模型参数</button>
+    <button aria-controls="view-runtime" aria-selected="false" class="tab" data-tab="runtime" id="tab-runtime" onclick="switchTab('runtime')" role="tab" tabindex="-1" type="button">运行设置</button>
     <button aria-controls="view-requests" aria-selected="false" class="tab" data-tab="requests" id="tab-requests" onclick="switchTab('requests')" role="tab" tabindex="-1" type="button">
      请求监控
      <span class="pill pill-accent" id="request-active-badge">0</span>
     </button>
     <button aria-controls="view-logs" aria-selected="false" class="tab" data-tab="logs" id="tab-logs" onclick="switchTab('logs')" role="tab" tabindex="-1" type="button">运行日志</button>
    </nav>
+   <label class="mobile-navigation">切换页面<select id="mobile-nav" class="inp" onchange="switchTab(this.value)"><option value="overview">数据概览</option><option value="channel">通道与凭证</option><option value="params">模型参数</option><option value="runtime">运行设置</option><option value="requests">请求监控</option><option value="logs">运行日志</option></select></label>
    <main id="main-content" tabindex="-1">
     <!-- Overview -->
     <section aria-labelledby="tab-overview" class="view" id="view-overview" role="tabpanel" tabindex="0">
@@ -199,6 +202,9 @@
        <p class="card-footnote">进度条表示各自占总量的比例。Cookie 通道不回传用量。</p>
       </div>
      </div>
+     <div class="recent-grid" aria-label="近期请求摘要"><div class="card"><span class="lbl">近 15 分钟成功率</span><strong id="recent-rate">—</strong></div><div class="card"><span class="lbl">首回复 P50 / P95</span><strong id="recent-latency">—</strong></div><button class="card" onclick="switchTab('requests');document.getElementById('request-filter').value='error';requestMonitor.refresh()"><span class="lbl">近期失败</span><strong id="recent-errors">—</strong></button></div>
+     <p class="card-footnote" id="recent-note">基于当前进程仍保留的记录；重启和记录回收会缩短样本范围。</p>
+     <details class="card connection-guide"><summary>API 接入信息与首次配置</summary><ol><li>在“通道与凭证”中添加并保存账号。</li><li>客户端选择 OpenAI 兼容接口，填写下方地址与控制台访问密码。</li><li>发送测试请求，在“请求监控”检查结果。</li></ol><label for="api-base">OpenAI Base URL</label><div class="connection-copy"><input id="api-base" class="inp" readonly><button class="btn-ghost" type="button" onclick="consoleForms.copyBase()">复制地址</button></div><p>Claude / Gemini 原生协议使用同一服务根地址，认证使用 API_KEY。</p></details>
      <div class="quick-grid">
       <button class="quick-card" onclick="switchTab('channel')">
        <span aria-hidden="true" class="quick-icon">⌘</span>
@@ -243,7 +249,7 @@
      <div class="channel-grid">
       <fieldset class="card settings-card channel-wide">
        <legend class="visually-hidden">上游调用通道</legend>
-       <div class="lbl mb-3">上游调用通道</div>
+       <div class="lbl mb-3">上游调用通道 <span class="pill">修改立即生效</span></div>
        <div class="flex flex-col sm:flex-row gap-3">
         <label class="channel-option" id="opt-api">
          <input class="mt-1" name="mode" onchange="updateMode('api_key')" type="radio" value="api_key"/>
@@ -264,10 +270,10 @@
          <div><div class="font-medium text-sm">Key + Cookie 混合</div><div class="text-xs text-neutral-500 mt-0.5">两类账号同时启用，共同参与调度</div></div>
         </label>
        </div>
-       <div class="credential-strategy"><label for="credential-strategy">账号调度</label><select id="credential-strategy" class="inp" onchange="updateCredentialStrategy(this)"><option value="random">随机使用</option><option value="roundrobin">按顺序轮询</option></select><span>仅调度已启用的账号；混合模式下每次请求选择一个身份。</span></div>
+       <div class="credential-strategy"><label for="credential-strategy">账号调度</label><select id="credential-strategy" class="inp" onchange="updateCredentialStrategy(this)"><option value="random">随机使用</option><option value="roundrobin">按顺序轮询</option></select><span>修改立即生效；仅调度已启用的账号。</span></div>
       </fieldset>
       <!-- Express API Key 列表（多账号，热编辑） -->
-      <fieldset class="card settings-card channel-wide">
+      <fieldset class="card settings-card channel-wide" data-draft-group="keys">
        <legend class="visually-hidden">Express API Key 列表</legend>
        <div class="card-toolbar">
         <div>
@@ -344,20 +350,20 @@
         </b>
         ：本列表按需要明文展示 Key（控制台本身有密码保护）；运行日志里只打掩码。
        </div>
-       <div class="space-y-2" id="keys-list">
+       <div class="credential-filter"><label class="visually-hidden" for="keys-search">搜索账号备注或项目</label><input id="keys-search" class="inp" type="search" placeholder="搜索备注 / 项目 / 凭证尾号" data-local oninput="consoleForms.filterAccounts('keys')"><select id="keys-filter" class="inp" aria-label="筛选账号状态" data-local onchange="consoleForms.filterAccounts('keys')"><option value="all">全部账号</option><option value="enabled">已启用</option><option value="disabled">已停用</option></select><span id="keys-visible" role="status"></span></div><div class="space-y-2" id="keys-list">
        </div>
        <p class="empty-state hidden" id="keys-empty">当前没有任何 Express Key。点「＋ 添加 Key」粘贴一个，再点「保存 Key 列表」。</p>
       </fieldset>
-      <fieldset class="card settings-card channel-wide" id="cookie-box">
+      <fieldset class="card settings-card channel-wide" id="cookie-box" data-draft-group="cookies">
        <legend class="visually-hidden">Cookie 账号列表</legend>
        <div class="card-toolbar"><div><div class="text-sm font-semibold">Cookie 账号列表</div><div class="text-xs text-neutral-500 mt-0.5">每个账号独立绑定 Cookie、Project ID 和代理；已保存的 Cookie 留空即可保留</div></div>
         <div class="toolbar-actions"><span class="pill" id="cookies-count">加载中…</span><button type="button" onclick="addCookieAccount()">＋ 添加 Cookie</button><button type="button" class="btn px-4 py-1.5 text-sm" onclick="runAction(this,()=>saveCookieAccounts())">保存 Cookie 列表</button></div>
        </div>
-       <div id="cookies-list"></div>
+       <div class="credential-filter"><label class="visually-hidden" for="cookies-search">搜索账号备注或项目</label><input id="cookies-search" class="inp" type="search" placeholder="搜索备注 / 项目 / 凭证尾号" data-local oninput="consoleForms.filterAccounts('cookies')"><select id="cookies-filter" class="inp" aria-label="筛选账号状态" data-local onchange="consoleForms.filterAccounts('cookies')"><option value="all">全部账号</option><option value="enabled">已启用</option><option value="disabled">已停用</option></select><span id="cookies-visible" role="status"></span></div><div id="cookies-list"></div>
        <p class="empty-state hidden" id="cookies-empty">尚未配置 Cookie 账号。添加一个或多个账号，并填写各自的 Project ID。</p>
        <p class="text-xs text-neutral-500 mt-3 leading-relaxed">支持粘贴完整 Cookie 头或 Cookie-Editor JSON；Project ID 可直接粘贴含项目参数的控制台 URL。Cookie 不在面板中明文回显。</p>
       </fieldset>
-      <fieldset class="card settings-card channel-wide">
+      <fieldset class="card settings-card channel-wide" data-draft-group="proxy">
        <legend class="visually-hidden">全局代理列表</legend>
        <div class="card-toolbar"><div><div class="text-sm font-semibold">全局代理列表 <button aria-controls="h_proxy" aria-expanded="false" aria-label="展开说明" class="helpq" onclick="hlp(this,'h_proxy')" type="button">?</button></div><div class="text-xs text-neutral-500 mt-0.5">从第一条开始使用，失败后依次切换。账号专属代理优先于此列表</div></div>
         <div class="toolbar-actions"><span class="pill" id="proxy-status">加载中…</span><span class="pill hidden" id="proxy-draft-state" role="status">未保存</span><button type="button" onclick="manageProxies('global')">管理 / 添加代理</button><button type="button" onclick="manageProxies('global',0,'import')">批量导入</button><button type="button" onclick="runAction(this,()=>testProxy())">测试首条</button><button type="button" class="btn px-4 py-1.5 text-sm" onclick="runAction(this,()=>saveProxy())">保存代理</button></div>
@@ -366,8 +372,9 @@
        <textarea aria-label="全局出站代理" class="inp log" id="proxy-input" rows="3" spellcheck="false" autocomplete="off" placeholder="每行一条，第一条为首选；留空 = 直连。点击「管理 / 添加代理」填写或识别代理"></textarea>
        <div class="text-xs mt-2 hidden leading-relaxed" id="proxy-test-result"></div>
       </fieldset>
+      <details class="card channel-advanced"><summary>高级：客户端身份与指纹</summary><div class="channel-grid">
       <!-- Cookie 通道 TLS/浏览器指纹伪装（curl_cffi，热开关） -->
-      <fieldset class="card settings-card">
+      <fieldset class="card settings-card" data-draft-group="fingerprint">
        <legend class="visually-hidden">Cookie 通道指纹伪装</legend>
        <div class="card-toolbar">
         <div>
@@ -428,7 +435,7 @@
        </div>
       </fieldset>
       <!-- Express API Key 通道请求头指纹（热改） -->
-      <fieldset class="card settings-card">
+      <fieldset class="card settings-card" data-draft-group="express-fingerprint">
        <legend class="visually-hidden">Express 通道请求头指纹</legend>
        <div class="card-toolbar">
         <div>
@@ -478,6 +485,7 @@
         <input aria-label="自定义 User-Agent" class="inp flex-1" id="express-ua-custom" placeholder="自定义 UA，占位符 {sdk} {python} {node} 自动展开，例：{sdk} {python} mycorp-gateway/1.0" style="min-width:260px"/>
        </div>
       </fieldset>
+      </div></details>
      </div>
     </section>
     <section aria-labelledby="tab-params" class="view hidden" id="view-params" role="tabpanel" tabindex="0">
@@ -485,7 +493,7 @@
       <div>
        <p class="eyebrow">WORKSPACE / CONFIGURATION</p>
        <h2>模型参数</h2>
-       <p>分别管理模型默认值与全局运行设置。</p>
+       <p>选择模型，按字段设置专属值；未覆盖的参数继续跟随默认值。</p>
       </div>
      </div>
      <div class="inline-notice hidden" id="params-load-error" role="alert">
@@ -519,8 +527,8 @@
         <div class="text-xs text-neutral-600 flex flex-wrap gap-2 max-w-xl" id="caps-summary">
         </div>
        </div>
-       <p class="scope-description">选择「全局默认」设置模型通用值，或选择模型设置专属值。切换时保留本页草稿，刷新页面后清空。</p>
-       <div class="scope-actions">
+       <p class="scope-description">选择「全局默认」设置模型通用值，或选择模型设置专属值。修改字段后将成为专属值；点击“恢复继承”可跟随默认。切换模型保留本页草稿。</p>
+       <div class="scope-actions"><button type="button" class="btn-ghost" onclick="discardModelDraft()">撤销本模型修改</button>
         <button class="btn px-4 py-2 text-sm" id="btn-scope-save" onclick="runAction(this,()=&gt;saveModelOverride())">保存模型默认值</button>
         <button class="px-4 py-2 text-sm rounded-lg border border-neutral-300 hover:bg-neutral-50" id="btn-scope-clear" onclick="runAction(this,()=&gt;clearModelOverride())">清除该模型专属</button>
         <span aria-live="polite" class="text-xs text-neutral-500" id="ov-hint">
@@ -550,14 +558,7 @@
         </div>
         <p class="text-xs text-neutral-500 mt-2" id="think-note">
         </p>
-        <div class="mt-3">
-         <label class="lbl mb-1" for="first_reply_timeout_seconds">模型首回复超时（秒，0=关闭）</label>
-         <input class="inp" id="first_reply_timeout_seconds" max="7200" min="0" step="0.5" type="number"/>
-         <details class="field-help">
-          <summary>首回复如何计时？假流式该怎么设置？</summary>
-          <p class="text-xs text-neutral-500 mt-2 leading-relaxed">默认 15 秒，每次上游尝试独立计时。思考、正文、工具调用、图片均算首回复；心跳、纯用量和签名不算。超时沿用下方重试预算。假流式和非流式需等待完整上游响应，可按模型调大或设为 0。</p>
-         </details>
-        </div>
+
         <div class="mt-3 pt-3 border-t border-neutral-100">
          <label class="lbl mb-1" for="native_thinking_mode">原生思考控制（native_thinking_mode）</label>
          <select class="inp" id="native_thinking_mode">
@@ -616,7 +617,8 @@
         </div>
        </div>
        <!-- 生图 -->
-       <div class="card settings-card">
+       <div class="card settings-card" id="image-settings">
+        <div id="image-applicability" hidden><p>当前模型不使用生图设置。</p><label><input type="checkbox" id="show-image-settings" data-local onchange="updateModelCapabilities()">查看不适用的参数</label></div><div id="image-controls">
         <div class="text-sm font-semibold mb-3">生图</div>
         <div class="mb-3">
          <label class="lbl mb-1" for="image_size">默认分辨率（image_size）</label>
@@ -705,6 +707,7 @@
          </div>
         </div>
        </div>
+       </div>
        <!-- 采样默认 -->
        <div class="card settings-card">
         <div class="text-sm font-semibold mb-3">
@@ -714,15 +717,15 @@
         <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
          <div>
           <label class="lbl mb-1.5" for="default_temperature">temperature</label>
-          <input class="inp" id="default_temperature" placeholder="—" step="0.1" type="number"/>
+          <input class="inp" id="default_temperature" placeholder="—" type="number" min="0" max="2" step="any"/>
          </div>
          <div>
           <label class="lbl mb-1.5" for="default_top_p">top_p</label>
-          <input class="inp" id="default_top_p" placeholder="—" step="0.05" type="number"/>
+          <input class="inp" id="default_top_p" placeholder="—" type="number" min="0" max="1" step="any"/>
          </div>
          <div>
           <label class="lbl mb-1.5" for="default_max_tokens">max_tokens</label>
-          <input class="inp" id="default_max_tokens" placeholder="—" type="number"/>
+          <input class="inp" id="default_max_tokens" placeholder="—" type="number" min="1"/>
          </div>
         </div>
         <div class="flex items-center justify-between gap-3 mt-5 pt-4 border-t border-neutral-100">
@@ -778,7 +781,7 @@
        <div class="card settings-card">
         <div class="flex items-center justify-between gap-3">
          <span class="text-sm font-semibold">
-          模型列表中的抗截断后缀
+          超时与抗截断传输
           <button aria-controls="h_at" aria-expanded="false" aria-label="展开说明" class="helpq" onclick="hlp(this,'h_at')" type="button">?</button>
          </span>
          <select aria-label="anti_truncation_mode" class="inp" id="anti_truncation_mode" style="max-width:190px">
@@ -787,6 +790,14 @@
           <option value="nonstream">仅显示非流式后缀</option>
           <option value="stream">仅显示流式后缀</option>
          </select>
+        </div>
+<div class="mt-3">
+         <label class="lbl mb-1" for="first_reply_timeout_seconds">模型首回复超时（秒，0=关闭）</label>
+         <input class="inp" id="first_reply_timeout_seconds" max="7200" min="0" type="number" step="any"/>
+         <details class="field-help">
+          <summary>首回复如何计时？假流式该怎么设置？</summary>
+          <p class="text-xs text-neutral-500 mt-2 leading-relaxed">默认 15 秒，每次上游尝试独立计时。思考、正文、工具调用、图片均算首回复；心跳、纯用量和签名不算。超时沿用下方重试预算。假流式和非流式需等待完整上游响应，可按模型调大或设为 0。</p>
+         </details>
         </div>
         <p class="text-xs text-neutral-500 mt-2" id="anti-truncation-note">默认仅 4 Argon / 3.8 Flash 提供抗截断后缀；普通无后缀名称始终不启用。</p>
         <div class="helpbox" id="h_at">
@@ -888,7 +899,7 @@
            <b>
             没有发送
            </b>
-           预填充时，代理自动补一条 assistant 消息，然后按“全局运行设置 → 预填充兼容”中的模式处理。
+           预填充时，代理自动补一条 assistant 消息，然后按“运行设置 → 预填充兼容”中的模式处理。
            <br/>
            轻量前端
            <b>
@@ -993,7 +1004,13 @@
         </div>
        </div>
       </div>
+     <div class="model-save-footer"><span id="model-footer-scope">保存到：全局默认</span><button type="button" class="btn" onclick="runAction(this,saveModelOverride)">保存当前参数</button></div>
      </fieldset>
+    </section>
+    <section aria-labelledby="tab-runtime" class="view hidden" id="view-runtime" role="tabpanel" tabindex="0">
+     <div class="page-heading"><div><p class="eyebrow">WORKSPACE / RUNTIME</p><h2>运行设置</h2><p>按任务配置超时、交付与资源限制。修改后统一保存，对所有模型生效。</p></div></div>
+     <div class="inline-notice hidden" id="runtime-load-error" role="alert"><span></span><button class="btn-ghost" onclick="runAction(this,loadParams)">重新加载配置</button></div>
+     <nav class="settings-jump" aria-label="运行设置分区"><a href="#runtime-network">网络与超时</a><a href="#runtime-delivery">交付与续传</a><a href="#runtime-resources">图片与保活</a></nav>
      <div class="settings-divider" id="global-settings">
       <div>
        <h3>全局运行设置</h3>
@@ -1001,10 +1018,10 @@
       </div>
       <span class="pill">全局</span>
      </div>
-     <fieldset class="global-settings-section">
+     <fieldset class="global-settings-section" data-draft-group="runtime">
       <legend class="visually-hidden">全局运行设置</legend>
       <div class="settings-grid">
-       <div class="card settings-card">
+<div class="card settings-card" id="runtime-network">
         <h3 class="settings-card-title">上游区域</h3>
         <div class="flex items-center justify-between gap-3">
          <span class="text-sm">
@@ -1098,7 +1115,7 @@
           GOOGLE_PROJECT_ID
          </code>
          ）。两者都没有时自动退回不指定区域的旧方式。
-         <br/>
+         ：使用当前 Express Key 自己绑定的 Project ID；可在“通道与凭证”中编辑或探测。缺少项目时退回裸模型路径。
          <br/>
          <b>
           注意
@@ -1120,46 +1137,20 @@
          ，并在运行日志说明怎么修——所以这个设置不会让原本能用的配置变得不能用。
         </div>
        </div>
-       <!-- 输入图压缩 -->
-       <div class="card settings-card">
-        <div class="flex items-center justify-between mb-3">
-         <div class="text-sm font-semibold">输入图片压缩</div>
-         <label class="switch">
-          <input aria-label="img_compress_enabled" id="img_compress_enabled" type="checkbox"/>
-          <span class="slider">
-          </span>
-         </label>
-        </div>
-        <div class="grid grid-cols-3 gap-3">
-         <div>
-          <label class="lbl mb-1" for="img_compress_max_dim">最长边(px)</label>
-          <input class="inp" id="img_compress_max_dim" type="number"/>
-         </div>
-         <div>
-          <label class="lbl mb-1" for="img_compress_max_mb">阈值(MB)</label>
-          <input class="inp" id="img_compress_max_mb" step="0.1" type="number"/>
-         </div>
-         <div>
-          <label class="lbl mb-1" for="img_compress_quality">JPEG质量</label>
-          <input class="inp" id="img_compress_quality" type="number"/>
-         </div>
-        </div>
-       </div>
-       <!-- 重试 -->
-       <div class="card settings-card">
+<div class="card settings-card">
         <div class="text-sm font-semibold mb-3">重试与退避</div>
         <div class="grid grid-cols-3 gap-3">
          <div>
           <label class="lbl mb-1" for="retry_max">最大重试次数</label>
-          <input class="inp" id="retry_max" type="number"/>
+          <input class="inp" id="retry_max" type="number" min="0" max="50"/>
          </div>
          <div>
           <label class="lbl mb-1" for="retry_backoff_seconds">重试间隔(秒)</label>
-          <input class="inp" id="retry_backoff_seconds" step="0.5" type="number"/>
+          <input class="inp" id="retry_backoff_seconds" type="number" min="0" max="120" step="any"/>
          </div>
          <div>
           <label class="lbl mb-1" for="retry_jitter_seconds">抖动幅度(秒)</label>
-          <input class="inp" id="retry_jitter_seconds" min="0" step="0.5" type="number"/>
+          <input class="inp" id="retry_jitter_seconds" type="number" min="0" max="60" step="any"/>
          </div>
         </div>
         <div class="flex items-center justify-between mt-3">
@@ -1175,64 +1166,9 @@
         <div class="helpbox" id="h_ccf" hidden="">主通道（Express 或 Cookie）在尚未输出任何内容前遇 429 拥堵、401/403 凭证问题或 5xx 服务端错误时，自动切换另一通道接力完成回复；已输出内容绝不切换，避免半截答案重发。结构化输出在未开启 Cookie 结构化支持时仍锁定 Express。鉴权失败或欠费的 Key / Cookie 会在本轮请求内自动隔离并跳过。</div>
         <div class="text-xs opacity-60 mt-2">实际等待 = 重试间隔 ± 抖动幅度/2（固定不变，不随重试次数增长；上游 Retry-After 更短时采纳其提示）</div>
        </div>
-       <div class="card settings-card">
-        <div class="text-sm font-semibold mb-3">请求与缓冲预算</div>
-        <div class="grid grid-cols-2 gap-3">
-         <div>
-          <label class="lbl mb-1" for="request_timeout_seconds">整轮期限(秒)</label>
-          <input class="inp" id="request_timeout_seconds" max="7200" min="30" type="number"/>
-         </div>
-         <div>
-          <label class="lbl mb-1" for="upstream_max_concurrency">上游最大并发</label>
-          <input class="inp" id="upstream_max_concurrency" max="1000" min="1" type="number"/>
-         </div>
-         <div>
-          <label class="lbl mb-1" for="resumable_disconnect_grace_seconds">断连续传窗口（秒）</label>
-          <input class="inp" id="resumable_disconnect_grace_seconds" max="7200" min="0" step="0.5" type="number"/>
-         </div>
-         <div>
-          <label class="lbl mb-1" for="resumable_max_buffer_mb">单次缓冲(MiB)</label>
-          <input class="inp" id="resumable_max_buffer_mb" max="1024" min="1" type="number"/>
-         </div>
-         <div>
-          <label class="lbl mb-1" for="resumable_max_total_mb">总缓冲(MiB)</label>
-          <input class="inp" id="resumable_max_total_mb" max="8192" min="1" type="number"/>
-         </div>
-        </div>
-        <p class="text-xs text-neutral-500 mt-2">最后一个客户端断开后，窗口内相同请求续接；超过窗口再发时取消旧任务并重新生成。0=断开后不再复用。有其他客户端连接时继续共享。</p>
-       </div>
-       <!-- 保活 -->
-       <div class="card settings-card">
-        <div class="text-sm font-semibold mb-3">保活（Keep-Alive）</div>
-        <div class="grid grid-cols-3 gap-3">
-         <div style="grid-column:span 2">
-          <label class="lbl mb-1" for="keepalive_url">保活 URL</label>
-          <input class="inp" id="keepalive_url" placeholder="https://你的域名/healthz（留空关闭）" type="url"/>
-         </div>
-         <div>
-          <label class="lbl mb-1" for="keepalive_interval">间隔(秒)</label>
-          <input class="inp" id="keepalive_interval" max="86400" min="5" type="number"/>
-         </div>
-        </div>
-        <p class="text-xs text-neutral-500 mt-2">定期 GET 该 URL（默认 60 秒一次）：填自己的 <code>/healthz</code> 可防止免费托管平台冻结闲置实例，也可驱动外部监控。留空 = 关闭。请求直连出站、不走出站代理；保存后立即生效，无需重启。环境变量 <code>KEEPALIVE_URL</code> / <code>KEEPALIVE_INTERVAL</code> 仅作初始值。</p>
-       </div>
-       <!-- 开关 -->
-       <div class="card settings-card">
-        <div class="text-sm font-semibold mb-3">交付与运行开关</div>
-        <div class="space-y-3">
-         <div class="flex items-center justify-between">
-          <span class="text-sm">假流式（fake streaming）</span>
-          <label class="switch">
-           <input aria-label="假流式（fake streaming）" id="fake_streaming" type="checkbox"/>
-           <span class="slider">
-           </span>
-          </label>
-         </div>
-         <div class="flex items-center justify-between">
-          <span class="text-sm">假流式心跳间隔(秒)</span>
-          <input aria-label="fake_streaming_interval" class="inp" id="fake_streaming_interval" step="0.5" style="width:90px" type="number"/>
-         </div>
-         <div>
+<div class="card settings-card">
+        <div class="text-sm font-semibold mb-3">超时、并发与续传缓冲</div>
+<div class="delivery-controls"><div>
           <div class="flex items-center justify-between">
            <span class="text-sm">
             弱网续传（服务端缓冲）
@@ -1264,22 +1200,58 @@
            。缓冲受期限与容量限制，进程重启后失效。
           </div>
          </div>
-         <div class="flex items-center justify-between">
+<div class="flex items-center justify-between">
           <span class="text-sm">续传缓冲保留时长(秒)</span>
-          <input aria-label="resumable_ttl_seconds" class="inp" id="resumable_ttl_seconds" step="60" style="width:90px" type="number"/>
+          <input aria-label="resumable_ttl_seconds" class="inp" id="resumable_ttl_seconds" style="width:90px" type="number" min="60" max="604800" step="1"/>
          </div>
-         <div class="flex items-center justify-between">
+<div class="flex items-center justify-between">
           <span class="text-sm">续传缓冲数量上限</span>
-          <input aria-label="resumable_max_streams" class="inp" id="resumable_max_streams" step="10" style="width:90px" type="number"/>
+          <input aria-label="resumable_max_streams" class="inp" id="resumable_max_streams" style="width:90px" type="number" min="1" max="10000" step="1"/>
+         </div></div>
+
+        <div class="grid grid-cols-2 gap-3">
+         <div>
+          <label class="lbl mb-1" for="request_timeout_seconds">整轮期限(秒)</label>
+          <input class="inp" id="request_timeout_seconds" max="7200" min="30" type="number"/>
          </div>
+         <div>
+          <label class="lbl mb-1" for="upstream_max_concurrency">上游最大并发</label>
+          <input class="inp" id="upstream_max_concurrency" max="1000" min="1" type="number"/>
+         </div>
+         <div>
+          <label class="lbl mb-1" for="resumable_disconnect_grace_seconds">断连续传窗口（秒）</label>
+          <input class="inp" id="resumable_disconnect_grace_seconds" max="7200" min="0" type="number" step="any"/>
+         </div>
+         <div>
+          <label class="lbl mb-1" for="resumable_max_buffer_mb">单次缓冲(MiB)</label>
+          <input class="inp" id="resumable_max_buffer_mb" max="1024" min="1" type="number"/>
+         </div>
+         <div>
+          <label class="lbl mb-1" for="resumable_max_total_mb">总缓冲(MiB)</label>
+          <input class="inp" id="resumable_max_total_mb" max="8192" min="1" type="number"/>
+         </div>
+        </div>
+        <p class="text-xs text-neutral-500 mt-2">最后一个客户端断开后，窗口内相同请求续接；超过窗口再发时取消旧任务并重新生成。0=断开后不再复用。有其他客户端连接时继续共享。</p>
+       </div>
+<div class="card settings-card settings-wide" id="runtime-delivery">
+        <div class="text-sm font-semibold mb-3">交付与运行开关</div>
+        <div class="space-y-3">
          <div class="flex items-center justify-between">
-          <span class="text-sm">账号轮询（Key / Cookie）（round-robin）</span>
+          <span class="text-sm">假流式（fake streaming）</span>
           <label class="switch">
-           <input aria-label="账号轮询（Key / Cookie）（round-robin）" id="roundrobin" type="checkbox"/>
+           <input aria-label="假流式（fake streaming）" id="fake_streaming" type="checkbox"/>
            <span class="slider">
            </span>
           </label>
          </div>
+         <div class="flex items-center justify-between">
+          <span class="text-sm">假流式心跳间隔(秒)</span>
+          <input aria-label="fake_streaming_interval" class="inp" id="fake_streaming_interval" style="width:90px" type="number" min="0" max="30" step="any"/>
+         </div>
+
+
+
+
          <div>
           <div class="flex items-center justify-between">
            <span class="text-sm">
@@ -1397,7 +1369,45 @@
          </div>
         </div>
        </div>
-       <div class="card settings-card">
+<div class="card settings-card" id="runtime-resources">
+        <div class="flex items-center justify-between mb-3">
+         <div class="text-sm font-semibold">输入图片压缩</div>
+         <label class="switch">
+          <input aria-label="img_compress_enabled" id="img_compress_enabled" type="checkbox"/>
+          <span class="slider">
+          </span>
+         </label>
+        </div>
+        <div class="grid grid-cols-3 gap-3">
+         <div>
+          <label class="lbl mb-1" for="img_compress_max_dim">最长边(px)</label>
+          <input class="inp" id="img_compress_max_dim" type="number" min="64" max="8192"/>
+         </div>
+         <div>
+          <label class="lbl mb-1" for="img_compress_max_mb">阈值(MB)</label>
+          <input class="inp" id="img_compress_max_mb" type="number" min="0.05" max="32" step="any"/>
+         </div>
+         <div>
+          <label class="lbl mb-1" for="img_compress_quality">JPEG质量</label>
+          <input class="inp" id="img_compress_quality" type="number" min="10" max="100"/>
+         </div>
+        </div>
+       </div>
+<div class="card settings-card">
+        <div class="text-sm font-semibold mb-3">保活（Keep-Alive）</div>
+        <div class="grid grid-cols-3 gap-3">
+         <div style="grid-column:span 2">
+          <label class="lbl mb-1" for="keepalive_url">保活 URL</label>
+          <input class="inp" id="keepalive_url" placeholder="https://你的域名/healthz（留空关闭）" type="url"/>
+         </div>
+         <div>
+          <label class="lbl mb-1" for="keepalive_interval">间隔(秒)</label>
+          <input class="inp" id="keepalive_interval" max="86400" min="5" type="number"/>
+         </div>
+        </div>
+        <p class="text-xs text-neutral-500 mt-2">定期 GET 该 URL（默认 60 秒一次）：填自己的 <code>/healthz</code> 可防止免费托管平台冻结闲置实例，也可驱动外部监控。留空 = 关闭。请求直连出站、不走出站代理；保存后立即生效，无需重启。环境变量 <code>KEEPALIVE_URL</code> / <code>KEEPALIVE_INTERVAL</code> 仅作初始值。</p>
+       </div>
+<div class="card settings-card">
         <h3 class="settings-card-title">预填充兼容</h3>
         <div class="space-y-3">
          <div>
@@ -1498,9 +1508,10 @@
          </div>
         </div>
        </div>
+
       </div>
-      <div class="global-save-bar">
-       <span class="text-xs text-neutral-500">仅保存全局运行设置。模型行为请使用上方保存按钮。</span>
+      <div class="global-save-bar" id="runtime-save-bar">
+       <span class="text-xs text-neutral-500">保存本页的运行设置，对所有模型生效。</span>
        <button class="btn px-5 py-2.5 text-sm" onclick="runAction(this,()=&gt;saveSettings())">保存全局设置</button>
       </div>
      </fieldset>
@@ -1542,6 +1553,9 @@
         <option value="completed">已结束</option>
        </select>
        <span class="lbl" id="request-refresh-state" role="status">每 2 秒刷新 · 点击一行查看详情</span>
+       <button class="btn-ghost" id="request-pause" aria-pressed="false" type="button">暂停刷新</button>
+       <label class="request-density"><input id="request-columns" type="checkbox" data-local>显示详细列</label>
+       <label class="request-density">每页<select id="request-page-size" aria-label="每页请求数"><option value="10">10</option><option value="25" selected>25</option><option value="50">50</option></select></label>
        <button class="btn-ghost" id="request-refresh" type="button">刷新</button>
       </div>
       <div class="request-table-scroll">

@@ -1,6 +1,7 @@
 const $ = id => document.getElementById(id);
 let CAPS = {}, curAR = "";
-let GLOBAL_SETTINGS = {}, OVERRIDES = {};
+let GLOBAL_SETTINGS = {}, OVERRIDES = {}, SAVED_MODEL_OVERRIDES = {}, BUILTIN_OVERRIDES = {};
+let modelEdits=new Set(), modelInherit=new Set();
 let settingsLoaded=false, capabilitiesLoaded=false, keysLoaded=false, runtimeLoaded=false;
 const PER_MODEL_KEYS = ['first_reply_timeout_seconds','anti_truncation_mode','native_thinking_mode','thinking_g3_level','image_size','image_aspect_ratio','default_temperature','default_top_p','default_max_tokens','inject_system_instruction','inject_prefill','prefill_instruction','image_system_instruction','inject_prefill_for_image','sampling_policy','prefill_cot_guard'];
 const COMMON_ARS = ["1:1","3:2","2:3","3:4","4:3","4:5","5:4","9:16","16:9","21:9","1:4","4:1","1:8","8:1","9:21"];
@@ -23,6 +24,7 @@ async function readJSON(url){
   return response.json();
 }
 function loadNotice(section,message){
+  if(section==='params') {const other=$('runtime-load-error');if(other){other.classList.toggle('hidden',!message);other.querySelector('span').textContent=message;}}
   const box=$(section+'-load-error');
   box.classList.toggle('hidden',!message);
   box.querySelector('span').textContent=message;
@@ -34,6 +36,7 @@ async function responseError(response,fallback='保存失败',result=null){
   const field=$(aliases[data.field]||data.field);
   if(field){
     field.setAttribute('aria-invalid','true');
+    window.consoleForms?.fieldError(field,typeof data.error==='string'?data.error:fallback);
     requestAnimationFrame(()=>{if(field.getClientRects().length && !field.matches(':disabled')) field.focus();});
   }
   if(typeof data.error==='string') return data.error;
@@ -42,7 +45,7 @@ async function responseError(response,fallback='保存失败',result=null){
 }
 
 function switchTab(t, updateHash=true){
-  if(!['overview','channel','params','requests','logs'].includes(t)) return;
+  if(!['overview','channel','params','runtime','requests','logs'].includes(t)) return;
   const changed=document.querySelector('.tab.active')?.dataset.tab!==t;
   document.querySelectorAll('.tab').forEach(e=>{
     const active=e.dataset.tab===t;
@@ -50,10 +53,13 @@ function switchTab(t, updateHash=true){
     e.setAttribute('aria-selected', String(active));
     e.tabIndex=active?0:-1;
   });
-  ['overview','channel','params','requests','logs'].forEach(v=>$('view-'+v).classList.toggle('hidden', v!==t));
+  ['overview','channel','params','runtime','requests','logs'].forEach(v=>$('view-'+v).classList.toggle('hidden', v!==t));
   if(updateHash) history.replaceState(null,'','#'+t);
+  $('mobile-nav').value=t;
+  document.body.dataset.view=t;
   if(changed) window.scrollTo({top:0,behavior:'instant'});
   $('tab-'+t).scrollIntoView({block:'nearest',inline:'nearest'});
+  if(t==='overview') queueMicrotask(fetchRecentMetrics);
   if(t==='requests') window.requestMonitor?.refresh();
   if(t==='logs' && autoscroll) logwin.scrollTop=logwin.scrollHeight;
 }
@@ -69,10 +75,10 @@ document.querySelector('.tab-bar').addEventListener('keydown',event=>{
 });
 function navigateHash(){
   const target=location.hash.slice(1);
-  if(['model-scope','global-settings'].includes(target)){
-    switchTab('params',false);
+  if(['model-scope','global-settings','runtime-network','runtime-delivery','runtime-resources'].includes(target)){
+    switchTab(target==='model-scope'?'params':'runtime',false);
     requestAnimationFrame(()=>$(target).scrollIntoView({block:'start'}));
-  }else switchTab(['overview','channel','params','requests','logs'].includes(target)?target:'overview',false);
+  }else switchTab(['overview','channel','params','runtime','requests','logs'].includes(target)?target:'overview',false);
 }
 window.addEventListener('hashchange',navigateHash);
 
@@ -199,6 +205,7 @@ function keyProxyPill(rec){
 }
 function renderKeys(){
   const box=$('keys-list');
+  window.consoleForms?.rememberAccounts('key');
   box.innerHTML=KEYS.map((rec,i)=>`
     <div class="key-card" data-i="${i}">
       <div class="key-head">
@@ -217,6 +224,7 @@ function renderKeys(){
       ${rec.detected_at?`<div class="key-meta">上次探测：${esc(new Date(rec.detected_at*1000).toLocaleString('zh-CN',{hour12:false}))}</div>`:''}
       ${rec._msg?`<div class="key-meta ${rec._msg_ok===false?'error-message':''}" role="status">${esc(rec._msg)}</div>`:''}
     </div>`).join('');
+  window.consoleForms?.accounts('key');
   $('keys-count').textContent=KEYS.length+' 个';
   $('keys-empty').classList.toggle('hidden',KEYS.length>0);
 }
@@ -236,15 +244,15 @@ function collectKeys(){
   });
   return KEYS.filter(r=>r.key);
 }
-function addKeyRow(){ if(!keysLoaded){toast('凭证列表尚未加载，请先重新加载配置');return;} collectKeys(); KEYS.push({key:'',project_id:'',project_source:'',proxy:'',proxies:[],proxy_fallback:true,enabled:true}); renderKeys(); $('key-'+(KEYS.length-1)).focus(); }
-function removeKeyRow(i){ collectKeys(); KEYS.splice(i,1); renderKeys(); }
+function addKeyRow(){ if(!keysLoaded){toast('凭证列表尚未加载，请先重新加载配置');return;} collectKeys(); KEYS.push({key:'',project_id:'',project_source:'',proxy:'',proxies:[],proxy_fallback:true,enabled:true}); renderKeys(); window.consoleForms?.openAccount('key',KEYS.length-1);$('key-'+(KEYS.length-1)).focus(); }
+function removeKeyRow(i){ collectKeys(); KEYS.splice(i,1); renderKeys();window.consoleForms?.refresh(); }
 async function loadExpressKeys(){
   try{
     const d=await readJSON('/api/express-keys');
     KEYS=(d.keys||[]).map(credentialCopy);
     SAVED_KEYS=KEYS.map(credentialCopy);
     keysLoaded=true;
-    renderKeys();
+    renderKeys();window.consoleForms?.saved('keys');
   }catch(e){loadNotice('channel','凭证列表'+e.message+'。重新加载成功后再保存 Key。');}
 }
 async function saveExpressKeys(){
@@ -254,7 +262,7 @@ async function saveExpressKeys(){
   try{
     const r=await fetch('/api/express-keys',{signal:AbortSignal.timeout(30000),method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keys:payload})});
     const d=await r.json();
-    if(r.ok){ KEYS=(d.keys||[]).map(credentialCopy); SAVED_KEYS=KEYS.map(credentialCopy); renderKeys(); toast('已保存 '+KEYS.length+' 个 Key（已热生效）'); }
+    if(r.ok){ KEYS=(d.keys||[]).map(credentialCopy); SAVED_KEYS=KEYS.map(credentialCopy); renderKeys();window.consoleForms?.saved('keys'); toast('已保存 '+KEYS.length+' 个 Key（已热生效）'); }
     else toast('❌ '+(d.error||'保存失败'));
   }catch(e){ toast('❌ 网络请求失败'); }
 }
@@ -325,7 +333,7 @@ async function saveProxy(){
   const proxies=proxyDraft($('proxy-input').value);
   try{
     const r=await fetch('/api/settings',{signal:AbortSignal.timeout(30000),method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxy_urls:proxies})});
-    if(r.ok){ const saved=await r.json(); GLOBAL_SETTINGS.proxy_urls=saved.proxy_urls;GLOBAL_SETTINGS.proxy_url=saved.proxy_url;$('proxy-input').value=saved.proxy_urls.join('\n');updateProxyPill(saved.proxy_urls.length);updateProxyDraft(); toast(proxies.length?'✅ 已保存 '+saved.proxy_urls.length+' 条代理（按顺序故障切换）':'已清空代理，恢复直连'); }
+    if(r.ok){ const saved=await r.json(); GLOBAL_SETTINGS.proxy_urls=saved.proxy_urls;GLOBAL_SETTINGS.proxy_url=saved.proxy_url;$('proxy-input').value=saved.proxy_urls.join('\n');updateProxyPill(saved.proxy_urls.length);updateProxyDraft();window.consoleForms?.saved('proxy'); toast(proxies.length?'✅ 已保存 '+saved.proxy_urls.length+' 条代理（按顺序故障切换）':'已清空代理，恢复直连'); }
     else toast('❌ '+await responseError(r));
   }catch(e){ toast('❌ 网络请求失败'); }
 }
@@ -363,7 +371,7 @@ async function saveFingerprint(){
   const v=$('cookie-impersonate').value;
   try{
     const r=await fetch('/api/settings',{signal:AbortSignal.timeout(30000),method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cookie_impersonate:v})});
-    if(r.ok){ GLOBAL_SETTINGS.cookie_impersonate=v;updateFpPill(v); toast(v==='off'?'✅ 已关闭伪装（下一个请求生效）':'✅ 伪装已保存并热生效：'+(FP_LABELS[v]||v)); }
+    if(r.ok){ GLOBAL_SETTINGS.cookie_impersonate=v;updateFpPill(v);window.consoleForms?.saved('fingerprint'); toast(v==='off'?'✅ 已关闭伪装（下一个请求生效）':'✅ 伪装已保存并热生效：'+(FP_LABELS[v]||v)); }
     else{
       let msg='保存失败';
       try{ const d=await r.json(); if(d && d.error) msg=d.error; }catch(_){}
@@ -392,7 +400,7 @@ async function saveExpressUa(){
   const c=$('express-ua-custom').value.trim();
   try{
     const r=await fetch('/api/settings',{signal:AbortSignal.timeout(30000),method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({express_ua_profile:v,express_ua_custom:c})});
-    if(r.ok){ GLOBAL_SETTINGS.express_ua_profile=v;GLOBAL_SETTINGS.express_ua_custom=c;updateExpressPill(v,c); updateExpressCustomVis();
+    if(r.ok){ GLOBAL_SETTINGS.express_ua_profile=v;GLOBAL_SETTINGS.express_ua_custom=c;updateExpressPill(v,c); updateExpressCustomVis();window.consoleForms?.saved('express-fingerprint');
       toast(v==='sdk'||(v==='custom'&&!c)?'✅ 已恢复官方 SDK 原生形态（下一个请求生效）':'✅ 请求头指纹已保存并热生效：'+(FP2_LABELS[v]||v)); }
     else{
       let msg='保存失败';
@@ -403,10 +411,11 @@ async function saveExpressUa(){
 }
 
 /* ---------- Params ---------- */
-function setV(id,v){ const el=$(id); if(!el) return; el.removeAttribute('aria-invalid'); if(el.type==='checkbox') el.checked=!!v; else el.value=(v===null||v===undefined)?'':v; }
+function setV(id,v){ const el=$(id); if(!el) return; window.consoleForms?.clearError(el); el.removeAttribute('aria-invalid'); if(el.type==='checkbox') el.checked=!!v; else el.value=(v===null||v===undefined)?'':v; }
 async function loadParams(){
   captureModelDraft();
   const selected=$('model-sel').value;
+  const formDrafts=window.consoleForms?.capture();
   loadNotice('params','');
   // 设置与模型能力两个接口互不依赖：并行拉取，面板加载不再串行等两次往返。
   const [sRes,cRes]=await Promise.allSettled([readJSON('/api/settings'),readJSON('/api/capabilities')]);
@@ -416,7 +425,7 @@ async function loadParams(){
     settingsLoaded=true;
     curAR = s.image_aspect_ratio || "";
     ['resumable_disconnect_grace_seconds','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','retry_jitter_seconds','fake_streaming_interval','prefill_mode','express_location','resumable_ttl_seconds','resumable_max_streams','request_timeout_seconds','upstream_max_concurrency','resumable_max_buffer_mb','resumable_max_total_mb','keepalive_url','keepalive_interval'].forEach(k=>setV(k,s[k]));
-    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','resumable_enabled','cookie_structured_output','cross_channel_fallback'].forEach(k=>setV(k,s[k]));
+    ['img_compress_enabled','fake_streaming','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','resumable_enabled','cookie_structured_output','cross_channel_fallback'].forEach(k=>setV(k,s[k]));
     setV('credential-strategy',s.roundrobin?'roundrobin':'random');
     // 出站代理：回填输入框并刷新状态徽标
     setV('proxy-input', proxyDraft(s.proxy_urls??s.proxy_url).join('\n'));
@@ -430,6 +439,7 @@ async function loadParams(){
     setV('express-ua-custom', s.express_ua_custom || '');
     updateExpressPill(s.express_ua_profile || 'sdk', s.express_ua_custom || '');
     updateExpressCustomVis();
+    window.consoleForms?.loaded(formDrafts);
     // Legacy thinking switches are normalized by the server. Do not reinterpret
     // an explicitly saved request mode using stale legacy flags.
   }else{loadNotice('params','设置'+sRes.reason.message+'。重新加载成功后再保存。');}
@@ -437,6 +447,8 @@ async function loadParams(){
     const c=cRes.value;
     CAPS=c.capabilities||{};
     OVERRIDES=c.overrides||{};
+    SAVED_MODEL_OVERRIDES=c.saved_overrides||c.overrides||{};
+    BUILTIN_OVERRIDES=c.builtin_overrides||{};
     capabilitiesLoaded=true;
     $('model-sel').innerHTML='<option value="__global__">＊ 全局默认（对所有模型）</option>'
       + (c.models||[]).map(m=>{const star=OVERRIDES[m]?' ★':''; return `<option value="${esc(m)}">${esc(m)}${star}</option>`;}).join('');
@@ -449,23 +461,67 @@ function readModelFields(){
 }
 function captureModelDraft(){
   if(!renderedModel || modelSnapshot===null) return;
-  const wasDirty=MODEL_DRAFTS.has(renderedModel);
-  const values=readModelFields();
-  if(JSON.stringify(values)===modelSnapshot) MODEL_DRAFTS.delete(renderedModel);
-  else MODEL_DRAFTS.set(renderedModel,values);
-  $('scope-draft-state').classList.toggle('hidden',!MODEL_DRAFTS.has(renderedModel));
-  if(wasDirty!==MODEL_DRAFTS.has(renderedModel)) refreshModelSelStars();
+  const values=readModelFields(), baseline=JSON.parse(modelSnapshot);
+  for(const key of PER_MODEL_KEYS) if(values[key]!==baseline[key] && !modelInherit.has(key)) modelEdits.add(key);
+  const dirty=renderedModel==='__global__'?JSON.stringify(values)!==modelSnapshot:modelEdits.size>0||modelInherit.size>0;
+  if(dirty) MODEL_DRAFTS.set(renderedModel,{values,edited:[...modelEdits],inherit:[...modelInherit]});
+  else MODEL_DRAFTS.delete(renderedModel);
+  $('scope-draft-state').classList.toggle('hidden',!dirty);
+  refreshModelSelStars();
+  renderFieldSources();
 }
 function finishModelRender(model){
   modelSnapshot=JSON.stringify(readModelFields());
+  modelEdits=new Set();modelInherit=new Set();
   const draft=MODEL_DRAFTS.get(model);
-  if(draft) PER_MODEL_KEYS.forEach(key=>setV(key,draft[key]));
+  if(draft){
+    // Reapply only edited fields: inherited values must follow newer defaults.
+    for(const key of draft.edited) setV(key,draft.values[key]);
+    for(const key of draft.inherit) setV(key,BUILTIN_OVERRIDES[model]?.[key] ?? (key==='anti_truncation_mode'?'off':GLOBAL_SETTINGS[key]));
+    modelEdits=new Set(draft.edited);modelInherit=new Set(draft.inherit);
+  }
   curAR=$('image_aspect_ratio').value;
   renderedModel=model;
   captureModelDraft();
-  refreshModelSelStars();
   updateSamplingDisplay();
+  updateModelCapabilities();
 }
+function discardModelDraft(){
+  MODEL_DRAFTS.delete($('model-sel').value);renderCaps(false);
+}
+function setFieldInheritance(key,inherit){
+  if(!PER_MODEL_KEYS.includes(key)||renderedModel==='__global__') return;
+  if(inherit){
+    modelEdits.delete(key);modelInherit.add(key);
+    setV(key,BUILTIN_OVERRIDES[renderedModel]?.[key] ?? (key==='anti_truncation_mode'?'off':GLOBAL_SETTINGS[key]));
+  }else{modelInherit.delete(key);modelEdits.add(key);}
+  captureModelDraft();updateModelCapabilities();
+}
+function renderFieldSources(){
+  for(const key of PER_MODEL_KEYS){
+    const el=$(key);let row=$('source-'+key);
+    if(!row){row=document.createElement('div');row.id='source-'+key;row.className='field-source';
+      const anchor=el.closest('.switch')?.parentElement||(el.parentElement.classList.contains('flex')?el.parentElement:el);anchor.after(row);}
+    const global=renderedModel==='__global__';
+    const own=!global&&!modelInherit.has(key)&&(modelEdits.has(key)||Object.hasOwn(SAVED_MODEL_OVERRIDES[renderedModel]||{},key));
+    const builtin=Object.hasOwn(BUILTIN_OVERRIDES[renderedModel]||{},key);
+    row.innerHTML=global?'':`<span>${own?'模型专属':builtin?'继承内置默认':'继承全局默认'}${modelEdits.has(key)||modelInherit.has(key)?' · 未保存':''}</span><button type="button" data-inherit="${key}" data-value="${own}" ${el.disabled?'disabled':''}>${own?'恢复继承':'设为专属'}</button>`;
+    row.hidden=global;
+  }
+}
+function updateModelCapabilities(){
+  const cap=CAPS[$('model-sel').value],global=$('model-sel').value==='__global__';
+  const imageOn=global||!!cap?.is_image;
+  $('image-settings').classList.toggle('is-inapplicable',!imageOn);
+  $('image-applicability').hidden=imageOn;
+  $('image-controls').hidden=!imageOn&&!$('show-image-settings').checked;
+  for(const key of ['image_size','image_aspect_ratio','image_system_instruction','inject_prefill_for_image']) $(key).disabled=!imageOn;
+  for(const [key,allowed] of [['thinking_g3_level',cap?.thinking?.levels],['image_size',cap?.image_sizes]]){
+    for(const option of $(key).options) option.disabled=!global&&!!allowed?.length&&option.value!==''&&!allowed.includes(option.value);
+  }
+  renderFieldSources();
+}
+document.addEventListener('click',event=>{const button=event.target.closest('[data-inherit]');if(button){const key=button.dataset.inherit;setFieldInheritance(key,button.dataset.value==='true');$('source-'+key).querySelector('button')?.focus({preventScroll:true});}});
 // 按编辑作用域回填模型参数：专属值优先，否则使用全局默认。
 function applyModelParamFields(model){
   // __global__ = 全局默认作用域：只显示全局值，不掺任何模型专属值
@@ -479,6 +535,7 @@ function applyModelParamFields(model){
   const has = !isGlobal && !!OVERRIDES[model] && Object.keys(OVERRIDES[model]).length>0;
   $('ov-badge').classList.toggle('hidden', !has);
   // 保存按钮的落点随作用域切换，避免"看着像全局、存进了专属"（或反过来）
+  $('model-footer-scope').textContent=isGlobal?'保存到：全局默认':'保存到：'+model;
   $('btn-scope-save').textContent = isGlobal ? '保存为全局默认' : '保存为该模型专属';
   $('btn-scope-clear').classList.toggle('hidden', isGlobal);
   $('ov-hint').textContent = isGlobal
@@ -489,7 +546,7 @@ function applyModelParamFields(model){
 async function saveModelOverride(){
   if(!settingsLoaded || !capabilitiesLoaded){toast('配置尚未加载，请先重新加载配置');return;}
   const m=$('model-sel').value; if(!m) return;
-  const patch={
+  let patch={
     first_reply_timeout_seconds:numOr('first_reply_timeout_seconds',15),
     anti_truncation_mode:$('anti_truncation_mode').value,
     native_thinking_mode:$('native_thinking_mode').value,
@@ -517,10 +574,16 @@ async function saveModelOverride(){
     }catch(e){ toast('保存失败'); }
     return;
   }
+  patch=Object.fromEntries(Object.entries(patch).filter(([key])=>modelEdits.has(key)));
+  if(modelInherit.size) patch._inherit=[...modelInherit];
+  if(!Object.keys(patch).length){toast('没有需要保存的修改');return;}
   try{
     const r=await fetch('/api/model-overrides/'+encodeURIComponent(m),{signal:AbortSignal.timeout(30000),method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});
     const d=await r.json();
-    if(r.ok){ OVERRIDES[m]=d.override||patch; MODEL_DRAFTS.delete(m); renderCaps(false); toast('已保存 '+m+' 专属参数'); }
+    if(r.ok){ if(Object.keys(d.override||{}).length)OVERRIDES[m]=d.override;else delete OVERRIDES[m];
+      const own={...(SAVED_MODEL_OVERRIDES[m]||{})};for(const key of modelInherit)delete own[key];
+      Object.assign(own,Object.fromEntries(Object.entries(patch).filter(([key])=>key!=='_inherit')));SAVED_MODEL_OVERRIDES[m]=own;
+      MODEL_DRAFTS.delete(m); renderCaps(false); toast('已保存 '+m+' 专属参数'); }
     else toast(await responseError(r,'保存失败',d));
   }catch(e){ toast('❌ 网络请求失败'); }
 }
@@ -528,12 +591,14 @@ async function clearModelOverride(){
   if(!capabilitiesLoaded){toast('模型配置尚未加载，请先重新加载配置');return;}
   const m=$('model-sel').value; if(!m) return;
   if(!OVERRIDES[m]){ toast('该模型没有专属参数'); return; }
+  if(!confirm('清除 '+m+' 的全部专属参数及本页草稿，恢复全局 / 内置默认？'))return;
   try{
     const r=await fetch('/api/model-overrides/'+encodeURIComponent(m),{signal:AbortSignal.timeout(30000),method:'DELETE'});
     if(r.ok){
       const d=await r.json();
       if(d.override && Object.keys(d.override).length) OVERRIDES[m]=d.override;
       else delete OVERRIDES[m];
+      delete SAVED_MODEL_OVERRIDES[m];
       MODEL_DRAFTS.delete(m); renderCaps(false); toast('已恢复 '+m+' 默认参数');
     }
     else toast(await responseError(r,'清除失败'));
@@ -631,7 +696,7 @@ function updateSamplingDisplay(){
 function numOrNull(id){ const v=$(id).value.trim(); return v===''?null:Number(v); }
 function numOr(id,d){ const v=$(id).value.trim(); return v===''?d:Number(v); }
 // 说明折叠：点 ⓘ 展开/收起对应的说明块
-function hlp(el,id){const b=$(id);const on=b.classList.toggle('show');el.classList.toggle('on',on);el.setAttribute('aria-expanded',String(on));el.setAttribute('aria-label',on?'收起说明':'展开说明');}
+function hlp(el,id){const b=$(id);const on=b.classList.toggle('show');b.hidden=!on;el.classList.toggle('on',on);el.setAttribute('aria-expanded',String(on));el.setAttribute('aria-label',on?'收起说明':'展开说明');}
 async function saveSettings(){
   if(!settingsLoaded){toast('设置尚未加载，请先重新加载配置');return;}
   // 只保存全局运行设置。
@@ -648,7 +713,6 @@ async function saveSettings(){
     cross_channel_fallback:$('cross_channel_fallback').checked,
     fake_streaming:$('fake_streaming').checked,
     fake_streaming_interval:numOr('fake_streaming_interval',1),
-    roundrobin:$('roundrobin').checked,
     safety_score:$('safety_score').checked,
     cookie_debug:$('cookie_debug').checked,
     cookie_structured_output:$('cookie_structured_output').checked,
@@ -676,7 +740,7 @@ async function saveSettings(){
       // Another section may have saved model defaults while this response was in flight.
       // Only merge the fields owned by this form, never an older full-state snapshot.
       Object.keys(patch).forEach(key=>GLOBAL_SETTINGS[key]=saved[key]);
-      setV('credential-strategy',saved.roundrobin?'roundrobin':'random');
+      window.consoleForms?.saved('runtime');
       toast(overriding?'全局运行设置已保存；模型专属参数保持不变':'全局运行设置已保存');
     }
     else toast(await responseError(r));
@@ -798,6 +862,7 @@ async function manageProxies(scope='global',index=0,view='list'){
 // Keep buttons in a cached previous HTML document usable during an upgrade.
 function openProxyEditor(scope='global',index=0){return manageProxies(scope,index);}
 function reloadConfiguration(){
+  if(window.consoleForms?.dirty()&&!confirm('重新加载会丢弃尚未保存的账号修改。继续？'))return;
   loadNotice('channel','');
   return Promise.allSettled([loadRuntime(),loadParams(),loadExpressKeys(),loadChannelFeatures()]);
 }
@@ -809,7 +874,8 @@ loadRuntime(); loadParams(); loadExpressKeys(); loadChannelFeatures();
 
 async function runAction(button,action){
   if(button.matches(':disabled')) return;
-  const groups=button.closest('dialog')?[...button.closest('dialog').querySelectorAll('fieldset')]:button.closest('.inline-notice')?[...button.closest('.view').querySelectorAll('fieldset')]:[button.closest('fieldset')].filter(Boolean);
+  const groups=button.closest('dialog')?[...button.closest('dialog').querySelectorAll('fieldset')]:button.closest('.inline-notice')?[...document.querySelectorAll('main fieldset')]:[button.closest('fieldset')].filter(Boolean);
+  if(window.consoleForms && !window.consoleForms.validate(button)) return;
   if(groups.some(group=>group.disabled)){toast('该分区正在处理，请稍后再试');return;}
   const label=button.textContent;
   button.disabled=true;button.setAttribute('aria-busy','true');button.textContent='处理中…';
@@ -819,7 +885,24 @@ async function runAction(button,action){
   finally{button.disabled=false;button.removeAttribute('aria-busy');if(button.textContent==='处理中…') button.textContent=label;groups.forEach((group,i)=>{group.disabled=disabled[i];group.removeAttribute('aria-busy');});window.consoleChannels?.sync?.();}
 }
 document.addEventListener('input',event=>{
-  event.target.removeAttribute('aria-invalid');
+  event.target.removeAttribute('aria-invalid');window.consoleForms?.clearError(event.target);
   if(event.target.id==='proxy-input') updateProxyDraft();
-  if(PER_MODEL_KEYS.includes(event.target.id)){captureModelDraft();if(event.target.id==='sampling_policy') updateSamplingDisplay();}
+  if(PER_MODEL_KEYS.includes(event.target.id)){modelEdits.add(event.target.id);modelInherit.delete(event.target.id);captureModelDraft();if(event.target.id==='sampling_policy') updateSamplingDisplay();}
 });
+
+/* Recent diagnostics are a bounded retained sample, not a lifetime counter. */
+let recentLoading=false;
+async function fetchRecentMetrics(){
+  if(recentLoading||document.hidden||$('view-overview').classList.contains('hidden'))return;
+  recentLoading=true;
+  try{
+    const d=await readJSON('/api/recent-metrics'),completed=d.success+d.error;
+    $('recent-rate').textContent=completed?(d.success/completed*100).toFixed(1)+'%':'—';
+    const duration=v=>v==null?'—':(v/1000).toFixed(1)+'s';
+    $('recent-latency').textContent=duration(d.first_reply_p50_ms)+' / '+duration(d.first_reply_p95_ms);
+    $('recent-errors').textContent=fmt(d.error);
+    $('recent-note').textContent=`近 15 分钟接收且仍保留的主请求 ${d.sample_count} 条，首回复样本 ${d.reply_samples} 条；`+Object.entries(d.channels).map(([name,c])=>`${name}：成功 ${c.success} / 失败 ${c.error} / 运行 ${c.active}`).join('；')+'。重启和记录回收会缩短样本范围；取消不计入成功率。';
+  }catch(error){$('recent-note').textContent='近期统计暂不可用：'+error.message;}
+  finally{recentLoading=false;}
+}
+fetchRecentMetrics();setInterval(fetchRecentMetrics,15000);

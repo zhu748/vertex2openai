@@ -11,7 +11,7 @@
   const flowLabel = r => [protocols[r.protocol] || r.protocol, channels[r.channel] || r.channel, modes[r.mode]]
     .filter(Boolean).join(' · ');
   const connections = {open:'连接中', completed:'发送结束', disconnected:'已断开'};
-  const state = {offset:0, limit:25, total:0, selected:null, listController:null, detailController:null, listLoading:false, detailLoading:false, loaded:false};
+  const state = {paused:false, offset:0, limit:matchMedia('(max-width:767px)').matches?10:25, total:0, selected:null, listController:null, detailController:null, listLoading:false, detailLoading:false, loaded:false};
   const duration = ms => ms == null ? '—' : ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} 秒`;
   const date = seconds => seconds == null ? '—' : new Date(seconds * 1000).toLocaleString('zh-CN', {hour12:false});
   const timing = (r,key) => duration(r.timings?.[key]?.elapsed_ms);
@@ -28,9 +28,22 @@
     $('request-overview').textContent=`前端连接 ${s.connections} · 上游生成 ${s.generations} · 后台运行 ${s.background} · 退避等待 ${s.retry_wait}`;
   }
 
+  function reconcileRows(html){
+    const fragment=document.createElement('tbody');fragment.innerHTML=html;
+    const target=$('request-rows'),old=new Map([...target.children].filter(row=>row.dataset.request).map(row=>[row.dataset.request,row]));
+    const keep=new Set();let previous=null;
+    for(const fresh of [...fragment.children]){
+      const existing=old.get(fresh.dataset.request),row=existing||fresh;
+      if(existing){for(let i=0;i<fresh.cells.length;i++)if(existing.cells[i].innerHTML!==fresh.cells[i].innerHTML)existing.cells[i].innerHTML=fresh.cells[i].innerHTML;}
+      const next=previous?previous.nextSibling:target.firstChild;
+      if(row!==next)target.insertBefore(row,next);
+      keep.add(row);previous=row;
+    }
+    for(const row of [...target.children])if(!keep.has(row))row.remove();
+  }
   async function refresh(force=true) {
     if(document.hidden || $('view-requests').classList.contains('hidden')) return;
-    if(!force && state.listLoading) return;
+    if(!force && (state.listLoading||state.paused)) return;
     // Keep text selection usable; keyboard focus is restored after rendering.
     if(!force && !window.getSelection().isCollapsed) return;
     state.listController?.abort();
@@ -50,16 +63,17 @@
       summary(data.summary);
       state.loaded=true;
       const focusedRequest=document.activeElement.closest('#request-rows [data-request]')?.dataset.request;
-      $('request-rows').innerHTML=data.items.length ? data.items.map(r => `<tr data-request="${esc(r.id)}" tabindex="0" role="button" aria-label="查看请求 ${esc(r.id)}">
+      const rowsHTML=data.items.length ? data.items.map(r => `<tr data-request="${esc(r.id)}" tabindex="0" role="button" aria-label="查看请求 ${esc(r.id)}">
         <td><span class="request-link request-id">${esc(r.id.slice(-8))}</span><div class="request-model" title="${esc(r.model)}">${esc(r.model || '尚未通过校验')}</div><div class="lbl">${esc(flowLabel(r))}</div></td>
         <td>${badge(r)}${r.parent_id?'<div class="lbl mt-1">续传读者</div>':''}${r.generation_active&&!r.http_active?'<div class="lbl mt-1">后台仍在生成</div>':''}</td>
         <td data-label="开始时间">${esc(date(r.created_at))}</td><td data-label="总耗时">${duration(r.duration_ms)}</td><td data-label="首回复 / 正文">${timing(r,r.parent_id?'first_sent_reply':'first_reply')} / ${timing(r,r.parent_id?'first_sent_content':'first_content')}</td>
         <td data-label="尝试 / 重试">${r.attempts} / ${r.retries}</td><td data-label="输出 / 思考">${fmt(r.content_chars || r.sent_content_chars)} / ${fmt(r.reasoning_chars || r.sent_reasoning_chars)} 字符</td><td data-label="连接状态">${esc(connections[r.connection])}</td></tr>`).join('') : '<tr><td colspan="8" class="table-empty"><span class="empty-title">没有符合条件的请求</span><span class="empty-description">可调整搜索与筛选；新请求将自动出现在这里。</span></td></tr>';
+      reconcileRows(rowsHTML);
       if(focusedRequest) $('request-rows').querySelector(`[data-request="${CSS.escape(focusedRequest)}"]`)?.focus({preventScroll:true});
       $('request-page-info').textContent=`${data.total?state.offset+1:0}–${Math.min(state.offset+state.limit,data.total)} / ${data.total} 条`;
       $('request-prev').disabled=state.offset===0;
       $('request-next').disabled=state.offset+state.limit>=data.total;
-      $('request-refresh-state').textContent='每 2 秒刷新 · 更新于 '+new Date().toLocaleTimeString('zh-CN',{hour12:false});
+      $('request-refresh-state').textContent=(state.paused?'已暂停 · 更新于 ':'每 2 秒刷新 · 更新于 ')+new Date().toLocaleTimeString('zh-CN',{hour12:false});
       $('request-refresh-state').classList.remove('error-message');
     } catch(error) {
       if(error.name!=='AbortError') {
@@ -75,7 +89,7 @@
 
   async function detail(force=true) {
     if(!state.selected || !$('request-dialog').open || document.hidden) return;
-    if(!force && state.detailLoading) return;
+    if(!force && (state.detailLoading||state.paused)) return;
     const selection=window.getSelection();
     if(!force && !selection.isCollapsed && $('request-dialog').contains(selection.anchorNode)) return;
     state.detailController?.abort();
@@ -157,13 +171,23 @@
   $('request-dialog').addEventListener('close',()=>{state.selected=null;state.detailController?.abort();});
   $('request-prev').addEventListener('click',()=>{state.offset=Math.max(0,state.offset-state.limit);refresh();});
   $('request-next').addEventListener('click',()=>{state.offset+=state.limit;refresh();});
-  $('request-refresh').addEventListener('click',()=>refresh());
+  $('request-refresh').addEventListener('click',()=>{refresh();detail();});
+  $('request-page-size').value=String(state.limit);
+  $('request-page-size').addEventListener('change',()=>{state.limit=Number($('request-page-size').value);state.offset=0;refresh();});
+  $('request-columns').addEventListener('change',()=>document.querySelector('.request-table').classList.toggle('show-details',$('request-columns').checked));
+  $('request-pause').addEventListener('click',()=>{
+    state.paused=!state.paused;
+    $('request-pause').setAttribute('aria-pressed',String(state.paused));
+    $('request-pause').textContent=state.paused?'恢复刷新':'暂停刷新';
+    if(state.paused){state.listController?.abort();state.detailController?.abort();$('request-refresh-state').textContent='已暂停自动刷新，可手动刷新';}
+    else{refresh();detail();}
+  });
   let searchTimer;
   $('request-search').addEventListener('input',()=>{clearTimeout(searchTimer);searchTimer=setTimeout(()=>{state.offset=0;refresh();},250);});
   $('request-filter').addEventListener('change',()=>{state.offset=0;refresh();});
   window.requestMonitor={refresh,summary,open};
   setInterval(()=>{refresh(false);detail(false);},2000);
-  document.addEventListener('visibilitychange',()=>{if(!document.hidden){refresh();detail();}});
+  document.addEventListener('visibilitychange',()=>{if(!document.hidden&&!state.paused){refresh();detail();}});
   // 首次 stats 已由 dashboard.js 末尾的 fetchStats() 发起（并通过
   // window.requestMonitor.summary 回填这里），再拉一次是冗余往返。
 })();

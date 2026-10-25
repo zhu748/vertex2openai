@@ -95,7 +95,7 @@ async function main() {
     // must work there too; the server owns durable Cookie account identities.
     await context.addInitScript(() => Object.defineProperty(Crypto.prototype, 'randomUUID', {value: undefined}));
     const errors = [], external = [];
-    context.on('page', page => page.on('pageerror', error => errors.push(error.message)));
+    context.on('page', page => {page.on('pageerror', error => errors.push(error.message));page.on('dialog', dialog => dialog.accept());});
     await context.route('**/*', route => {
       if (!route.request().url().startsWith(origin)) {external.push(route.request().url());return route.abort();}
       return route.continue();
@@ -111,7 +111,10 @@ async function main() {
     const page = await context.newPage();
     const responseFor = (pathname, method = 'POST') => page.waitForResponse(r => new URL(r.url()).pathname === pathname && r.request().method() === method);
     const screenshot = async name => {if (screenshots) await page.screenshot({path: path.join(screenshots, name + '.png'), fullPage: false});};
-    const openTab = async tab => {await page.evaluate(t => switchTab(t), tab);};
+    const openTab = async tab => {
+      await page.evaluate(t => switchTab(t), tab);
+      if(tab==='channel') for(const summary of await page.locator('#view-channel .account-editor:not([open]) > summary:visible').all()) await summary.click();
+    };
     const openProxyForm = async () => {await page.click('#proxy-tab-form');};
     const finishProxyBatch = async (allowEmpty=false) => {
       await page.waitForSelector('#proxy-panel-import:not(.hidden)');
@@ -154,7 +157,9 @@ async function main() {
     assert.equal(response.status(), 200);
     assert.equal(response.request().postDataJSON().prefill_cot_guard, true);
     assert.equal(response.request().postDataJSON().first_reply_timeout_seconds, 28.5);
+    assert.deepEqual(Object.keys(response.request().postDataJSON()).sort(),['first_reply_timeout_seconds','prefill_cot_guard']);
     await page.waitForFunction(() => !document.querySelector('#btn-scope-save').disabled);
+    await openTab('runtime');
     assert.equal(await page.locator('#cookie_structured_output').isChecked(),false);
     await page.locator('#cookie_structured_output').check();
     pending = responseFor('/api/settings');
@@ -170,6 +175,7 @@ async function main() {
     await upstreamSettingsPage.close();
     await page.bringToFront();
     check('上游 Cookie 结构化输出开关默认关闭，保存后在新页面正确回填');
+    await openTab('params');
     await page.selectOption('#model-sel', '__global__');
     assert.equal(await page.inputValue('#image_aspect_ratio'), '16:9');
     assert.match(await page.locator('#model-sel option').first().textContent(), /全局默认/);
@@ -193,12 +199,9 @@ async function main() {
     await page.selectOption('#sampling_policy', 'auto');
     assert.match(await page.textContent('#sampling-note'), /自动移除/);
     await page.fill('#default_top_p', '2');
-    pending=responseFor('/api/model-overrides/gemini-4-argon');
     await page.click('#btn-scope-save');
-    response=await pending;
-    assert.equal(response.status(),400);
     await page.waitForFunction(()=>document.querySelector('#default_top_p').getAttribute('aria-invalid')==='true' && document.activeElement.id==='default_top_p');
-    assert.match(await page.textContent('#toast'), /default_top_p.*\[0, 1\]/);
+    assert.equal(await page.locator('#default_top_p-error').isVisible(),true);
     await page.fill('#default_top_p','');
     assert.equal(await page.getAttribute('#default_top_p','aria-invalid'),null);
     let releaseModel, modelStarted;
@@ -236,9 +239,11 @@ async function main() {
       runtimeStarted();await runtimeGate;
       return route.fulfill({json:{...staleSettings,...patch}});
     });
+    await openTab('runtime');
     const runtimeResponse=page.waitForResponse(r=>new URL(r.url()).pathname==='/api/settings' && r.request().postDataJSON()?.retry_max!==undefined);
     await page.locator('button[onclick*="saveSettings"]').click();
     await runtimeReady;
+    await openTab('params');
     pending=responseFor('/api/settings');
     await page.click('#btn-scope-save');
     response=await pending;
@@ -733,6 +738,7 @@ async function main() {
     await page.unroute('**/api/proxy/test',batchProbe);
     check('停止测试立即取消在途与排队项，忽略迟到结果，并可重试未完成节点；移动端导入布局');
 
+    await page.evaluate(()=>consoleForms.openAccount('key',0));
     await page.locator('#keys-list .field-heading button').first().click();
     await page.click('#proxy-tab-list');
     await page.locator('[data-proxy-index="0"]').getByRole('button',{name:'删除第 1 条代理',exact:true}).click();
@@ -800,16 +806,15 @@ async function main() {
     assert.equal(savedCookies.accounts[0].proxies[0],'socks5://cookie-user:private%3Apassword@cookie-proxy.invalid:1080');
     assert.equal((await (await page.request.get(origin+'/api/settings/runtime')).json()).mode,'mixed');
     await page.selectOption('#credential-strategy','roundrobin');
-    await page.waitForFunction(()=>!document.querySelector('#credential-strategy').disabled && document.querySelector('#roundrobin').checked);
+    await page.waitForFunction(()=>!document.querySelector('#credential-strategy').disabled);
+    assert.equal((await (await page.request.get(origin+'/api/settings')).json()).roundrobin,true);
     check('混合模式、多 Cookie 项目与代理绑定、空值保留凭证、独立启停和轮询');
 
-    await openTab('params');
-    await page.uncheck('#roundrobin');
     pending=responseFor('/api/settings');
-    await page.locator('button[onclick*="saveSettings"]').click();
+    await page.selectOption('#credential-strategy','random');
     assert.equal((await pending).status(),200);
-    await page.waitForFunction(()=>!document.querySelector('#roundrobin').matches(':disabled') && document.querySelector('#credential-strategy').value==='random');
-    check('全局设置保存后同步通道页账号调度状态');
+    assert.equal(await page.locator('#roundrobin').count(),0);
+    check('账号调度仅有一个入口，选择后立即保存');
 
     await openTab('requests');
     await page.waitForSelector('#request-rows tr[data-request]');
@@ -857,11 +862,12 @@ async function main() {
 
     for (const width of [1440, 1024, 768, 390, 320]) {
       await page.setViewportSize({width, height: 900});
-      for (const tab of ['overview', 'channel', 'params', 'requests', 'logs']) {
+      for (const tab of ['overview', 'channel', 'params', 'runtime', 'requests', 'logs']) {
         await openTab(tab);
         await page.evaluate(() => scrollTo(0, 0));
         assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), `${width}px ${tab}: horizontal overflow`);
         if (width === 390 || width === 1440) await screenshot(`${tab}-${width}`);
+        if(tab==='channel'){await page.locator('.account-editor').evaluateAll(items=>items.forEach(el=>el.open=false));assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));}
       }
       await openTab('requests');
       await page.locator('#request-rows tr[data-request]').first().click();
@@ -903,7 +909,7 @@ async function main() {
       if(await page.locator('#proxy-close-prompt').isVisible()) await page.locator('#proxy-close-prompt').getByRole('button',{name:'放弃并关闭',exact:true}).click();
       assert.equal(await page.locator('#proxy-dialog').evaluate(el=>el.open),false);
     }
-    check('五个页面及长请求详情通过 320 / 390 / 768 / 1024 / 1440px 宽度检查');
+    check('六个页面及长请求详情通过 320 / 390 / 768 / 1024 / 1440px 宽度检查');
 
     await openTab('logs');
     await page.waitForSelector('.log-line.error');
@@ -1007,9 +1013,9 @@ async function main() {
     assert.equal(await failedPage.getAttribute('#tab-params', 'aria-selected'), 'true');
     check('配置加载失败提示、禁止空数据保存、重试与链接定位');
     await failedPage.goto(origin+'/#global-settings');
-    await failedPage.waitForFunction(()=>document.querySelector('#tab-params').getAttribute('aria-selected')==='true');
+    await failedPage.waitForFunction(()=>document.querySelector('#tab-runtime').getAttribute('aria-selected')==='true');
     await failedPage.reload();
-    await failedPage.waitForFunction(()=>document.querySelector('#tab-params').getAttribute('aria-selected')==='true');
+    await failedPage.waitForFunction(()=>document.querySelector('#tab-runtime').getAttribute('aria-selected')==='true');
     assert.equal(await failedPage.locator('#global-settings').isVisible(),true);
     await failedPage.goto(origin+'/#model-scope');
     await failedPage.waitForFunction(()=>document.querySelector('#tab-params').getAttribute('aria-selected')==='true');

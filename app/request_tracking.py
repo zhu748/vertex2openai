@@ -434,6 +434,46 @@ class RequestRegistry:
         return {"connections": connections, "generations": generations,
                 "background": background, "retry_wait": retry_wait, "active": active}
 
+    def recent_metrics(self, window_seconds=900):
+        """A bounded sample of retained primary requests, never a durable history."""
+        now = time.time()
+        success = errors = cancelled = running = 0
+        replies = []
+        channels = {}
+        with self._lock:
+            self._prune()
+            records = list(self._records.values())
+        for trace in records:
+            with trace._lock:
+                data = trace.data
+                if data["created_at"] < now - window_seconds or data["parent_id"]:
+                    continue
+                channel = data["channel"] or "unknown"
+                counts = channels.setdefault(channel, {"success": 0, "error": 0, "active": 0})
+                if data["http_active"] or data["generation_active"]:
+                    running += 1
+                    counts["active"] += 1
+                elif data["outcome"] == "error":
+                    errors += 1
+                    counts["error"] += 1
+                elif data["outcome"] == "succeeded":
+                    success += 1
+                    counts["success"] += 1
+                else:
+                    cancelled += 1
+                reply = trace.timings.get("first_reply", {}).get("elapsed_ms")
+                if reply is not None:
+                    replies.append(reply)
+        replies.sort()
+        def percentile(fraction):
+            return replies[max(0, math.ceil(len(replies) * fraction) - 1)] if replies else None
+        return {"window_seconds": window_seconds, "success": success, "error": errors,
+                "cancelled": cancelled, "active": running,
+                "sample_count": success + errors + cancelled + running,
+                "reply_samples": len(replies), "first_reply_p50_ms": percentile(.5),
+                "first_reply_p95_ms": percentile(.95), "channels": channels,
+                "retained_sample": True}
+
 
 request_registry = RequestRegistry()
 

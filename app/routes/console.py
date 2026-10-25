@@ -101,6 +101,11 @@ async def list_requests(_auth: bool = Depends(require_auth), status: str = "all"
                         headers={"Cache-Control": "no-store"})
 
 
+@router.get("/api/recent-metrics")
+async def recent_metrics(_auth: bool = Depends(require_auth)):
+    return JSONResponse(content=request_registry.recent_metrics(), headers={"Cache-Control": "no-store"})
+
+
 @router.get("/api/requests/{request_id}")
 async def request_detail(request_id: str, _auth: bool = Depends(require_auth)):
     trace = request_registry.get(request_id)

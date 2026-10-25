@@ -156,3 +156,6 @@ web_state.json
 singbox/
 proxy-bridge/
 bin/vertex-proxy-bridge*
+
+# Optional frontend development dependencies
+node_modules/

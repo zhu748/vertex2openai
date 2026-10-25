@@ -2,7 +2,7 @@
  * Keep state local so a failed/cached script can be retried without redeclaration errors. */
 (() => {
 if(window.consoleChannels) return;
-let COOKIE_ACCOUNTS=[], cookiesLoaded=false, proxyEditor=null, proxyEditorInitialized=false;
+let COOKIE_ACCOUNTS=[], SAVED_COOKIES=[], cookiesLoaded=false, proxyEditor=null, proxyEditorInitialized=false;
 // In-memory only: proxy credentials and test results never enter localStorage.
 const proxyResults=new Map();
 
@@ -14,12 +14,13 @@ async function updateCredentialStrategy(select){
     const roundrobin=select.value==='roundrobin';
     const response=await fetch('/api/settings',{method:'POST',signal:AbortSignal.timeout(30000),headers:{'Content-Type':'application/json'},body:JSON.stringify({roundrobin})});
     if(!response.ok) throw new Error(await responseError(response));
-    GLOBAL_SETTINGS.roundrobin=roundrobin;setV('roundrobin',roundrobin);toast('账号调度已切换为'+(roundrobin?'按顺序轮询':'随机使用'));
+    GLOBAL_SETTINGS.roundrobin=roundrobin;toast('账号调度已切换为'+(roundrobin?'按顺序轮询':'随机使用'));
   }catch(error){select.value=previous?'roundrobin':'random';toast(error.message);}
   finally{select.disabled=false;}
 }
 
 function renderCookieAccounts(){
+  window.consoleForms?.rememberAccounts('cookie');
   $('cookies-list').innerHTML=COOKIE_ACCOUNTS.map((rec,index)=>`
     <div class="key-card cookie-card" data-cookie-index="${index}">
       <div class="key-head"><div class="key-title"><span class="pill pill-accent">Cookie ${index+1}</span>
@@ -35,6 +36,7 @@ function renderCookieAccounts(){
         ${accountProxyFields('cookie',index,rec)}
       </div>
     </div>`).join('');
+  window.consoleForms?.accounts('cookie');
   $('cookies-count').textContent=COOKIE_ACCOUNTS.length+' 个';
   $('cookies-empty').classList.toggle('hidden',COOKIE_ACCOUNTS.length>0);
 }
@@ -55,7 +57,7 @@ async function loadCookieAccounts(){
   try{
     const data=await readJSON('/api/cookie-accounts');
     COOKIE_ACCOUNTS=(data.accounts||[]).map(credentialCopy);
-    cookiesLoaded=true;renderCookieAccounts();
+    cookiesLoaded=true;SAVED_COOKIES=COOKIE_ACCOUNTS.map(credentialCopy);renderCookieAccounts();window.consoleForms?.saved('cookies');
   }catch(error){loadNotice('channel','Cookie 账号'+error.message+'。请重新加载配置。');}
 }
 function addCookieAccount(){
@@ -64,7 +66,7 @@ function addCookieAccount(){
   // The server assigns an account ID on save, including on ordinary HTTP sites
   // where crypto.randomUUID() is unavailable.
   COOKIE_ACCOUNTS.push({cookie:'',project_id:'',note:'',enabled:true,proxies:[],proxy_fallback:true});
-  renderCookieAccounts();$('cookie-'+(COOKIE_ACCOUNTS.length-1)).focus();
+  renderCookieAccounts();window.consoleForms?.openAccount('cookie',COOKIE_ACCOUNTS.length-1);$('cookie-'+(COOKIE_ACCOUNTS.length-1)).focus();
 }
 function removeCookieAccount(index){collectCookieAccounts();COOKIE_ACCOUNTS.splice(index,1);renderCookieAccounts();}
 async function saveCookieAccounts(){
@@ -74,7 +76,7 @@ async function saveCookieAccounts(){
     const response=await fetch('/api/cookie-accounts',{method:'POST',signal:AbortSignal.timeout(30000),headers:{'Content-Type':'application/json'},body:JSON.stringify({accounts})});
     const result=await response.json();
     if(!response.ok) throw new Error(await responseError(response,'保存失败',result));
-    COOKIE_ACCOUNTS=result.accounts.map(credentialCopy);renderCookieAccounts();
+    COOKIE_ACCOUNTS=result.accounts.map(credentialCopy);SAVED_COOKIES=COOKIE_ACCOUNTS.map(credentialCopy);renderCookieAccounts();window.consoleForms?.saved('cookies');
     toast('已保存 '+COOKIE_ACCOUNTS.length+' 个 Cookie 账号（已热生效）');
   }catch(error){toast('❌ '+error.message);}
 }
@@ -356,7 +358,7 @@ async function applyProxyEditor(persist=false){
         GLOBAL_SETTINGS.proxy_urls=saved.proxy_urls;GLOBAL_SETTINGS.proxy_url=saved.proxy_url;
         updateProxyPill(saved.proxy_urls.length);
       }
-      $('proxy-input').value=normalized.join('\n');updateProxyDraft();
+      $('proxy-input').value=normalized.join('\n');updateProxyDraft();if(persist)window.consoleForms?.saved('proxy');else window.consoleForms?.refresh();
     }
     else{
       const record=(editor.scope==='key'?KEYS:COOKIE_ACCOUNTS)[editor.index];
@@ -589,7 +591,7 @@ function initProxyEditor(){
   proxyEditorInitialized=true;
 }
 
-window.consoleChannels={load:loadCookieAccounts,init:initProxyEditor,open:openProxyEditor,sync:updateProxyEditorControls};
+window.consoleChannels={hasDraft:()=>!!proxyEditor&&(JSON.stringify(proxyEditor.initial)!==JSON.stringify(proxyEditor.proxies)||proxyFormDirty()||!!$('proxy-import-text').value.trim()),discard:()=>{COOKIE_ACCOUNTS=SAVED_COOKIES.map(credentialCopy);renderCookieAccounts();},load:loadCookieAccounts,init:initProxyEditor,open:openProxyEditor,sync:updateProxyEditorControls};
 Object.assign(window,{updateCredentialStrategy,loadCookieAccounts,addCookieAccount,removeCookieAccount,saveCookieAccounts,
   closeProxyEditor,moveProxy,deleteProxy,resetProxyForm,proxyTypeChanged,recognizeProxyPaste,editProxy,addProxyDraft,
   applyProxyEditor,testEditorProxy,renderProxyEditor,proxyMissingFields,switchProxyView,proxyTargetChanged,

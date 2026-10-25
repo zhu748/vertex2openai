@@ -100,7 +100,9 @@ async def get_capabilities_api(_auth: bool = Depends(require_auth)):
     }
     # 附带各模型是否已有专属参数覆盖，供前端标示
     overrides = app_state.get_model_overrides()
-    return JSONResponse(content={"models": models, "capabilities": caps, "overrides": overrides},
+    return JSONResponse(content={"models": models, "capabilities": caps, "overrides": overrides,
+                                 "saved_overrides": app_state.get_saved_model_overrides(),
+                                 "builtin_overrides": config.DEFAULT_SETTINGS["model_overrides"]},
                         headers={"Cache-Control": "no-store"})
 
 
@@ -119,6 +121,12 @@ async def save_model_override(model_name: str, request: Request, _auth: bool = D
         return JSONResponse(status_code=400, content={"error": "请求体必须是合法 JSON 对象。"})
     if not isinstance(patch, dict):
         return JSONResponse(status_code=400, content={"error": "请求体必须是 JSON 对象。"})
+    # Explicit removals preserve the existing flat patch API and null semantics.
+    inherit = patch.get("_inherit", [])
+    if (not isinstance(inherit, list)
+            or any(not isinstance(k, str) or k not in config.PER_MODEL_KEYS for k in inherit)
+            or any(k in patch for k in inherit)):
+        return JSONResponse(status_code=400, content={"error": "继承字段必须是合法模型参数，且不能同时赋值。"})
     # 模型专属键同样做类型/枚举校验（与全局设置共用一套规则）
     verr = validate_settings_patch(patch, keys_scope=set(config.PER_MODEL_KEYS))
     if verr:
@@ -129,11 +137,11 @@ async def save_model_override(model_name: str, request: Request, _auth: bool = D
     # （2026-10 修复）。保持 200 语义不变（既有契约：全未知键返回成功、
     # 不写入），仅消除幽灵条目。
     clean = {k: v for k, v in patch.items() if k in config.PER_MODEL_KEYS}
-    if not clean:
+    if not clean and not inherit:
         current = await asyncio.to_thread(app_state.get_model_overrides)
         return JSONResponse(content={"status": "success", "model": model_name,
                                      "override": current.get(model_name, {})})
-    saved = await asyncio.to_thread(app_state.set_model_override, model_name, clean)
+    saved = await asyncio.to_thread(app_state.set_model_override, model_name, clean, inherit=inherit)
     return JSONResponse(content={"status": "success", "model": model_name, "override": saved})
 
 
