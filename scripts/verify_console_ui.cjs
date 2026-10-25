@@ -160,8 +160,13 @@ async function main() {
     assert.deepEqual(Object.keys(response.request().postDataJSON()).sort(),['first_reply_timeout_seconds','prefill_cot_guard']);
     await page.waitForFunction(() => !document.querySelector('#btn-scope-save').disabled);
     await openTab('runtime');
+    assert.equal(await page.locator('#cross_channel_fallback').isChecked(),false);
     assert.equal(await page.locator('#cookie_structured_output').isChecked(),false);
     await page.locator('#cookie_structured_output').check();
+    assert.equal(await page.locator('#cookie_auto_refresh').isChecked(),true);
+    assert.equal(await page.inputValue('#cookie_refresh_interval_seconds'),'600');
+    await page.locator('#cookie_auto_refresh').check();
+    await page.fill('#cookie_refresh_interval_seconds','900');
     pending = responseFor('/api/settings');
     await page.locator('button[onclick*="saveSettings"]').click();
     response = await pending;
@@ -169,12 +174,15 @@ async function main() {
     assert.ok(!('first_reply_timeout_seconds' in response.request().postDataJSON()));
     assert.ok(!('prefill_cot_guard' in response.request().postDataJSON()));
     assert.equal(response.request().postDataJSON().cookie_structured_output,true);
+    assert.equal(response.request().postDataJSON().cookie_auto_refresh,true);
+    assert.equal(response.request().postDataJSON().cookie_refresh_interval_seconds,900);
     const upstreamSettingsPage=await context.newPage();
     await upstreamSettingsPage.goto(origin+'/#params');
     await upstreamSettingsPage.waitForFunction(()=>document.querySelector('#cookie_structured_output')?.checked===true);
+    await upstreamSettingsPage.waitForFunction(()=>document.querySelector('#cookie_auto_refresh')?.checked===true && document.querySelector('#cookie_refresh_interval_seconds')?.value==='900');
     await upstreamSettingsPage.close();
     await page.bringToFront();
-    check('上游 Cookie 结构化输出开关默认关闭，保存后在新页面正确回填');
+    check('Cookie 结构化输出默认关闭、自动续期默认开启，保存后在新页面正确回填');
     await openTab('params');
     await page.selectOption('#model-sel', '__global__');
     assert.equal(await page.inputValue('#image_aspect_ratio'), '16:9');
@@ -279,6 +287,7 @@ async function main() {
     await page.click('input[name=mode][value=web_proxy]');
     await page.waitForFunction(() => document.querySelector('input[name=mode][value=api_key]').checked);
     assert.equal(await page.locator('#cookie-box').isVisible(), false);
+    assert.equal(await page.locator('#keys-box').isVisible(), true);
     await page.unroute('**/api/settings/mode');
     check('凭证探测保留草稿、服务端字符串转义、通道失败回滚');
     assert.ok((await page.textContent('#fp2-status')).length<60);
@@ -805,10 +814,35 @@ async function main() {
     assert.equal(savedCookies.accounts[0].proxy_fallback,false);
     assert.equal(savedCookies.accounts[0].proxies[0],'socks5://cookie-user:private%3Apassword@cookie-proxy.invalid:1080');
     assert.equal((await (await page.request.get(origin+'/api/settings/runtime')).json()).mode,'mixed');
+    for(const selected of ['api_key','web_proxy','mixed']){
+      pending=responseFor('/api/settings/mode');
+      await page.click(`input[name=mode][value=${selected}]`);
+      assert.equal((await pending).status(),200);
+      await page.waitForFunction(mode=>!document.querySelector(`input[name=mode][value=${mode}]`).disabled,selected);
+      assert.equal(await page.locator('#keys-box').isVisible(),selected!=='web_proxy');
+      assert.equal(await page.locator('#cookie-box').isVisible(),selected!=='api_key');
+      assert.equal(await page.locator('.k-key').count(),savedKeys.keys.length);
+      assert.equal(await page.locator('.c-cookie').count(),savedCookies.accounts.length);
+      assert.deepEqual((await (await page.request.get(origin+'/api/express-keys')).json()).keys,savedKeys.keys);
+      assert.deepEqual((await (await page.request.get(origin+'/api/cookie-accounts')).json()).accounts,savedCookies.accounts);
+    }
     await page.selectOption('#credential-strategy','roundrobin');
     await page.waitForFunction(()=>!document.querySelector('#credential-strategy').disabled);
     assert.equal((await (await page.request.get(origin+'/api/settings')).json()).roundrobin,true);
-    check('混合模式、多 Cookie 项目与代理绑定、空值保留凭证、独立启停和轮询');
+    check('三种模式显示隔离且保留两类凭证，混合模式支持多 Cookie 和轮询');
+
+    await page.route('**/api/cookie-accounts/refresh',route=>route.fulfill({json:{
+      results:[{id:savedCookies.accounts[0].id,label:'Cookie 1',status:'refreshed',detail:'已更新 SIDCC <img src=x>'}],
+      total:1,refreshed:1,unchanged:0,errors:0,
+    }}));
+    pending=responseFor('/api/cookie-accounts/refresh');
+    await page.getByRole('button',{name:'立即刷新',exact:true}).first().click();
+    response=await pending;
+    assert.deepEqual(response.request().postDataJSON(),{id:savedCookies.accounts[0].id});
+    await page.waitForFunction(()=>document.querySelector('#cookie-accounts-refresh-result').textContent.includes('已更新 SIDCC'));
+    assert.equal(await page.locator('#cookie-accounts-refresh-result img').count(),0);
+    await page.unroute('**/api/cookie-accounts/refresh');
+    check('单账号立即刷新显示结果，服务端文本按纯文本渲染');
 
     pending=responseFor('/api/settings');
     await page.selectOption('#credential-strategy','random');

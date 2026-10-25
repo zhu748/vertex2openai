@@ -13,6 +13,7 @@ import threading
 from typing import Any, AsyncIterator, Callable
 
 import httpx
+from proxy_tls import build_httpx_proxy
 
 from runtime_state import app_state
 from client_pool import schedule_graceful_close, _closer
@@ -297,7 +298,10 @@ def _curl_remote_dns_proxy(proxy: str) -> str:
 def _create_upstream_client(client_kwargs: dict):
     profile = get_impersonate_profile()
     if profile == "off":
-        return httpx.AsyncClient(**client_kwargs)
+        options = dict(client_kwargs)
+        if isinstance(options.get("proxy"), str):
+            options["proxy"] = build_httpx_proxy(options["proxy"], verify=options.get("verify", True))
+        return httpx.AsyncClient(**options)
 
     from curl_cffi.requests import AsyncSession
 

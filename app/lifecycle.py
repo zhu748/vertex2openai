@@ -45,7 +45,8 @@ def start_background_task(coro) -> asyncio.Task:
 async def _probe_express_projects_on_startup() -> None:
     """启动后异步探测尚无 Project ID 的 Express Key（失败不影响服务）。"""
     try:
-        pending = [r["key"] for r in app_state.get_express_keys() if not r.get("project_id")]
+        pending = [r["key"] for r in app_state.get_express_keys()
+                   if r.get("enabled", True) and not r.get("project_id")]
         if not pending:
             return
         print(
@@ -185,7 +186,7 @@ async def lifespan(app: FastAPI):
     start_background_task(_probe_express_projects_on_startup())
     # 过期缓冲清理器（弱网续传用，见 resumable.py）
     start_background_task(resumable_store.sweeper_loop())
-    # Cookie 短期令牌自动续期（RotateCookies；默认关，控制台/设置 API 可开，
+    # Cookie 短期令牌自动续期（RotateCookies；默认开，控制台/设置 API 可关，
     # 见 cookie_refresh.py。失败只打日志，绝不影响生成流量。）
     try:
         import cookie_refresh

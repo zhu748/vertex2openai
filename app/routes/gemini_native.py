@@ -75,6 +75,7 @@ from express_fingerprint import build_direct_headers
 from client_pool import passthrough_client_pool
 from proxy_resolver import ProxyResolveError, resolve_proxy_uri
 from proxy_failover import ProxyChain
+from proxy_tls import build_httpx_proxy
 from streaming import sse_frames, with_heartbeats, HEARTBEAT, HEARTBEAT_FRAME
 from resumable import (resumable_store, resolve_buffer, ResumeRequestError, BufferCapacityError,
                        DetachedRequest, sse_from_buffer, within_request_deadline,
@@ -368,7 +369,7 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
         client_kwargs: dict[str, Any] = {"timeout": _UPSTREAM_TIMEOUT, "follow_redirects": False, "trust_env": False}
         proxy_url = resolve_proxy_uri(proxy_raw)
         if proxy_url:
-            client_kwargs["proxy"] = proxy_url
+            client_kwargs["proxy"] = build_httpx_proxy(proxy_url, verify=app_config.SSL_CERT_FILE or True)
         if app_config.SSL_CERT_FILE:
             client_kwargs["verify"] = app_config.SSL_CERT_FILE
         return httpx.AsyncClient(**client_kwargs)

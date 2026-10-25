@@ -81,16 +81,18 @@ def _structured_locks_express(request_obj: OpenAIRequest) -> bool:
 
 def _express_manager(fastapi_request: Request):
     """从请求对象安全取出 Express Key 管理器（兼容测试桩与 DetachedRequest）。"""
-    state = getattr(fastapi_request, "state", None)
-    if state is None:
-        app = getattr(fastapi_request, "app", None)
-        state = getattr(app, "state", None)
-    return getattr(state, "express_key_manager", None)
+    # Starlette always provides request.state, but the manager is registered
+    # on app.state. An empty request state must not hide the real Key pool.
+    app = getattr(fastapi_request, "app", None)
+    manager = getattr(getattr(app, "state", None), "express_key_manager", None)
+    if manager is not None:
+        return manager
+    return getattr(getattr(fastapi_request, "state", None), "express_key_manager", None)
 
 
 def _other_channel(fastapi_request: Request, primary: str, request_obj: OpenAIRequest) -> Optional[str]:
     """跨通道兜底开启且另一通道有可用凭证时，返回备用通道名；否则 None。"""
-    if not app_state.get_setting("cross_channel_fallback", True):
+    if not app_state.get_setting("cross_channel_fallback", False):
         return None
     if primary == "express":
         # 结构化输出锁定 Express：没有可用的 Cookie 备用

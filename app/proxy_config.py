@@ -140,16 +140,19 @@ def normalize_proxy_uri(value, default_scheme="socks5", *, allow_incomplete=Fals
             endpoint, credentials = left, right
         else:
             credentials = left
+        percent_encoded = True
         if ":" not in credentials:
             try:
                 decoded = base64.b64decode(credentials + "=" * (-len(credentials) % 4),
                                            altchars=b"-_", validate=True).decode()
                 if ":" in decoded:
                     credentials = decoded
+                    percent_encoded = False
             except (ValueError, UnicodeError):
                 pass
         username, _, password = credentials.partition(":")
-        username, password = unquote(username), unquote(password)
+        if percent_encoded:
+            username, password = unquote(username), unquote(password)
     else:
         endpoint = netloc.rstrip("/")
         # Colon and whitespace supplier formats. IPv6 endpoints must use brackets.

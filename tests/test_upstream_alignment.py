@@ -508,11 +508,11 @@ class BadCredentialWarningTests(unittest.TestCase):
 
 
 class ConfigIntegrationTests(unittest.TestCase):
-    """cross_channel_fallback 默认开启且可被控制台保存。"""
+    """cross_channel_fallback 默认关闭，保留显式启用能力。"""
 
     def test_default_settings_include_cross_channel_fallback(self):
         self.assertIn("cross_channel_fallback", config.DEFAULT_SETTINGS)
-        self.assertIs(config.DEFAULT_SETTINGS["cross_channel_fallback"], True)
+        self.assertIs(config.DEFAULT_SETTINGS["cross_channel_fallback"], False)
 
     def test_setting_validates_as_boolean(self):
         from settings_validation import validate_settings_patch

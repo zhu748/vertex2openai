@@ -9,6 +9,7 @@ import config as app_config
 from proxy_failover import ProxyChain
 from express_fingerprint import build_direct_headers
 from http_io import read_limited_bytes
+from proxy_tls import build_httpx_proxy
 
 _model_cache: Optional[Dict[str, List[str]]] = None
 _cache_lock = asyncio.Lock()
@@ -80,7 +81,7 @@ async def fetch_and_parse_models_config() -> Optional[Dict[str, List[str]]]:
             async def fetch(raw, resolved):
                 options = dict(client_args)
                 if resolved:
-                    options["proxy"] = resolved
+                    options["proxy"] = build_httpx_proxy(resolved, verify=app_config.SSL_CERT_FILE or True)
                 async with httpx.AsyncClient(**options) as client:
                     async with client.stream("GET", url, headers=fp_headers) as response:
                         response.raise_for_status()

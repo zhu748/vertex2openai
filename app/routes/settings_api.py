@@ -79,7 +79,12 @@ async def update_settings_api(request: Request, _auth: bool = Depends(require_au
     error = validate_global_settings_patch(patch)
     if error:
         return JSONResponse(status_code=400, content=error)
+    refresh_keys = {"cookie_auto_refresh", "cookie_refresh_interval_seconds"} & set(patch)
+    previous_refresh = {key: app_state.get_setting(key) for key in refresh_keys}
     updated = await asyncio.to_thread(app_state.update_settings, patch)
+    if any(updated[key] != previous_refresh[key] for key in refresh_keys):
+        from cookie_refresh import notify_settings_changed
+        notify_settings_changed()
     if {"keepalive_url", "keepalive_interval"} & set(patch):
         # 保活配置热更新：立即按新配置重启任务（清空 URL 即停止），无需重启服务。
         await keepalive_service.restart()

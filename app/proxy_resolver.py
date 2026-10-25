@@ -170,9 +170,9 @@ def _to_port(text: Any, uri: str) -> int:
     try:
         port = int(str(text).strip())
     except (TypeError, ValueError):
-        raise ProxyResolveError(f"[{uri[:40]}…] 端口不是数字：{text!r}。")
+        raise ProxyResolveError("代理节点端口不是数字。") from None
     if not (1 <= port <= 65535):
-        raise ProxyResolveError(f"[{uri[:40]}…] 端口超出 1–65535：{port}。")
+        raise ProxyResolveError("代理节点端口超出 1–65535。")
     return port
 
 
@@ -180,21 +180,23 @@ def _parse_host_port(hostport: str, uri: str) -> tuple[str, int]:
     """'host:port'（兼容 IPv6 [::1]:443 与 SIP002 尾斜杠）→ (host, port)。"""
     hostport = (hostport or "").strip().rstrip("/")
     if not hostport:
-        raise ProxyResolveError(f"[{uri[:40]}…] 缺少主机与端口。")
+        raise ProxyResolveError("代理节点缺少主机与端口。")
     if hostport.startswith("["):                      # IPv6 字面量
         end = hostport.find("]")
         if end < 0:
-            raise ProxyResolveError(f"[{uri[:40]}…] IPv6 地址格式不完整。")
+            raise ProxyResolveError("代理节点 IPv6 地址格式不完整。")
         host = hostport[1:end]
         rest = hostport[end + 1:]
         if not rest.startswith(":"):
-            raise ProxyResolveError(f"[{uri[:40]}…] 缺少端口。")
+            raise ProxyResolveError("代理节点缺少端口。")
         port = _to_port(rest[1:], uri)
     else:
         if ":" not in hostport:
-            raise ProxyResolveError(f"[{uri[:40]}…] 缺少端口（正确形态 host:port）。")
+            raise ProxyResolveError("代理节点缺少端口（正确形态 host:port）。")
         host, _, port_s = hostport.rpartition(":")
         port = _to_port(port_s, uri)
+    if not host:
+        raise ProxyResolveError("代理节点缺少服务器地址。")
     return host, port
 
 
@@ -222,6 +224,8 @@ def _build_tls(q: dict, *, default_sni: str = "", force: bool = False,
     utls 指纹（fp=chrome 等）一并挂上——分享链接几乎都带，sing-box 全支持。
     """
     security = str(q.get("security") or "").strip().lower()
+    if security not in ("", "none", "tls", "reality"):
+        raise ProxyResolveError("不支持该 TLS security 类型，不能自动改为未加密连接。")
     enabled = force or security in ("tls", "reality")
     if not enabled:
         return None
@@ -251,13 +255,15 @@ def _build_tls(q: dict, *, default_sni: str = "", force: bool = False,
 
 
 def _build_transport(net: str, q: dict) -> Optional[dict]:
-    """从查询参数构造 sing-box transport 对象（ws/grpc/http）。
+    """从查询参数构造 sing-box transport 对象，未知类型明确拒绝。
 
     vless/trojan 用 type= 参数；vmess 用 net= 字段（值域相同，调用方归一后传入）。
     tcp / 无值 → 返回 None（不设 transport）。
     """
     net = (net or "tcp").strip().lower()
     if net in ("", "tcp", "raw", "none"):
+        if str(q.get("headerType") or "none").strip().lower() != "none":
+            raise ProxyResolveError("当前转换不支持 TCP 伪装头，不能忽略伪装要求改用普通 TCP。")
         return None
     if net == "ws":
         tr: dict[str, Any] = {"type": "ws"}
@@ -289,21 +295,33 @@ def _build_transport(net: str, q: dict) -> Optional[dict]:
         if path:
             tr["path"] = path          # 同上：parse_qs 已解码，不二次 unquote
         return tr
-    # quic / kcp 等罕见值：sing-box 无对应 transport，忽略（回落 TCP）
-    return None
+    if net == "httpupgrade":
+        tr = {"type": "httpupgrade"}
+        for field in ("host", "path"):
+            if q.get(field):
+                tr[field] = str(q[field])
+        return tr
+    if net == "quic":
+        if (str(q.get("quicSecurity") or "none").lower() != "none"
+                or q.get("key") or str(q.get("headerType") or "none").lower() != "none"):
+            raise ProxyResolveError("QUIC 传输不支持额外加密、密钥或伪装头，不能转换为普通 QUIC。")
+        return {"type": "quic"}
+    raise ProxyResolveError("不支持该传输类型；可用 tcp/ws/grpc/http/h2/httpupgrade/quic，不能自动改为 TCP。")
 
 
 # ============================================================
 # 各协议 URI → sing-box outbound
 # ============================================================
 
-def _require_port(parts, scheme: str) -> int:
+def _require_port(parts, scheme: str, *, default: int | None = None) -> int:
     """从 urlsplit 结果取端口；缺失/非法/越界直接报错（sing-box 配置不允许）。"""
     try:
         port = parts.port
     except ValueError as e:
         raise ProxyResolveError(f"{scheme} 链接端口不合法：{e}")
     if port is None:
+        if default is not None:
+            return default
         raise ProxyResolveError(f"{scheme} 链接缺少端口（正确形态 {scheme}://…@host:port）。")
     if port < 1:
         raise ProxyResolveError(f"{scheme} 链接端口必须在 1–65535 范围内（收到 {port}）。")
@@ -322,11 +340,13 @@ def _parse_vless(uri: str) -> dict:
     port = _require_port(parts, "vless")
     ob: dict[str, Any] = {"type": "vless", "server": server, "server_port": port, "uuid": uuid}
     q = _qs(parts.query)
+    if str(q.get("encryption") or "none").strip().lower() != "none":
+        raise ProxyResolveError("当前 VLESS 转换仅支持 encryption=none，不能忽略额外加密要求。")
     flow = str(q.get("flow") or "").strip()
     tls = _build_tls(q)
-    if tls is not None and flow:
-        # flow（xtls-rprx-vision 等）只在 TLS/REALITY 下有意义；裸 TCP 链接
-        # 带上会被 sing-box 直接拒启，这里静默剥离（链接本身不常见这么写）。
+    if flow:
+        if tls is None:
+            raise ProxyResolveError("VLESS flow 需要 TLS 或 REALITY，不能忽略 flow 改用普通 VLESS。")
         ob["flow"] = flow
     if tls:
         ob["tls"] = tls
@@ -365,7 +385,10 @@ def _parse_vmess(uri: str) -> dict:
         ob["alter_id"] = int(data.get("aid") or 0)
     except (TypeError, ValueError):
         pass
-    if str(data.get("tls", "")).strip().lower() in ("tls", "1", "true"):
+    tls_mode = str(data.get("tls", "")).strip().lower()
+    if tls_mode not in ("", "none", "0", "false", "tls", "1", "true"):
+        raise ProxyResolveError("vmess 链接使用了不支持的 TLS 类型，不能自动改为未加密连接。")
+    if tls_mode in ("tls", "1", "true"):
         q = {
             "sni": data.get("sni"), "alpn": data.get("alpn"),
             "fp": data.get("fp"),
@@ -376,7 +399,10 @@ def _parse_vmess(uri: str) -> dict:
             ob["tls"] = tls
     tr = _build_transport(str(data.get("net") or ""), {
         "path": data.get("path"), "host": data.get("host"),
+        "headerType": data.get("type"),
         "serviceName": data.get("path") if str(data.get("net") or "").lower() == "grpc" else "",
+        **({"quicSecurity": data.get("host"), "key": data.get("path"), "headerType": data.get("type")}
+           if str(data.get("net") or "").lower() == "quic" else {}),
     })
     if tr:
         ob["transport"] = tr
@@ -419,6 +445,7 @@ def _parse_ss(uri: str) -> dict:
                 "ss 链接启用了 SIP003 plugin（如 v2ray-plugin/obfs），本项目暂不支持："
                 "请换不带 plugin 的节点，或改用 vless/trojan/vmess 等协议的分享链接。")
     userinfo: str
+    percent_encoded = False
     if "@" in body:
         userinfo_raw, hostport = body.rsplit("@", 1)
         userinfo = userinfo_raw
@@ -427,6 +454,8 @@ def _parse_ss(uri: str) -> dict:
                 userinfo = _b64decode_text(userinfo_raw)
             except Exception:
                 raise ProxyResolveError("ss 链接的 userinfo 无法解码（应为 base64(method:password)）。")
+        else:
+            percent_encoded = True
     else:                                             # 旧式：整体 base64(method:pass@host:port)
         try:
             decoded = _b64decode_text(body)
@@ -435,7 +464,9 @@ def _parse_ss(uri: str) -> dict:
         if "@" not in decoded:
             raise ProxyResolveError("ss 链接格式不认识（既非 SIP002 也非旧式 base64）。")
         userinfo, _, hostport = decoded.rpartition("@")
-    method, _, password = unquote(userinfo).partition(":")
+    method, _, password = userinfo.partition(":")
+    if percent_encoded:
+        method, password = unquote(method), unquote(password)
     if not method or not password:
         raise ProxyResolveError("ss 链接缺少 method:password（userinfo 解析失败）。")
     host, port = _parse_host_port(hostport, uri)
@@ -462,15 +493,19 @@ def _parse_hysteria2(uri: str) -> dict:
     """hysteria2://auth@host:port?sni=..&insecure=1&obfs=salamander&obfs-password=..#name"""
     parts = urlsplit(uri)
     auth = unquote(parts.username or "")
+    if parts.password is not None:
+        auth += ":" + unquote(parts.password)
     if not auth:
         raise ProxyResolveError("hysteria2 链接缺少认证密码（userinfo 部分）。")
     server = parts.hostname or ""
     if not server:
         raise ProxyResolveError("hysteria2 链接缺少服务器地址。")
-    port = _require_port(parts, "hysteria2")
+    port = _require_port(parts, "hysteria2", default=443)
     ob: dict[str, Any] = {"type": "hysteria2", "server": server, "server_port": port,
                           "password": auth}
     q = _qs(parts.query)
+    if q.get("pinSHA256") or q.get("ech"):
+        raise ProxyResolveError("当前 Hysteria2 转换不支持 pinSHA256 或 ECH，不能忽略这些 TLS 校验参数。")
     tls: dict[str, Any] = {"enabled": True, "alpn": ["h3"]}
     sni = str(q.get("sni") or "").strip()
     if sni:

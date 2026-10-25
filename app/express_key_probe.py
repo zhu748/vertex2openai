@@ -29,6 +29,7 @@ from express_fingerprint import build_direct_headers
 from proxy_resolver import resolve_proxy_uri
 from proxy_failover import PROXY_FAILURE_STATUSES, ProxyChain
 from http_io import read_limited_bytes
+from proxy_tls import build_httpx_proxy
 
 # 调模型的正确 URL（Express 全局端点格式），{model} 处填一个不存在的模型名来探测
 GENERATE_CONTENT_URL = (
@@ -52,7 +53,7 @@ def _client_args(key_proxy_raw: str = "") -> dict:
     args = {"timeout": PROBE_TIMEOUT_SECONDS, "trust_env": False}
     proxy_url = resolve_proxy_uri(key_proxy_raw or "")
     if proxy_url:
-        args["proxy"] = proxy_url
+        args["proxy"] = build_httpx_proxy(proxy_url, verify=app_config.SSL_CERT_FILE or True)
     if app_config.SSL_CERT_FILE:
         args["verify"] = app_config.SSL_CERT_FILE
     return args
@@ -126,6 +127,9 @@ async def probe_and_store(key: str, *, force: bool = False) -> dict:
     rec = records.get((key or "").strip())
     if rec is None:
         return {"key": key, "ok": False, "message": "该 Key 不在列表中（可能刚被删除）。"}
+    if not rec.get("enabled", True) and not force:
+        return {"key": key, "ok": False, "project_id": rec.get("project_id", ""),
+                "message": "账号已停用，跳过自动探测；需要测试时可手动强制探测。"}
     if rec.get("project_id") and not force:
         return {"key": key, "ok": True, "project_id": rec["project_id"], "message": "已有 Project ID，跳过探测。"}
     if rec.get("project_source") == "manual" and not force:

@@ -120,8 +120,9 @@ DEFAULT_SETTINGS = {
     # 长蹲守的成功率更高（对齐旧版行为，按需开启）。
     "retry_backoff_mode": "fixed",
     # 跨通道兜底（对齐上游 bad-woman/vertex2openai）：主通道在未输出内容前
-    # 遇 429/401/403/5xx 失败时，自动切换另一通道（Express ↔ Cookie）接力。
-    "cross_channel_fallback": True,
+    # 遇 429/401/403/5xx 失败时，切换另一通道（Express ↔ Cookie）接力。
+    # 默认关闭，保存另一类凭证不应改变单一模式的默认行为；可显式开启。
+    "cross_channel_fallback": False,
     "first_reply_timeout_seconds": 15.0,  # 每次上游尝试等待模型首回复；0=关闭，可按模型覆盖
     # 开关（初始值取环境变量）
     "fake_streaming": FAKE_STREAMING_ENABLED,
@@ -235,12 +236,12 @@ DEFAULT_SETTINGS = {
     "cookie_client_version": "",
     "cookie_authuser": "0",
     # ===== Cookie 短期令牌自动续期（RotateCookies，见 cookie_refresh.py）=====
-    # 开启后按账号定期调用 accounts.google.com/RotateCookies（与浏览器同一
+    # 默认开启，按账号定期调用 accounts.google.com/RotateCookies（与浏览器同一
     # 续期端点，实测节奏约 600s 一轮），把响应 Set-Cookie 下发的短期令牌
     # （__Secure-1/3PSIDTS、SIDCC 族等）合并回存储的 Cookie 并原子落盘。
     # 只要账号会话未被登出/改密，Cookie 可长期保活，不再隔几天手动重抓。
     # 长效凭证（SID/SAPISID/OSID 族）绝不会被改动；失败不影响生成流量。
-    "cookie_auto_refresh": False,
+    "cookie_auto_refresh": True,
     "cookie_refresh_interval_seconds": 600,   # 下限 300（见 settings_validation 数值范围）
     # ===== Express API Key 通道请求头指纹（热改，见 express_fingerprint.py）=====
     # SDK 通道 TLS 栈换不了（google-genai 强依赖 httpx），但请求头可完整接管：

@@ -3,6 +3,7 @@
 (() => {
 if(window.consoleChannels) return;
 let COOKIE_ACCOUNTS=[], SAVED_COOKIES=[], cookiesLoaded=false, proxyEditor=null, proxyEditorInitialized=false;
+let cookieRefreshPending=false;
 // In-memory only: proxy credentials and test results never enter localStorage.
 const proxyResults=new Map();
 
@@ -26,6 +27,7 @@ function renderCookieAccounts(){
       <div class="key-head"><div class="key-title"><span class="pill pill-accent">Cookie ${index+1}</span>
         <span class="pill">${rec.cookie_configured?'已保存 Cookie':'待填写 Cookie'}</span></div>
         <div class="key-actions"><label><input type="checkbox" class="c-enabled" ${rec.enabled===false?'':'checked'} aria-label="启用 Cookie ${index+1}">启用</label>
+          <button type="button" ${rec.enabled===false?'disabled title="启用并保存账号后可刷新"':''} onclick="runAction(this,()=>refreshCookies(${index}))">立即刷新</button>
           <button type="button" class="danger" onclick="removeCookieAccount(${index})" aria-label="删除 Cookie ${index+1}">删除</button></div></div>
       <div class="key-fields">
         <div><label for="cookie-${index}">Google Cookie（含 HttpOnly 字段）</label>
@@ -79,6 +81,38 @@ async function saveCookieAccounts(){
     COOKIE_ACCOUNTS=result.accounts.map(credentialCopy);SAVED_COOKIES=COOKIE_ACCOUNTS.map(credentialCopy);renderCookieAccounts();window.consoleForms?.saved('cookies');
     toast('已保存 '+COOKIE_ACCOUNTS.length+' 个 Cookie 账号（已热生效）');
   }catch(error){toast('❌ '+error.message);}
+}
+
+async function refreshCookies(index=null){
+  if(!cookiesLoaded){toast('Cookie 账号尚未加载，请先重新加载配置');return;}
+  if(cookieRefreshPending){toast('Cookie 正在刷新，请等待当前任务完成');return;}
+  if(window.consoleForms?.capture()?.cookies){toast('请先保存或撤销 Cookie 列表的修改，再刷新已保存凭证');return;}
+  const accounts=SAVED_COOKIES.filter(rec=>rec.enabled!==false && rec.id && (index===null || rec.id===COOKIE_ACCOUNTS[index]?.id));
+  if(!accounts.length){toast('没有匹配的已保存且启用的 Cookie 账号');return;}
+  const show=message=>{
+    for(const id of ['cookie-refresh-result','cookie-accounts-refresh-result']){
+      const box=$(id);if(box){box.textContent=message;box.hidden=false;}
+    }
+  };
+  cookieRefreshPending=true;
+  show('正在刷新 '+accounts.length+' 个已保存账号，请稍候…');
+  try{
+    // Each account has a 45-second server deadline plus a one-second gap.
+    const response=await fetch('/api/cookie-accounts/refresh',{method:'POST',
+      signal:AbortSignal.timeout(15000+accounts.length*46000),headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(index===null?{}:{id:accounts[0].id})});
+    const result=await response.json();
+    if(!response.ok)throw new Error(await responseError(response,'刷新失败',result));
+    const labels={refreshed:'已更新',unchanged:'无新令牌',error:'失败'};
+    const lines=(result.results||[]).map(rec=>`${rec.label||rec.id}：${labels[rec.status]||rec.status} · ${rec.detail||''}`);
+    show(lines.join('\n')||'没有可刷新的账号');
+    toast(`刷新完成：更新 ${result.refreshed||0}，无新令牌 ${result.unchanged||0}，失败 ${result.errors||0}`);
+    // Leave credential editors untouched: refreshing must never discard drafts
+    // created in the other section while this request was in flight.
+  }catch(error){
+    const message=error.name==='TimeoutError'?'请求超时，请在运行日志确认刷新结果':error.message;
+    show('刷新未完成：'+message);toast('❌ '+message);
+  }finally{cookieRefreshPending=false;}
 }
 
 /* Proxy editor stores a draft until Apply; account list/global Save persists it. */
@@ -446,7 +480,11 @@ async function runProxyTests(entries,origin='list'){
       rememberProxyResult(entry.uri,job.target,{state:'testing'});
       if(entry.row) entry.row.state='testing';
       if(proxyEditor===editor){updateProxyResults();renderProxyImport();}
-      const result=await probeOneProxy(entry.uri,job.target,job.controller.signal);
+      let result=await probeOneProxy(entry.uri,job.target,job.controller.signal);
+      // A closed dialog may already have a new job probing the same URI.
+      // Neither its cache nor its selected import rows belong to this job.
+      if(proxyEditor!==editor||editor.job!==job)return;
+      if(job.controller.signal.aborted)result={state:'cancelled',message:'已停止测试'};
       entry.result=result;rememberProxyResult(entry.uri,job.target,result);job.completed++;
       if(entry.row){entry.row.state=result.state;entry.row.result=result;entry.row.selected=result.state==='passed';}
       if(result.fatal){job.controller.abort();if(proxyEditor===editor) $('proxy-editor-error').textContent=result.message;}
@@ -456,7 +494,8 @@ async function runProxyTests(entries,origin='list'){
   try{await Promise.all(Array.from({length:Math.min(3,entries.length)},()=>worker()));}
   finally{
     for(const entry of entries) if(!entry.result){
-      entry.result={state:'cancelled',message:'已停止测试'};rememberProxyResult(entry.uri,job.target,entry.result);
+      entry.result={state:'cancelled',message:'已停止测试'};
+      if(proxyEditor===editor&&editor.job===job)rememberProxyResult(entry.uri,job.target,entry.result);
       if(entry.row){entry.row.state='cancelled';entry.row.result=entry.result;entry.row.selected=false;}
     }
     if(proxyEditor===editor&&editor.job===job){
@@ -591,7 +630,7 @@ function initProxyEditor(){
   proxyEditorInitialized=true;
 }
 
-window.consoleChannels={hasDraft:()=>!!proxyEditor&&(JSON.stringify(proxyEditor.initial)!==JSON.stringify(proxyEditor.proxies)||proxyFormDirty()||!!$('proxy-import-text').value.trim()),discard:()=>{COOKIE_ACCOUNTS=SAVED_COOKIES.map(credentialCopy);renderCookieAccounts();},load:loadCookieAccounts,init:initProxyEditor,open:openProxyEditor,sync:updateProxyEditorControls};
+window.consoleChannels={hasDraft:()=>!!proxyEditor&&(JSON.stringify(proxyEditor.initial)!==JSON.stringify(proxyEditor.proxies)||proxyFormDirty()||!!$('proxy-import-text').value.trim()),discard:()=>{COOKIE_ACCOUNTS=SAVED_COOKIES.map(credentialCopy);renderCookieAccounts();},load:loadCookieAccounts,refreshCookies,init:initProxyEditor,open:openProxyEditor,sync:updateProxyEditorControls};
 Object.assign(window,{updateCredentialStrategy,loadCookieAccounts,addCookieAccount,removeCookieAccount,saveCookieAccounts,
   closeProxyEditor,moveProxy,deleteProxy,resetProxyForm,proxyTypeChanged,recognizeProxyPaste,editProxy,addProxyDraft,
   applyProxyEditor,testEditorProxy,renderProxyEditor,proxyMissingFields,switchProxyView,proxyTargetChanged,

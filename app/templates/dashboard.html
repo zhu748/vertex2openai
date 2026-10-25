@@ -273,7 +273,7 @@
        <div class="credential-strategy"><label for="credential-strategy">账号调度</label><select id="credential-strategy" class="inp" onchange="updateCredentialStrategy(this)"><option value="random">随机使用</option><option value="roundrobin">按顺序轮询</option></select><span>修改立即生效；仅调度已启用的账号。</span></div>
       </fieldset>
       <!-- Express API Key 列表（多账号，热编辑） -->
-      <fieldset class="card settings-card channel-wide" data-draft-group="keys">
+      <fieldset class="card settings-card channel-wide" id="keys-box" data-draft-group="keys">
        <legend class="visually-hidden">Express API Key 列表</legend>
        <div class="card-toolbar">
         <div>
@@ -362,6 +362,7 @@
        <div class="credential-filter"><label class="visually-hidden" for="cookies-search">搜索账号备注或项目</label><input id="cookies-search" class="inp" type="search" placeholder="搜索备注 / 项目 / 凭证尾号" data-local oninput="consoleForms.filterAccounts('cookies')"><select id="cookies-filter" class="inp" aria-label="筛选账号状态" data-local onchange="consoleForms.filterAccounts('cookies')"><option value="all">全部账号</option><option value="enabled">已启用</option><option value="disabled">已停用</option></select><span id="cookies-visible" role="status"></span></div><div id="cookies-list"></div>
        <p class="empty-state hidden" id="cookies-empty">尚未配置 Cookie 账号。添加一个或多个账号，并填写各自的 Project ID。</p>
        <p class="text-xs text-neutral-500 mt-3 leading-relaxed">支持粘贴完整 Cookie 头或 Cookie-Editor JSON；Project ID 可直接粘贴含项目参数的控制台 URL。Cookie 不在面板中明文回显。</p>
+       <p class="lbl mt-2" id="cookie-accounts-refresh-result" role="status" style="white-space:pre-wrap" hidden></p>
       </fieldset>
       <fieldset class="card settings-card channel-wide" data-draft-group="proxy">
        <legend class="visually-hidden">全局代理列表</legend>
@@ -1007,7 +1008,7 @@
     <section aria-labelledby="tab-runtime" class="view hidden" id="view-runtime" role="tabpanel" tabindex="0">
      <div class="page-heading"><div><p class="eyebrow">WORKSPACE / RUNTIME</p><h2>运行设置</h2><p>按任务配置超时、交付与资源限制。修改后统一保存，对所有模型生效。</p></div></div>
      <div class="inline-notice hidden" id="runtime-load-error" role="alert"><span></span><button class="btn-ghost" onclick="runAction(this,loadParams)">重新加载配置</button></div>
-     <nav class="settings-jump" aria-label="运行设置分区"><a href="#runtime-network">上游区域</a><a href="#runtime-retry">重试</a><a href="#runtime-transport">超时与续传</a><a href="#runtime-delivery">交付开关</a><a href="#runtime-resources">图片压缩</a><a href="#runtime-keepalive">保活</a><a href="#runtime-compatibility">预填充兼容</a></nav>
+     <nav class="settings-jump" aria-label="运行设置分区"><a href="#runtime-network">上游区域</a><a href="#runtime-retry">重试</a><a href="#runtime-transport">超时与续传</a><a href="#runtime-delivery">交付开关</a><a href="#runtime-cookie-refresh">Cookie 续期</a><a href="#runtime-resources">图片压缩</a><a href="#runtime-keepalive">保活</a><a href="#runtime-compatibility">预填充兼容</a></nav>
      <div class="settings-divider" id="global-settings">
       <div>
        <h3>全局运行设置</h3>
@@ -1160,7 +1161,8 @@
           </span>
          </label>
         </div>
-        <div class="helpbox" id="h_ccf" hidden="">主通道（Express 或 Cookie）在尚未输出任何内容前遇 429 拥堵、401/403 凭证问题或 5xx 服务端错误时，自动切换另一通道接力完成回复；已输出内容绝不切换，避免半截答案重发。结构化输出在未开启 Cookie 结构化支持时仍锁定 Express。鉴权失败或欠费的 Key / Cookie 会在本轮请求内自动隔离并跳过。</div>
+        <p class="lbl mt-1">默认关闭；手动开启后，单一模式请求失败时也可使用另一类已保存凭证。</p>
+        <div class="helpbox" id="h_ccf" hidden="">开启后，主通道（Express 或 Cookie）在尚未输出任何内容前遇 429 拥堵、401/403 凭证问题或 5xx 服务端错误时，自动切换另一通道接力完成回复；已输出内容绝不切换，避免半截答案重发。结构化输出在未开启 Cookie 结构化支持时仍锁定 Express。鉴权失败或欠费的 Key / Cookie 会在本轮请求内自动隔离并跳过。</div>
         <div class="text-xs opacity-60 mt-2">实际等待 = 重试间隔 ± 抖动幅度/2（固定不变，不随重试次数增长；上游 Retry-After 更短时采纳其提示）</div>
        </div>
 <div class="card settings-card" id="runtime-transport">
@@ -1365,6 +1367,22 @@
           </div>
          </div>
         </div>
+       </div>
+<div class="card settings-card" id="runtime-cookie-refresh">
+        <div class="flex items-center justify-between mb-3">
+         <label class="text-sm font-semibold" for="cookie_auto_refresh">Cookie 短期令牌自动续期</label>
+         <label class="switch">
+          <input aria-label="Cookie 短期令牌自动续期" id="cookie_auto_refresh" type="checkbox"/>
+          <span class="slider"></span>
+         </label>
+        </div>
+        <p class="lbl mb-3" id="cookie-refresh-description">默认开启，按账号代理设置定期续期已启用的 Cookie 账号，并保存新令牌。续期无法恢复已退出登录或已失效的会话。保存后生效，结果可在运行日志查看。</p>
+        <label class="lbl mb-1" for="cookie_refresh_interval_seconds">续期间隔（秒）</label>
+        <input aria-describedby="cookie-refresh-description cookie-refresh-range" class="inp" id="cookie_refresh_interval_seconds" type="number" min="300" max="86400" step="1" value="600"/>
+        <p class="lbl mt-1" id="cookie-refresh-range">默认 600 秒，范围 300–86400 秒。</p>
+        <button class="btn-ghost mt-3" type="button" id="cookie-refresh-now" onclick="runAction(this,()=>refreshCookies())">立即刷新已启用账号</button>
+        <p class="lbl mt-1">使用已保存的凭证和代理；关闭自动续期后仍可手动刷新。</p>
+        <p class="lbl mt-2" id="cookie-refresh-result" role="status" style="white-space:pre-wrap" hidden></p>
        </div>
 <div class="card settings-card" id="runtime-resources">
         <div class="flex items-center justify-between mb-3">

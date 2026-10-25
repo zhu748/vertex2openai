@@ -5,6 +5,8 @@ import re
 import time
 from typing import Any
 
+from models import normalize_content_part
+
 # CJK 统一表意文字与全角标点：粗估 1 字 ≈ 1 token；其余按 4 字符 ≈ 1 token。
 _CJK_RE = re.compile(r"[\u2e80-\u9fff\uf900-\ufaff\uff00-\uffef]")
 
@@ -44,6 +46,7 @@ def messages_prompt_text(messages: Any) -> str:
             return
         if isinstance(content, list):
             for item in content:
+                item = normalize_content_part(item)
                 if isinstance(item, dict) and item.get("type") == "text":
                     text = item.get("text")
                     if isinstance(text, str):
@@ -54,7 +57,8 @@ def messages_prompt_text(messages: Any) -> str:
         if content is None and isinstance(message, dict):
             content = message.get("content")
         _walk(content)
-        for tc in getattr(message, "tool_calls", None) or []:
+        calls = message.get("tool_calls") if isinstance(message, dict) else getattr(message, "tool_calls", None)
+        for tc in calls or []:
             fn = (tc or {}).get("function") or {}
             args = fn.get("arguments")
             if isinstance(args, str):

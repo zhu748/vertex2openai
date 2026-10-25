@@ -4,6 +4,7 @@ import config as app_config
 from runtime_state import get_effective_proxy_url
 from express_fingerprint import build_sdk_channel_overrides
 from proxy_resolver import resolve_proxy_uri
+from proxy_tls import build_httpx_proxy
 
 
 def _request_timeout(request):
@@ -44,7 +45,7 @@ def get_http_options(
 
     client_args = {}
     if resolved_proxy:
-        client_args["proxy"] = resolved_proxy
+        client_args["proxy"] = build_httpx_proxy(resolved_proxy, verify=app_config.SSL_CERT_FILE or True)
     if app_config.SSL_CERT_FILE:
         client_args["verify"] = app_config.SSL_CERT_FILE
 

@@ -17,6 +17,7 @@ from proxy_config import (BRIDGE_PROXY_SCHEMES, FORM_PROXY_SCHEMES, ProxyFormatE
                           build_proxy_uri, parse_proxy_list, proxy_fields)
 from proxy_failover import PROXY_FAILURE_STATUSES
 from proxy_import import MAX_IMPORT_BYTES, preview_proxy_import
+from proxy_tls import build_httpx_proxy
 
 
 router = APIRouter()
@@ -233,7 +234,7 @@ async def _test_proxy_candidate(body: ProxyTestBody):
             "trust_env": False,
         }
         if resolved_target:
-            client_kwargs["proxy"] = resolved_target
+            client_kwargs["proxy"] = build_httpx_proxy(resolved_target, verify=config.SSL_CERT_FILE or True)
         if config.SSL_CERT_FILE:
             client_kwargs["verify"] = config.SSL_CERT_FILE
         async with _httpx.AsyncClient(**client_kwargs) as client:

@@ -13,10 +13,11 @@ from console_auth import require_auth
 from cookie_auth import validate_cookie
 from credential_config import parse_cookie_header
 from cookie_probe import probe_all as probe_cookie_accounts
+from cookie_refresh import RefreshInProgressError, refresh_once as refresh_cookie_accounts
 from lifecycle import start_background_task
 from proxy_resolver import validate_proxy_uri
 from proxy_config import ProxyFormatError, parse_proxy_list
-from runtime_state import app_state
+from runtime_state import CookieAccountConflictError, app_state
 
 
 router = APIRouter()
@@ -103,7 +104,7 @@ async def save_express_keys(body: ExpressKeysBody, request: Request, _auth: bool
     saved = await asyncio.to_thread(app_state.set_express_keys, body.keys)
     request.app.state.express_key_manager.refresh_keys()
     # 新加进来、还没有 Project ID 的 Key 立刻在后台探一次
-    pending = [r["key"] for r in saved if not r.get("project_id")]
+    pending = [r["key"] for r in saved if r.get("enabled", True) and not r.get("project_id")]
     if pending:
         start_background_task(express_key_probe.probe_all(keys=pending))
     payload = _express_keys_payload()
@@ -135,7 +136,7 @@ async def list_cookie_accounts(_auth: bool = Depends(require_auth)):
 @router.post("/api/cookie-accounts")
 async def save_cookie_accounts(body: CookieAccountsBody, _auth: bool = Depends(require_auth)):
     existing = {rec["id"]: rec for rec in app_state.get_cookie_accounts()}
-    clean, ids, cookies = [], set(), set()
+    clean, ids, cookies, preserve_cookie_ids = [], set(), set(), set()
     for index, item in enumerate(body.accounts):
         label = f"第 {index + 1} 个 Cookie 账号"
         if not isinstance(item, dict):
@@ -156,6 +157,8 @@ async def save_cookie_accounts(body: CookieAccountsBody, _auth: bool = Depends(r
                 return JSONResponse(status_code=400, content={"error": f"{label}的 Cookie JSON 无效。"})
         else:
             cookie = existing.get(record_id, {}).get("cookie", "")
+            if cookie:
+                preserve_cookie_ids.add(record_id)
         validation = validate_cookie(cookie)
         if not validation["valid"]:
             return JSONResponse(status_code=400, content={"error": f"{label}：{validation['message']}"})
@@ -174,13 +177,37 @@ async def save_cookie_accounts(body: CookieAccountsBody, _auth: bool = Depends(r
         cookies.add(cookie)
         record.update(cookie=cookie, project_id=project)
         clean.append(record)
-    await asyncio.to_thread(app_state.set_cookie_accounts, clean)
+    try:
+        await asyncio.to_thread(app_state.set_cookie_accounts, clean, preserve_cookie_ids=preserve_cookie_ids)
+    except CookieAccountConflictError as exc:
+        return JSONResponse(status_code=409, content={"error": str(exc)}, headers={"Cache-Control": "no-store"})
     return JSONResponse(content={"status": "success", **_cookie_accounts_payload()},
                         headers={"Cache-Control": "no-store"})
 
 
 class CookieTestBody(BaseModel):
     id: str = ""  # 指定账号 ID；空 = 测试全部启用账号
+
+
+@router.post("/api/cookie-accounts/refresh")
+async def refresh_cookie_accounts_api(body: CookieTestBody, _auth: bool = Depends(require_auth)):
+    """Refresh saved enabled accounts without changing the automatic setting."""
+    accounts = [rec for rec in app_state.get_cookie_accounts() if rec["enabled"]]
+    if body.id.strip():
+        accounts = [rec for rec in accounts if rec["id"] == body.id.strip()]
+    if not accounts:
+        return JSONResponse(status_code=404, content={"error": "没有匹配的已保存且启用的 Cookie 账号。"},
+                            headers={"Cache-Control": "no-store"})
+    try:
+        results = await refresh_cookie_accounts(accounts)
+    except RefreshInProgressError as exc:
+        return JSONResponse(status_code=409, content={"error": str(exc)}, headers={"Cache-Control": "no-store"})
+    return JSONResponse(content={
+        "results": results, "total": len(results),
+        "refreshed": sum(r["status"] == "refreshed" for r in results),
+        "unchanged": sum(r["status"] == "unchanged" for r in results),
+        "errors": sum(r["status"] == "error" for r in results),
+    }, headers={"Cache-Control": "no-store"})
 
 
 @router.post("/api/cookie-accounts/test")

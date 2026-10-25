@@ -7,6 +7,7 @@ from typing import Optional, Tuple
 
 import config as app_config
 import httpx
+from proxy_tls import build_httpx_proxy
 from runtime_state import app_state, get_effective_proxy_url, get_effective_proxy_urls
 
 try:
@@ -202,7 +203,7 @@ def _fetch_remote_image_once(url, timeout, proxy_url):
 
     client_args = {"timeout": timeout, "follow_redirects": False, "trust_env": False}
     if proxy_url:
-        client_args["proxy"] = proxy_url
+        client_args["proxy"] = build_httpx_proxy(proxy_url, verify=app_config.SSL_CERT_FILE or True)
     if getattr(app_config, "SSL_CERT_FILE", None):
         client_args["verify"] = app_config.SSL_CERT_FILE
 

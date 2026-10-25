@@ -174,11 +174,11 @@ class ParseTests(unittest.TestCase):
         ob = parse_share_uri_to_outbound(uri)
         self.assertEqual(ob["tls"]["utls"]["fingerprint"], "chrome")
 
-    def test_vless_flow_stripped_without_tls(self):
-        # flow 只在 TLS/REALITY 下有意义；裸 TCP 带上会被 sing-box 拒启
-        ob = parse_share_uri_to_outbound(
-            "vless://uuid-1@1.2.3.4:80?security=none&flow=xtls-rprx-vision&type=tcp#x")
-        self.assertNotIn("flow", ob)
+    def test_vless_flow_requires_tls(self):
+        # 不可通过剥离 flow 把链接静默改成普通 VLESS。
+        with self.assertRaises(ProxyResolveError):
+            parse_share_uri_to_outbound(
+                "vless://uuid-1@1.2.3.4:80?security=none&flow=xtls-rprx-vision&type=tcp#x")
 
     def test_ss_plugin_rejected_explicitly(self):
         # SIP003 plugin 静默忽略会产出永远连不上的代理——必须明确报错

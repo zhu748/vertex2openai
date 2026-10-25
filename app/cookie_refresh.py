@@ -23,6 +23,8 @@ from typing import Iterable
 
 import httpx
 
+import config
+from http_io import read_limited_bytes
 from impersonate import apply_browser_headers, open_upstream_client
 from proxy_failover import ProxyChain
 from request_tracking import redact
@@ -45,10 +47,23 @@ DEFAULT_REFRESH_INTERVAL_SECONDS = 600
 
 # 单次 RotateCookies 请求预算（含代理切换）；循环轮内账号间稍作间隔。
 _ROTATE_TIMEOUT = httpx.Timeout(connect=15.0, read=30.0, write=15.0, pool=15.0)
+ROTATE_TOTAL_TIMEOUT_SECONDS = 45.0
+MAX_ROTATE_RESPONSE_BYTES = 64 * 1024
 _ACCOUNT_GAP_SECONDS = 1.0
+_STARTUP_DELAY_SECONDS = 15
 
-# 循环锁：防止热改设置重载或事件循环抖动导致两轮轮换叠加。
+# 自动和手动共用锁，避免重复轮换同一批凭证。
 _loop_lock = asyncio.Lock()
+_settings_changed = asyncio.Event()
+
+
+class RefreshInProgressError(RuntimeError):
+    """A manual or automatic refresh round already owns the credentials."""
+
+
+def notify_settings_changed() -> None:
+    """Wake the loop on its owning event loop after a console settings save."""
+    _settings_changed.set()
 
 
 def refresh_interval_seconds() -> float:
@@ -66,7 +81,7 @@ def refresh_interval_seconds() -> float:
 
 def auto_refresh_enabled() -> bool:
     try:
-        return bool(app_state.get_setting("cookie_auto_refresh", False))
+        return bool(app_state.get_setting("cookie_auto_refresh", True))
     except Exception:
         return False
 
@@ -119,13 +134,15 @@ def merge_refreshed_cookies(cookie_str: str, set_cookie_values: Iterable[str]) -
     # 白名单内、原串没有的字段：追加（浏览器同样会种下这些新字段），
     # 且计入 changed——否则"新种令牌"会被误判为无变更而不落盘。
     appended = [n for n in updates if n not in seen]
+    cookie_out = ";".join(parts)
     if appended:
-        tail = cookie_str.rstrip()
+        tail = cookie_out.rstrip()
+        trailing_semicolon = tail.endswith(";")
         extra = "; ".join(f"{n}={updates[n]}" for n in appended)
-        cookie_out = f"{tail}; {extra}" if tail else extra
+        cookie_out = f"{tail.rstrip('; ')}; {extra}" if tail else extra
+        if trailing_semicolon:
+            cookie_out += ";"
         changed = changed + appended
-    else:
-        cookie_out = ";".join(parts)
     return cookie_out, changed
 
 
@@ -140,7 +157,7 @@ def _extract_set_cookie_list(headers) -> list[str]:
         except Exception:
             pass
     try:
-        return [f"{k}: {v}" and str(v) for k, v in headers.multi_items()
+        return [str(v) for k, v in headers.multi_items()
                 if str(k).lower() == "set-cookie"]
     except Exception:
         return []
@@ -153,8 +170,6 @@ async def rotate_account(record: dict) -> dict:
           "changed": [...], "detail", "elapsed_ms"}。
     探测口径之外的独立网络动作：失败不隔离账号、不影响生成流量。
     """
-    from proxy_config import parse_proxy_list
-
     started = time.monotonic()
     account_id = str(record.get("id", "") or "")
     label = str(record.get("note", "") or "") or account_id
@@ -164,11 +179,11 @@ async def rotate_account(record: dict) -> dict:
                 "changed": [], "detail": "账号缺少 ID 或 Cookie，跳过。", "elapsed_ms": 0}
 
     # 账号专属代理（空列表则继承全局），与生成流量同一 ProxyChain 语义。
-    proxies = parse_proxy_list(record.get("proxies")
-                               if "proxies" in record else record.get("proxy", ""))
-    chain = ProxyChain(candidates=proxies) if proxies else ProxyChain(record)
+    chain = ProxyChain(record)
     options = {"timeout": _ROTATE_TIMEOUT, "follow_redirects": False,
                "trust_env": False, "_proxy_chain": chain}
+    if config.SSL_CERT_FILE:
+        options["verify"] = config.SSL_CERT_FILE
 
     headers = apply_browser_headers({
         "content-type": "application/json",
@@ -178,11 +193,15 @@ async def rotate_account(record: dict) -> dict:
     })
 
     try:
-        async with open_upstream_client(options) as client:
-            response = await client.post(ROTATE_COOKIES_URL, headers=headers, json=[])
-        status_code = response.status_code
-        set_cookies = _extract_set_cookie_list(response.headers)
-        await _drain(response)
+        # Bound all proxy attempts and the decoded body, including curl's
+        # streaming path. A read timeout alone does not stop a trickling peer.
+        async with asyncio.timeout(ROTATE_TOTAL_TIMEOUT_SECONDS):
+            async with open_upstream_client(options) as client:
+                async with client.stream("POST", ROTATE_COOKIES_URL, headers=headers, json=[]) as response:
+                    status_code = response.status_code
+                    set_cookies = _extract_set_cookie_list(response.headers)
+                    if status_code == 200:
+                        await read_limited_bytes(response, MAX_ROTATE_RESPONSE_BYTES)
     except Exception as exc:
         return {"id": account_id, "label": label, "status": "error", "changed": [],
                 "detail": redact(f"网络/代理错误：{type(exc).__name__}: {exc}")[:400],
@@ -190,52 +209,38 @@ async def rotate_account(record: dict) -> dict:
 
     if status_code != 200:
         return {"id": account_id, "label": label, "status": "error", "changed": [],
-                "detail": f"RotateCookies 返回 HTTP {status_code}，本轮跳过。", 
+                "detail": f"RotateCookies 返回 HTTP {status_code}，本轮跳过。",
                 "elapsed_ms": round((time.monotonic() - started) * 1000)}
 
     new_cookie, changed = merge_refreshed_cookies(cookie, set_cookies)
     elapsed = round((time.monotonic() - started) * 1000)
     if not changed:
         return {"id": account_id, "label": label, "status": "unchanged", "changed": [],
-                "detail": f"HTTP 200，上游未下发新的短期令牌（令牌仍在有效窗口）。",
+                "detail": "HTTP 200，上游未下发新的短期令牌。",
                 "elapsed_ms": elapsed}
 
     # 健康表按凭证摘要绑定：凭证更新后，旧凭证的失败计数/冷却会被
     # _prune_cookie_health_locked 在下次访问时自动清理，无需手动重置。
     saved = await asyncio.to_thread(
-        app_state.update_cookie_account_cookie, account_id, new_cookie)
+        app_state.update_cookie_account_cookie, account_id, new_cookie, expected_cookie=cookie)
     if not saved:
         return {"id": account_id, "label": label, "status": "error", "changed": [],
-                "detail": "新令牌已取得，但写回状态失败（账号可能刚被删除/重存）。",
+                "detail": "新令牌未写回：账号已删除或凭证已被更新，请使用当前凭证重试。",
                 "elapsed_ms": elapsed}
     return {"id": account_id, "label": label, "status": "refreshed", "changed": changed,
             "detail": f"已续期 {len(changed)} 个短期令牌：{', '.join(changed)}。",
             "elapsed_ms": elapsed}
 
 
-async def _drain(response) -> None:
-    """有界读完响应体，帮连接池尽快复用（RotateCookies 响应体极小）。"""
-    try:
-        aiter = getattr(response, "aiter_bytes", None)
-        if callable(aiter):
-            gen = aiter()
-            try:
-                async for _ in gen:
-                    pass
-            finally:
-                aclose = getattr(gen, "aclose", None)
-                if callable(aclose):
-                    await aclose()
-            return
-        aread = getattr(response, "aread", None)
-        if callable(aread):
-            await aread()
-    except Exception:
-        pass
-
-
 async def refresh_once(records: list | None = None) -> list[dict]:
     """手动/单轮入口：对所有启用账号各续期一次，返回逐账号结果。"""
+    if _loop_lock.locked():
+        raise RefreshInProgressError("Cookie 正在刷新，请等待当前任务完成后再试。")
+    async with _loop_lock:
+        return await _refresh_records(records)
+
+
+async def _refresh_records(records: list | None) -> list[dict]:
     if records is None:
         records = [r for r in app_state.get_cookie_accounts() if r.get("enabled")]
     results = []
@@ -258,22 +263,28 @@ def _log_round(results: list) -> None:
         mark = {"refreshed": "🔄", "unchanged": "✅", "error": "⚠️"}.get(r.get("status"), "•")
         print(f"{mark} [Cookie 续期] {r.get('label', '')}：{r.get('detail', '')}"
               f"（{r.get('elapsed_ms', 0)} ms）" if r.get("status") != "unchanged" else
-              f"{mark} [Cookie 续期] {r.get('label', '')}：短期令牌仍有效，无需更新。")
+              f"{mark} [Cookie 续期] {r.get('label', '')}：上游未下发新的短期令牌。")
 
 
 async def refresh_loop() -> None:
     """后台常驻循环：启动后先做一轮，此后按 cookie_refresh_interval_seconds 周期续期。"""
     # 启动先小憩，避开 lifespan 高峰；首轮尽快验证配置是否可用。
-    await asyncio.sleep(15)
+    await asyncio.sleep(_STARTUP_DELAY_SECONDS)
     while True:
+        _settings_changed.clear()
         if auto_refresh_enabled():
             accounts = [r for r in app_state.get_cookie_accounts() if r.get("enabled")]
             if accounts:
-                async with _loop_lock:
-                    try:
-                        await refresh_once(accounts)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        print(f"⚠️ [Cookie 续期] 本轮异常（不影响服务）：{type(exc).__name__}: {exc}")
-        await asyncio.sleep(refresh_interval_seconds())
+                try:
+                    await refresh_once(accounts)
+                except RefreshInProgressError:
+                    pass  # A manual round is already refreshing the accounts.
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    print(f"⚠️ [Cookie 续期] 本轮异常（不影响服务）：{type(exc).__name__}: {exc}")
+        try:
+            async with asyncio.timeout(refresh_interval_seconds()):
+                await _settings_changed.wait()
+        except TimeoutError:
+            pass

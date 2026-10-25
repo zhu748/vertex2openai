@@ -22,6 +22,10 @@ class StatePersistenceError(RuntimeError):
     """A management update could not be durably committed."""
 
 
+class CookieAccountConflictError(ValueError):
+    """A saved credential needed by a blank-cookie update no longer exists."""
+
+
 class AppState:
     """运行态管理器（内存优先 + 写时落盘）。
 
@@ -475,7 +479,7 @@ class AppState:
                     stored = app_config.ENV_COOKIE_ACCOUNTS
             return [rec for item in stored if (rec := self._normalize_cookie_record(item))]
 
-    def set_cookie_accounts(self, records: list) -> list:
+    def set_cookie_accounts(self, records: list, *, preserve_cookie_ids: set[str] | None = None) -> list:
         clean, ids, cookies = [], set(), set()
         for item in records:
             rec = self._normalize_cookie_record(item)
@@ -485,6 +489,17 @@ class AppState:
             cookies.add(rec["cookie"])
             clean.append(rec)
         with self._lock:
+            if preserve_cookie_ids:
+                current = {rec["id"]: rec for rec in self.get_cookie_accounts()}
+                for rec in clean:
+                    if rec["id"] in preserve_cookie_ids:
+                        if rec["id"] not in current:
+                            raise CookieAccountConflictError("Cookie 账号已被删除，请重新加载列表后再保存。")
+                        # Resolve blank-cookie preservation inside the commit
+                        # lock, after any rotation or manual replacement.
+                        rec["cookie"] = current[rec["id"]]["cookie"]
+                if len({rec["cookie"] for rec in clean}) != len(clean):
+                    raise CookieAccountConflictError("Cookie 凭证已更新并产生重复，请重新加载列表后再保存。")
             self._state["cookie_accounts"] = clean
             self._state["cookie_accounts_initialized"] = True
             # Old credentials must not resurrect after deleting every account.
@@ -501,12 +516,14 @@ class AppState:
         self.set_cookie_accounts(records)
         return len(records)
 
-    def update_cookie_account_cookie(self, account_id: str, new_cookie: str) -> bool:
+    def update_cookie_account_cookie(self, account_id: str, new_cookie: str,
+                                    *, expected_cookie: str | None = None) -> bool:
         """只更新某个 Cookie 账号的凭证字符串（短期令牌自动续期用）。
 
         其余字段（project_id/代理/开关/备注）一律不动；其他字段一并改写
         必须走控制台的整表保存接口。锁内完成内存替换，_save 落盘在锁外
-        （与既有方法口径一致）；账号不存在返回 False，由调用方决定告警。
+        （与既有方法口径一致）；账号不存在或与 expected_cookie 快照不符返回
+        False。比较与替换在同一把锁内，迟到的续期不得覆盖手动更换的新凭证。
         """
         new_cookie = str(new_cookie or "").strip()
         if not account_id or not new_cookie:
@@ -522,6 +539,8 @@ class AppState:
                 if not rec:
                     continue
                 if rec["id"] == account_id:
+                    if expected_cookie is not None and rec["cookie"] != expected_cookie:
+                        return False
                     rec["cookie"] = new_cookie
                     hit = True
                 cleaned.append(rec)

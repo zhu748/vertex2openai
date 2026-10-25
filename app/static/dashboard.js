@@ -161,6 +161,7 @@ function accountProxyFields(scope,index,record){
 /* ---------- Channel ---------- */
 let currentMode='api_key';
 function renderMode(mode){
+  $('keys-box').classList.toggle('hidden',mode==='web_proxy');
   $('cookie-box').classList.toggle('hidden',mode==='api_key');
   $('mode-pill').textContent=({api_key:'通道 Express API',web_proxy:'通道 Cookie 直连',mixed:'通道 Key + Cookie 混合'})[mode];
 }
@@ -317,6 +318,7 @@ function mergeProbeResults(results,saved){
   });
   SAVED_KEYS=saved.map(credentialCopy);
   renderKeys();
+  window.consoleForms?.rebaseKeys();
 }
 
 /* ---------- 出站代理（网络出口） ---------- */
@@ -436,8 +438,8 @@ async function loadParams(){
     GLOBAL_SETTINGS=s;
     settingsLoaded=true;
     curAR = s.image_aspect_ratio || "";
-    ['resumable_disconnect_grace_seconds','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','retry_jitter_seconds','fake_streaming_interval','prefill_mode','express_location','resumable_ttl_seconds','resumable_max_streams','request_timeout_seconds','upstream_max_concurrency','resumable_max_buffer_mb','resumable_max_total_mb','keepalive_url','keepalive_interval'].forEach(k=>setV(k,s[k]));
-    ['img_compress_enabled','fake_streaming','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','resumable_enabled','cookie_structured_output','cross_channel_fallback'].forEach(k=>setV(k,s[k]));
+    ['resumable_disconnect_grace_seconds','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','retry_jitter_seconds','fake_streaming_interval','prefill_mode','express_location','resumable_ttl_seconds','resumable_max_streams','request_timeout_seconds','upstream_max_concurrency','resumable_max_buffer_mb','resumable_max_total_mb','keepalive_url','keepalive_interval','cookie_refresh_interval_seconds'].forEach(k=>setV(k,s[k]));
+    ['img_compress_enabled','fake_streaming','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','resumable_enabled','cookie_structured_output','cross_channel_fallback','cookie_auto_refresh'].forEach(k=>setV(k,s[k]));
     setV('credential-strategy',s.roundrobin?'roundrobin':'random');
     // 出站代理：回填输入框并刷新状态徽标
     setV('proxy-input', proxyDraft(s.proxy_urls??s.proxy_url).join('\n'));
@@ -751,6 +753,8 @@ async function saveSettings(){
     resumable_max_total_mb:numOr('resumable_max_total_mb',256),
     keepalive_url:$('keepalive_url').value.trim(),
     keepalive_interval:numOr('keepalive_interval',60),
+    cookie_auto_refresh:$('cookie_auto_refresh').checked,
+    cookie_refresh_interval_seconds:numOr('cookie_refresh_interval_seconds',600),
   };
   const m=$('model-sel').value;
   const overriding = !!(OVERRIDES[m] && Object.keys(OVERRIDES[m]).length>0);
@@ -874,6 +878,12 @@ async function loadChannelFeatures(){
     channels.init();
     channelAssetNotice('');
   }catch(error){channelAssetNotice(error.message+'。已保存的 Key、代理和模型参数仍可查看与修改，请刷新或重新加载配置以重试编辑器。');}
+}
+async function refreshCookies(index=null){
+  try{
+    const channels=await ensureChannelConfig();
+    await channels.refreshCookies(index);
+  }catch(error){toast('Cookie 刷新未完成：'+error.message);}
 }
 async function manageProxies(scope='global',index=0,view='list'){
   try{

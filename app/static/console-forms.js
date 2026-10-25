@@ -5,7 +5,21 @@
   const group=name=>document.querySelector(`[data-draft-group="${name}"]`);
   const controls=el=>[...el.querySelectorAll('input,select,textarea')].filter(input=>!input.hasAttribute('data-local')&&!input.closest('.credential-filter')&&!input.closest('.field-source'));
   const value=input=>input.type==='checkbox'?input.checked:input.value;
-  const read=el=>controls(el).map(input=>({id:input.id,value:value(input)}));
+  // Compare editable credential fields only. Probe diagnostics are saved by
+  // the server and must not masquerade as unsaved edits after a row rerender.
+  const keyState=records=>records.flatMap((record,index)=>Object.entries({
+    key:record.key||'',project_id:record.project_id||'',
+    note:record.note||'',enabled:record.enabled!==false,
+    proxies:proxyDraft(record.proxies??record.proxy),proxy_fallback:record.proxy_fallback!==false,
+  }).map(([field,value])=>({id:`key-${index}-${field}`,value})));
+  const read=el=>{
+    if(el.dataset.draftGroup==='keys')return keyState([...el.querySelectorAll('[data-i]')].map(row=>({
+      key:row.querySelector('.k-key').value.trim(),project_id:projectFromInput(row.querySelector('.k-project').value),
+      note:row.querySelector('.k-note').value.trim(),enabled:row.querySelector('.k-enabled').checked,
+      proxies:proxyDraft(row.querySelector('.k-proxy').value),proxy_fallback:row.querySelector('.k-fallback').checked,
+    })));
+    return controls(el).map(input=>({id:input.id,value:value(input)}));
+  };
   const fingerprint=el=>JSON.stringify(read(el));
   function layout(){
     const nav=[...document.querySelectorAll('.tab-bar,.mobile-navigation')].find(el=>el.getClientRects().length);
@@ -32,6 +46,7 @@
     }
   }
   function saved(name){const el=group(name);if(el){snapshots.set(name,read(el));refresh();}}
+  function rebaseKeys(){snapshots.set('keys',keyState(SAVED_KEYS));refresh('keys');}
   function capture(){return Object.fromEntries(groups().filter(el=>changed(el.dataset.draftGroup)).map(el=>[el.dataset.draftGroup,read(el)]));}
   function loaded(drafts={}){
     for(const name of ['runtime','proxy','fingerprint','express-fingerprint']){
@@ -120,7 +135,7 @@
   document.addEventListener('input',event=>{clearError(event.target);refreshEditedGroup(event);});
   document.addEventListener('change',refreshEditedGroup);
   document.addEventListener('click',event=>{if(event.target.closest('.key-actions'))queueMicrotask(refresh);});
-  window.consoleForms={saved,capture,loaded,refresh,dirty,discard,fieldError,clearError,validate,accounts,rememberAccounts,openAccount,filterAccounts,copyBase,layout};
+  window.consoleForms={saved,rebaseKeys,capture,loaded,refresh,dirty,discard,fieldError,clearError,validate,accounts,rememberAccounts,openAccount,filterAccounts,copyBase,layout};
   if(window.ResizeObserver){const observer=new ResizeObserver(layout);document.querySelectorAll('.tab-bar,.mobile-navigation,.scope-card').forEach(el=>observer.observe(el));}
   window.addEventListener('resize',layout);layout();
   // Initialization may already have completed when a cached optional script loads.

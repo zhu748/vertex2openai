@@ -13,6 +13,8 @@ async function main(){
  const w=dom.window,d=w.document;
  const settings={thinking_g3_level:'low',native_thinking_mode:'request',first_reply_timeout_seconds:15,image_size:'4K',image_aspect_ratio:'16:9',sampling_policy:'auto',default_top_p:null,default_temperature:null,default_max_tokens:null,roundrobin:false,proxy_urls:[],cookie_impersonate:'chrome',express_ua_profile:'sdk',retry_max:10,retry_backoff_seconds:5,retry_jitter_seconds:1,request_timeout_seconds:1800,upstream_max_concurrency:32,resumable_enabled:true,resumable_disconnect_grace_seconds:10,resumable_ttl_seconds:1800,resumable_max_streams:200,resumable_max_buffer_mb:64,resumable_max_total_mb:256,keepalive_interval:60,img_compress_enabled:true,img_compress_max_dim:1536,img_compress_max_mb:1.5,img_compress_quality:85,fake_streaming_interval:1,prefill_mode:'smart',express_location:'global'};
  const overrides={},builtins={text:{anti_truncation_mode:'both'}};
+ settings.cookie_auto_refresh=true;settings.cookie_refresh_interval_seconds=600;
+ let mode='mixed';
  let keys=[{key:'ui-fixture-key',project_id:'project-one',note:'主账号',enabled:true,proxies:[],proxy_fallback:true}];
  let cookies=[{id:'cookie-one',project_id:'project-cookie',note:'备用账号',enabled:true,cookie_configured:true,proxies:[],proxy_fallback:true}];
  const cap={family:'3',thinking:{kind:'level',levels:['low','medium','high']},supports_anti_truncation:true,supports_search:true,image_sizes:['1K','2K','4K'],image_aspect_ratios:['1:1','16:9']};
@@ -27,12 +29,16 @@ async function main(){
   const target=new URL(url,w.location.href),method=options.method||'GET',body=options.body?JSON.parse(options.body):null;requests.push({path:target.pathname,query:target.search,method,body});
   const intercepted=transport?.(target,options);if(intercepted!==undefined)return intercepted;
   let result={};
-  if(target.pathname==='/api/settings/runtime')result={mode:'mixed'};
+  if(target.pathname==='/api/settings/runtime')result={mode};
   else if(target.pathname==='/api/settings'){if(body)Object.assign(settings,body);result={...settings};}
   else if(target.pathname==='/api/capabilities')result={models:['text','image'],capabilities:{text:{...cap,is_image:false},image:{...cap,is_image:true}},overrides:{text:{...builtins.text,...overrides.text},...Object.fromEntries(Object.entries(overrides).filter(([m])=>m!=='text'))},saved_overrides:overrides,builtin_overrides:builtins};
   else if(target.pathname.startsWith('/api/model-overrides/')){const model=target.pathname.split('/').pop();if(method==='DELETE')delete overrides[model];else{const current={...overrides[model]};for(const key of body._inherit||[])delete current[key];Object.assign(current,Object.fromEntries(Object.entries(body).filter(([k])=>k!=='_inherit')));overrides[model]=current;}result={override:{...builtins[model],...overrides[model]}};}
   else if(target.pathname==='/api/express-keys'){if(body)keys=body.keys;result={keys};}
   else if(target.pathname==='/api/cookie-accounts'){if(body)cookies=body.accounts;result={accounts:cookies};}
+  else if(target.pathname==='/api/cookie-accounts/refresh'){
+   const results=cookies.filter(rec=>rec.enabled!==false&&(!body.id||rec.id===body.id)).map(rec=>({id:rec.id,label:rec.note,status:'unchanged',changed:[],detail:'无新令牌 <img src=x onerror="window.refreshInjected=true">'}));
+   result={results,total:results.length,refreshed:0,unchanged:results.length,errors:0};
+  }
   else if(target.pathname==='/api/stats')result={total:3,success:1,error:1,retries:0,requests:summary,prompt_tokens:100,completion_tokens:200,uptime:50};
   else if(target.pathname==='/api/recent-metrics')result={sample_count:3,success:1,error:1,active:1,reply_samples:2,first_reply_p50_ms:100,first_reply_p95_ms:900,channels:{express:{success:1,error:1,active:1}}};
   else if(target.pathname==='/api/requests'){
@@ -41,7 +47,7 @@ async function main(){
   }
   else if(target.pathname.startsWith('/api/requests/'))result={...record,id:decodeURIComponent(target.pathname.split('/').pop())};
   else if(target.pathname==='/api/proxy/parse')result={proxies:[]};
-  else if(target.pathname==='/api/settings/mode')result={status:'success'};
+  else if(target.pathname==='/api/settings/mode'){mode=body.mode;result={status:'success'};}
   else throw Error('Unexpected endpoint '+target.pathname);
   return new Response(JSON.stringify(result),{status:200,headers:{'content-type':'application/json'}});
  };
@@ -59,6 +65,26 @@ async function main(){
   assert.equal(el('keys-list').querySelector('details').open,false);
   assert.equal(el('key-0').type,'password');
   console.log('✓ Navigation, initial clean state, account masking/collapse, recent metrics');
+
+  w.switchTab('channel');edit('key-note-0','切换保留 Key 草稿');edit('cookie-note-0','切换保留 Cookie 草稿');
+  const credentialWrites=requests.filter(r=>r.method==='POST'&&['/api/express-keys','/api/cookie-accounts'].includes(r.path)).length;
+  const modeVisible=selected=>{
+   assert.equal(d.querySelector('[data-draft-group=keys]').classList.contains('hidden'),selected==='web_proxy');
+   assert.equal(el('cookie-box').classList.contains('hidden'),selected==='api_key');
+  };
+  for(const selected of ['api_key','web_proxy','mixed']){
+   d.querySelector(`input[name=mode][value=${selected}]`).checked=true;await w.updateMode(selected);
+   assert.equal(mode,selected);modeVisible(selected);
+   await w.loadRuntime();modeVisible(selected);
+   assert.equal(d.querySelector('input[name=mode]:checked').value,selected);
+   assert.equal(el('key-note-0').value,'切换保留 Key 草稿');assert.equal(el('cookie-note-0').value,'切换保留 Cookie 草稿');
+  }
+  transport=target=>{if(target.pathname==='/api/settings/mode'){transport=null;return new Response('{}',{status:503});}};
+  d.querySelector('input[name=mode][value=web_proxy]').checked=true;await w.updateMode('web_proxy');
+  assert.equal(mode,'mixed');modeVisible('mixed');assert.equal(d.querySelector('input[name=mode]:checked').value,'mixed');
+  assert.equal(requests.filter(r=>r.method==='POST'&&['/api/express-keys','/api/cookie-accounts'].includes(r.path)).length,credentialWrites);
+  w.consoleForms.discard('keys');w.consoleForms.discard('cookies');assert.equal(w.consoleForms.dirty(),false);
+  console.log('✓ Three channel modes show matching credential lists, preserve drafts and roll back failed saves');
 
   for(const link of d.querySelectorAll('.settings-jump a')){
    w.history.replaceState(null,'',link.href);w.navigateHash();
@@ -126,6 +152,44 @@ async function main(){
   assert.equal(settings.retry_max,13);assert.equal(w.consoleForms.dirty(),false);
   console.log('✓ Runtime draft reload preservation, save and undo');
 
+  assert.equal(el('cookie_auto_refresh').checked,true);
+  edit('cookie_auto_refresh',true);edit('cookie_refresh_interval_seconds','900');
+  assert.equal(w.consoleForms.dirty(),true);
+  d.querySelector('button[onclick*="saveSettings"]').click();await tick();
+  assert.equal(settings.cookie_auto_refresh,true);assert.equal(settings.cookie_refresh_interval_seconds,900);
+  assert.equal(w.consoleForms.dirty(),false);
+  await w.loadParams();assert.equal(el('cookie_auto_refresh').checked,true);
+  assert.equal(el('cookie_refresh_interval_seconds').value,'900');
+  edit('cookie_refresh_interval_seconds','299');
+  const beforeInvalid=requests.length;d.querySelector('button[onclick*="saveSettings"]').click();await tick();
+  assert.equal(requests.length,beforeInvalid);assert.equal(el('cookie_refresh_interval_seconds').getAttribute('aria-invalid'),'true');
+  w.consoleForms.discard('runtime');assert.equal(el('cookie_refresh_interval_seconds').value,'900');
+  console.log('✓ Cookie refresh controls save, reload, validate limits and undo');
+
+  edit('cookie_auto_refresh',false);d.querySelector('button[onclick*="saveSettings"]').click();await tick();
+  const settingsWrites=requests.filter(r=>r.path==='/api/settings'&&r.method==='POST').length;
+  await w.refreshCookies(0);
+  assert.deepEqual(requests.filter(r=>r.path==='/api/cookie-accounts/refresh').at(-1).body,{id:'cookie-one'});
+  assert(el('cookie-refresh-result').textContent.includes('无新令牌 <img'));
+  assert.equal(el('cookie-refresh-result').querySelector('img'),null);assert.equal(w.refreshInjected,undefined);
+  assert.equal(settings.cookie_auto_refresh,false);
+  let resolveRefresh;
+  transport=target=>{if(target.pathname==='/api/cookie-accounts/refresh'){transport=null;return new Promise(resolve=>{resolveRefresh=resolve;});}};
+  el('cookie-refresh-now').click();await tick();assert.equal(el('cookie-refresh-now').matches(':disabled'),true);
+  const refreshRequests=requests.filter(r=>r.path==='/api/cookie-accounts/refresh').length;
+  await w.refreshCookies(0);assert.equal(requests.filter(r=>r.path==='/api/cookie-accounts/refresh').length,refreshRequests);
+  edit('cookie-note-0','刷新期间保留草稿');
+  resolveRefresh(new Response(JSON.stringify({results:[{id:'cookie-one',label:'备用账号',status:'refreshed',detail:'已更新 SIDCC'}],total:1,refreshed:1,unchanged:0,errors:0})));
+  await tick();assert.equal(el('cookie-refresh-now').matches(':disabled'),false);
+  assert.equal(el('cookie-note-0').value,'刷新期间保留草稿');assert.equal(w.consoleForms.dirty(),true);
+  await w.refreshCookies(0);assert.equal(requests.filter(r=>r.path==='/api/cookie-accounts/refresh').length,refreshRequests);
+  w.consoleForms.discard('cookies');
+  transport=target=>{if(target.pathname==='/api/cookie-accounts/refresh'){transport=null;return new Response(JSON.stringify({error:'Cookie 正在刷新'}),{status:409});}};
+  await w.refreshCookies(0);assert(el('cookie-refresh-result').textContent.includes('Cookie 正在刷新'));
+  assert.equal(requests.filter(r=>r.path==='/api/settings'&&r.method==='POST').length,settingsWrites);
+  assert.equal(w.consoleForms.dirty(),false);
+  console.log('✓ Manual Cookie refresh works with auto off, escapes results, prevents duplicates and preserves drafts');
+
   w.switchTab('channel');w.consoleForms.openAccount('key',0);edit('key-note-0','新备注');
   assert.equal(w.consoleForms.dirty(),true);assert.equal(d.querySelector('.account-name').textContent,'新备注');
   w.consoleForms.discard('keys');assert.equal(el('key-note-0').value,'主账号');
@@ -136,6 +200,38 @@ async function main(){
   edit('credential-strategy','roundrobin');await tick();assert.equal(settings.roundrobin,true);assert.equal(w.consoleForms.dirty(),false);
   edit('proxy-input','http://proxy.test:80');await w.saveProxy();assert.equal(w.consoleForms.dirty(),false);
   console.log('✓ Credential drafts, filters, add/undo, immediate strategy and proxy save state');
+
+  let probed={...keys[0],project_id:'detected-project',project_source:'auto'};
+  keys=[probed];w.mergeProbeResults([{key:probed.key,ok:true,project_id:probed.project_id}],keys);
+  assert.equal(el('project-0').value,'detected-project');assert.equal(w.consoleForms.dirty(),false);
+  edit('project-0','temporary-project');assert.equal(w.consoleForms.dirty(),true);
+  edit('project-0','detected-project');assert.equal(w.consoleForms.dirty(),false);
+  assert.equal(w.collectKeys()[0].project_source,'auto');
+  edit('key-note-0','保留草稿');
+  probed={...probed,project_id:'new-detected-project'};keys=[probed];
+  w.mergeProbeResults([{key:probed.key,ok:true,project_id:probed.project_id}],keys);
+  assert.equal(el('key-note-0').value,'保留草稿');assert.equal(w.consoleForms.dirty(),true);
+  w.consoleForms.discard('keys');assert.equal(el('project-0').value,'new-detected-project');
+  assert.equal(el('key-note-0').value,'主账号');assert.equal(w.consoleForms.dirty(),false);
+  w.addKeyRow();assert.equal(w.consoleForms.dirty(),true);w.consoleForms.discard('keys');
+  console.log('✓ Persisted probe results rebase saved state without swallowing credential drafts');
+
+  let resolveOldProxy;
+  transport=target=>{if(target.pathname==='/api/proxy/test'){transport=null;return new Promise(resolve=>{resolveOldProxy=resolve;});}};
+  w.consoleChannels.open('global');const oldProxyJob=w.testAllEditorProxies();await tick();
+  w.closeProxyEditor(true);w.consoleChannels.open('global');
+  transport=target=>{if(target.pathname==='/api/proxy/test'){transport=null;return new Response(JSON.stringify({ok:true,message:'fresh pass'}));}};
+  await w.testAllEditorProxies();assert.equal(el('proxy-result-0').dataset.state,'passed');
+  resolveOldProxy(new Response(JSON.stringify({ok:false,message:'late stale failure'})));await oldProxyJob;
+  w.renderProxyEditor();assert.equal(el('proxy-result-0').dataset.state,'passed');
+  assert(el('proxy-result-0').textContent.includes('fresh pass'));w.closeProxyEditor(true);
+  let resolveStoppedProxy;
+  transport=target=>{if(target.pathname==='/api/proxy/test'){transport=null;return new Promise(resolve=>{resolveStoppedProxy=resolve;});}};
+  w.consoleChannels.open('global');const stoppedProxyJob=w.testAllEditorProxies();await tick();w.stopProxyTests();
+  resolveStoppedProxy(new Response(JSON.stringify({ok:true,message:'late cancelled pass'})));await stoppedProxyJob;
+  assert.equal(el('proxy-result-0').dataset.state,'cancelled');
+  assert(el('proxy-job-state').textContent.includes('通过 0 / 1'));w.closeProxyEditor(true);
+  console.log('✓ Closed and cancelled proxy probes cannot overwrite newer results or import cancelled passes');
 
   w.switchTab('requests');await tick();const row=el('request-rows').firstElementChild;
   await w.requestMonitor.refresh();assert.equal(el('request-rows').firstElementChild,row);
@@ -171,7 +267,7 @@ async function main(){
   const ids=[...d.querySelectorAll('[id]')].map(e=>e.id);assert.equal(new Set(ids).size,ids.length);
   assert.deepEqual(errors,[]);
   console.log('✓ Stable request rows, pause/resume, pagination and unique DOM IDs');
-  console.log('9 groups of console DOM checks passed. Layout requires the browser suite.');
+  console.log('14 groups of console DOM checks passed. Layout requires the browser suite.');
  }finally{dom.window.close();}
 }
 main().catch(error=>{console.error(error);process.exitCode=1;});
