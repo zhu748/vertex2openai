@@ -88,26 +88,30 @@ def signature_from_extra(value: Any) -> Tuple[Optional[bytes], Optional[str]]:
         return str(encoded).encode("utf-8"), google.get("thought_signature_part")
 
 
-def ordinary_part_metadata(kind: str, text: str, signature: Optional[bytes]) -> dict:
+def ordinary_part_metadata(kind: str, text: str, signature: Optional[bytes], *, thought=False) -> dict:
     item = {"kind": kind, "text": text}
+    if kind == "image" and thought:
+        item["thought"] = True
     encoded = encode_thought_signature(signature)
     if encoded:
         item["thought_signature"] = encoded
     return item
 
 
-def ordinary_parts_from_extra(value: Any) -> Optional[List[types.Part]]:
+def ordinary_parts_from_extra(value: Any, image_loader=None) -> Optional[List[types.Part]]:
     """Restore exact flattened ordinary Part boundaries from bridge metadata."""
     raw = google_metadata(value).get("ordinary_parts")
     if not isinstance(raw, list):
         return None
     parts: List[types.Part] = []
+    images = {}
+    image_indices = {False: 0, True: 0}
     for item in raw:
         if not isinstance(item, dict):
             return None
         kind = item.get("kind")
         text = item.get("text")
-        if (not isinstance(kind, str) or kind not in {"text", "thought", "signature_only"}
+        if (not isinstance(kind, str) or kind not in {"text", "thought", "signature_only", "image"}
                 or not isinstance(text, str)):
             return None
         # Generated images are flattened to markdown in OpenAI content. Let the
@@ -122,6 +126,22 @@ def ordinary_parts_from_extra(value: Any) -> Optional[List[types.Part]]:
                 signature = base64.b64decode(str(encoded), validate=True)
             except Exception:
                 signature = str(encoded).encode("utf-8")
+        # Images live in content exactly once. Metadata carries their position
+        # and signature, including compatibility with older [image] carriers.
+        if kind == "image" or (kind in {"text", "thought"} and text == "[image]"):
+            thought = kind == "thought" or item.get("thought") is True
+            if thought not in images:
+                images[thought] = image_loader(thought) if image_loader else []
+            index = image_indices[thought]
+            if index < len(images[thought]):
+                part = images[thought][index].model_copy(deep=True)
+                part.thought_signature = signature
+                part.thought = True if thought else None
+                parts.append(part)
+                image_indices[thought] += 1
+                continue
+            if kind == "image":
+                return None
         parts.append(
             types.Part(
                 text=text,

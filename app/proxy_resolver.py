@@ -54,7 +54,7 @@ current_proxy_usage = ContextVar("current_proxy_usage", default=None)
 
 
 class ProxyUsage:
-    """Keep every proxy touched by a generation alive until its stream closes."""
+    """Keep transports/proxy listeners alive until their request scope closes."""
 
     def __init__(self, *, temporary=False):
         self._entries = set()

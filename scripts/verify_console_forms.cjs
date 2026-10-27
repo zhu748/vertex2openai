@@ -32,10 +32,15 @@ async function main(){
   const target=new URL(url,w.location.href),method=options.method||'GET',body=options.body?JSON.parse(options.body):null;requests.push({path:target.pathname,query:target.search,method,body});
   const intercepted=transport?.(target,options);if(intercepted!==undefined)return intercepted;
   let result={};
+  if(body?._expected){
+   const baseline=target.pathname==='/api/settings'?settings:(overrides[target.pathname.split('/').pop()]||{});
+   const conflict=Object.entries(body._expected).find(([key,old])=>old.present!==Object.hasOwn(baseline,key)||(old.present&&JSON.stringify(baseline[key])!==JSON.stringify(old.value)));
+   if(conflict)return new Response(JSON.stringify({error:'已被另一页面修改，请重新加载后检查草稿再保存。',field:conflict[0]}),{status:409});
+  }
   if(target.pathname==='/api/settings/runtime')result={mode};
-  else if(target.pathname==='/api/settings'){if(body)Object.assign(settings,body);result={...settings};}
+  else if(target.pathname==='/api/settings'){if(body)Object.assign(settings,Object.fromEntries(Object.entries(body).filter(([k])=>k!=='_expected')));result={...settings};}
   else if(target.pathname==='/api/capabilities')result={models:['text','image'],capabilities:{text:{...cap,is_image:false},image:{...cap,is_image:true}},overrides:{text:{...builtins.text,...overrides.text},...Object.fromEntries(Object.entries(overrides).filter(([m])=>m!=='text'))},saved_overrides:overrides,builtin_overrides:builtins};
-  else if(target.pathname.startsWith('/api/model-overrides/')){const model=target.pathname.split('/').pop();if(method==='DELETE')delete overrides[model];else{const current={...overrides[model]};for(const key of body._inherit||[])delete current[key];Object.assign(current,Object.fromEntries(Object.entries(body).filter(([k])=>k!=='_inherit')));overrides[model]=current;}result={override:{...builtins[model],...overrides[model]}};}
+  else if(target.pathname.startsWith('/api/model-overrides/')){const model=target.pathname.split('/').pop();if(method==='DELETE')delete overrides[model];else{const current={...overrides[model]};for(const key of body._inherit||[])delete current[key];Object.assign(current,Object.fromEntries(Object.entries(body).filter(([k])=>!['_inherit','_expected'].includes(k))));overrides[model]=current;}result={override:{...builtins[model],...overrides[model]}};}
   else if(target.pathname==='/api/express-keys'){if(body)keys=body.keys;result={keys};}
   else if(target.pathname==='/api/cookie-accounts'){if(body)cookies=body.accounts;result={accounts:cookies};}
   else if(target.pathname==='/api/cookie-accounts/reveal')result={id:body.id,cookie:savedCookie};
@@ -144,10 +149,10 @@ async function main(){
 
   w.switchTab('params');edit('model-sel','text');edit('first_reply_timeout_seconds','35');await save('btn-scope-save');
   const first=requests.filter(r=>r.path==='/api/model-overrides/text').at(-1).body;
-  assert.deepEqual(first,{first_reply_timeout_seconds:35});
+  assert.deepEqual(first,{first_reply_timeout_seconds:35,_expected:{first_reply_timeout_seconds:{present:false}}});
   assert.equal(el('source-thinking_g3_level').textContent.includes('继承全局'),true);
   w.setFieldInheritance('first_reply_timeout_seconds',true);await save('btn-scope-save');
-  assert.deepEqual(requests.filter(r=>r.path==='/api/model-overrides/text').at(-1).body,{_inherit:['first_reply_timeout_seconds']});
+  assert.deepEqual(requests.filter(r=>r.path==='/api/model-overrides/text').at(-1).body,{_inherit:['first_reply_timeout_seconds'],_expected:{first_reply_timeout_seconds:{present:true,value:35}}});
   edit('first_reply_timeout_seconds','24');edit('model-sel','image');edit('model-sel','text');
   assert.equal(el('first_reply_timeout_seconds').value,'24');
   edit('model-sel','__global__');edit('thinking_g3_level','high');await save('btn-scope-save');
@@ -164,7 +169,7 @@ async function main(){
   w.setFieldInheritance('first_reply_timeout_seconds',false);assert.equal(w.consoleForms.dirty(),true);
   edit('model-sel','image');edit('model-sel','text');
   await save('btn-scope-save');
-  assert.deepEqual(requests.filter(r=>r.path==='/api/model-overrides/text').at(-1).body,{first_reply_timeout_seconds:15});
+  assert.deepEqual(requests.filter(r=>r.path==='/api/model-overrides/text').at(-1).body,{first_reply_timeout_seconds:15,_expected:{first_reply_timeout_seconds:{present:false}}});
   w.setFieldInheritance('first_reply_timeout_seconds',true);await save('btn-scope-save');
   edit('first_reply_timeout_seconds','25');w.setFieldInheritance('first_reply_timeout_seconds',true);
   assert.equal(w.consoleForms.dirty(),false);
@@ -175,7 +180,7 @@ async function main(){
   edit('model-sel','image');w.setFieldInheritance('image_aspect_ratio',true);
   assert.equal(el('image_aspect_ratio').value,'21:9');assert.equal(el('image_aspect_ratio').selectedOptions[0].disabled,true);
   await save('btn-scope-save');edit('default_max_tokens','512');await save('btn-scope-save');
-  assert.deepEqual(requests.filter(r=>r.path==='/api/model-overrides/image').at(-1).body,{default_max_tokens:512});
+  assert.deepEqual(requests.filter(r=>r.path==='/api/model-overrides/image').at(-1).body,{default_max_tokens:512,_expected:{default_max_tokens:{present:false}}});
   builtins.text.default_top_p=null;settings.default_top_p=0.8;await w.loadParams();edit('model-sel','text');
   assert.equal(el('default_top_p').value,'');edit('default_top_p','0.5');await save('btn-scope-save');
   w.setFieldInheritance('default_top_p',true);assert.equal(el('default_top_p').value,'');await save('btn-scope-save');
@@ -334,7 +339,25 @@ async function main(){
   const ids=[...d.querySelectorAll('[id]')].map(e=>e.id);assert.equal(new Set(ids).size,ids.length);
   assert.deepEqual(errors,[]);
   console.log('✓ Stable request rows, pause/resume, pagination and unique DOM IDs');
-  console.log('15 groups of console DOM checks passed. Layout requires the browser suite.');
+  await w.loadParams();w.switchTab('runtime');
+  const retryBefore=Number(el('retry_max').value),keepaliveBefore=Number(el('keepalive_interval').value);
+  settings.retry_max=retryBefore+1;
+  edit('keepalive_interval',String(keepaliveBefore+5));d.querySelector('button[onclick*="saveSettings"]').click();await tick();
+  assert.equal(settings.retry_max,retryBefore+1);
+  const sparse=requests.filter(r=>r.path==='/api/settings'&&r.method==='POST').at(-1).body;
+  assert.deepEqual(Object.keys(sparse).sort(),['_expected','keepalive_interval']);
+  edit('retry_max',String(retryBefore+2));d.querySelector('button[onclick*="saveSettings"]').click();await tick();
+  assert.equal(settings.retry_max,retryBefore+1);assert(el('toast').textContent.includes('另一页面'));
+  assert.equal(w.consoleForms.dirty(),true);w.consoleForms.discard('runtime');await w.loadParams();
+  w.switchTab('params');edit('model-sel','__global__');
+  const oldThinking=el('thinking_g3_level').value;
+  settings.thinking_g3_level=oldThinking==='high'?'low':'high';
+  edit('inject_system_instruction','concurrent global edit');await save('btn-scope-save');
+  assert.equal(settings.thinking_g3_level,oldThinking==='high'?'low':'high');
+  edit('thinking_g3_level','medium');await save('btn-scope-save');
+  assert(el('toast').textContent.includes('另一页面'));w.discardModelDraft();
+  console.log('✓ Cross-tab sparse runtime/global saves and same-field conflict preservation');
+  console.log('16 groups of console DOM checks passed. Layout requires the browser suite.');
  }finally{dom.window.close();}
 }
 main().catch(error=>{console.error(error);process.exitCode=1;});

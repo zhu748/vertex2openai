@@ -2,6 +2,9 @@
 
 from typing import Optional
 
+from schema_validation import SchemaValidationError
+from tool_arguments import parse_tool_arguments
+
 
 # ============================================================
 # Gemini finishReason 分类表与 OpenAI 映射
@@ -73,6 +76,24 @@ class PendingMetadataGate:
 
 class IncompleteResponseError(ValueError):
     code = 502
+
+
+def complete_function_arguments(call) -> dict:
+    """Real tool responses must be complete; private text streaming is decoded first."""
+    def field(snake, camel=None):
+        if isinstance(call, dict):
+            return call.get(camel or snake, call.get(snake))
+        return getattr(call, snake, None)
+
+    name = field("name")
+    if not isinstance(name, str) or not name.strip():
+        raise IncompleteResponseError("上游函数调用缺少有效名称。")
+    if field("partial_args", "partialArgs") or field("will_continue", "willContinue"):
+        raise IncompleteResponseError("上游返回尚未完成的工具参数；当前工具通道需要完整调用。")
+    try:
+        return parse_tool_arguments(field("args"))
+    except SchemaValidationError:
+        raise IncompleteResponseError("上游函数调用参数必须是有效的 JSON 对象。") from None
 
 
 class AntiTruncationError(ValueError):

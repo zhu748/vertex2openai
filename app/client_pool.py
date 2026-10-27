@@ -8,9 +8,8 @@ TCP + TLS 握手（多 100~300ms 延迟 + CPU），高并发下还会攒出大�
 
 失效与回收：缓存签名包含全部会影响出站形态的设置（代理、自定义证书、
 base_url、请求头指纹档案）。控制台热改任一项，新请求立即拿到新形态
-客户端；旧客户端**延迟 _GRACE_CLOSE_SECONDS 再关闭**，避免把仍在
-飞行中的长流式请求（上游 read 超时最长 600s，叠加重试更久）拦腰
-打断。到点后同时关闭底层同步/异步 httpx 客户端，不留资源悬挂。
+客户端；旧客户端进入可复用的空闲缓存。请求作用域持有客户端引用直到
+响应结束或流关闭；仅空闲客户端可被容量淘汰或超时回收。
 
 并发安全（跨请求复用同一个 genai.Client）：
 - client.aio.models.* 底层共享的 httpx.AsyncClient 本身就是并发安全
@@ -29,14 +28,14 @@ from google import genai
 
 import config as app_config
 from runtime_state import get_effective_proxy_url
-from proxy_resolver import resolve_proxy_uri
+from proxy_resolver import resolve_proxy_uri, current_proxy_usage
 from express_fingerprint import get_express_ua_profile, get_express_ua_custom
 from http_options import get_http_options
 
 # SDK Client 池上限：Key 池轮换时最多同时保留这么多个（LRU 淘汰最久未用）
 _SDK_POOL_MAX = 6
-# 旧客户端延迟关闭的宽限期（秒）：覆盖最长流式 + 重试窗口
-_GRACE_CLOSE_SECONDS = 7230.0  # longest supported request (7200s), including hot setting changes
+# 空闲客户端复用窗口；活跃请求由显式引用保护，不受此时限影响
+_GRACE_CLOSE_SECONDS = 60.0  # idle reuse window; active leases never expire
 
 
 def _resolve_proxy_for_signature(key_proxy: Optional[str]) -> str:
@@ -91,10 +90,65 @@ class _GracefulCloser:
         self._pending: dict = {}
         self._retired: dict = {}
         self._max_pending = max_pending
+        self._users = {}
+        self._users_lock = threading.Lock()
+
+    def track(self, resource, usage=None):
+        # Generation admission owns this scope through stream EOF/cancellation.
+        usage = usage if usage is not None else current_proxy_usage.get()
+        if usage is not None:
+            usage.include(self, id(resource))
+        return resource
+
+    def retain(self, ident, *, temporary=False):
+        with self._users_lock:
+            self._users[ident] = self._users.get(ident, 0) + 1
+
+    def release(self, ident):
+        with self._users_lock:
+            count = self._users.get(ident, 0) - 1
+            if count > 0:
+                self._users[ident] = count
+            else:
+                self._users.pop(ident, None)
+
+    def discard_unused(self, ident):
+        pass  # Temporary probe scopes use the same idle cache as generations.
+
+    def _active(self, resource):
+        with self._users_lock:
+            return resource is None or self._users.get(id(resource), 0) > 0
+
+    def _detach(self, task):
+        entry = self._pending.pop(task, None)
+        if entry is not None and self._retired.get(entry[1]) is task:
+            self._retired.pop(entry[1], None)
+        return entry
+
+    async def _close(self, close):
+        try:
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            pass
 
     def ensure_capacity(self, count=1):
+        # Discard the oldest idle retired clients before refusing active churn.
+        if len(self._pending) + count <= self._max_pending:
+            return
+        for task, (close, _key, resource) in list(self._pending.items()):
+            if len(self._pending) + count <= self._max_pending:
+                return
+            if self._active(resource):
+                continue
+            self._detach(task)
+            task.cancel()
+            closing = asyncio.get_running_loop().create_task(self._close(close))
+            self._tasks.add(closing)
+            closing.add_done_callback(self._tasks.discard)
         if len(self._pending) + count > self._max_pending:
-            raise PoolCapacityError("客户端配置切换过于频繁，连接正在回收，请稍后重试。")
+            raise PoolCapacityError("活跃请求占满连接回收队列，请稍后重试。")
 
     def reclaim(self, key):
         task = self._retired.pop(key, None)
@@ -105,37 +159,17 @@ class _GracefulCloser:
         return entry[2]
 
     def schedule(self, close: Callable[[], Any], *, key=None, resource=None) -> None:
-        # 容量不足时直接关闭而非抛错：淘汰中的旧客户端（同 Key 换签名 + LRU
-        # 可一次产生 2 个 stale）已从池字典弹出，若在 schedule 内抛
-        # PoolCapacityError，这些客户端既不在池也不在 pending——连接/fd
-        # 只能等 GC 兜底（2026-10 修复）。直接关闭对调用方无感：延迟回收
-        # 只是优化，立即回收不会影响活跃请求（被淘汰者已无引用）。
-        # get() 入口的 ensure_capacity 预检仍保留 503 语义，拦截高频换签名的场景。
-        try:
-            self.ensure_capacity()
-        except PoolCapacityError:
-            result = close()
-            if inspect.isawaitable(result):
-                task = asyncio.get_running_loop().create_task(result)
-                task.add_done_callback(lambda _: None)
-            if key is not None:
-                self._retired.pop(key, None)
-            return
+        self.ensure_capacity()
 
         async def _close_later():
-            from resumable import request_timeout_seconds
-            await asyncio.sleep(max(_GRACE_CLOSE_SECONDS, request_timeout_seconds() + 30))
-            entry = self._pending.pop(asyncio.current_task(), None)
-            if entry is None:
+            while True:
+                await asyncio.sleep(_GRACE_CLOSE_SECONDS)
+                if resource is not None and self._active(resource):
+                    continue
+                entry = self._detach(asyncio.current_task())
+                if entry is not None:
+                    await self._close(close)
                 return
-            if key is not None and self._retired.get(key) is asyncio.current_task():
-                self._retired.pop(key, None)
-            try:
-                result = close()
-                if inspect.isawaitable(result):
-                    await result
-            except Exception:
-                pass
 
         loop = asyncio.get_running_loop()
         task = loop.create_task(_close_later())
@@ -193,7 +227,7 @@ class SdkClientPool:
                 # LRU 触碰：pop 再放回，保持 dict 插入序 = 最近使用序
                 self._clients.pop(api_key)
                 self._clients[api_key] = entry
-                return entry[1]
+                return _closer.track(entry[1])
 
         retired_key = ("sdk", id(self), api_key, sig)
         client = _closer.reclaim(retired_key)
@@ -208,10 +242,7 @@ class SdkClientPool:
             entry = self._clients.get(api_key)
             if entry is not None and entry[0] == sig:
                 # 同签名竞态败者：复用先到协程刚登记的客户端，退役自己的副本。
-                # 旧实现把胜者刚建好的客户端退役进延迟回收池（7230s 空驻留），
-                # N 路并发冷启动会平白多建 N-1 个 SDK 客户端（对齐
-                # HttpxClientPool/_UpstreamClientPool 的既有正确写法）。
-                stale.append((retired_key, client))
+                stale.append((None, client))
                 client = entry[1]
             else:
                 if entry is not None:      # 同 Key 旧签名
@@ -226,7 +257,7 @@ class SdkClientPool:
 
         for retired_key, c in stale:
             _closer.schedule(_make_sdk_closer(c), key=retired_key, resource=c)
-        return client
+        return _closer.track(client)
 
     def size(self) -> int:
         with self._lock:
@@ -287,7 +318,7 @@ class HttpxClientPool:
                 # LRU 触碰：pop 再放回，dict 插入序 = 最近使用序
                 self._entries.pop(sig)
                 self._entries[sig] = hit
-                return hit
+                return _closer.track(hit)
 
         client = _closer.reclaim(("httpx", id(self), sig))
         _closer.ensure_capacity(int(len(self._entries) >= self._maxsize))
@@ -311,7 +342,7 @@ class HttpxClientPool:
 
         for retired_key, c in stale:
             _closer.schedule(_make_httpx_closer(c), key=retired_key, resource=c)
-        return client
+        return _closer.track(client)
 
     async def aclose(self) -> None:
         with self._lock:

@@ -62,11 +62,13 @@ class RequestConversionTests(unittest.TestCase):
             variables = native_request_to_variables(parsed, "gemini-3-pro", "p")
         self.assertEqual(variables["generationConfig"]["temperature"], 0.7)
 
-    def test_candidate_count_stripped_for_g3_seed_kept(self):
+    def test_multiple_candidates_rejected_and_single_candidate_seed_kept(self):
         parsed = {"contents": [], "generationConfig": {"candidateCount": 2, "seed": 42}}
-        with mock.patch.object(cookie_native, "print"):
-            with _settings():
-                variables = native_request_to_variables(parsed, "gemini-3.5-flash-lite", "p")
+        with _settings(), self.assertRaises(SchemaValidationError):
+            native_request_to_variables(parsed, "gemini-3.5-flash-lite", "p")
+        parsed["generationConfig"]["candidateCount"] = 1
+        with _settings():
+            variables = native_request_to_variables(parsed, "gemini-3.5-flash-lite", "p")
         self.assertNotIn("candidateCount", variables["generationConfig"])
         self.assertEqual(variables["generationConfig"]["seed"], 42)
 

@@ -146,9 +146,7 @@ def prepare_transport(request, base_model: str, settings: dict, *,
     elif extra.get("functions") or extra.get("function_call") or any(
             m.role == "function" or (m.model_extra or {}).get("function_call") for m in request.messages):
         reason = "本轮使用旧版 functions 协议"
-    elif any(str((t.get("function") or {}).get("name", "")).lower() in
-             {"google_search", "googlesearch", "web_search", "websearch", "search"}
-             or t.get("type") != "function" for t in (request.tools or [])):
+    elif any(t.get("type", "function") != "function" for t in (request.tools or [])):
         reason = "本轮包含内建搜索或非函数工具"
     if reason:
         print(f"ℹ️ [抗截断] 本轮跳过：{reason}。")

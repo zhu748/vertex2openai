@@ -184,7 +184,7 @@ class PrepareTests(unittest.TestCase):
                  {"tool_choice": {"type": "function", "function": {"name": "read_database"}}},
                  {"response_format": {"type": "json_object"}}, {"n": 2},
                  {"tools": [{"type": "web_search"}]},
-                 {"tools": [{"type": "function", "function": {"name": "google_search"}}]},
+                 {"tools": [{"type": "google_search"}]},
                  {"functions": [{"name": "legacy"}]}]
         for case in cases:
             with self.subTest(case=case):

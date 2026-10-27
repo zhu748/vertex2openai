@@ -268,6 +268,10 @@ def native_request_to_variables(parsed: dict, model_name: str, project_id: str,
 
     gen = parsed.get("generationConfig")
     gen = dict(gen) if isinstance(gen, dict) else {}
+    if gen.get("candidateCount", 1) != 1:
+        raise SchemaValidationError("Cookie 通道暂不支持 candidateCount != 1。")
+    if gen.get("responseLogprobs") or "logprobs" in gen:
+        raise SchemaValidationError("Cookie 通道暂不支持 responseLogprobs / logprobs。")
     unknown_gen = [k for k in gen if k not in _native_supported_generation_keys()]
     if unknown_gen:
         print(f"⚠️ [Cookie 原生桥] generationConfig 未经验证的字段将原样透传：{unknown_gen}")

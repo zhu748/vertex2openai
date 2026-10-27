@@ -69,6 +69,7 @@ from proxy_failover import FailoverSDKClient, ProxyChain, ProxyResolveError
 from proxy_resolver import ProxyUsage, current_proxy_usage
 from client_pool import get_pooled_express_client
 from request_tracking import configure as track_configure
+from response_validation import IncompleteResponseError
 from request_connection import BodyTooLargeError
 from routes.chat_api import _call_upstream
 from runtime_state import app_state
@@ -371,8 +372,11 @@ async def claude_messages(fastapi_request: Request, api_key: str = Depends(get_c
             message = _openai_error_message(payload, f"上游请求失败（HTTP {status}）。")
             err_status = status if status >= 400 else 502
             return claude_error(err_status, anthropic_error_type(err_status), message)
-        anthropic_payload = openai_completion_to_anthropic(
-            payload or {}, display_model, new_message_id(), omit_thinking=omit_thinking)
+        try:
+            anthropic_payload = openai_completion_to_anthropic(
+                payload or {}, display_model, new_message_id(), omit_thinking=omit_thinking)
+        except IncompleteResponseError as exc:
+            return claude_error(502, "api_error", str(exc))
         # 与 OpenAI 通道的完成日志同构：显示模型 | 耗时 | tokens
         usage = (anthropic_payload.get("usage") or {}) if isinstance(anthropic_payload, dict) else {}
         tokens = ""

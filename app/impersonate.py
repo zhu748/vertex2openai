@@ -262,19 +262,26 @@ async def open_upstream_client(client_kwargs: dict):
     client_kwargs 是 httpx 语义（timeout/follow_redirects/proxy），由工厂内部转换。
     """
     from proxy_failover import FailoverHTTPClient
-    options = dict(client_kwargs)
-    chain = options.pop("_proxy_chain", None)
-    if chain is not None:
-        def factory(raw, resolved):
-            candidate = dict(options)
-            candidate.pop("proxy", None)
-            if resolved:
-                candidate["proxy"] = resolved
-            return _upstream_client_pool.get(candidate, _create_upstream_client)
-        yield FailoverHTTPClient(chain, factory)
-        return
-    client = _upstream_client_pool.get(options, _create_upstream_client)
-    yield client
+    from proxy_resolver import ProxyUsage
+    # Probes/refresh jobs may run outside generation admission. Give every
+    # context its own lease so pool eviction cannot close its active transport.
+    usage = ProxyUsage()
+    try:
+        options = dict(client_kwargs)
+        chain = options.pop("_proxy_chain", None)
+        if chain is not None:
+            def factory(raw, resolved):
+                candidate = dict(options)
+                candidate.pop("proxy", None)
+                if resolved:
+                    candidate["proxy"] = resolved
+                return _upstream_client_pool.get(candidate, _create_upstream_client, usage=usage)
+            yield FailoverHTTPClient(chain, factory)
+            return
+        client = _upstream_client_pool.get(options, _create_upstream_client, usage=usage)
+        yield client
+    finally:
+        usage.close()
 
 
 def _curl_remote_dns_proxy(proxy: str) -> str:
@@ -357,7 +364,7 @@ class _UpstreamClientPool:
             repr(client_kwargs.get("verify", True)),
         )
 
-    def get(self, client_kwargs: dict, factory: Callable[[dict], Any]) -> Any:
+    def get(self, client_kwargs: dict, factory: Callable[[dict], Any], *, usage=None) -> Any:
         sig = self._signature(client_kwargs)
         with self._lock:
             hit = self._entries.get(sig)
@@ -365,7 +372,7 @@ class _UpstreamClientPool:
                 # LRU 触碰：pop 再放回，dict 插入序 = 最近使用序
                 self._entries.pop(sig)
                 self._entries[sig] = hit
-                return hit
+                return _closer.track(hit, usage)
 
         client = _closer.reclaim(("cookie", id(self), sig))
         _closer.ensure_capacity(int(len(self._entries) >= _UPSTREAM_POOL_MAX))
@@ -388,7 +395,7 @@ class _UpstreamClientPool:
 
         for retired_key, c in stale:
             schedule_graceful_close(_make_upstream_closer(c), key=retired_key, resource=c)
-        return client
+        return _closer.track(client, usage)
 
     async def aclose(self) -> None:
         with self._lock:

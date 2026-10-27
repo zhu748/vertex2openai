@@ -21,6 +21,7 @@ from message_processing import (
 from prefill import PrefillDeduper, strip_prefill_overlap
 from response_validation import (
     map_finish_reason_to_openai,
+    complete_function_arguments,
 )
 from runtime_state import app_state
 from signature_store import SignatureState
@@ -178,23 +179,23 @@ def _build_chunk_payload(
                         text_value is None
                         and getattr(part, "inline_data", None) is not None
                     ):
-                        # 同 message_processing 非流式路径：ordinary_parts 的
-                        # round-trip 消费端拒绝 data: 图片，再编码一遍 base64
-                        # 只会把每个生图回合的响应体积翻倍（2026-10 修复）。
-                        text_value = "[image]"
+                        text_value = ""
                     elif (
                         text_value is None
                         and getattr(part, "file_data", None) is not None
                     ):
                         text_value = f"![Image]({part.file_data.file_uri})"
                     text_value = "" if text_value is None else str(text_value)
-                    if getattr(part, "thought", None) is True:
+                    if getattr(part, "inline_data", None) is not None or getattr(part, "file_data", None) is not None:
+                        kind = "image"
+                        text_value = ""
+                    elif getattr(part, "thought", None) is True:
                         kind = "thought"
                     elif text_value == "" and sig:
                         kind = "signature_only"
                     else:
                         kind = "text"
-                    metadata = ordinary_part_metadata(kind, text_value, sig)
+                    metadata = ordinary_part_metadata(kind, text_value, sig, thought=getattr(part, "thought", None) is True)
                     # Restored private text has no upstream Part signature to
                     # replay. Repeating its entire accumulated text in metadata
                     # on every token would make a native stream quadratic.
@@ -212,6 +213,7 @@ def _build_chunk_payload(
                         ordinary_signature = sig
                         ordinary_signature_kind = kind
                     continue
+                arguments = complete_function_arguments(fc)
                 tc_index = (
                     indexer.next_index(output_index)
                     if indexer
@@ -231,7 +233,7 @@ def _build_chunk_payload(
                     "type": "function",
                     "function": {
                         "name": fc.name,
-                        "arguments": json.dumps(fc.args) if fc.args is not None else "",
+                        "arguments": json.dumps(arguments, ensure_ascii=False, allow_nan=False),
                     },
                 }
                 attach_signature_extra(tc, sig)

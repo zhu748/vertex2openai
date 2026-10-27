@@ -167,7 +167,7 @@ async function main() {
     assert.equal(response.status(), 200);
     assert.equal(response.request().postDataJSON().prefill_cot_guard, true);
     assert.equal(response.request().postDataJSON().first_reply_timeout_seconds, 28.5);
-    assert.deepEqual(Object.keys(response.request().postDataJSON()).sort(),['first_reply_timeout_seconds','prefill_cot_guard']);
+    assert.deepEqual(Object.keys(response.request().postDataJSON()).sort(),['_expected','first_reply_timeout_seconds','prefill_cot_guard']);
     assert.equal((await response.json()).override.prefill_cot_guard, true);
     await page.waitForFunction(() => !document.querySelector('#btn-scope-save').disabled);
     await openTab('runtime');
@@ -185,7 +185,8 @@ async function main() {
     assert.ok(!('first_reply_timeout_seconds' in response.request().postDataJSON()));
     assert.ok(!('prefill_cot_guard' in response.request().postDataJSON()));
     assert.equal(response.request().postDataJSON().cookie_structured_output,true);
-    assert.equal(response.request().postDataJSON().cookie_auto_refresh,true);
+    assert.equal(response.request().postDataJSON().cookie_auto_refresh,undefined);
+    assert.equal((await response.json()).cookie_auto_refresh,true);
     assert.equal(response.request().postDataJSON().cookie_refresh_interval_seconds,900);
     const upstreamSettingsPage=await context.newPage();
     await upstreamSettingsPage.goto(origin+'/#params');
@@ -259,10 +260,12 @@ async function main() {
       return route.fulfill({json:{...staleSettings,...patch}});
     });
     await openTab('runtime');
+    await page.fill('#retry_max','11');
     const runtimeResponse=page.waitForResponse(r=>new URL(r.url()).pathname==='/api/settings' && r.request().postDataJSON()?.retry_max!==undefined);
     await page.locator('button[onclick*="saveSettings"]').click();
     await runtimeReady;
     await openTab('params');
+    await page.fill('#inject_system_instruction','concurrent section save');
     pending=responseFor('/api/settings');
     await page.click('#btn-scope-save');
     response=await pending;
@@ -1157,6 +1160,51 @@ async function main() {
       check(kind+' 跨标签页保存冲突返回 409，保留草稿及服务器新状态');
     }
     await page.bringToFront();
+    const runtimeA=await context.newPage(), runtimeB=await context.newPage();
+    for(const editor of [runtimeA,runtimeB]){
+      await editor.goto(origin+'/#runtime');
+      await editor.waitForFunction(()=>settingsLoaded && capabilitiesLoaded);
+    }
+    const oldRetry=Number(await runtimeA.inputValue('#retry_max'));
+    const oldKeepalive=Number(await runtimeB.inputValue('#keepalive_interval'));
+    async function saveRuntime(editor){
+      const saved=editor.waitForResponse(r=>new URL(r.url()).pathname==='/api/settings' && r.request().method()==='POST');
+      await editor.locator('button[onclick*="saveSettings"]').click();
+      return await saved;
+    }
+    await runtimeA.fill('#retry_max',String(oldRetry+1));
+    assert.equal((await saveRuntime(runtimeA)).status(),200);
+    await runtimeB.fill('#keepalive_interval',String(oldKeepalive+5));
+    const disjoint=await saveRuntime(runtimeB);
+    assert.equal(disjoint.status(),200);
+    assert.deepEqual(Object.keys(disjoint.request().postDataJSON()).sort(),['_expected','keepalive_interval']);
+    assert.equal((await disjoint.json()).retry_max,oldRetry+1);
+    await runtimeB.waitForFunction(()=>!document.querySelector('button[onclick*="saveSettings"]').disabled);
+    await runtimeB.fill('#retry_max',String(oldRetry+2));
+    assert.equal((await saveRuntime(runtimeB)).status(),409);
+    await runtimeB.waitForFunction(()=>document.querySelector('#toast').textContent.includes('另一页面'));
+    assert.equal(await runtimeB.inputValue('#retry_max'),String(oldRetry+2));
+    assert.equal(await runtimeB.evaluate(()=>consoleForms.dirty()),true);
+    await runtimeA.close();await runtimeB.close();
+    check('运行设置双标签页：独立字段合并，同字段冲突返回 409 并保留草稿');
+    const modelA=await context.newPage(), modelB=await context.newPage();
+    for(const editor of [modelA,modelB]){
+      await editor.goto(origin+'/#params');
+      await editor.waitForFunction(()=>settingsLoaded && capabilitiesLoaded);
+      await editor.selectOption('#model-sel','gemini-4-argon');
+    }
+    const oldTimeout=Number(await modelA.inputValue('#first_reply_timeout_seconds'));
+    for(const [editor,value,status] of [[modelA,oldTimeout+1,200],[modelB,oldTimeout+2,409]]){
+      await editor.fill('#first_reply_timeout_seconds',String(value));
+      const saved=editor.waitForResponse(r=>new URL(r.url()).pathname==='/api/model-overrides/gemini-4-argon' && r.request().method()==='POST');
+      await editor.click('#btn-scope-save');
+      assert.equal((await saved).status(),status);
+    }
+    await modelB.waitForFunction(()=>document.querySelector('#toast').textContent.includes('另一页面'));
+    assert.equal(await modelB.inputValue('#first_reply_timeout_seconds'),String(oldTimeout+2));
+    assert.equal(await modelB.evaluate(()=>consoleForms.dirty()),true);
+    await modelA.close();await modelB.close();
+    check('模型参数双标签页：拒绝过期覆盖并保留未保存修改');
     const beforeLogout=page.url();
     await page.route('**/api/logout',route=>route.fulfill({status:503,json:{error:'测试退出失败'}}));
     pending=responseFor('/api/logout');

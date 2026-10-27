@@ -178,9 +178,9 @@ Render / HuggingFace Space 等免费托管平台会休眠长时间无流量的�
 
 ## Gemini 原生格式端点（透传）
 
-除了 OpenAI 兼容接口，本服务还提供 **Gemini 原生 REST 端点**——请求体一个字节不改地透传到
-Express 端点，因此 tools / function calling / `thinkingConfig` / `safetySettings` / `responseSchema` /
-`cachedContent` 等原生字段保持原样，由目标模型和上游 API 决定支持情况：
+除了 OpenAI 兼容接口，本服务还提供 **Gemini 原生 REST 端点**。Express 通道按字节透传普通请求，
+因此 tools / function calling / `thinkingConfig` / `safetySettings` / `responseSchema` / `cachedContent`
+等原生字段由目标模型和上游 API 决定支持情况。Cookie 通道对生成接口执行协议转换，能力范围见下表：
 
 ```bash
 # 非流式
@@ -208,8 +208,9 @@ curl -s https://你的域名/v1beta/models -H "x-goog-api-key: 你的API_KEY"
   `retry_max + 1`，设 0 仍请求一次），间隔为**固定值 + 抖动**（默认 5±0.5 秒，不随次数增长）；
   上游 `Retry-After` 更短时采纳其提示，更长时钳位到窗口上限。每次重试按策略重新选 Key，
   单 Key 或 Key 池轮转一遍后仍可继续重试，客户端断开即停止；上游错误状态码与 body 原样透传。
-  Cookie 通道是私有 GraphQL 协议，无法承载原生
-  REST，故透传始终走 Express 通道（未配置 Express Key 时返回 403 与说明）。
+  Cookie 模式下，`generateContent` / `streamGenerateContent` 转换为私有 batchGraphql 请求；
+  其它模式优先使用 Express，没有 Key 而有 Cookie 时可桥接生成接口。
+  `countTokens` / `embedContent` 仍需要 Express Key；仅有 Cookie 时返回明确的 400。
 - **面板统计**：两个前缀的原生 POST 请求均计入总请求数，每个客户端请求只计一次；成功、
   失败、拥堵重试分别计数。流式成功在转发完成时计入，中途失败计入错误。模型列表 GET 不计数。
 - **模型路径拼接与 SDK 完全一致**：裸模型名拼 `publishers/google/models/{model}`（Express 端点
@@ -266,6 +267,7 @@ curl -s https://你的域名/v1/messages/count_tokens -H "x-api-key: 你的API_K
 - **模型名映射**：`claude-opus-*` → 最新 Pro、`claude-sonnet-*` → 最新 Flash、
   `claude-haiku-*` → Flash-Lite（静态别名表 + 模型目录热启发）；`gemini-*` 名字原样透传，
   Claude 客户端也可直接用 Gemini 模型及其 `-search` / 抗截断后缀变体。
+- **结构化输出**：`output_config.format = {"type":"json_schema","schema":{...}}` 转为 Gemini JSON Schema，格式或 Schema 非法时返回 400，并遵循上表通道限制。
 - **思考兼容**：`thinking.budget_tokens`（整数 ≥1024）映射到内部思考档位
   （≤1024 → low、≤8192 → medium、>8192 → high；`disabled` → off、`adaptive` → 跟随默认）；
   优先级对齐 vertex-master：`thinking` 的 enabled/disabled 钉住档位，
@@ -303,6 +305,25 @@ curl -s https://你的域名/v1/messages/count_tokens -H "x-api-key: 你的API_K
   `ANTHROPIC_AUTH_TOKEN=你的API_KEY`、`ANTHROPIC_MODEL=claude-sonnet-4-5`（或
   `ANTHROPIC_SMALL_FAST_MODEL=claude-haiku-4-5`）。
 
+工具转换的完整性约定：
+
+- 历史 `tool_calls[].function.arguments` 必须是合法 JSON 对象；省略或空串按 `{}` 处理，
+  非对象、非法 JSON、非有限数字返回 400。适配器不会再用空参数掩盖错误，也不会把上游
+  非法参数改成额外的 `value` 入参；上游完整调用无效时返回 502（流式使用 error 事件）。
+- 同一 assistant 消息内的工具 ID、声明中的函数名不能重复。未知工具类型明确拒绝；
+  兼容省略 `type`、直接携带 `function` 对象的旧客户端。
+- Claude 历史及带完整顺序元数据的非流式回复保留文本与工具的交错顺序；工具结果仍按
+  `tool_use_id` 关联，允许同名并行调用的结果按不同顺序回传。
+- Claude 流式转换按工具 `index` 累积参数，支持 ID / 名称稍后到达；冲突 ID 不会覆盖已收
+  参数。累计工具内容上限为 32 MiB、调用数量上限为 1024；收尾后释放缓冲。
+  `max_tokens` / 内容过滤造成的截断保留原始参数分片和结束原因，客户端应检查结束原因
+  后再决定是否执行工具。普通完整回复收尾时校验参数对象。
+- 普通工具通道暂不聚合 Gemini 原生 `partialArgs` / `willContinue` 参数分片，遇到这类
+  不完整调用会明确报错，避免把它转换为空参数调用；防截断模式的私有文本传输不受影响。
+
+协议依据：[Claude 流式协议](https://platform.claude.com/docs/en/build-with-claude/streaming)
+及 [Gemini 函数调用](https://ai.google.dev/gemini-api/docs/function-calling)。
+
 ## Cookie 通道浏览器档案（curl_cffi）
 
 默认使用 `chrome`；也可选择 `edge`、`firefox`、`safari`、`safari_ios` 或 `off`。
@@ -331,8 +352,9 @@ SDK 主通道仍保留自身 Python 标签。自定义值支持 `{sdk}`、`{pyth
 TCP+TLS 握手（每次约省 100~300ms 与相应 CPU）；429 重试场景收益最大
 （默认 10 次重试从 11 次握手降到 1 次）。控制台热改代理或指纹档案后，
 新请求自动使用新配置；宽限期内再次用到相同客户端时直接复用，避免 Key 数超过热池容量后反复重建。
-待回收客户端上限为 256；配置频繁变化导致预算满时返回明确的 503。
-回收宽限期覆盖最长允许请求及配置热更新期间的旧请求，停机时立即统一关闭。
+待回收缓存上限为 256，空闲客户端最多保留约 60 秒以便复用；缓存满时优先关闭空闲客户端。
+活跃请求持有连接引用直到响应结束、流关闭或取消，超过缓存窗口仍不会被关闭。
+只有待回收连接全部处于使用中且预算耗尽时才返回 503；停机时统一关闭连接。
 
 配套优化：Cookie 通道重试不再重复构建请求体（含重复下载/压缩同一批输入
 图片）；batchGraphql 流式响应按对象边界增量收集，完整后只解码一次 JSON，
@@ -381,7 +403,25 @@ TCP+TLS 握手（每次约省 100~300ms 与相应 CPU）；429 重试场景收�
 
 ### 多账号与混合模式配置
 
-控制台「通道与凭证」支持三种模式：仅 Express Key、仅 Cookie、Key + Cookie 混合。每条记录可独立启用或停用，账号数量可以为一个或多个。Cookie 的 Project ID 和代理始终跟随该账号，请勿把其他账号的 Cookie 与项目混用。结构化输出请求默认在混合模式中只选择 Express Key；Cookie 通道的结构化输出可经控制台开关 `cookie_structured_output` 显式启用（见下）。Gemini 原生 REST 调用仍要求 Express Key。
+控制台「通道与凭证」支持三种模式：仅 Express Key、仅 Cookie、Key + Cookie 混合。每条记录可独立启用或停用，账号数量可以为一个或多个。Cookie 的 Project ID 和代理始终跟随该账号，请勿把其他账号的 Cookie 与项目混用。结构化输出请求默认在混合模式中只选择 Express Key；Cookie 通道的结构化输出可经控制台开关 `cookie_structured_output` 显式启用（见下）。Gemini 原生生成接口同时支持 Express 透传与 Cookie 桥接；原生计数和向量接口需要 Express Key。
+
+| 功能 | Express 通道 | Cookie 通道 |
+| --- | --- | --- |
+| OpenAI / Claude 文本、工具调用、图片历史 | 支持，受模型能力限制 | 支持，受模型和私有协议限制 |
+| JSON Schema（含 Claude `output_config.format`） | 映射为 Gemini Schema | 需开启 `cookie_structured_output` 并验证上游支持 |
+| OpenAI `n > 1` | 仅支持多候选的模型；Gemini 3.x 明确拒绝 | 明确返回 400，避免合并不同答案 |
+| `logprobs` / `top_logprobs` | 受模型支持情况限制 | 明确返回 400 |
+| 原生 `generateContent` / `streamGenerateContent` | 透传 | 协议桥接；只支持单候选 |
+| 原生 `countTokens` / `embedContent` | 需要 Express Key | 不支持 |
+
+混合模式下，OpenAI / Claude 请求只会分配给能保留其参数语义的通道；多候选、logprobs
+以及未开启 Cookie 支持的结构化输出锁定 Express，跨通道兜底也遵循同一规则。
+
+控制台的运行设置与全局模型默认值仅提交实际修改的字段；运行设置和模型专属参数保存
+时携带字段原值作为并发条件。同字段已被另一页面修改时返回 409，并保留草稿，重新加载
+后检查再保存。自定义 API 调用方可在设置 POST 中传入
+`"_expected": {"retry_max": {"present": true, "value": 10}}`；模型继承字段用
+`{"present": false}` 表示尚无专属值。未传 `_expected` 的旧客户端继续使用原有合并语义。
 
 > **Cookie 通道结构化输出（`cookie_structured_output`，默认关）**：batchGraphql 私有协议对 `responseMimeType` / `responseSchema` 的接受度没有官方承诺，离线无法验证，因此默认对 `response_format` 显式 400 并提示改用 Express 通道。要启用：先在部署环境运行 `python scripts/probe_cookie_structured_output.py --model 模型名`（凭证取 `--cookie/--project-id`、环境变量或加 `--use-state` 读控制台记录），脚本直连上游跑 json_object / 严格 schema / json_patch 宽松方言三档用例并给出「完全可开 / 仅 JSON 模式 / 不可开」结论；探测通过后在控制台「运行设置」打开开关。开启后转换链与工具参数完全一致：`sanitize_for_gemini`（OpenAI 宽松方言 → Gemini 严格方言，空节点/`type` 数组/元组 `items` 自动净化）→ Studio 私有 UI Schema。若探测报告 `QUERY_SIGNATURE_NOT_FOUND` 或未知字段错误，说明 Google 已改私有协议，保持开关关闭即可，其余功能不受影响。
 
@@ -551,7 +591,8 @@ Cookie 原生入口会检查 `toolConfig` 和 `allowedFunctionNames` 的格式�
 | 自定义函数声明 | 原生下发；流式与非流式响应都返回 OpenAI `tool_calls` |
 | `-search` 模型 + 默认/`auto` 工具选择 | 优先内建搜索，跳过客户端附带的可选自定义函数（如 `get_time_info`）；显式 `required` / 指定自定义函数仍优先执行自定义函数 |
 | 原生搜索工具类型 `web_search` / `web_search_preview` / `google_search` | 两个通道的 OpenAI 入口均识别并映射为 Google 内建搜索；纯搜索请求不附加函数专用配置 |
-| 声明里含搜索类工具（`google_search` / `web_search` 等） | 映射为 Studio 内建 `googleSearch`。实机确认 batchGraphql 不允许它与自定义函数混用：混合 AUTO/required 请求优先自定义函数并忽略搜索；显式强制搜索时只发送 `googleSearch` |
+| 显式声明内建搜索与自定义函数 | batchGraphql 不允许二者混用：普通模型的混合 AUTO/required 请求优先自定义函数并忽略搜索；显式选择未声明为自定义函数的搜索别名时，仅发送 `googleSearch` |
+| 自定义函数恰好叫 `search` / `google_search` / `web_search` | 两通道均保留其函数声明、参数和指定调用；不再按名字替换为内建搜索。需要 Google 搜索时使用 `{"type":"web_search"}`、`{"google_search":{}}` 或 `-search` 模型后缀 |
 | 历史里的 assistant `tool_calls` | 回放为 role=`model` 的 `functionCall` Parts，并从 `extra_content` 或短期缓存恢复 thought signature |
 | 连续的 role=`tool` 结果 | 按 `tool_call_id` 关联函数名，合并为 role=`user` 的 `functionResponse` Parts；并行顺序为 FC1, FC2, FR1, FR2 |
 | 模型或协议明确拒绝原生函数 Schema | 仅本次固定降级为文本工具观测并重试一次；没有用户可见策略开关，也不会恢复旧版严格拒绝路径 |

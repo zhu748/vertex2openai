@@ -12,12 +12,29 @@ import model_capabilities as mc
 from console_auth import require_auth
 from keepalive import keepalive_service
 from model_loader import get_express_models
-from runtime_state import app_state
+from runtime_state import app_state, SettingsConflictError
 from request_connection import BodyTooLargeError
 from settings_validation import validate_global_settings_patch, validate_settings_patch
 
 
 router = APIRouter()
+
+
+def _expected_settings(patch, keys):
+    expected = patch.get("_expected")
+    if "_expected" not in patch:
+        return None
+    if not isinstance(expected, dict) or set(expected) != set(keys):
+        raise ValueError("_expected 必须包含本次修改的每个字段。")
+    for snapshot in expected.values():
+        if (not isinstance(snapshot, dict) or type(snapshot.get("present")) is not bool
+                or (snapshot["present"] and "value" not in snapshot)):
+            raise ValueError("_expected 字段必须包含 present 布尔值与已存在字段的 value。")
+    return expected
+
+
+def _settings_conflict(exc):
+    return JSONResponse(status_code=409, content={"error": str(exc), "field": exc.field})
 
 
 def mask_cookie(cookie_str: str) -> str:
@@ -81,7 +98,13 @@ async def update_settings_api(request: Request, _auth: bool = Depends(require_au
         return JSONResponse(status_code=400, content=error)
     refresh_keys = {"cookie_auto_refresh", "cookie_refresh_interval_seconds"} & set(patch)
     previous_refresh = {key: app_state.get_setting(key) for key in refresh_keys}
-    updated = await asyncio.to_thread(app_state.update_settings, patch)
+    try:
+        expected = _expected_settings(patch, set(patch) & (set(config.DEFAULT_SETTINGS) - {"model_overrides"}))
+        updated = await asyncio.to_thread(app_state.update_settings, patch, expected=expected)
+    except SettingsConflictError as exc:
+        return _settings_conflict(exc)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
     if any(updated[key] != previous_refresh[key] for key in refresh_keys):
         from cookie_refresh import notify_settings_changed
         notify_settings_changed()
@@ -142,11 +165,18 @@ async def save_model_override(model_name: str, request: Request, _auth: bool = D
     # （2026-10 修复）。保持 200 语义不变（既有契约：全未知键返回成功、
     # 不写入），仅消除幽灵条目。
     clean = {k: v for k, v in patch.items() if k in config.PER_MODEL_KEYS}
+    try:
+        expected = _expected_settings(patch, set(clean) | set(inherit))
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
     if not clean and not inherit:
         current = await asyncio.to_thread(app_state.get_model_overrides)
         return JSONResponse(content={"status": "success", "model": model_name,
                                      "override": current.get(model_name, {})})
-    saved = await asyncio.to_thread(app_state.set_model_override, model_name, clean, inherit=inherit)
+    try:
+        saved = await asyncio.to_thread(app_state.set_model_override, model_name, clean, inherit=inherit, expected=expected)
+    except SettingsConflictError as exc:
+        return _settings_conflict(exc)
     return JSONResponse(content={"status": "success", "model": model_name, "override": saved})
 
 

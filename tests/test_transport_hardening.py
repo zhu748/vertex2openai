@@ -175,6 +175,10 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
             return c
         with mock.patch.object(client_pool, "_closer", closer), \
              mock.patch.object(client_pool, "_direct_signature", side_effect=lambda uri: (uri,)):
+            usage = proxy_resolver.ProxyUsage()
+            token = proxy_resolver.current_proxy_usage.set(usage)
+            self.addCleanup(proxy_resolver.current_proxy_usage.reset, token)
+            self.addCleanup(usage.close)
             pool.get(factory, "one")
             pool.get(factory, "two")
             with self.assertRaises(client_pool.PoolCapacityError):

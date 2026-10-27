@@ -312,6 +312,29 @@ function applyModelParamFields(model) {
       ? '当前编辑：模型专属参数（★）。保存仅影响此模型。'
       : '当前继承默认值。保存后将创建此模型的专属参数。';
 }
+function settingsExpectation(baseline, keys) {
+  return Object.fromEntries(
+    keys.map((key) => [
+      key,
+      Object.hasOwn(baseline, key) ? { present: true, value: baseline[key] } : { present: false }
+    ])
+  );
+}
+function changedSettings(values) {
+  return Object.fromEntries(
+    Object.entries(values).filter(
+      ([key, value]) => JSON.stringify(value) !== JSON.stringify(GLOBAL_SETTINGS[key])
+    )
+  );
+}
+function settingsBody(patch, baseline = GLOBAL_SETTINGS) {
+  const keys = [
+    ...Object.keys(patch).filter((key) => key !== '_inherit'),
+    ...(patch._inherit || [])
+  ];
+  return { ...patch, _expected: settingsExpectation(baseline, keys) };
+}
+
 async function saveModelOverride() {
   if (!settingsLoaded || !capabilitiesLoaded) {
     toast('配置尚未加载，请先重新加载配置');
@@ -339,13 +362,18 @@ async function saveModelOverride() {
   };
   if (m === '__global__') {
     delete patch.anti_truncation_mode;
+    patch = changedSettings(patch);
+    if (!Object.keys(patch).length) {
+      toast('没有需要保存的修改');
+      return;
+    }
     // 全局默认作用域：写进全局设置，而不是任何模型的专属值
     try {
       const r = await fetch('/api/settings', {
         signal: AbortSignal.timeout(30000),
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(patch)
+        body: JSON.stringify(settingsBody(patch))
       });
       if (r.ok) {
         Object.assign(GLOBAL_SETTINGS, patch);
@@ -369,7 +397,7 @@ async function saveModelOverride() {
       signal: AbortSignal.timeout(30000),
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(patch)
+      body: JSON.stringify(settingsBody(patch, SAVED_MODEL_OVERRIDES[m] || {}))
     });
     const d = await r.json();
     if (r.ok) {
@@ -590,7 +618,7 @@ async function saveSettings() {
   // 只保存全局运行设置。
   // 模型行为字段显示的是当前编辑对象的生效值，不能在这里一并提交。
   // 一起提交会把某个模型的专属值（比如生图的注入内容）写成全局默认。
-  const patch = {
+  const patch = changedSettings({
     img_compress_enabled: $('img_compress_enabled').checked,
     img_compress_max_dim: numOr('img_compress_max_dim', 1536),
     img_compress_max_mb: numOr('img_compress_max_mb', 1.5),
@@ -620,7 +648,11 @@ async function saveSettings() {
     keepalive_interval: numOr('keepalive_interval', 60),
     cookie_auto_refresh: $('cookie_auto_refresh').checked,
     cookie_refresh_interval_seconds: numOr('cookie_refresh_interval_seconds', 600)
-  };
+  });
+  if (!Object.keys(patch).length) {
+    toast('没有需要保存的修改');
+    return;
+  }
   const m = $('model-sel').value;
   const overriding = !!(OVERRIDES[m] && Object.keys(OVERRIDES[m]).length > 0);
   try {
@@ -628,7 +660,7 @@ async function saveSettings() {
       signal: AbortSignal.timeout(30000),
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(patch)
+      body: JSON.stringify(settingsBody(patch))
     });
     if (r.ok) {
       const saved = await r.json();

@@ -38,6 +38,10 @@ import secrets
 from typing import Any, Optional
 
 from models import OpenAIMessage, OpenAIRequest
+from tool_arguments import parse_tool_arguments
+from response_validation import IncompleteResponseError
+from thought_signatures import google_metadata, ordinary_part_metadata
+from schema_validation import SchemaValidationError, validate_json_schema, sanitize_for_gemini
 
 # ============================================================
 # 错误与 ID 生成
@@ -382,6 +386,7 @@ def _append_assistant_blocks(label: str, content: list, openai_messages: list) -
     """assistant 消息块数组 → 内部消息（text 拼接 + tool_calls；thinking 丢弃）。"""
     texts: list[str] = []
     tool_calls: list[dict] = []
+    ordinary, order = [], []
     for bi, block in enumerate(content):
         block_label = f"{label}.content[{bi}]"
         block = _block_dict(block, block_label)
@@ -391,6 +396,8 @@ def _append_assistant_blocks(label: str, content: list, openai_messages: list) -
             if not isinstance(text, str):
                 raise ClaudeRequestError(f"{block_label}.text must be a string")
             texts.append(text)
+            order.append({"type": "ordinary", "index": len(ordinary)})
+            ordinary.append(ordinary_part_metadata("text", text, None))
         elif btype == "tool_use":
             call_id = block.get("id")
             name = block.get("name")
@@ -407,6 +414,7 @@ def _append_assistant_blocks(label: str, content: list, openai_messages: list) -
                 args_str = json.dumps(args, ensure_ascii=False, allow_nan=False)
             except (TypeError, ValueError, RecursionError):
                 raise ClaudeRequestError(f"{block_label}.input must contain valid JSON values") from None
+            order.append({"type": "tool_call", "index": len(tool_calls)})
             tool_calls.append({"id": call_id, "type": "function",
                                "function": {"name": name, "arguments": args_str}})
         elif btype in ("thinking", "redacted_thinking"):
@@ -421,6 +429,7 @@ def _append_assistant_blocks(label: str, content: list, openai_messages: list) -
         role="assistant",
         content=text or None,
         tool_calls=tool_calls or None,
+        extra_content={"google": {"ordinary_parts": ordinary, "part_order": order}} if tool_calls else None,
     ))
 
 
@@ -437,6 +446,8 @@ def _convert_tools(raw_tools: Any) -> Optional[list[dict]]:
             raise ClaudeRequestError(f"tools[{ti}].name must be a non-empty string")
         function: dict[str, Any] = {"name": name}
         description = tool.get("description")
+        if description is not None and not isinstance(description, str):
+            raise ClaudeRequestError(f"tools[{ti}].description must be a string")
         if isinstance(description, str) and description:
             function["description"] = description
         schema = tool.get("input_schema")
@@ -550,10 +561,22 @@ def anthropic_to_openai_request(body: dict, internal_model: str,
     # ---- output_config.effort → reasoning_effort（仅在 thinking 未钉住时生效，对齐 vertex-master）----
     # 校验始终执行（vertex-master 在 anthropicToChatRequest 里先行校验），
     # 但 thinking.enabled/disabled 钉住档位后不再覆盖（Go 版后写覆盖的反向还原）。
+    response_format = None
     output_config = body.get("output_config")
     if output_config is not None:
         if not isinstance(output_config, dict):
             raise ClaudeRequestError("output_config must be an object")
+        output_format = output_config.get("format")
+        if output_format is not None:
+            if not isinstance(output_format, dict) or output_format.get("type") != "json_schema":
+                raise ClaudeRequestError("output_config.format.type must be json_schema")
+            schema = output_format.get("schema")
+            try:
+                validate_json_schema(schema, label="output_config.format.schema")
+                sanitize_for_gemini(schema)
+            except SchemaValidationError as exc:
+                raise ClaudeRequestError(str(exc)) from None
+            response_format = {"type": "json_schema", "json_schema": {"name": "response", "schema": schema}}
         effort = output_config.get("effort")
         if effort is not None:
             if not isinstance(effort, str) or not effort.strip():
@@ -644,6 +667,7 @@ def anthropic_to_openai_request(body: dict, internal_model: str,
         top_p=_optional_number(body, "top_p"),
         top_k=top_k,
         stop=stop_sequences or None,
+        response_format=response_format,
         tools=tools,
         tool_choice=tool_choice,
         # Claude 协议的用量在 message_delta 里给出：内部流式开启 include_usage
@@ -686,16 +710,66 @@ def anthropic_stop_reason(finish_reason: Optional[str], has_tool_calls: bool) ->
 
 
 def _parse_tool_arguments(raw: Any) -> dict:
-    """OpenAI tool_call.function.arguments（JSON 字符串）→ 对象。"""
-    if isinstance(raw, dict):
-        return raw
-    if isinstance(raw, str) and raw.strip():
-        try:
-            parsed = json.loads(raw)
-            return parsed if isinstance(parsed, dict) else {"value": parsed}
-        except (ValueError, TypeError):
-            return {"value": raw}
-    return {}
+    """Validate upstream arguments without inventing an executable replacement."""
+    try:
+        return parse_tool_arguments(raw)
+    except SchemaValidationError:
+        raise IncompleteResponseError("上游工具参数不是有效的 JSON 对象。") from None
+
+
+def _tool_use_block(call):
+    if not isinstance(call, dict) or not isinstance(call.get("function"), dict):
+        raise IncompleteResponseError("上游工具调用缺少 function 对象。")
+    function = call["function"]
+    name = function.get("name")
+    ident = call.get("id")
+    if not isinstance(name, str) or not name.strip():
+        raise IncompleteResponseError("上游工具调用缺少函数名称。")
+    if ident is not None and not isinstance(ident, str):
+        raise IncompleteResponseError("上游工具调用 ID 必须是字符串。")
+    return {"type": "tool_use", "id": ident or new_tool_id(), "name": name,
+            "input": _parse_tool_arguments(function.get("arguments"))}
+
+
+def _ordered_completion_blocks(message, tools, omit_thinking):
+    """Use exact bridge topology only when it covers the entire visible message."""
+    metadata = google_metadata(message)
+    ordinary, order = metadata.get("ordinary_parts"), metadata.get("part_order")
+    if not isinstance(ordinary, list) or not isinstance(order, list):
+        return None
+    blocks, texts, thoughts = [], [], []
+    for item in ordinary:
+        if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+            return None
+        kind, text = item.get("kind"), item["text"]
+        if kind == "text":
+            texts.append(text)
+            blocks.append({"type": "text", "text": text} if text else None)
+        elif kind == "thought":
+            thoughts.append(text)
+            blocks.append({"type": "thinking", "thinking": text, "signature": thinking_signature(text)}
+                          if text and not omit_thinking else None)
+        elif kind == "signature_only":
+            blocks.append(None)
+        else:
+            return None  # Image/text extensions stay intact in the fallback.
+    if ("".join(texts) != (message.get("content") or "")
+            or "".join(thoughts) != (message.get("reasoning_content") or "")):
+        return None
+    sources = {"ordinary": blocks, "tool_call": tools}
+    seen, result = set(), []
+    for item in order:
+        if not isinstance(item, dict):
+            return None
+        kind, index = item.get("type"), item.get("index")
+        if (not isinstance(kind, str) or kind not in sources or type(index) is not int
+                or not 0 <= index < len(sources[kind]) or (kind, index) in seen):
+            return None
+        seen.add((kind, index))
+        block = sources[kind][index]
+        if block is not None:
+            result.append(block)
+    return result if len(seen) == len(blocks) + len(tools) else None
 
 
 def _anthropic_usage(usage: Any) -> dict:
@@ -763,16 +837,13 @@ def openai_completion_to_anthropic(payload: dict, display_model: str, message_id
     elif not tool_calls:
         # 无工具调用时 Anthropic 必须至少一个 text 块（可为空串）
         content_blocks.append({"type": "text", "text": text if isinstance(text, str) else ""})
-    for tc in tool_calls:
-        if not isinstance(tc, dict):
-            continue
-        function = tc.get("function") or {}
-        content_blocks.append({
-            "type": "tool_use",
-            "id": tc.get("id") or new_tool_id(),
-            "name": function.get("name") or "",
-            "input": _parse_tool_arguments(function.get("arguments")),
-        })
+    if not isinstance(tool_calls, list):
+        raise IncompleteResponseError("上游 tool_calls 必须是数组。")
+    tool_blocks = [_tool_use_block(call) for call in tool_calls]
+    content_blocks.extend(tool_blocks)
+    ordered = _ordered_completion_blocks(message, tool_blocks, omit_thinking)
+    if ordered:
+        content_blocks = ordered
 
     return {
         "id": message_id,
@@ -799,6 +870,10 @@ PING_EVENT = _sse_event("ping", {"type": "ping"})
 
 def error_event(err_type: str, message: str) -> str:
     return _sse_event("error", {"type": "error", "error": {"type": err_type, "message": message}})
+
+
+MAX_TOOL_STREAM_BYTES = 32 * 1024 * 1024
+MAX_STREAM_TOOL_CALLS = 1024
 
 
 class ClaudeStreamState:
@@ -839,6 +914,9 @@ class ClaudeStreamState:
         self.usage: dict = {"input_tokens": 0, "output_tokens": 0}
         self.finish: Optional[str] = None
         self.has_tools = False
+        self._tool_ids = {}
+        self._tool_bytes = 0
+        self._finished = False
 
     # ---- 事件构造 ----
     def message_start_event(self) -> str:
@@ -879,6 +957,15 @@ class ClaudeStreamState:
         }))
         return events
 
+    def _reserve_tool_bytes(self, value):
+        try:
+            size = len(value.encode("utf-8"))
+        except UnicodeError:
+            raise IncompleteResponseError("上游工具调用包含无效的 Unicode。") from None
+        if self._tool_bytes + size > MAX_TOOL_STREAM_BYTES:
+            raise IncompleteResponseError("上游流式工具调用超过缓冲限制。")
+        self._tool_bytes += size
+
     # ---- 喂入 ----
     def feed_openai_chunk(self, payload: dict) -> list[str]:
         """单条 OpenAI chunk → Anthropic 事件。
@@ -888,10 +975,12 @@ class ClaudeStreamState:
         content 与 tool_calls 时（_build_chunk_payload 合帧），先发 text 块
         再累积工具，两者都不会丢失；finish_reason 恒被采集。
         """
+        if self._finished:
+            raise IncompleteResponseError("上游在消息结束后继续发送内容。")
         payload = payload if isinstance(payload, dict) else {}
+        self.feed_usage(payload.get("usage"))
         choices = payload.get("choices") or []
         if not choices:
-            self.feed_usage(payload.get("usage"))
             return []
         choice = choices[0] if isinstance(choices[0], dict) else {}
         delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
@@ -924,23 +1013,52 @@ class ClaudeStreamState:
         # 3) 工具调用：分片参数只累积，块事件延迟到 finish_events
         #    （交错场景下立即开块会引用已关闭的块索引，见类 docstring）
         tool_calls = delta.get("tool_calls")
+        if tool_calls is not None and not isinstance(tool_calls, list):
+            raise IncompleteResponseError("上游流式 tool_calls 必须是数组。")
         if isinstance(tool_calls, list) and tool_calls:
             for tc in tool_calls:
-                tc = tc if isinstance(tc, dict) else {}
-                function = tc.get("function") if isinstance(tc.get("function"), dict) else {}
-                tc_index = tc.get("index") if isinstance(tc.get("index"), int) else 0
+                if not isinstance(tc, dict):
+                    raise IncompleteResponseError("上游流式工具调用必须是对象。")
+                function = tc.get("function")
+                if function is None:
+                    function = {}
+                if not isinstance(function, dict):
+                    raise IncompleteResponseError("上游流式 function 必须是对象。")
+                tc_index = tc.get("index", 0)
+                if type(tc_index) is not int or tc_index < 0:
+                    raise IncompleteResponseError("上游工具调用索引必须是非负整数。")
                 known = self._tools.get(tc_index)
-                tc_id = tc.get("id")
-                if known is None or (isinstance(tc_id, str) and tc_id and tc_id != known["id"]):
-                    # 新工具，或同 index 换 id（上游重发整轮的罕见场景）：重开累积槽
-                    known = {"id": tc_id or new_tool_id(),
-                             "name": function.get("name") or "", "parts": []}
+                if known is None:
+                    if len(self._tools) >= MAX_STREAM_TOOL_CALLS:
+                        raise IncompleteResponseError("上游流式工具调用数量超过限制。")
+                    known = {"id": None, "name": "", "parts": []}
                     self._tools[tc_index] = known
-                if not known["name"] and function.get("name"):
-                    known["name"] = function["name"]  # 分片首帧可能只有 id，name 后到
+                tc_id, name = tc.get("id"), function.get("name")
+                if tc_id is not None and not isinstance(tc_id, str):
+                    raise IncompleteResponseError("上游工具调用 ID 必须是字符串。")
+                if tc_id:
+                    if ((known["id"] and known["id"] != tc_id)
+                            or self._tool_ids.get(tc_id, tc_index) != tc_index):
+                        raise IncompleteResponseError("上游流式工具调用 ID 与索引不一致。")
+                    # Late IDs fill the existing slot without resetting arguments.
+                    if known["id"] is None:
+                        self._reserve_tool_bytes(tc_id)
+                    known["id"] = tc_id
+                    self._tool_ids[tc_id] = tc_index
+                if name is not None and not isinstance(name, str):
+                    raise IncompleteResponseError("上游工具函数名称必须是字符串。")
+                if name:
+                    if known["name"] and known["name"] != name:
+                        raise IncompleteResponseError("同一流式工具调用的函数名称发生变化。")
+                    if not known["name"]:
+                        self._reserve_tool_bytes(name)
+                    known["name"] = name
                 arguments = function.get("arguments")
-                if isinstance(arguments, str) and arguments:
-                    known["parts"].append(arguments)  # list 追加，收尾 join 一次
+                if arguments is not None and not isinstance(arguments, str):
+                    raise IncompleteResponseError("上游流式工具参数必须是 JSON 字符串分片。")
+                if arguments:
+                    self._reserve_tool_bytes(arguments)
+                    known["parts"].append(arguments)
             self.has_tools = True
 
         # 4) 结束原因
@@ -955,17 +1073,29 @@ class ClaudeStreamState:
 
     # ---- 收尾 ----
     def finish_events(self) -> list[str]:
+        if self._finished:
+            return []
+        # Validate all calls before emitting any executable tool block. Truncated
+        # streams retain their raw partial JSON and their max_tokens/refusal stop.
+        calls = []
+        for known in self._tools.values():
+            if not known["name"].strip():
+                raise IncompleteResponseError("上游流式工具调用缺少函数名称。")
+            args = "".join(known["parts"]).strip() or "{}"
+            if self.finish not in ("length", "content_filter"):
+                _parse_tool_arguments(args)
+            calls.append((known, args))
+        self._finished = True
         events = self._close_block()
         # 延迟发射的全部 tool_use 块：start → 单条完整 input_json_delta → stop
-        for known in self._tools.values():
+        for known, args in calls:
             index = self._next_index
             self._next_index += 1
             events.append(_sse_event("content_block_start", {
                 "type": "content_block_start", "index": index,
-                "content_block": {"type": "tool_use", "id": known["id"],
+                "content_block": {"type": "tool_use", "id": known["id"] or new_tool_id(),
                                   "name": known["name"], "input": {}},
             }))
-            args = "".join(known["parts"]).strip() or "{}"
             events.append(_sse_event("content_block_delta", {
                 "type": "content_block_delta", "index": index,
                 "delta": {"type": "input_json_delta", "partial_json": args},
@@ -973,6 +1103,9 @@ class ClaudeStreamState:
             events.append(_sse_event("content_block_stop", {
                 "type": "content_block_stop", "index": index,
             }))
+        self._tools.clear()
+        self._tool_ids.clear()
+        self._tool_bytes = 0
         final_usage = dict(self.usage)
         final_usage.setdefault("cache_creation_input_tokens", 0)
         final_usage.setdefault("cache_read_input_tokens", 0)

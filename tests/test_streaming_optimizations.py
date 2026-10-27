@@ -225,7 +225,7 @@ class SettingsTests(unittest.TestCase):
         with mock.patch.object(settings_api.app_state, "update_settings", return_value={}) as save:
             result = client.post("/api/settings", json={"prefill_mode": "keep_turn"})
             self.assertEqual(result.status_code, 200)
-            save.assert_called_once_with({"prefill_mode": "keep_turn"})
+            save.assert_called_once_with({"prefill_mode": "keep_turn"}, expected=None)
 
     def test_image_system_instruction_uses_model_override_in_both_channels(self):
         obj = OpenAIRequest(model="gemini-nano-banana-2.1", messages=[

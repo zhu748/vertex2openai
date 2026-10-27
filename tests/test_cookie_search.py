@@ -205,9 +205,9 @@ class CookieSearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("functionDeclarations", variables["tools"][0])
 
     async def test_forced_search_and_declared_search_still_work(self):
-        search_tool = {"type": "function", "function": {"name": "google_search"}}
+        search_tool = {"type": "web_search"}
         for request in (
-            self.request(tools=[CUSTOM, search_tool], tool_choice=search_tool),
+            self.request(tools=[CUSTOM, search_tool], tool_choice={"type": "function", "function": {"name": "google_search"}}),
             self.request(MODEL, tools=[search_tool]),
         ):
             with self.subTest(request=request):

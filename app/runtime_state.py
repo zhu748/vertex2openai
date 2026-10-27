@@ -30,6 +30,21 @@ class CookieAccountConflictError(ValueError):
     """A saved credential needed by a blank-cookie update no longer exists."""
 
 
+class SettingsConflictError(ValueError):
+    def __init__(self, field):
+        self.field = field
+        super().__init__(f"{field} 已被另一页面修改，请重新加载后检查草稿再保存。")
+
+
+def _check_expected_settings(current, expected):
+    if expected is None:
+        return
+    for key, snapshot in expected.items():
+        present = key in current
+        if present != snapshot["present"] or (present and current[key] != snapshot.get("value")):
+            raise SettingsConflictError(key)
+
+
 class AppState:
     """运行态管理器（内存优先 + 写时落盘）。
 
@@ -643,11 +658,12 @@ class AppState:
                 return copy.deepcopy(stored[key])
             return default
 
-    def update_settings(self, patch: dict) -> dict:
+    def update_settings(self, patch: dict, *, expected=None) -> dict:
         """合并更新设置，只接受已知键，返回更新后的完整设置。"""
         if not isinstance(patch, dict):
             return self.get_settings()
         with self._lock:
+            _check_expected_settings(self.get_settings(), expected)
             current = self._state.get("settings")
             current = dict(current) if isinstance(current, dict) else {}
             accepted = 0
@@ -678,7 +694,7 @@ class AppState:
         with self._lock:
             return copy.deepcopy((self._state.get("settings") or {}).get("model_overrides") or {})
 
-    def set_model_override(self, model_name: str, patch: dict, *, inherit=()) -> dict:
+    def set_model_override(self, model_name: str, patch: dict, *, inherit=(), expected=None) -> dict:
         model_name = (model_name or "").strip()
         if not model_name or not isinstance(patch, dict):
             return {}
@@ -690,6 +706,7 @@ class AppState:
             overrides = dict(overrides) if isinstance(overrides, dict) else {}
             previous = overrides.get(model_name)
             previous = dict(previous) if isinstance(previous, dict) else {}
+            _check_expected_settings(previous, expected)
             # Removal is explicit: null remains a valid 'do not inject' value.
             for key in inherit:
                 if key in app_config.PER_MODEL_KEYS:

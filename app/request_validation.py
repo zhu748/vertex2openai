@@ -1,6 +1,8 @@
 """Validate loose OpenAI extension dictionaries before either upstream uses them."""
 
+import model_capabilities as mc
 from models import normalize_content_part
+from tool_arguments import parse_tool_arguments
 from schema_validation import SchemaValidationError, validate_request_schemas
 from tool_policy import (
     has_search_suffix,
@@ -28,8 +30,26 @@ def validate_openai_request(request):
     AttributeError in a worker or stream becomes a misleading upstream 500.
     """
     validate_request_schemas(request)
+    declared_names = set()
+    for index, tool in enumerate(request.tools or []):
+        if "function" in tool or tool.get("type") == "function":
+            if tool.get("type") not in (None, "function"):
+                raise SchemaValidationError(f"tools[{index}].type must be function")
+            name = tool["function"]["name"]
+            if name in declared_names:
+                raise SchemaValidationError(f"tools[{index}] duplicates a function name")
+            declared_names.add(name)
+        elif not is_builtin_search_tool(tool):
+            raise SchemaValidationError(f"tools[{index}] has an unsupported tool type")
+    if request.n is not None:
+        if request.n < 1:
+            raise SchemaValidationError("n must be an integer >= 1")
+        if request.n > 1 and "candidate_count" not in mc.get_profile(request.model)["allowed_sampling"]:
+            raise SchemaValidationError("This model does not support n > 1")
     choice = request.tool_choice
     if isinstance(choice, dict) and (choice.get("type") == "function" or "function" in choice):
+        if choice.get("type") not in (None, "function"):
+            raise SchemaValidationError("tool_choice.type must be function")
         _function(choice.get("function"), "tool_choice.function")
         name = normalized_tool_name(choice)
         declared = {normalized_tool_name(tool) for tool in request.tools or []}
@@ -46,8 +66,20 @@ def validate_openai_request(request):
             raise SchemaValidationError("tool_choice 'required' requires at least one tool")
     for index, message in enumerate(request.messages):
         label = f"messages[{index}]"
+        call_ids = set()
         for call_index, call in enumerate(message.tool_calls or []):
-            _function(call.get("function"), f"{label}.tool_calls[{call_index}].function")
+            call_label = f"{label}.tool_calls[{call_index}]"
+            if call.get("type") not in (None, "function"):
+                raise SchemaValidationError(f"{call_label}.type must be function")
+            _function(call.get("function"), f"{call_label}.function")
+            call_id = call.get("id")
+            if call_id is not None and not isinstance(call_id, str):
+                raise SchemaValidationError(f"{call_label}.id must be a string")
+            if call_id:
+                if call_id in call_ids:
+                    raise SchemaValidationError(f"{call_label}.id duplicates another call in this message")
+                call_ids.add(call_id)
+            parse_tool_arguments(call["function"].get("arguments"), label=f"{call_label}.function.arguments")
         if not isinstance(message.content, list):
             continue
         for part_index, part in enumerate(message.content):

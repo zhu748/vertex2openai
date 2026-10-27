@@ -39,6 +39,7 @@ from request_tracking import (
     upstream_chunk,
 )
 from request_validation import validate_openai_request
+from channel_capabilities import cookie_feature_error
 from response_validation import (
     FINISH_CONTENT_FILTER,
     AntiTruncationError,
@@ -63,11 +64,9 @@ from thought_signatures import (
 from upstream_errors import create_openai_error_response, extract_upstream_error
 from upstreams.base import BaseUpstream
 from upstreams.cookie_request import (
-    COOKIE_STRUCTURED_OUTPUT_DISABLED_MESSAGE,
     build_request_body_async,
     classify_tool_traffic,
-    is_builtin_search_name,
-    normalized_tool_name,
+    is_forced_builtin_search,
     search_suffix_has_priority,
 )
 from upstreams.cookie_response import (
@@ -1374,15 +1373,9 @@ def _prepare_cookie_generation(
     track_configure(mode="stream" if request_obj.stream else "json", channel="cookie")
     try:
         validate_openai_request(request_obj)
-        # 与 build_request_body 的门控同口径：开关关闭时快速失败（省去
-        # Cookie 认证与请求体构造的网络准备）；开启时放行，由构造侧注入
-        # responseMimeType/responseSchema。
-        if (
-            request_obj.response_format
-            and request_obj.response_format.get("type") not in (None, "text")
-            and not app_state.get_setting("cookie_structured_output", False)
-        ):
-            raise SchemaValidationError(COOKIE_STRUCTURED_OUTPUT_DISABLED_MESSAGE)
+        error = cookie_feature_error(request_obj, structured_output=app_state.get_setting("cookie_structured_output", False))
+        if error:
+            raise SchemaValidationError(error)
     except SchemaValidationError as exc:
         # 统一错误形状：message/type/code/param 四字段，与 Express 通道及
         # OpenAI SDK 重试逻辑的读取口径一致（旧实现缺 code/param）。
@@ -1447,12 +1440,7 @@ def _prepare_cookie_generation(
     # ===== 2.5 工具流量处理：原生函数调用 =====
     _tool_info = classify_tool_traffic(request_obj.messages, request_obj.tools)
     force_builtin_search = bool(_tool_info["builtin_search"])
-    _choice_name = (
-        normalized_tool_name(request_obj.tool_choice)
-        if isinstance(request_obj.tool_choice, dict)
-        else ""
-    )
-    _forced_search = bool(_choice_name and is_builtin_search_name(_choice_name))
+    _forced_search = is_forced_builtin_search(request_obj)
     search_selected = _forced_search or search_suffix_has_priority(request_obj)
     native_custom_tools = bool(_tool_info["custom_names"] or _tool_info["history"]) and not search_selected
     if (force_builtin_search or search_selected) and _tool_info["custom_names"]:

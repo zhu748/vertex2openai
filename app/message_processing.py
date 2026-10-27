@@ -14,8 +14,9 @@ from image_processing import (
     fetch_remote_image,
     optimize_image_bytes,
 )
+from tool_arguments import parse_tool_arguments
 from models import OpenAIMessage, message_text, normalize_content_part
-from response_validation import map_finish_reason_to_openai
+from response_validation import map_finish_reason_to_openai, complete_function_arguments
 from runtime_state import app_state
 from signature_store import SignatureState
 from thought_signatures import (
@@ -227,28 +228,7 @@ def _assistant_tool_parts(
         arguments_str = function_call_data.get("arguments", "{}")
         tool_call_id_str = tool_call.get("id", "") or ""
 
-        try:
-            parsed_arguments = (
-                json.loads(arguments_str)
-                if isinstance(arguments_str, str)
-                else (arguments_str or {})
-            )
-        except json.JSONDecodeError as e:
-            print(
-                f"⚠️ [工具调用] 历史 tool_call 的 arguments 不是合法 JSON（{e}），"
-                f"已按空参数下发：{str(arguments_str)[:120]}"
-            )
-            parsed_arguments = {}
-        # FunctionCall.args 必须是 dict：合法 JSON 但非对象（如 "[1,2]"、"\"x\""）
-        # 会让主分支与 from_function_call 回退分支**同样**抛 ValidationError
-        # （旧实现两处都未兑底，异常直达客户端变 500）。与 Cookie 通道
-        # _parse_function_args 的防御口径对齐：非 dict 一律归一为 {}。
-        if not isinstance(parsed_arguments, dict):
-            print(
-                f"⚠️ [工具调用] 历史 tool_call 的 arguments 不是 JSON 对象，已按空参数下发："
-                f"{str(arguments_str)[:120]}"
-            )
-            parsed_arguments = {}
+        parsed_arguments = parse_tool_arguments(arguments_str, label="tool_call.function.arguments")
 
         explicit_sig, _ = signature_from_extra(tool_call)
         # One assistant message is one function-calling step: only its
@@ -277,7 +257,7 @@ def _assistant_tool_parts(
             )
         tool_parts.append(fc_part)
 
-    ordinary_parts = ordinary_parts_from_extra(message)
+    ordinary_parts = _restored_ordinary_parts(message)
     if ordinary_parts is None:
         ordinary_parts = []
         reasoning = getattr(message, "reasoning_content", None)
@@ -389,6 +369,16 @@ def _assistant_tool_parts(
     return parts
 
 
+def _restored_ordinary_parts(message: OpenAIMessage):
+    def images(thought=False):
+        # Use the normal media conversion once, without replaying metadata.
+        plain = message.model_copy(update={"extra_content": None, "reasoning_content": None,
+                                           "content": message.reasoning_content if thought else message.content})
+        return [part for part in _ordinary_message_parts(plain)[1]
+                if part.inline_data is not None or part.file_data is not None]
+    return ordinary_parts_from_extra(message, images)
+
+
 def _ordinary_message_parts(message: OpenAIMessage) -> tuple[str, list[types.Part]]:
     """Convert text/images/thoughts and attach an ordinary-part signature once."""
     role = message.role
@@ -404,7 +394,7 @@ def _ordinary_message_parts(message: OpenAIMessage) -> tuple[str, list[types.Par
     if current_gemini_role not in SUPPORTED_ROLES:
         current_gemini_role = "user"
 
-    exact_ordinary_parts = ordinary_parts_from_extra(message)
+    exact_ordinary_parts = _restored_ordinary_parts(message)
     if exact_ordinary_parts is not None:
         parts.extend(exact_ordinary_parts)
 
@@ -875,6 +865,7 @@ def process_gemini_response_to_openai_dict(
                 fc = getattr(part, "function_call", None)
                 sig = signature_bytes(part, fc)
                 if fc is not None:
+                    arguments = complete_function_arguments(fc)
                     missing_state = (
                         SignatureState.UNSIGNED_FOLLOWER
                         if tool_index > 0
@@ -888,7 +879,7 @@ def process_gemini_response_to_openai_dict(
                         "type": "function",
                         "function": {
                             "name": fc.name,
-                            "arguments": json.dumps(fc.args or {}),
+                            "arguments": json.dumps(arguments, ensure_ascii=False, allow_nan=False),
                         },
                     }
                     attach_signature_extra(tool_payload, sig)
@@ -906,17 +897,17 @@ def process_gemini_response_to_openai_dict(
                     text_value is None
                     and getattr(part, "inline_data", None) is not None
                 ):
-                    # ordinary_parts 的唯一消费端（round-trip 重建）会拒绝含
-                    # data: 图片的列表——这里再编码一遍 base64 只会让每个生图
-                    # 回合的响应体积翻倍且无人使用（正文 content 已有同一张图
-                    # 的 markdown，2026-10 修复）。file_data 的 URI 很短，保留。
-                    text_value = "[image]"
+                    # The image is stored in content; metadata only records its slot.
+                    text_value = ""
                 elif (
                     text_value is None and getattr(part, "file_data", None) is not None
                 ):
                     text_value = f"![Image]({part.file_data.file_uri})"
                 text_value = "" if text_value is None else str(text_value)
-                if is_thought:
+                if getattr(part, "inline_data", None) is not None or getattr(part, "file_data", None) is not None:
+                    ordinary_kind = "image"
+                    text_value = ""
+                elif is_thought:
                     ordinary_kind = "thought"
                 elif text_value == "" and sig:
                     ordinary_kind = "signature_only"
@@ -924,7 +915,7 @@ def process_gemini_response_to_openai_dict(
                     ordinary_kind = "text"
                 ordinary_index = len(ordinary_metadata)
                 ordinary_metadata.append(
-                    ordinary_part_metadata(ordinary_kind, text_value, sig)
+                    ordinary_part_metadata(ordinary_kind, text_value, sig, thought=is_thought)
                 )
                 order_descriptors.append({"type": "ordinary", "index": ordinary_index})
                 if sig:

@@ -4,6 +4,8 @@ from starlette.background import BackgroundTask
 from models import OpenAIRequest
 from auth import get_api_key, get_api_key_flexible
 
+from channel_capabilities import cookie_feature_error
+
 import asyncio
 import hashlib
 import json
@@ -71,12 +73,9 @@ def _fallback_eligible_code(code) -> bool:
 
 
 def _structured_locks_express(request_obj: OpenAIRequest) -> bool:
-    """结构化输出在 Cookie 私有协议未验证前只允许走 Express。"""
-    return bool(
-        request_obj.response_format
-        and request_obj.response_format.get("type") not in (None, "text")
-        and not app_state.get_setting("cookie_structured_output", False)
-    )
+    """Requests with unsupported Cookie features must stay on Express."""
+    return bool(cookie_feature_error(
+        request_obj, structured_output=app_state.get_setting("cookie_structured_output", False)))
 
 
 def _express_manager(fastapi_request: Request):
@@ -336,16 +335,12 @@ async def _call_upstream(request_obj: OpenAIRequest, fastapi_request: Request):
             if app_state.get_channel_mode() == "mixed":
                 # 结构化输出默认只选 Express（Cookie 私有协议未验证）；控制台
                 # 打开 cookie_structured_output 后 Cookie 记录同样参与选择。
-                structured = bool(
-                    request_obj.response_format
-                    and request_obj.response_format.get("type") not in (None, "text")
-                    and not app_state.get_setting("cookie_structured_output", False)
-                )
+                structured = _structured_locks_express(request_obj)
                 record = credential_manager.get_mixed_record(
                     fastapi_request.app.state.express_key_manager, express_only=structured)
                 if record is None:
                     return JSONResponse(status_code=401, content=create_openai_error_response(
-                        401, "没有可用的上游账号。请启用 Express Key 或填写完整的 Cookie 与 Project ID；结构化输出需要 Express Key。",
+                        401, "没有可用的上游账号。请启用 Express Key 或填写完整的 Cookie 与 Project ID；结构化输出（未开启 Cookie 支持）、多候选与 logprobs 请求需要 Express Key。",
                         "authentication_error"))
                 upstream = cookie_upstream if record["channel"] == "cookie" else express_upstream
                 _note_channel(record["channel"])

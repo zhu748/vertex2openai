@@ -9,7 +9,7 @@ import model_capabilities as mc
 from models import OpenAIRequest, normalize_content_part
 from runtime_state import app_state
 from schema_validation import sanitize_for_gemini
-from tool_policy import is_builtin_search_name, is_builtin_search_tool, normalized_tool_name
+from tool_policy import is_builtin_search_tool, is_forced_builtin_search
 
 
 _TEXT_SAFETY_CATEGORIES = (
@@ -104,7 +104,7 @@ def _response_format(request: OpenAIRequest) -> dict[str, Any]:
 def _function_tools(request: OpenAIRequest) -> list[dict]:
     declarations = []
     for tool in request.tools or []:
-        function = tool.get("function") if tool.get("type") == "function" else None
+        function = tool.get("function") if tool.get("type") in (None, "function") else None
         if not function or not function.get("name"):
             continue
         declaration = {
@@ -125,7 +125,7 @@ def _tool_choice(choice: str | dict | None) -> dict:
     if isinstance(choice, str):
         mode = {"none": "NONE", "auto": "AUTO", "required": "ANY"}.get(choice.lower())
         return {"function_calling_config": {"mode": mode}} if mode else {}
-    if isinstance(choice, dict) and choice.get("type") == "function":
+    if isinstance(choice, dict) and choice.get("type") in (None, "function"):
         name = (choice.get("function") or {}).get("name")
         if name:
             return {"function_calling_config": {"mode": "ANY", "allowed_function_names": [name]}}
@@ -195,8 +195,7 @@ def create_generation_config(request: OpenAIRequest) -> dict[str, Any]:
         tools = [] if disabled else _function_tools(request)
         declared_names = {declaration["name"] for tool in tools
                           for declaration in tool.get("function_declarations", [])}
-        choice_name = normalized_tool_name(request.tool_choice) if isinstance(request.tool_choice, dict) else ""
-        forced_search = bool(choice_name and is_builtin_search_name(choice_name) and choice_name not in declared_names)
+        forced_search = is_forced_builtin_search(request)
         declared_search = any(is_builtin_search_tool(tool) for tool in request.tools or [])
         if disabled:
             tools = []

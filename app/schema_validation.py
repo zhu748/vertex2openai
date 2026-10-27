@@ -53,6 +53,9 @@ def validate_json_schema(schema: Any, *, label: str = "schema") -> None:
             raise SchemaValidationError(f"{label} contains a circular reference at {path}")
         active.add(ident)
         try:
+            for key in ("description", "title", "format"):
+                if key in node and not isinstance(node[key], str):
+                    raise SchemaValidationError(f"{path}.{key} must be a string")
             raw_type = node.get("type")
             types = raw_type if isinstance(raw_type, list) else [raw_type]
             if raw_type is not None:
@@ -110,6 +113,12 @@ def validate_request_schemas(request: Any) -> None:
             raise SchemaValidationError(f"tools[{index}].function.name must be a non-empty string")
         if any(ord(char) < 32 or ord(char) == 127 for char in name):
             raise SchemaValidationError(f"tools[{index}].function.name must not contain control characters")
+        description = function.get("description")
+        if description is not None and not isinstance(description, str):
+            raise SchemaValidationError(f"tools[{index}].function.description must be a string")
+        strict = function.get("strict")
+        if strict is not None and not isinstance(strict, bool):
+            raise SchemaValidationError(f"tools[{index}].function.strict must be a boolean")
         parameters = function.get("parameters")
         if parameters is not None:
             validate_json_schema(parameters, label=f"tools[{index}].function.parameters")

@@ -7,7 +7,7 @@ import re
 import time
 from typing import Any, AsyncGenerator, Optional
 
-from response_validation import IncompleteResponseError
+from response_validation import IncompleteResponseError, complete_function_arguments
 from json_stream import MAX_JSON_OBJECT_BYTES, JsonObjects as _JsonObjects
 from signature_store import SignatureRecord, SignatureState, signature_store
 from thought_signatures import (
@@ -234,7 +234,11 @@ def extract_events(obj: dict, *, preserve_parts: bool = False):
                 yield ("blocked", msg)
 
         candidates = _wire_list(data.get("candidates"), "candidates")
+        if len(candidates) > 1:
+            raise IncompleteResponseError("Cookie 上游返回多个候选，当前桥接无法无损转换。")
         for candidate in candidates:
+            if isinstance(candidate, dict) and candidate.get("index", 0) not in (None, 0):
+                raise IncompleteResponseError("Cookie 上游返回非零候选索引，当前桥接无法无损转换。")
             candidate = _wire_object(candidate, "candidate", allow_null=False)
             content_obj = _wire_object(candidate.get("content"), "content")
             parts = _wire_list(content_obj.get("parts"), "parts")
@@ -268,6 +272,7 @@ def extract_events(obj: dict, *, preserve_parts: bool = False):
                         raise IncompleteResponseError("上游 functionCall.id 必须是字符串。")
                     args = function_call.get("args")
                     args = _wire_object(args, "functionCall.args")
+                    complete_function_arguments(function_call)
                     native_part["functionCall"] = {"name": name, "args": args}
                     if call_id:
                         native_part["functionCall"]["id"] = call_id

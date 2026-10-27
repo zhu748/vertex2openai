@@ -7,12 +7,14 @@ from typing import Any, Optional
 
 import config as app_config
 import model_capabilities as mc
+from channel_capabilities import COOKIE_STRUCTURED_OUTPUT_DISABLED_MESSAGE, cookie_feature_error
 from cookie_auth import (
     STREAM_GENERATE_OPERATION_NAME,
     get_client_version,
     get_stream_query_signature,
 )
 from media_tasks import run_media_task
+from tool_arguments import parse_tool_arguments
 from message_processing import _coerce_tool_response, openai_content_to_wire_parts
 from models import OpenAIRequest, normalize_content_part
 from runtime_state import app_state
@@ -28,19 +30,12 @@ from thought_signatures import (
 )
 from tool_policy import (
     has_search_suffix,
-    is_builtin_search_name,
+    is_forced_builtin_search,
     is_builtin_search_tool,
     normalized_tool_name,
     search_suffix_has_priority,
 )
 
-# Cookie 通道结构化输出未开启时的统一拒绝文案（cookie_proxy 的快速失败
-# 与 build_request_body 的构造侧共用同一事实源，避免两处漂移）。
-COOKIE_STRUCTURED_OUTPUT_DISABLED_MESSAGE = (
-    "Cookie 通道默认不启用结构化输出：batchGraphql 私有协议的接受度未经真机验证。"
-    "请先运行 scripts/probe_cookie_structured_output.py 探测，通过后在控制台打开"
-    " cookie_structured_output，或改用 Express 通道模型。"
-)
 
 
 def _get_experiment_flags() -> str:
@@ -184,7 +179,7 @@ def classify_tool_traffic(messages: list, tools: Any = None) -> dict:
             continue
         fn = t.get("function") if isinstance(t.get("function"), dict) else {}
         name = str(fn.get("name") or t.get("name") or t.get("type") or "").strip()
-        if is_builtin_search_tool(t, include_function_aliases=True):
+        if is_builtin_search_tool(t):
             builtin_search = True
         elif name:
             custom_names.append(name)
@@ -263,7 +258,7 @@ def _build_function_declarations(tools: Any) -> tuple[list[dict], bool]:
     for tool in tools or []:
         if not isinstance(tool, dict):
             continue
-        if is_builtin_search_tool(tool, include_function_aliases=True):
+        if is_builtin_search_tool(tool):
             builtin_search = True
             continue
         name = normalized_tool_name(tool)
@@ -297,7 +292,7 @@ def _build_tool_config(tool_choice: Any, function_names: list[str]) -> Optional[
         # OpenAI alias in allowedFunctionNames makes the wire config self-invalid.
         allowed = (
             None
-            if (name and is_builtin_search_name(name))
+            if name not in function_names
             else ([name] if name else (function_names or None))
         )
     else:
@@ -329,15 +324,7 @@ def _plain_text_of(content: Any) -> str:
 
 
 def _parse_function_args(value: Any) -> dict:
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, str):
-        try:
-            parsed = json.loads(value)
-            return parsed if isinstance(parsed, dict) else {}
-        except json.JSONDecodeError:
-            return {}
-    return {}
+    return parse_tool_arguments(value, label="tool_call.function.arguments")
 
 
 def _ordinary_wire_parts_from_extra(message: Any) -> Optional[list[dict]]:
@@ -346,14 +333,31 @@ def _ordinary_wire_parts_from_extra(message: Any) -> Optional[list[dict]]:
     if not isinstance(raw, list):
         return None
     parts = []
+    images = {}
+    image_indices = {False: 0, True: 0}
     for item in raw:
         if (not isinstance(item, dict) or not isinstance(item.get("kind"), str)
-                or item["kind"] not in {"text", "thought", "signature_only"}):
+                or item["kind"] not in {"text", "thought", "signature_only", "image"}):
             return None
         text = item.get("text")
         if not isinstance(text, str) or (item["kind"] == "text" and "data:image/" in text):
             return None
         part = {"text": text}
+        if item["kind"] == "image" or (item["kind"] in {"text", "thought"} and text == "[image]"):
+            thought = item["kind"] == "thought" or item.get("thought") is True
+            if thought not in images:
+                field = "reasoning_content" if thought else "content"
+                content = message.get(field) if isinstance(message, dict) else getattr(message, field, None)
+                images[thought] = [p for p in openai_content_to_wire_parts(content)
+                                   if "inlineData" in p or "fileData" in p]
+            index = image_indices[thought]
+            if index < len(images[thought]):
+                part = dict(images[thought][index])
+                image_indices[thought] += 1
+                if thought:
+                    part["thought"] = True
+            elif item["kind"] == "image":
+                return None
         if item["kind"] == "thought":
             part["thought"] = True
         if item.get("thought_signature"):
@@ -572,6 +576,9 @@ def build_request_body(
     force_search: bool = False,
     native_tools: bool = True,
 ) -> dict:
+    error = cookie_feature_error(request, structured_output=app_state.get_setting("cookie_structured_output", False))
+    if error:
+        raise SchemaValidationError(error)
     contents, system_text = _convert_messages_to_contents(
         request.messages, model_name=model_name, native_tools=native_tools
     )
@@ -693,11 +700,10 @@ def build_request_body(
     # googleSearch are each supported, but mixing them in one request is rejected:
     # "Multiple tools are supported only when they are all search tools." Choose a
     # single upstream mode deterministically instead of sending a doomed payload.
-    choice_name = normalized_tool_name(request.tool_choice) if isinstance(request.tool_choice, dict) else ""
-    forced_search = bool(choice_name and is_builtin_search_name(choice_name))
+    forced_search = is_forced_builtin_search(request)
     tools_disabled = isinstance(request.tool_choice, str) and request.tool_choice.lower() == "none"
     prefer_search = forced_search or search_suffix_has_priority(request)
-    declared_search = any(is_builtin_search_tool(tool, include_function_aliases=True)
+    declared_search = any(is_builtin_search_tool(tool)
                           for tool in request.tools or [])
     declarations = []
     # Skip recursive Studio Schema conversion for functions that cannot be

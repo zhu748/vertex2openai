@@ -370,12 +370,12 @@ class NonStreamResponseTests(unittest.TestCase):
         self.assertEqual(block["name"], "get_weather")
         self.assertEqual(block["input"], {"city": "Beijing"})
         self.assertEqual(out["stop_reason"], "tool_use")
-        # arguments 非法 JSON → {"value": 原文}；缺 id → 兜底 toolu_ 前缀
-        out = openai_completion_to_anthropic(self.completion(
-            content="",
-            tool_calls=[{"type": "function",
-                         "function": {"name": "f", "arguments": "not-json"}}]), "m", "msg_4")
-        self.assertEqual(out["content"][0]["input"], {"value": "not-json"})
+        # Invalid upstream JSON must fail instead of inventing a different input.
+        with self.assertRaises(cp.IncompleteResponseError):
+            openai_completion_to_anthropic(self.completion(content="", tool_calls=[{
+                "type": "function", "function": {"name": "f", "arguments": "not-json"}}]), "m", "msg_4")
+        out = openai_completion_to_anthropic(self.completion(content="", tool_calls=[{
+            "type": "function", "function": {"name": "f", "arguments": "{}"}}]), "m", "msg_5")
         self.assertTrue(out["content"][0]["id"].startswith("toolu_"))
 
     def test_empty_text_block_when_no_content_and_no_tools(self):
