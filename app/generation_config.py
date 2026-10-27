@@ -9,6 +9,7 @@ import model_capabilities as mc
 from models import OpenAIRequest, normalize_content_part
 from runtime_state import app_state
 from schema_validation import sanitize_for_gemini
+from tool_policy import is_builtin_search_name, is_builtin_search_tool, normalized_tool_name
 
 
 _TEXT_SAFETY_CATEGORIES = (
@@ -24,7 +25,6 @@ _IMAGE_SAFETY_CATEGORIES = (
     "IMAGE_HARASSMENT",
     "IMAGE_SEXUALLY_EXPLICIT",
 )
-_IMAGE_SEARCH_NAMES = {"google_search", "googlesearch", "web_search", "websearch", "search"}
 
 
 def _system_instruction(request: OpenAIRequest) -> str | None:
@@ -123,7 +123,7 @@ def _function_tools(request: OpenAIRequest) -> list[dict]:
 
 def _tool_choice(choice: str | dict | None) -> dict:
     if isinstance(choice, str):
-        mode = {"none": "NONE", "auto": "AUTO", "required": "ANY"}.get(choice)
+        mode = {"none": "NONE", "auto": "AUTO", "required": "ANY"}.get(choice.lower())
         return {"function_calling_config": {"mode": mode}} if mode else {}
     if isinstance(choice, dict) and choice.get("type") == "function":
         name = (choice.get("function") or {}).get("name")
@@ -150,10 +150,8 @@ def _configure_images(config: dict, request: OpenAIRequest, settings: dict, prof
         config.pop(key, None)
 
     # 生图仅保留明确声明且未被禁用的搜索，不下发自定义函数。
-    declared_search = any(
-        str((tool.get("function") or {}).get("name") or "").lower() in _IMAGE_SEARCH_NAMES
-        for tool in request.tools or []
-    )
+    declared_search = any(is_builtin_search_tool(tool, include_function_aliases=True)
+                          for tool in request.tools or [])
     disabled = isinstance(request.tool_choice, str) and request.tool_choice.lower() == "none"
     return (
         [{"google_search": {}}] if declared_search and not disabled and profile.get("supports_search") else []
@@ -191,7 +189,21 @@ def create_generation_config(request: OpenAIRequest) -> dict[str, Any]:
     if profile["is_image"]:
         tools = _configure_images(config, request, settings, profile)
     else:
-        tools = _function_tools(request)
+        disabled = isinstance(request.tool_choice, str) and request.tool_choice.lower() == "none"
+        # Validation already checks client schemas. Do not convert them again
+        # when the request explicitly disables every tool.
+        tools = [] if disabled else _function_tools(request)
+        declared_names = {declaration["name"] for tool in tools
+                          for declaration in tool.get("function_declarations", [])}
+        choice_name = normalized_tool_name(request.tool_choice) if isinstance(request.tool_choice, dict) else ""
+        forced_search = bool(choice_name and is_builtin_search_name(choice_name) and choice_name not in declared_names)
+        declared_search = any(is_builtin_search_tool(tool) for tool in request.tools or [])
+        if disabled:
+            tools = []
+        elif forced_search:
+            tools = [{"google_search": {}}] if profile["supports_search"] else []
+        elif declared_search and profile["supports_search"]:
+            tools.append({"google_search": {}})
         for key, default_key in (
             ("temperature", "default_temperature"),
             ("top_p", "default_top_p"),
@@ -200,7 +212,7 @@ def create_generation_config(request: OpenAIRequest) -> dict[str, Any]:
             if config.get(key) is None and settings.get(default_key) is not None:
                 config[key] = settings[default_key]
         tool_config = _tool_choice(request.tool_choice)
-        if tool_config:
+        if tool_config and not disabled and not forced_search and declared_names:
             config["tool_config"] = tool_config
 
     mc.sanitize_sampling(config, profile)

@@ -241,14 +241,13 @@ def _build_chunk_payload(
                 tool_call_deltas.append(tc)
 
         # Google often emits the functionCall in one chunk and a final STOP in a
-        # later empty chunk. Once this candidate has produced any tool call, the
-        # OpenAI finish reason for that turn must remain tool_calls.
-        if (
-            openai_finish_reason == "stop"
-            and indexer
-            and indexer.has_tool_calls(output_index)
-        ):
-            openai_finish_reason = "tool_calls"
+        # later empty chunk. Normal completion after any call must remain
+        # tool_calls; truncation and filtering
+        # must survive so clients do not execute an incomplete tool request.
+        if tool_call_deltas or (indexer and indexer.has_tool_calls(output_index)):
+            openai_finish_reason = map_finish_reason_to_openai(
+                raw_gemini_finish_reason, default=None, has_tool_calls=True
+            )
 
         if tool_call_deltas:
             delta_payload["tool_calls"] = tool_call_deltas

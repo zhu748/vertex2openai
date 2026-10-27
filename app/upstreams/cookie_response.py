@@ -19,7 +19,7 @@ from thought_signatures import (
 
 
 def _stable_cookie_tool_call_id(response_id: str, call_index: int, name: str, args: Any) -> str:
-    """Generate deterministic OpenAI ids because batchGraphql functionCall has no id."""
+    """Generate a deterministic fallback when batchGraphql omits a call id."""
     canonical = json.dumps(args or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(f"{response_id}\0{call_index}\0{name}\0{canonical}".encode()).hexdigest()[:20]
     return f"call_{digest}"
@@ -56,7 +56,7 @@ def apply_wire_signature(data: dict, ordinary_metadata: list, part_order: list) 
 
 def openai_tool_call(response_id: str, call_index: int, call: dict) -> dict:
     name, args = call["name"], call.get("args") or {}
-    call_id = _stable_cookie_tool_call_id(response_id, call_index, name, args)
+    call_id = call.get("id") or _stable_cookie_tool_call_id(response_id, call_index, name, args)
     signature = signature_bytes_from_wire(call.get("thought_signature"))
     if signature:
         signature_store.put_record(call_id, SignatureRecord(SignatureState.SIGNED, signature))
@@ -263,15 +263,21 @@ def extract_events(obj: dict, *, preserve_parts: bool = False):
                 if name is not None and not isinstance(name, str):
                     raise IncompleteResponseError("上游 functionCall.name 必须是字符串。")
                 if name and name.strip():
+                    call_id = function_call.get("id")
+                    if call_id is not None and not isinstance(call_id, str):
+                        raise IncompleteResponseError("上游 functionCall.id 必须是字符串。")
                     args = function_call.get("args")
                     args = _wire_object(args, "functionCall.args")
                     native_part["functionCall"] = {"name": name, "args": args}
+                    if call_id:
+                        native_part["functionCall"]["id"] = call_id
                     if not preserve_parts:
                         yield (
                             "function_call",
                             {
                                 "name": name,
                                 "args": args,
+                                **({"id": call_id} if call_id else {}),
                                 "thought_signature": part.get("thoughtSignature") or None,
                             },
                         )

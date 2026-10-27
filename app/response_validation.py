@@ -18,25 +18,28 @@ FINISH_TRUNCATING = ("MAX_TOKENS",) + FINISH_CONTENT_FILTER
 FINISH_KNOWN = ("STOP",) + FINISH_TRUNCATING + FINISH_TOOL_CALLS
 
 
-def map_finish_reason_to_openai(raw: object, default: Optional[str] = "stop") -> Optional[str]:
+def map_finish_reason_to_openai(
+    raw: object, default: Optional[str] = "stop", *, has_tool_calls: bool = False
+) -> Optional[str]:
     """Gemini finishReason（SDK 枚举或字符串）→ OpenAI finish_reason。
 
     未知或缺失的原因返回 default：流式路径传 None 保持缺省，
-    非流式与 Cookie 通道传 "stop"。
+    非流式与 Cookie 通道传 "stop"。has_tool_calls 将普通完成改为
+    tool_calls，截断和内容过滤原因保持不变。
     """
     if hasattr(raw, "name"):
         value = str(raw.name).upper()
     else:
         value = str(raw or "").upper()
     if value == "STOP":
-        return "stop"
+        return "tool_calls" if has_tool_calls else "stop"
     if value == "MAX_TOKENS":
         return "length"
     if value in FINISH_CONTENT_FILTER:
         return "content_filter"
     if value in FINISH_TOOL_CALLS:
         return "tool_calls"
-    return default
+    return "tool_calls" if has_tool_calls and default == "stop" else default
 
 
 class PendingMetadataGate:
@@ -64,6 +67,7 @@ class PendingMetadataGate:
         """取出并清空已缓冲的元数据（保持原顺序）。"""
         items = self.items
         self.items = []
+        self._bytes = 0
         return items
 
 
@@ -100,7 +104,8 @@ def require_unblocked_response(response) -> None:
     """三种 SDK 交付模式共用的请求拦截检查，统一保留上游原因。"""
     feedback = getattr(response, "prompt_feedback", None)
     reason = getattr(feedback, "block_reason", None)
-    if reason:
+    value = str(getattr(reason, "value", reason) or "").upper()
+    if value and not value.endswith("UNSPECIFIED"):
         message = f"请求被上游安全策略拦截：{reason}"
         detail = getattr(feedback, "block_reason_message", None)
         if detail:

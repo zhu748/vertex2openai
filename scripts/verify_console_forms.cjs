@@ -7,7 +7,7 @@ const {JSDOM,VirtualConsole}=require('jsdom');
 const root=path.resolve(__dirname,'..');
 const tick=()=>new Promise(r=>setTimeout(r,20));
 async function main(){
- const errors=[],requests=[];
+ const errors=[],requests=[],clipboard=[];
  const virtualConsole=new VirtualConsole();virtualConsole.on('jsdomError',e=>errors.push(e.message));
  const dom=new JSDOM(fs.readFileSync(path.join(root,'app/templates/dashboard.html'),'utf8'),{url:'http://console.test/',runScripts:'dangerously',pretendToBeVisual:true,virtualConsole});
  const w=dom.window,d=w.document;
@@ -17,6 +17,7 @@ async function main(){
  let mode='mixed';
  let keys=[{key:'ui-fixture-key',project_id:'project-one',note:'主账号',enabled:true,proxies:[],proxy_fallback:true}];
  let cookies=[{id:'cookie-one',project_id:'project-cookie',note:'备用账号',enabled:true,cookie_configured:true,proxies:[],proxy_fallback:true}];
+ let savedCookie='SAPISID=ui-cookie-secret; SID=ui-cookie-sid';
  const cap={family:'3',thinking:{kind:'level',levels:['low','medium','high']},supports_anti_truncation:true,supports_search:true,image_sizes:['1K','2K','4K'],image_aspect_ratios:['1:1','16:9']};
  const summary={connections:1,generations:1,background:0,retry_wait:0,active:1};
  const record={id:'trace-1234567890abcdef',model:'text',protocol:'openai',channel:'express',mode:'stream',phase:'streaming',status:'running',connection:'open',created_at:Date.now()/1000,duration_ms:1000,timings:{},attempts:1,retries:0,finish_reasons:[],usage:{},events:[],logs:[]};
@@ -25,6 +26,8 @@ async function main(){
  w.AbortSignal=AbortSignal;w.AbortController=AbortController;w.matchMedia=()=>({matches:false});w.scrollTo=({top})=>{scrollPosition=top;};w.HTMLElement.prototype.scrollIntoView=()=>{};w.confirm=()=>true;
  w.CSS={escape:s=>s};w.HTMLDialogElement.prototype.showModal=function(){this.open=true;};w.HTMLDialogElement.prototype.close=function(){this.open=false;this.dispatchEvent(new w.Event('close'));};
  w.EventSource=class {close(){}};
+ const clipboardAPI={writeText:async value=>{clipboard.push(value);}};
+ Object.defineProperty(w.navigator,'clipboard',{configurable:true,value:clipboardAPI});
  w.fetch=async(url,options={})=>{
   const target=new URL(url,w.location.href),method=options.method||'GET',body=options.body?JSON.parse(options.body):null;requests.push({path:target.pathname,query:target.search,method,body});
   const intercepted=transport?.(target,options);if(intercepted!==undefined)return intercepted;
@@ -35,6 +38,7 @@ async function main(){
   else if(target.pathname.startsWith('/api/model-overrides/')){const model=target.pathname.split('/').pop();if(method==='DELETE')delete overrides[model];else{const current={...overrides[model]};for(const key of body._inherit||[])delete current[key];Object.assign(current,Object.fromEntries(Object.entries(body).filter(([k])=>k!=='_inherit')));overrides[model]=current;}result={override:{...builtins[model],...overrides[model]}};}
   else if(target.pathname==='/api/express-keys'){if(body)keys=body.keys;result={keys};}
   else if(target.pathname==='/api/cookie-accounts'){if(body)cookies=body.accounts;result={accounts:cookies};}
+  else if(target.pathname==='/api/cookie-accounts/reveal')result={id:body.id,cookie:savedCookie};
   else if(target.pathname==='/api/cookie-accounts/refresh'){
    const results=cookies.filter(rec=>rec.enabled!==false&&(!body.id||rec.id===body.id)).map(rec=>({id:rec.id,label:rec.note,status:'unchanged',changed:[],detail:'无新令牌 <img src=x onerror="window.refreshInjected=true">'}));
    result={results,total:results.length,refreshed:0,unchanged:results.length,errors:0};
@@ -65,6 +69,46 @@ async function main(){
   assert.equal(el('keys-list').querySelector('details').open,false);
   assert.equal(el('key-0').type,'password');
   console.log('✓ Navigation, initial clean state, account masking/collapse, recent metrics');
+
+  w.switchTab('channel');
+  let cookieRow=el('cookies-list').firstElementChild;
+  const cookiePreview=()=>el('cookies-list').querySelector('.cookie-secret-preview');
+  assert.equal(cookiePreview().hidden,true);assert.equal(cookiePreview().value,'');
+  assert.equal(el('cookie-0').value,'');assert(!d.body.innerHTML.includes(savedCookie));
+  cookieRow.querySelector('.c-cookie-reveal').click();await tick();
+  assert.equal(cookiePreview().value,savedCookie);assert.equal(cookiePreview().readOnly,true);
+  assert.equal(cookiePreview().hidden,false);assert.equal(w.consoleForms.dirty(),false);
+  assert.deepEqual(requests.filter(r=>r.path==='/api/cookie-accounts/reveal').at(-1).body,{id:'cookie-one'});
+  cookieRow.querySelector('.c-cookie-reveal').click();
+  assert.equal(cookiePreview().hidden,true);assert.equal(cookiePreview().value,'');
+  savedCookie='SAPISID=ui-cookie-refreshed; SID=ui-cookie-sid';
+  cookieRow.querySelector('.c-cookie-copy').click();await tick();
+  assert.equal(clipboard.at(-1),savedCookie);assert.equal(cookiePreview().hidden,true);
+  assert.equal(el('cookie-0').value,'');assert.equal(w.consoleForms.dirty(),false);
+  Object.defineProperty(w.navigator,'clipboard',{configurable:true,value:undefined});
+  d.execCommand=command=>{assert.equal(command,'copy');clipboard.push(d.activeElement.value);return true;};
+  cookieRow.querySelector('.c-cookie-copy').click();await tick();
+  assert.equal(clipboard.at(-1),savedCookie);assert.equal(cookiePreview().hidden,true);
+  d.execCommand=()=>false;
+  cookieRow.querySelector('.c-cookie-copy').click();await tick();
+  assert.equal(cookiePreview().hidden,false);assert.equal(cookiePreview().selectionStart,0);
+  assert.equal(cookiePreview().selectionEnd,savedCookie.length);
+  assert(el('toast').textContent.includes('手动复制'));assert.equal(w.consoleForms.dirty(),false);
+  cookieRow.querySelector('.c-cookie-reveal').click();
+  Object.defineProperty(w.navigator,'clipboard',{configurable:true,value:clipboardAPI});
+  transport=target=>{if(target.pathname==='/api/cookie-accounts/reveal'){transport=null;return new Response('{}',{status:401});}};
+  cookieRow.querySelector('.c-cookie-reveal').click();await tick();
+  assert.equal(cookiePreview().value,'');assert(el('toast').textContent.includes('登录已过期'));
+  let resolveReveal;
+  transport=target=>{if(target.pathname==='/api/cookie-accounts/reveal'){transport=null;return new Promise(resolve=>{resolveReveal=resolve;});}};
+  cookieRow.querySelector('.c-cookie-copy').click();await tick();
+  const copiesBeforeRemoval=clipboard.length;
+  w.removeCookieAccount(0);
+  resolveReveal(new Response(JSON.stringify({id:'cookie-one',cookie:savedCookie}),{status:200}));await tick();
+  assert.equal(clipboard.length,copiesBeforeRemoval);
+  w.consoleForms.discard('cookies');assert.equal(w.consoleForms.dirty(),false);
+  assert.equal(cookiePreview().hidden,true);assert.equal(cookiePreview().value,'');
+  console.log('✓ Saved Cookie reveal/hide/copy, HTTP clipboard fallback, session errors and stale-row isolation');
 
   w.switchTab('channel');edit('key-note-0','切换保留 Key 草稿');edit('cookie-note-0','切换保留 Cookie 草稿');
   const credentialWrites=requests.filter(r=>r.method==='POST'&&['/api/express-keys','/api/cookie-accounts'].includes(r.path)).length;

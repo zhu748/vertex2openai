@@ -43,6 +43,13 @@ class FirstReplyTests(unittest.IsolatedAsyncioTestCase):
         self.stats = ProxyStats()
         for patch in (
             mock.patch.object(first_reply, "timeout_seconds", return_value=.02),
+            # The SDK adapter imports this function into its own module. Follow
+            # the shared mock dynamically so per-test overrides to zero still
+            # disable deadlines instead of waiting for the real 15s default.
+            mock.patch.object(api_helpers, "timeout_seconds",
+                              side_effect=lambda model: first_reply.timeout_seconds(model)),
+            mock.patch.object(cookie_transport, "timeout_seconds",
+                              side_effect=lambda model: first_reply.timeout_seconds(model)),
             mock.patch.object(api_helpers, "stats", self.stats),
             mock.patch.object(api_helpers.app_state, "get_setting", side_effect=lambda k, d=None: self.settings.get(k, d)),
         ):

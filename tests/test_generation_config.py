@@ -16,7 +16,9 @@ import config
 import generation_config
 import model_capabilities as mc
 from models import OpenAIRequest
+from request_validation import validate_openai_request
 from runtime_state import app_state
+from schema_validation import SchemaValidationError
 from upstreams.request_preparation import prepare_messages
 
 
@@ -25,6 +27,44 @@ def request(**kwargs):
 
 
 class GenerationConfigTests(unittest.TestCase):
+    def test_tool_choice_case_and_disabled_tools_match_cookie_channel(self):
+        tool = {"type": "function", "function": {"name": "lookup"}}
+        for choice, mode in (("AUTO", "AUTO"), ("REQUIRED", "ANY")):
+            with self.subTest(choice=choice):
+                result = generation_config.create_generation_config(request(tools=[tool], tool_choice=choice))
+                self.assertEqual(result["tool_config"]["function_calling_config"]["mode"], mode)
+        with mock.patch.object(generation_config, "_function_tools",
+                               wraps=generation_config._function_tools) as build:
+            disabled = generation_config.create_generation_config(request(tools=[tool], tool_choice="NONE"))
+        build.assert_not_called()
+        self.assertNotIn("tools", disabled)
+        self.assertNotIn("tool_config", disabled)
+
+    def test_native_search_tool_is_not_silently_dropped_or_configured_as_function(self):
+        for kind in ("web_search", "web_search_preview", "google_search"):
+            with self.subTest(kind=kind):
+                result = generation_config.create_generation_config(
+                    request(tools=[{"type": kind}], tool_choice="required"))
+                self.assertEqual(result["tools"], [{"google_search": {}}])
+                self.assertNotIn("tool_config", result)
+
+    def test_named_custom_search_function_keeps_its_custom_schema(self):
+        tool = {"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}}
+        result = generation_config.create_generation_config(request(tools=[tool], tool_choice=tool))
+        self.assertEqual(result["tools"][0]["function_declarations"][0]["name"], "search")
+        self.assertEqual(result["tool_config"]["function_calling_config"]["allowed_function_names"], ["search"])
+
+    def test_forced_builtin_search_has_no_undeclared_allowed_function_name(self):
+        result = generation_config.create_generation_config(
+            request(tool_choice={"type": "function", "function": {"name": "google_search"}}))
+        self.assertEqual(result["tools"], [{"google_search": {}}])
+        self.assertNotIn("tool_config", result)
+
+    def test_unknown_tool_choices_are_rejected_before_upstream(self):
+        for choice in ("sometimes", "required", {"type": "function", "function": {"name": "missing"}}):
+            with self.subTest(choice=choice), self.assertRaises(SchemaValidationError):
+                validate_openai_request(request(tool_choice=choice))
+
     def test_explicit_zero_and_token_alias_take_precedence_over_defaults(self):
         settings = dict(
             config.DEFAULT_SETTINGS, default_temperature=0.8, default_top_p=0.9, default_max_tokens=100

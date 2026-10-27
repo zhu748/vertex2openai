@@ -60,6 +60,109 @@
       return `<span class="pill" style="text-transform:none;color:#b45309" title="近期鉴权失败 ${health.failures} 次，再失败可能进入冷却">失败 ${health.failures} 次</span>`;
     return '';
   }
+  function cookieSecretControls(row, record, index) {
+    if (!record.id || !record.cookie_configured) return;
+    const input = row.querySelector('.c-cookie');
+    const actions = document.createElement('div');
+    actions.className = 'cookie-secret-actions';
+    const toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'secret-toggle c-cookie-reveal';
+    toggle.textContent = '显示 Cookie';
+    toggle.setAttribute('aria-expanded', 'false');
+    const copy = document.createElement('button');
+    copy.type = 'button';
+    copy.className = 'secret-toggle c-cookie-copy';
+    copy.textContent = '复制 Cookie';
+    const preview = document.createElement('textarea');
+    preview.id = 'cookie-saved-' + index;
+    preview.className = 'inp log cookie-secret-preview';
+    preview.rows = 3;
+    preview.readOnly = true;
+    preview.hidden = true;
+    preview.spellcheck = false;
+    preview.setAttribute('autocomplete', 'off');
+    preview.setAttribute('aria-label', '已保存的 Cookie ' + (index + 1));
+    // Viewing a credential must never turn it into a replacement draft or
+    // overwrite a newer value saved by automatic Cookie refresh.
+    preview.dataset.local = '';
+    toggle.setAttribute('aria-controls', preview.id);
+    actions.append(toggle, copy);
+    input.after(actions, preview);
+    let busy = false;
+    const show = (cookie) => {
+      preview.value = cookie;
+      preview.hidden = false;
+      toggle.textContent = '隐藏 Cookie';
+      toggle.setAttribute('aria-expanded', 'true');
+    };
+    const hide = () => {
+      preview.value = '';
+      preview.hidden = true;
+      toggle.textContent = '显示 Cookie';
+      toggle.setAttribute('aria-expanded', 'false');
+    };
+    async function useCookie(action) {
+      if (busy) return;
+      if (action === 'show' && !preview.hidden) {
+        hide();
+        return;
+      }
+      busy = true;
+      toggle.disabled = copy.disabled = true;
+      actions.setAttribute('aria-busy', 'true');
+      try {
+        const response = await fetch('/api/cookie-accounts/reveal', {
+          method: 'POST',
+          cache: 'no-store',
+          signal: AbortSignal.timeout(15000),
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: record.id })
+        });
+        const result = await response.json();
+        if (!response.ok)
+          throw new Error(await responseError(response, '读取 Cookie 失败', result));
+        if (!row.isConnected) return;
+        if (result.id !== record.id || typeof result.cookie !== 'string' || !result.cookie)
+          throw new Error('读取响应缺少该账号的 Cookie，请重新加载配置');
+        if (action === 'show') {
+          show(result.cookie);
+          return;
+        }
+        if (!preview.hidden) preview.value = result.cookie;
+        try {
+          await navigator.clipboard.writeText(result.cookie);
+          toast('Cookie 已复制');
+        } catch {
+          // Ordinary HTTP sites may not expose the Clipboard API.
+          const wasHidden = preview.hidden;
+          const focused = document.activeElement;
+          show(result.cookie);
+          preview.focus({ preventScroll: true });
+          preview.select();
+          let copied = false;
+          try {
+            copied = document.execCommand('copy');
+          } catch {}
+          if (copied) {
+            if (wasHidden) hide();
+            focused?.focus({ preventScroll: true });
+            toast('Cookie 已复制');
+          } else {
+            toast('自动复制不可用，已选中 Cookie，请手动复制');
+          }
+        }
+      } catch (error) {
+        if (row.isConnected) toast('❌ ' + error.message);
+      } finally {
+        busy = false;
+        toggle.disabled = copy.disabled = false;
+        actions.removeAttribute('aria-busy');
+      }
+    }
+    toggle.addEventListener('click', () => useCookie('show'));
+    copy.addEventListener('click', () => useCookie('copy'));
+  }
   function renderCookieAccounts() {
     if (!$('cookies-list')) return; // 分区尚未随页面就绪时保持静默（缓存旧文档/升级中）
     window.consoleForms?.rememberAccounts('cookie');
@@ -84,6 +187,9 @@
     </div>`
     ).join('');
     window.consoleForms?.accounts('cookie');
+    [...$('cookies-list').children].forEach((row, index) =>
+      cookieSecretControls(row, COOKIE_ACCOUNTS[index], index)
+    );
     $('cookies-count').textContent = COOKIE_ACCOUNTS.length + ' 个';
     $('cookies-empty').classList.toggle('hidden', COOKIE_ACCOUNTS.length > 0);
   }

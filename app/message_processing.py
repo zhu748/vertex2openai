@@ -368,12 +368,12 @@ def _assistant_tool_parts(
         for item in part_order:
             if isinstance(item, dict) and item.get("type") == "tool_call":
                 i = item.get("index")
-                if isinstance(i, int) and 0 <= i < len(tool_parts):
+                if type(i) is int and 0 <= i < len(tool_parts) and i not in used_tools:
                     ordered.append(tool_parts[i])
                     used_tools.add(i)
             elif isinstance(item, dict) and item.get("type") == "ordinary":
                 i = item.get("index")
-                if isinstance(i, int) and 0 <= i < len(ordinary_parts):
+                if type(i) is int and 0 <= i < len(ordinary_parts) and i not in used_ordinary:
                     ordered.append(ordinary_parts[i])
                     used_ordinary.add(i)
         ordered.extend(
@@ -539,14 +539,6 @@ def create_gemini_prompt(
     print("🔄 [消息转换] 正在将 OpenAI 格式消息转换为 Gemini contents。")
     require_sig = requires_signature(model_name)
     tool_name_by_id = {}
-    for prior in messages:
-        for call in getattr(prior, "tool_calls", None) or []:
-            call_id = str(call.get("id") or "")
-            call_name = str((call.get("function") or {}).get("name") or "")
-            if call_id and call_name:
-                tool_name_by_id[call_id] = call_name
-                tool_name_by_id[call_id.partition(LEGACY_THOUGHT_SEP)[0]] = call_name
-
     contents = []
     for message in messages:
         if message.role in ("system", "developer"):
@@ -554,6 +546,12 @@ def create_gemini_prompt(
         if message.role in ("tool", "function"):
             role, parts = "user", _tool_result_parts(message, tool_name_by_id)
         elif message.role in ("assistant", "model") and message.tool_calls:
+            for call in message.tool_calls:
+                call_id = str(call.get("id") or "")
+                call_name = str((call.get("function") or {}).get("name") or "")
+                if call_id and call_name:
+                    tool_name_by_id[call_id] = call_name
+                    tool_name_by_id[call_id.partition(LEGACY_THOUGHT_SEP)[0]] = call_name
             role, parts = "model", _assistant_tool_parts(message, require_sig)
         else:
             role, parts = _ordinary_message_parts(message)
@@ -897,7 +895,9 @@ def process_gemini_response_to_openai_dict(
                     message_payload.setdefault("tool_calls", []).append(tool_payload)
                     order_descriptors.append({"type": "tool_call", "index": tool_index})
                     tool_index += 1
-                    openai_finish_reason = "tool_calls"
+                    openai_finish_reason = map_finish_reason_to_openai(
+                        raw_finish_reason, has_tool_calls=True
+                    )
                     continue
 
                 is_thought = getattr(part, "thought", None) is True

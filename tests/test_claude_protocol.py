@@ -932,8 +932,8 @@ class UsageDetailsTests(unittest.TestCase):
             "prompt_tokens_details": {"cached_tokens": 60},
             "completion_tokens_details": {"reasoning_tokens": 30},
         })
-        # input_tokens 含缓存命中（子集细分到 cache_read_input_tokens）
-        self.assertEqual(usage["input_tokens"], 100)
+        # Anthropic 的普通输入与缓存读取分开计数，二者之和等于总输入。
+        self.assertEqual(usage["input_tokens"], 40)
         self.assertEqual(usage["output_tokens"], 50)
         self.assertEqual(usage["cache_read_input_tokens"], 60)
         self.assertEqual(usage["cache_creation_input_tokens"], 0)

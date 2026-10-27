@@ -294,7 +294,8 @@ curl -s https://你的域名/v1/messages/count_tokens -H "x-api-key: 你的API_K
   Models 形状（claude 别名 + Gemini 模型）；`GET /v1/models/{id}` 单模型检索
   同样双格式（Anthropic `models.retrieve` / OpenAI `models.retrieve`），
   未知模型分别返回 `not_found_error` / `detail` 形状的 404。
-- **`cache_control` 全程剥离**（含 tool_result 复杂块，不做计费，`cache_*_tokens` 恒 0）；
+- **`cache_control` 全程剥离**（含 tool_result 复杂块，不创建显式缓存）；上游隐式缓存命中映射为
+  `cache_read_input_tokens`，普通 `input_tokens` 扣除这部分，二者之和等于总输入；
   中途 system 消息（Claude Code queued steering）降级为 user 轮；`stop_reason` 映射
   tool_use / max_tokens / refusal / end_turn；`anthropic-version` / `anthropic-beta`
   头放行不校验。
@@ -397,7 +398,7 @@ PROXY_URLS='["socks5://global-first:1080","http://global-second:8080"]'
 
 简单配置也可以使用 `VERTEX_EXPRESS_API_KEY=key-a,key-b`；多个 Cookie 可在 `GOOGLE_COOKIES` 中填写字符串 JSON 数组，并通过 `GOOGLE_PROJECT_IDS` 指定对应项目。
 
-旧的单 Cookie、单代理和通道选择会自动兼容。账号列表首次导入并保存后，以面板中的持久化记录为准；清空列表后重启不会重新导入环境变量。面板只回显 Cookie 的配置状态，编辑已保存账号时 Cookie 留空即可保留原值。
+旧的单 Cookie、单代理和通道选择会自动兼容。账号列表首次导入并保存后，以面板中的持久化记录为准；清空列表后重启不会重新导入环境变量。Cookie 默认只显示配置状态；展开已保存账号后，可点击“显示 Cookie / 隐藏 Cookie”查看，或点击“复制 Cookie”复制最新保存值。查看框只读，不会生成编辑草稿；编辑框留空即可保留原 Cookie。普通 HTTP 页面无法自动复制时，会选中文本供手动复制。
 
 ### 出站代理与多协议支持
 
@@ -430,12 +431,12 @@ PROXY_URLS='["socks5://global-first:1080","http://global-second:8080"]'
 | **`retry_max` 语义** | Express 通道当作总次数，设 0 时一次请求都不发 | 统一为「重试次数」，总请求数 = `retry_max + 1`，设 0 仍请求一次；取值钳到 0–50 |
 | **并行函数调用（流式）** | 只发第一个，`index` 恒为 0 | 全部下发，`index` 跨 chunk 稳定递增 |
 | **思考签名** | base64 拼进 `tool_call_id`（上千字符，易被前端截断） | 主要通过 OpenAI 扩展 `extra_content.google.thought_signature` 原样回传；进程内短期缓存、旧 id 格式与官方 `skip_thought_signature_validator` 哨兵仅作兼容兜底 |
-| **Cookie 通道 + 函数调用** | 静默把 `role=tool` 折成 model，发出错乱历史 | 原生下发函数声明，按 `functionCall` / `functionResponse` 回放历史并保留 thought signature |
+| **Cookie 通道 + 函数调用** | 静默把 `role=tool` 折成 model，发出错乱历史 | 原生下发函数声明，按 `functionCall` / `functionResponse` 回放历史，保留调用 ID 与 thought signature；同名并行调用可按 ID 匹配结果 |
 | **Cookie 通道输入图** | 不压缩、不支持 http(s) 图片、不解析正文内联图 | 与标准通道一致（压缩开关对两条通道都生效） |
 | **`stop` 字段** | 只接受数组，传字符串 422 | 字符串/数组都接受 |
 | **`logprobs` 字段** | 按 Gemini 语义当整数 | 兼容 OpenAI 的 `logprobs: bool` + `top_logprobs: int` |
 | **Express 流式 usage** | 从不下发，客户端显示 0 | 支持 `stream_options.include_usage` |
-| **控制台 Cookie 回显** | 明文返回完整 Cookie | 仅返回“已配置/字段数/总长度”，不返回任何值的前后缀；输入框留空＝保持原 Cookie 不变 |
+| **控制台 Cookie 回显** | 明文返回完整 Cookie | 列表仅返回“已配置/字段数/总长度”；登录后点击单账号“显示 / 复制”才读取最新完整值，响应禁止缓存；编辑框留空＝保持原 Cookie 不变 |
 | **登录** | 无限速、会话 token 为确定值 | 失败 3 次后指数退避；随机会话 token，可单独失效 |
 | **状态文件** | 每次读设置都同步读盘、非原子写 | 内存优先 + 原子写 + 权限 0600 + 支持 `STATE_DIR` |
 | **文本保真** | 所有消息的多空格/缩进被压平 | 仅在确实抽走内联图片时才压平 |
@@ -541,13 +542,23 @@ PROXY_URLS='["socks5://global-first:1080","http://global-second:8080"]'
 
 Cookie 直连通道会把 OpenAI `tools` 转成 batchGraphql 的原生 `functionDeclarations`。`tool_choice=none` 会直接省略全部上游工具；`auto` / `required` / 指定自定义函数分别使用 Studio 的 `AUTO` / `ANY` 模式。嵌套对象与数组参数会递归转换成 Studio 私有 UI Schema。内建 `googleSearch` 没有可放进 `allowedFunctionNames` 的声明名，因此搜索请求不附加自定义函数的 `toolConfig`。
 
+OpenAI 入口的 `tool_choice` 字符串在两个通道都兼容大小写。强制选择未声明的自定义函数、未知选择模式，或没有任何可用工具时使用 `required`，会在请求上游前返回 400。Express 的 `[Express 工具]` 日志会列出实际函数声明、搜索启用状态和工具选择方式，便于区分工具回传引起的第二轮请求。
+
+Cookie 原生入口会检查 `toolConfig` 和 `allowedFunctionNames` 的格式；允许名称全部未声明时返回 400，不会通过删除名称限制改成任意函数调用。禁用工具或已优先选择搜索时，会跳过不会发送的函数 Schema 转换。
+
 | 情况 | 行为 |
 |---|---|
 | 自定义函数声明 | 原生下发；流式与非流式响应都返回 OpenAI `tool_calls` |
+| `-search` 模型 + 默认/`auto` 工具选择 | 优先内建搜索，跳过客户端附带的可选自定义函数（如 `get_time_info`）；显式 `required` / 指定自定义函数仍优先执行自定义函数 |
+| 原生搜索工具类型 `web_search` / `web_search_preview` / `google_search` | 两个通道的 OpenAI 入口均识别并映射为 Google 内建搜索；纯搜索请求不附加函数专用配置 |
 | 声明里含搜索类工具（`google_search` / `web_search` 等） | 映射为 Studio 内建 `googleSearch`。实机确认 batchGraphql 不允许它与自定义函数混用：混合 AUTO/required 请求优先自定义函数并忽略搜索；显式强制搜索时只发送 `googleSearch` |
 | 历史里的 assistant `tool_calls` | 回放为 role=`model` 的 `functionCall` Parts，并从 `extra_content` 或短期缓存恢复 thought signature |
 | 连续的 role=`tool` 结果 | 按 `tool_call_id` 关联函数名，合并为 role=`user` 的 `functionResponse` Parts；并行顺序为 FC1, FC2, FR1, FR2 |
 | 模型或协议明确拒绝原生函数 Schema | 仅本次固定降级为文本工具观测并重试一次；没有用户可见策略开关，也不会恢复旧版严格拒绝路径 |
+
+工具历史按消息顺序关联结果；客户端跨轮复用 ID 不会改写先前的调用名。`extra_content.google.part_order` 中重复、布尔和越界索引会被忽略，避免同一调用被重复回放。Claude `tool_result.is_error: true` 会保留为 Gemini 的工具错误响应，供模型判断失败并选择下一步。
+
+工具调用遇到输出截断或内容过滤时，仍返回 `length` / `content_filter`（Claude 对应 `max_tokens` / `refusal`）；只有正常完成才以 `tool_calls` / `tool_use` 交给客户端执行，避免将不完整调用误报为已就绪。
 
 ---
 
@@ -640,6 +651,18 @@ curl http://localhost:8050/v1/chat/completions \
   ]
 }
 ```
+
+Cookie 通道的搜索限制：
+
+- `-search` 启用的是 Studio 内建 `googleSearch` 工具，模型会根据问题决定是否执行搜索。
+- batchGraphql 不支持内建搜索与自定义函数混用。OpenAI/Claude 请求使用 `-search` 且工具选择为默认/`auto` 时，优先内建搜索，跳过客户端自动附带的自定义工具（如 `get_time_info`）。显式 `required` / 指定自定义函数时保留自定义工具；显式强制选择搜索工具时只发送内建搜索。
+- Gemini 原生入口走 Cookie 桥接时也保留搜索后缀的优先级；`functionCallingConfig.mode=ANY` 保留显式函数调用要求。原生协议的 `NONE` 只禁用函数调用，不禁用已声明的内建搜索。
+- `tool_choice: "none"` 会禁用搜索，即使模型名带 `-search`。
+- 与已开启的抗截断后缀组合时（如 `-search-antitruncation-stream`），保留搜索并跳过抗截断传输。
+
+运行日志中的 `[Studio 搜索]` 会说明搜索工具已启用，或因工具冲突、`tool_choice=none` 等原因被忽略。
+
+Express 文本通道保留普通 `type: "function"` 声明的自定义函数语义，包括名称恰好叫 `search` 的函数。使用内建搜索请选 `-search` 后缀或声明原生搜索工具类型。
 
 ### 单次请求覆盖参数（任意前端可用）
 

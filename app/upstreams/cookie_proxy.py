@@ -68,6 +68,7 @@ from upstreams.cookie_request import (
     classify_tool_traffic,
     is_builtin_search_name,
     normalized_tool_name,
+    search_suffix_has_priority,
 )
 from upstreams.cookie_response import (
     RawSampler,
@@ -909,9 +910,9 @@ class CookieGeneration:
                     yield make_openai_chunk(
                         self.response_id,
                         self.model_display,
-                        finish_reason="tool_calls"
-                        if got_tool_call
-                        else map_finish_reason_to_openai(finish_raw),
+                        finish_reason=map_finish_reason_to_openai(
+                            finish_raw, has_tool_calls=got_tool_call
+                        ),
                     )
                 else:
                     # 无正文：明确告知客户端 + 落诊断日志（旧版此处一个字节都不发就关流）
@@ -1219,10 +1220,8 @@ class CookieGeneration:
                         full_text = self.prefill_text + strip_prefill_overlap(
                             self.prefill_text, full_text
                         )
-                    finish_reason = (
-                        "tool_calls"
-                        if tool_calls
-                        else map_finish_reason_to_openai(finish_raw)
+                    finish_reason = map_finish_reason_to_openai(
+                        finish_raw, has_tool_calls=bool(tool_calls)
                     )
                     stats.add_success()
                     credential_manager.record_cookie_success(
@@ -1454,11 +1453,13 @@ def _prepare_cookie_generation(
         else ""
     )
     _forced_search = bool(_choice_name and is_builtin_search_name(_choice_name))
-    native_custom_tools = bool(_tool_info["custom_names"] or _tool_info["history"])
-    if force_builtin_search and _tool_info["custom_names"]:
-        if _forced_search:
+    search_selected = _forced_search or search_suffix_has_priority(request_obj)
+    native_custom_tools = bool(_tool_info["custom_names"] or _tool_info["history"]) and not search_selected
+    if (force_builtin_search or search_selected) and _tool_info["custom_names"]:
+        if search_selected:
             print(
-                "🔎 [Studio] batchGraphql 不支持内建搜索与自定义函数混用；本轮按强制选择仅启用 googleSearch。"
+                "🔎 [Studio 搜索] batchGraphql 不支持内建搜索与自定义函数混用；"
+                "本轮按搜索后缀或显式选择优先搜索，仅启用 googleSearch，跳过可选自定义函数。"
             )
         else:
             print(
@@ -1466,7 +1467,7 @@ def _prepare_cookie_generation(
             )
     elif force_builtin_search:
         print("🔎 [Studio] 请求声明了搜索类工具，已映射为 Studio 内建 googleSearch。")
-    if _tool_info["custom_names"] and not _forced_search:
+    if _tool_info["custom_names"] and not search_selected:
         print(
             f"🛠️ [Studio] 原生函数调用：{'、'.join(_tool_info['custom_names'][:5])}"
             f"{' 等' if len(_tool_info['custom_names']) > 5 else ''}。"
@@ -1478,6 +1479,9 @@ def _prepare_cookie_generation(
     is_grounded_search = base_model_name.endswith("-search")
     if is_grounded_search:
         base_model_name = base_model_name[: -len("-search")]
+    # Persist the parsed selection for every delivery/retry path. Inspecting the
+    # raw request model later misses whitespace and combined transport aliases.
+    force_builtin_search = force_builtin_search or is_grounded_search or _forced_search
 
     _profile = mc.get_profile(base_model_name)
     _inj_settings = app_state.get_effective_settings(base_model_name)
@@ -1492,7 +1496,7 @@ def _prepare_cookie_generation(
         request_obj,
         base_model_name,
         _inj_settings,
-        search=force_builtin_search or is_grounded_search or _forced_search,
+        search=force_builtin_search,
         prefill=prefill_active or bool(prefill_text),
     )
 

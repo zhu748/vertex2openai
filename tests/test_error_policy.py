@@ -20,7 +20,7 @@ import config
 import retry_policy
 from logger import ProxyStats
 from models import OpenAIRequest
-from response_validation import SafetyBlockedError
+from response_validation import PendingMetadataGate, SafetyBlockedError
 from runtime_state import app_state
 from upstream_errors import extract_upstream_error
 from upstreams.express_sdk import _build_thinking_config
@@ -47,6 +47,32 @@ class RetrySettingsTests(unittest.TestCase):
 
 
 class BlockedResponseTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unspecified_block_reason_does_not_reject_valid_replies(self):
+        valid = types.GenerateContentResponse(
+            prompt_feedback={"block_reason": "BLOCKED_REASON_UNSPECIFIED"},
+            candidates=[{"content": {"parts": [{"text": "valid answer"}]}, "finish_reason": "STOP"}],
+        )
+        for mode in ("json", "stream", "fake"):
+            with self.subTest(mode=mode):
+                settings = {"retry_max": 0, "fake_streaming": mode == "fake", "fake_streaming_interval": 0}
+
+                async def stream():
+                    yield valid
+
+                models = SimpleNamespace(
+                    generate_content=mock.AsyncMock(return_value=valid),
+                    generate_content_stream=mock.AsyncMock(side_effect=lambda **_: stream()),
+                )
+                client = SimpleNamespace(aio=SimpleNamespace(models=models))
+                obj = OpenAIRequest(model="gemini-3.6-flash", messages=[], stream=mode != "json")
+                with mock.patch.object(app_state, "get_setting", side_effect=settings.get):
+                    result = await api_helpers.execute_gemini_call(client, obj.model, lambda _: [], {}, obj)
+                    body = ("".join([frame async for frame in result.body_iterator])
+                            if mode != "json" else result.body.decode())
+                self.assertIn("valid answer", body)
+                self.assertNotIn('"error"', body)
+                self.assertEqual(models.generate_content.await_count + models.generate_content_stream.await_count, 1)
+
     async def test_all_delivery_modes_report_400_without_retry(self):
         blocked = types.GenerateContentResponse(
             prompt_feedback={
@@ -103,6 +129,16 @@ class BlockedResponseTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     models.generate_content.await_count + models.generate_content_stream.await_count, 1
                 )
+
+
+class MetadataBufferTests(unittest.TestCase):
+    def test_draining_releases_the_byte_budget(self):
+        gate = PendingMetadataGate()
+        gate.LIMIT_BYTES = 8
+        gate.add("first", 6)
+        self.assertEqual(gate.drain(), ["first"])
+        gate.add("second", 6)
+        self.assertEqual(gate.drain(), ["second"])
 
 
 if __name__ == "__main__":

@@ -54,6 +54,7 @@ from retry_policy import get_retry_settings, retry_delay
 from runtime_state import app_state
 from schema_validation import SchemaValidationError
 from streaming import HEARTBEAT, HEARTBEAT_FRAME, with_heartbeats
+from tool_policy import has_search_suffix
 from upstreams.cookie_response import RawSampler
 from upstreams.cookie_transport import (
     stream_events,
@@ -197,10 +198,8 @@ def _normalize_system_instruction(si: Any) -> Optional[dict]:
 def _native_tools_to_variables(tools: Any) -> tuple[list[dict], bool, list[str]]:
     """原生 tools → (functionDeclarations 列表, 是否启用 googleSearch, 声明名)。
 
-    与 OpenAI 兼容通道同口径：自定义函数与内建搜索混用会被上游拒绝
-    （"Multiple tools are supported only when they are all search tools."），
-    函数优先、搜索退位。parameters 走 _cookie_ui_schema（严格方言 → Studio
-    私有 UI Schema），与工具参数的转换链完全一致。
+    工具冲突由调用方结合搜索后缀和 functionCallingConfig 决定，避免在
+    解析阶段丢掉搜索意图。parameters 走 Studio 私有 UI Schema。
     """
     declarations: list[dict] = []
     use_search = False
@@ -218,9 +217,6 @@ def _native_tools_to_variables(tools: Any) -> tuple[list[dict], bool, list[str]]
                 converted["description"] = decl["description"]
             converted["parameters"] = _cookie_ui_schema(decl.get("parameters") or {"type": "object"})
             declarations.append(converted)
-    if declarations and use_search:
-        print("⚠️ [Cookie 原生桥] batchGraphql 不支持函数与内建搜索混用；已保留自定义函数，忽略 googleSearch。")
-        use_search = False
     return declarations, use_search, [d["name"] for d in declarations]
 
 
@@ -228,15 +224,28 @@ def _sanitize_tool_config(tool_config: Any, declared_names: list[str]) -> Option
     """原生 toolConfig 透传，仅把 allowedFunctionNames 收窄到已声明函数
     （内建搜索没有 functionDeclaration 名字，写进去会让 wire config 自非法）。"""
     if not isinstance(tool_config, dict):
+        if tool_config is not None:
+            raise SchemaValidationError("toolConfig 必须是 JSON 对象。")
         return None
     config = tool_config.get("functionCallingConfig")
     if not isinstance(config, dict):
+        if config is not None:
+            raise SchemaValidationError("toolConfig.functionCallingConfig 必须是 JSON 对象。")
         return dict(tool_config) if tool_config else None
     cleaned = dict(tool_config)
     fcc = dict(config)
     allowed = fcc.get("allowedFunctionNames")
+    if allowed is not None and (
+        not isinstance(allowed, list)
+        or any(not isinstance(name, str) or not name.strip() for name in allowed)
+    ):
+        raise SchemaValidationError("toolConfig.functionCallingConfig.allowedFunctionNames 必须是非空名称的字符串数组。")
     if isinstance(allowed, list):
         kept = [n for n in allowed if n in declared_names]
+        if allowed and not kept:
+            # Dropping the only requested names would turn ANY into a request
+            # for any other function, changing the client's explicit choice.
+            raise SchemaValidationError("toolConfig.allowedFunctionNames 没有任何已声明的函数。")
         if kept:
             fcc["allowedFunctionNames"] = kept
         else:
@@ -247,7 +256,8 @@ def _sanitize_tool_config(tool_config: Any, declared_names: list[str]) -> Option
     return cleaned
 
 
-def native_request_to_variables(parsed: dict, model_name: str, project_id: str) -> dict:
+def native_request_to_variables(parsed: dict, model_name: str, project_id: str,
+                                *, requested_model: str = "") -> dict:
     """Gemini 原生请求体 → batchGraphql variables（未包信封）。
 
     raises SchemaValidationError：结构化输出被策略拒绝（与 OpenAI 通道同口径）。
@@ -297,8 +307,20 @@ def native_request_to_variables(parsed: dict, model_name: str, project_id: str) 
 
     declarations, use_search, names = _native_tools_to_variables(parsed.get("tools"))
     tool_config = _sanitize_tool_config(parsed.get("toolConfig"), names)
+    function_config = (tool_config or {}).get("functionCallingConfig")
+    mode = str(function_config.get("mode") or "AUTO").upper() if isinstance(function_config, dict) else "AUTO"
+    if mode == "NONE":
+        # Gemini's NONE applies to function calling, not to built-in search.
+        declarations = []
     if profile["is_image"]:
         declarations = []
+    if declarations and use_search:
+        if has_search_suffix(requested_model or model_name) and mode in ("AUTO", "MODE_UNSPECIFIED"):
+            declarations = []
+            print("🔎 [Cookie 原生桥] 搜索后缀优先内建搜索，跳过可选自定义函数。")
+        else:
+            use_search = False
+            print("⚠️ [Cookie 原生桥] batchGraphql 不支持函数与内建搜索混用；已保留自定义函数，忽略 googleSearch。")
     if declarations:
         variables["tools"] = [{"functionDeclarations": declarations}]
         if tool_config:
@@ -308,13 +330,15 @@ def native_request_to_variables(parsed: dict, model_name: str, project_id: str) 
     return variables
 
 
-def build_native_body(parsed: dict, model_name: str, project_id: str) -> dict:
+def build_native_body(parsed: dict, model_name: str, project_id: str,
+                      *, requested_model: str = "") -> dict:
     """variables + GraphQL 信封（requestContext / querySignature 均为热改感知）。"""
     return {
         "requestContext": _build_request_context(project_id),
         "querySignature": get_stream_query_signature(),
         "operationName": STREAM_GENERATE_OPERATION_NAME,
-        "variables": native_request_to_variables(parsed, model_name, project_id),
+        "variables": native_request_to_variables(parsed, model_name, project_id,
+                                                 requested_model=requested_model),
     }
 
 
@@ -363,6 +387,8 @@ class NativeAssembler:
             part = _image_part(data)
         elif kind == "function_call":
             part = {"functionCall": {"name": data.get("name"), "args": data.get("args") or {}}}
+            if data.get("id"):
+                part["functionCall"]["id"] = data["id"]
             signature = data.get("thought_signature")
             if signature:
                 part["thoughtSignature"] = signature
@@ -568,7 +594,7 @@ async def _handle_native_request(fastapi_request: Request, model: str, action: s
         return _native_error(401, "Cookie 中未找到 SAPISID，无法计算认证头。")
     account_id = record.get("id", "")
     try:
-        body = build_native_body(parsed, model, project_id)
+        body = build_native_body(parsed, model, project_id, requested_model=requested_model)
     except SchemaValidationError as exc:
         return _native_error(400, str(exc), "INVALID_ARGUMENT")
 

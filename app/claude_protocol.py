@@ -22,8 +22,8 @@
 - 响应侧 thinking 块必须携带非空 signature（此处用 SHA-256 前 32 字节 hex 伪签），
   否则 Claude Code / SDK 下一轮会把历史判为非法；
 - cache_control 全程剥离（不做显式缓存计费）；上游隐式缓存命中经
-  prompt_tokens_details.cached_tokens 透传为 cache_read_input_tokens（对齐
-  vertex-master 的 fillAnthropicUsage 口径，cache_creation 恒 0）；
+  prompt_tokens_details.cached_tokens 映射为 cache_read_input_tokens，并从
+  input_tokens 中扣除，避免重复计数；cache_creation 恒 0；
 - 中途 system 消息（Claude Code queued steering 场景）降级为 user 轮，保留新近性；
 - tool_choice: auto→auto、any→required、none→none、tool→指定函数（未声明则 400）；
 - stop_reason 映射：tool_use / max_tokens / refusal / end_turn；
@@ -32,6 +32,7 @@
 
 import hashlib
 import json
+import math
 import re
 import secrets
 from typing import Any, Optional
@@ -298,16 +299,18 @@ def _tool_result_payload(content: Any, label: str) -> Any:
         return content
     if isinstance(content, list):
         texts: list[str] = []
+        text_only = True
         for block in content:
             block = _block_dict(block, f"{label}.content")
             if block.get("type") != "text":
-                return _strip_cache_control(content)  # 复杂块：剥离缓存标记后透传
+                text_only = False
+                continue
             text = block.get("text")
             if not isinstance(text, str):
-                return _strip_cache_control(content)
+                raise ClaudeRequestError(f"{label}.content text must be a string")
             texts.append(text)
-        return "\n".join(texts)
-    return content
+        return "\n".join(texts) if text_only else _strip_cache_control(content)
+    raise ClaudeRequestError(f"{label}.content must be a string or an array of content blocks")
 
 
 def _append_user_blocks(label: str, content: list, openai_messages: list) -> None:
@@ -352,10 +355,22 @@ def _append_user_blocks(label: str, content: list, openai_messages: list) -> Non
             tool_use_id = block.get("tool_use_id")
             if not isinstance(tool_use_id, str) or not tool_use_id:
                 raise ClaudeRequestError(f"{block_label} tool_result requires tool_use_id")
+            is_error = block.get("is_error", False)
+            if not isinstance(is_error, bool):
+                raise ClaudeRequestError(f"{block_label}.is_error must be a boolean")
+            result = _tool_result_payload(block.get("content"), block_label)
+            if is_error:
+                # Gemini FunctionResponse uses its error key to distinguish
+                # execution failures from successful outputs. Preserve this
+                # across both transports and the text compatibility fallback.
+                try:
+                    result = json.dumps({"error": result}, ensure_ascii=False, allow_nan=False)
+                except (TypeError, ValueError, RecursionError):
+                    raise ClaudeRequestError(f"{block_label}.content must contain valid JSON values") from None
             flush()  # 普通 blocks 与 tool_result 分属不同轮次
             openai_messages.append(OpenAIMessage(
                 role="tool",
-                content=_tool_result_payload(block.get("content"), block_label),
+                content=result,
                 tool_call_id=tool_use_id,
             ))
         else:
@@ -389,9 +404,9 @@ def _append_assistant_blocks(label: str, content: list, openai_messages: list) -
             if not isinstance(args, dict):
                 raise ClaudeRequestError(f"{block_label}.input must be an object")
             try:
-                args_str = json.dumps(args, ensure_ascii=False)
-            except (TypeError, ValueError):
-                args_str = "{}"
+                args_str = json.dumps(args, ensure_ascii=False, allow_nan=False)
+            except (TypeError, ValueError, RecursionError):
+                raise ClaudeRequestError(f"{block_label}.input must contain valid JSON values") from None
             tool_calls.append({"id": call_id, "type": "function",
                                "function": {"name": name, "arguments": args_str}})
         elif btype in ("thinking", "redacted_thinking"):
@@ -425,6 +440,8 @@ def _convert_tools(raw_tools: Any) -> Optional[list[dict]]:
         if isinstance(description, str) and description:
             function["description"] = description
         schema = tool.get("input_schema")
+        if schema is not None and not isinstance(schema, dict):
+            raise ClaudeRequestError(f"tools[{ti}].input_schema must be an object")
         function["parameters"] = schema if isinstance(schema, dict) and schema else {"type": "object", "properties": {}}
         decls.append({"type": "function", "function": function})
     return decls or None
@@ -464,7 +481,13 @@ def _optional_number(body: dict, key: str) -> Optional[float]:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ClaudeRequestError(f"{key} must be a number")
-    return float(value)
+    try:
+        value = float(value)
+    except OverflowError:
+        raise ClaudeRequestError(f"{key} must be a finite number") from None
+    if not math.isfinite(value):
+        raise ClaudeRequestError(f"{key} must be a finite number")
+    return value
 
 
 def anthropic_to_openai_request(body: dict, internal_model: str,
@@ -653,12 +676,12 @@ def anthropic_omit_thinking(body: dict) -> bool:
 
 def anthropic_stop_reason(finish_reason: Optional[str], has_tool_calls: bool) -> str:
     """OpenAI finish_reason → Anthropic stop_reason。"""
-    if has_tool_calls or finish_reason == "tool_calls":
-        return "tool_use"
     if finish_reason == "length":
         return "max_tokens"
     if finish_reason == "content_filter":
         return "refusal"
+    if has_tool_calls or finish_reason == "tool_calls":
+        return "tool_use"
     return "end_turn"
 
 
@@ -682,7 +705,10 @@ def _anthropic_usage(usage: Any) -> dict:
         for key in keys:
             value = usage.get(key)
             if isinstance(value, (int, float)) and not isinstance(value, bool):
-                return max(0, int(value))
+                try:
+                    return max(0, int(value))
+                except (ValueError, OverflowError):
+                    continue
         return 0
 
     def detail(field: str, key: str) -> int:
@@ -690,16 +716,21 @@ def _anthropic_usage(usage: Any) -> dict:
         if isinstance(block, dict):
             value = block.get(key)
             if isinstance(value, (int, float)) and not isinstance(value, bool):
-                return max(0, int(value))
+                try:
+                    return max(0, int(value))
+                except (ValueError, OverflowError):
+                    return 0
         return 0
 
+    total_input = pick("prompt_tokens", "input_tokens")
+    cached_input = min(total_input, detail("prompt_tokens_details", "cached_tokens"))
     out = {
-        # input_tokens 含缓存命中部分（与 Anthropic 官方口径一致，
-        # cache_read 是它的子集细分，对齐 vertex-master fillAnthropicUsage）
-        "input_tokens": pick("prompt_tokens", "input_tokens"),
+        # OpenAI prompt_tokens includes cache hits; Anthropic's input_tokens
+        # and cache_read_input_tokens are disjoint components of total input.
+        "input_tokens": total_input - cached_input,
         "output_tokens": pick("completion_tokens", "output_tokens"),
         "cache_creation_input_tokens": 0,
-        "cache_read_input_tokens": detail("prompt_tokens_details", "cached_tokens"),
+        "cache_read_input_tokens": cached_input,
     }
     thinking = detail("completion_tokens_details", "reasoning_tokens")
     if thinking:
@@ -943,7 +974,8 @@ class ClaudeStreamState:
                 "type": "content_block_stop", "index": index,
             }))
         final_usage = dict(self.usage)
-        final_usage.update({"cache_creation_input_tokens": 0, "cache_read_input_tokens": 0})
+        final_usage.setdefault("cache_creation_input_tokens", 0)
+        final_usage.setdefault("cache_read_input_tokens", 0)
         events.append(_sse_event("message_delta", {
             "type": "message_delta",
             "delta": {"stop_reason": anthropic_stop_reason(self.finish, self.has_tools),

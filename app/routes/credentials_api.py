@@ -196,6 +196,19 @@ class CookieTestBody(BaseModel):
     id: str = ""  # 指定账号 ID；空 = 测试全部启用账号
 
 
+@router.post("/api/cookie-accounts/reveal")
+async def reveal_cookie_account(body: CookieTestBody, _auth: bool = Depends(require_auth)):
+    """Return one saved Cookie only after an explicit console action."""
+    headers = {"Cache-Control": "no-store", "Pragma": "no-cache"}
+    account_id = body.id.strip()
+    if not account_id:
+        return JSONResponse(status_code=400, content={"error": "请选择一个已保存的 Cookie 账号。"}, headers=headers)
+    record = next((rec for rec in app_state.get_cookie_accounts() if rec["id"] == account_id), None)
+    if record is None:
+        return JSONResponse(status_code=404, content={"error": "Cookie 账号不存在或已删除。"}, headers=headers)
+    return JSONResponse(content={"id": record["id"], "cookie": record["cookie"]}, headers=headers)
+
+
 @router.post("/api/cookie-accounts/refresh")
 async def refresh_cookie_accounts_api(body: CookieTestBody, _auth: bool = Depends(require_auth)):
     """Refresh saved enabled accounts without changing the automatic setting."""

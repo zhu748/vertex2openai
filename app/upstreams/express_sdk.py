@@ -23,6 +23,7 @@ from schema_validation import SchemaValidationError
 from request_validation import validate_openai_request
 from request_tracking import configure as track_configure
 from retry_policy import is_auth_or_billing_error
+from tool_policy import normalized_tool_name
 
 LEGACY_EXPRESS_PREFIX = "[EXPRESS] "
 LEGACY_PAY_PREFIX = "[PAY]"
@@ -245,6 +246,16 @@ class ExpressSDKUpstream(BaseUpstream):
             else:
                 gen_config_dict["tools"] = [search_tool]
             print(f"🔎 [搜索增强] 已为模型 {base_model_name} 启用 Google Search 工具。")
+
+        if request_obj.tools or is_grounded_search or "tools" in gen_config_dict:
+            functions = [item["name"] for tool in gen_config_dict.get("tools", [])
+                         for item in tool.get("function_declarations", [])]
+            search_enabled = any("google_search" in tool for tool in gen_config_dict.get("tools", []))
+            choice_label = (normalized_tool_name(request_obj.tool_choice)
+                            if isinstance(request_obj.tool_choice, dict) else request_obj.tool_choice or "auto")
+            print(f"🛠️ [Express 工具] 函数声明：{'、'.join(functions[:5]) or '无'}"
+                  f" | 内建搜索：{'启用' if search_enabled else '关闭'}"
+                  f" | tool_choice={choice_label}。")
 
         # 传入真实模型名：create_gemini_prompt 需要它来判断是否对缺失的思考签名
         # 启用官方哨兵（仅 Gemini 3.x 强校验，见 thought_signatures.resolve_tool_call_signature）

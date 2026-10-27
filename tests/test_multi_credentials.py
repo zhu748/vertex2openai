@@ -187,6 +187,7 @@ class ManagementTests(StateFixture, unittest.TestCase):
 
     def test_new_endpoints_require_authentication(self):
         for method, path in (("GET", "/api/cookie-accounts"), ("POST", "/api/cookie-accounts"),
+                             ("POST", "/api/cookie-accounts/reveal"),
                              ("POST", "/api/proxy/parse")):
             self.assertEqual(self.client.request(method, path, json={}).status_code, 401)
 
@@ -209,6 +210,33 @@ class ManagementTests(StateFixture, unittest.TestCase):
             self.assertNotIn("private", self.client.get(path).text)
         self.assertEqual(self.client.post("/api/cookie-accounts", json={"accounts": []}).status_code, 200)
         self.assertFalse(app_state.get_google_cookie())
+
+    def test_cookie_reveal_is_explicit_per_account_and_reads_the_latest_saved_value(self):
+        self.login()
+        accounts = [{"cookie": "SAPISID=reveal-one; SID=private-one", "project_id": "p1"},
+                    {"cookie": "SAPISID=reveal-two", "project_id": "p2", "enabled": False}]
+        saved = self.client.post("/api/cookie-accounts", json={"accounts": accounts})
+        first_id, second_id = [record["id"] for record in saved.json()["accounts"]]
+        revision = saved.json()["revision"]
+        response = self.client.post("/api/cookie-accounts/reveal", json={"id": first_id})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"id": first_id, "cookie": accounts[0]["cookie"]})
+        self.assertIn("no-store", response.headers["cache-control"])
+        self.assertEqual(response.headers["pragma"], "no-cache")
+        self.assertNotIn("reveal-two", response.text)
+        self.assertEqual(self.client.get("/api/cookie-accounts").json()["revision"], revision)
+        disabled = self.client.post("/api/cookie-accounts/reveal", json={"id": second_id})
+        self.assertEqual(disabled.json()["cookie"], accounts[1]["cookie"])
+        updated = app_state.get_cookie_accounts()
+        updated[0]["cookie"] = "SAPISID=refreshed-one"
+        app_state.set_cookie_accounts(updated)
+        self.assertEqual(self.client.post("/api/cookie-accounts/reveal", json={"id": first_id}).json()["cookie"],
+                         "SAPISID=refreshed-one")
+        self.assertNotIn("refreshed-one", self.client.get("/api/cookie-accounts").text)
+        for account_id, code in (("", 400), ("missing", 404)):
+            response = self.client.post("/api/cookie-accounts/reveal", json={"id": account_id})
+            self.assertEqual(response.status_code, code)
+            self.assertNotIn("SAPISID", response.text)
 
     def test_invalid_account_updates_and_mode_are_rejected_atomically(self):
         self.login()

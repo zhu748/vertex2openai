@@ -18,12 +18,20 @@ from models import OpenAIRequest, normalize_content_part
 from runtime_state import app_state
 from schema_validation import SchemaValidationError, sanitize_for_gemini
 from thought_signatures import (
+    LEGACY_THOUGHT_SEP,
     encode_thought_signature,
     google_metadata,
     is_thought_part,
     requires_signature,
     resolve_tool_call_signature,
     signature_from_extra,
+)
+from tool_policy import (
+    has_search_suffix,
+    is_builtin_search_name,
+    is_builtin_search_tool,
+    normalized_tool_name,
+    search_suffix_has_priority,
 )
 
 # Cookie 通道结构化输出未开启时的统一拒绝文案（cookie_proxy 的快速失败
@@ -166,18 +174,6 @@ def _structured_output(request: OpenAIRequest, profile: dict) -> dict | None:
     )
 
 
-_BUILTIN_SEARCH_NAMES = {
-    "google_search",
-    "googlesearch",
-    "google_search_retrieval",
-    "web_search",
-    "websearch",
-    "search_web",
-    "browse",
-    "search",
-}
-
-
 def classify_tool_traffic(messages: list, tools: Any = None) -> dict:
     """识别搜索、自定义函数声明和工具历史，用于通道选择与预填充保护。"""
     declared = bool(tools)
@@ -188,7 +184,7 @@ def classify_tool_traffic(messages: list, tools: Any = None) -> dict:
             continue
         fn = t.get("function") if isinstance(t.get("function"), dict) else {}
         name = str(fn.get("name") or t.get("name") or t.get("type") or "").strip()
-        if name.lower().replace("-", "_") in _BUILTIN_SEARCH_NAMES:
+        if is_builtin_search_tool(t, include_function_aliases=True):
             builtin_search = True
         elif name:
             custom_names.append(name)
@@ -261,26 +257,17 @@ def _tool_function(tool: Any) -> dict:
     return tool.get("function") if isinstance(tool, dict) and isinstance(tool.get("function"), dict) else {}
 
 
-def normalized_tool_name(tool: Any) -> str:
-    fn = _tool_function(tool)
-    return str(fn.get("name") or (tool.get("name") if isinstance(tool, dict) else "") or "").strip()
-
-
-def is_builtin_search_name(name: str) -> bool:
-    return name.lower().replace("-", "_") in _BUILTIN_SEARCH_NAMES
-
-
 def _build_function_declarations(tools: Any) -> tuple[list[dict], bool]:
     declarations = []
     builtin_search = False
     for tool in tools or []:
         if not isinstance(tool, dict):
             continue
+        if is_builtin_search_tool(tool, include_function_aliases=True):
+            builtin_search = True
+            continue
         name = normalized_tool_name(tool)
         if not name:
-            continue
-        if is_builtin_search_name(name):
-            builtin_search = True
             continue
         fn = _tool_function(tool)
         declaration = {"name": name}
@@ -404,16 +391,18 @@ def _convert_messages_to_contents(messages: list, model_name: str = "", native_t
     system_parts = []
     require_sig = requires_signature(model_name)
     call_names = {}
-    for message in messages or []:
-        for tc in getattr(message, "tool_calls", None) or []:
-            tc_id = str((tc or {}).get("id") or "")
-            fn_name = str(((tc or {}).get("function") or {}).get("name") or "")
-            if tc_id and fn_name:
-                call_names[tc_id] = fn_name
-
     for msg in messages:
         role = msg.role
         content = msg.content
+        # Resolve against preceding calls only. A later turn may reuse a
+        # client-generated id and must not rename an earlier tool result.
+        if role in ("assistant", "model"):
+            for tc in msg.tool_calls or []:
+                tc_id = str(tc.get("id") or "")
+                fn_name = str((tc.get("function") or {}).get("name") or "")
+                if tc_id and fn_name:
+                    call_names[tc_id] = fn_name
+                    call_names[tc_id.partition(LEGACY_THOUGHT_SEP)[0]] = fn_name
 
         # developer 与 system 同语义（OpenAI 新约定的最高优先级指令）：
         # 统一收集进 system_parts，不降级为 user 轮混进对话。
@@ -432,14 +421,16 @@ def _convert_messages_to_contents(messages: list, model_name: str = "", native_t
         # 旧版 functions 协议的结果消息是 role="function"（与 Express 通道的
         # message_processing 保持同一兼容口径），漏掉会被当成 model 自述文本。
         if role in ("tool", "function"):
-            name = getattr(msg, "name", None) or call_names.get(getattr(msg, "tool_call_id", "") or "")
+            call_id = (msg.tool_call_id or "").partition(LEGACY_THOUGHT_SEP)[0]
+            name = msg.name or call_names.get(msg.tool_call_id or "") or call_names.get(call_id)
             if native_tools and name:
+                response = {"name": name, "response": _coerce_tool_response(content)}
+                if call_id:
+                    response["id"] = call_id
                 contents.append(
                     {
                         "role": "user",
-                        "parts": [
-                            {"functionResponse": {"name": name, "response": _coerce_tool_response(content)}}
-                        ],
+                        "parts": [{"functionResponse": response}],
                     }
                 )
             else:
@@ -468,7 +459,7 @@ def _convert_messages_to_contents(messages: list, model_name: str = "", native_t
             for tool_index, tc in enumerate(tool_calls):
                 fn = (tc or {}).get("function") or {}
                 explicit_sig, _ = signature_from_extra(tc)
-                _, signature = resolve_tool_call_signature(
+                call_id, signature = resolve_tool_call_signature(
                     str((tc or {}).get("id") or ""),
                     require_signature=require_sig and tool_index == 0,
                     explicit_signature=explicit_sig,
@@ -480,6 +471,8 @@ def _convert_messages_to_contents(messages: list, model_name: str = "", native_t
                         "args": _parse_function_args(fn.get("arguments", {})),
                     }
                 }
+                if call_id:
+                    part["functionCall"]["id"] = call_id
                 encoded = encode_thought_signature(signature)
                 if encoded:
                     part["thoughtSignature"] = encoded
@@ -504,15 +497,17 @@ def _convert_messages_to_contents(messages: list, model_name: str = "", native_t
                     idx = item.get("index")
                     if (
                         item.get("type") == "tool_call"
-                        and isinstance(idx, int)
+                        and type(idx) is int
                         and 0 <= idx < len(call_parts)
+                        and idx not in used_calls
                     ):
                         parts.append(call_parts[idx])
                         used_calls.add(idx)
                     elif (
                         item.get("type") == "ordinary"
-                        and isinstance(idx, int)
+                        and type(idx) is int
                         and 0 <= idx < len(ordinary_parts)
+                        and idx not in used_ordinary
                     ):
                         parts.append(ordinary_parts[idx])
                         used_ordinary.add(idx)
@@ -698,31 +693,34 @@ def build_request_body(
     # googleSearch are each supported, but mixing them in one request is rejected:
     # "Multiple tools are supported only when they are all search tools." Choose a
     # single upstream mode deterministically instead of sending a doomed payload.
-    declarations, declared_search = (
-        _build_function_declarations(request.tools) if native_tools else ([], False)
-    )
-    if profile["is_image"]:
-        declarations = []
-
     choice_name = normalized_tool_name(request.tool_choice) if isinstance(request.tool_choice, dict) else ""
     forced_search = bool(choice_name and is_builtin_search_name(choice_name))
     tools_disabled = isinstance(request.tool_choice, str) and request.tool_choice.lower() == "none"
+    prefer_search = forced_search or search_suffix_has_priority(request)
+    declared_search = any(is_builtin_search_tool(tool, include_function_aliases=True)
+                          for tool in request.tools or [])
+    declarations = []
+    # Skip recursive Studio Schema conversion for functions that cannot be
+    # sent. Search declarations remain available during function degradation.
+    if native_tools and not (tools_disabled or profile["is_image"] or prefer_search):
+        declarations, _ = _build_function_declarations(request.tools)
     _wants_search = (
         force_search
         or declared_search
         or forced_search
-        or (hasattr(request, "model") and request.model.endswith("-search"))
+        or has_search_suffix(request.model)
     )
 
     selected_declarations = []
     use_google_search = False
     if not tools_disabled:
-        if forced_search:
+        if prefer_search:
             # Built-in search has no functionDeclaration name, so it cannot be
             # referenced by allowedFunctionNames. Send googleSearch alone.
             use_google_search = bool(profile["supports_search"])
         elif declarations:
-            # Custom functions take precedence for mixed AUTO/required traffic.
+            # Preserve explicit custom selections, and the ordinary model's
+            # legacy preference when search is only another declared tool.
             selected_declarations = declarations
         elif _wants_search and profile["supports_search"]:
             use_google_search = True
@@ -733,8 +731,17 @@ def build_request_body(
         variables["toolConfig"] = _build_tool_config(request.tool_choice, function_names)
     elif use_google_search:
         variables["tools"] = [{"googleSearch": {}}]
+        print(f"🔎 [Studio 搜索] {model_name} | 已启用 Google Search 工具（是否执行搜索由模型决定）。")
     # With no upstream tools, omitting toolConfig is equivalent to NONE and avoids
     # applying custom functionCallingConfig to the built-in search protocol.
+    if _wants_search and not use_google_search:
+        if tools_disabled:
+            reason = "tool_choice=none 已禁用全部工具"
+        elif selected_declarations:
+            reason = "batchGraphql 不支持内建搜索与自定义函数混用，本轮优先自定义函数"
+        else:
+            reason = "当前模型不支持内建搜索"
+        print(f"⚠️ [Studio 搜索] {model_name} | 忽略搜索：{reason}。")
 
     return {
         "requestContext": _build_request_context(project_id),

@@ -163,6 +163,25 @@ class RequestConversionTests(unittest.TestCase):
             variables = native_request_to_variables(parsed, "gemini-3.5-flash-lite", "p")
         self.assertEqual(variables["tools"], [{"googleSearch": {}}])
 
+    def test_search_alias_takes_priority_over_optional_native_functions(self):
+        parsed = {"contents": [], "tools": [
+            {"functionDeclarations": [{"name": "get_time_info", "parameters": {"type": "object"}}]},
+            {"googleSearch": {}},
+        ]}
+        for mode, search in (("AUTO", True), ("ANY", False), ("NONE", True)):
+            parsed["toolConfig"] = {"functionCallingConfig": {"mode": mode}}
+            with self.subTest(mode=mode), _settings():
+                variables = native_request_to_variables(
+                    parsed, "gemini-3.5-flash-lite", "p",
+                    requested_model="gemini-3.5-flash-lite-search")
+                if search:
+                    self.assertEqual(variables["tools"], [{"googleSearch": {}}])
+                    self.assertNotIn("toolConfig", variables)
+                else:
+                    self.assertIn("functionDeclarations", variables["tools"][0])
+                    self.assertEqual(variables["toolConfig"]["functionCallingConfig"]["mode"], "ANY")
+
+
     def test_structured_output_gated_like_openai_channel(self):
         parsed = {"contents": [], "generationConfig": {"responseMimeType": "application/json"}}
         with _settings():
@@ -199,6 +218,25 @@ class RequestConversionTests(unittest.TestCase):
                 variables = native_request_to_variables(parsed, "gemini-3.5-flash-lite", "p")
         self.assertEqual(
             variables["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"], ["f1"])
+
+    def test_unknown_forced_function_is_not_broadened_to_any_declared_function(self):
+        parsed = {"contents": [], "tools": [{"functionDeclarations": [{"name": "f1"}]}],
+                  "toolConfig": {"functionCallingConfig": {
+                      "mode": "ANY", "allowedFunctionNames": ["missing"]}}}
+        with _settings(), self.assertRaises(SchemaValidationError):
+            native_request_to_variables(parsed, "gemini-3.5-flash-lite", "p")
+
+    def test_bad_native_allowed_names_report_request_errors(self):
+        for allowed in ("f1", 42, [None], [{"name": "f1"}], [""]):
+            parsed = {"contents": [], "tools": [{"functionDeclarations": [{"name": "f1"}]}],
+                      "toolConfig": {"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": allowed}}}
+            with self.subTest(allowed=allowed), _settings(), self.assertRaises(SchemaValidationError):
+                native_request_to_variables(parsed, "gemini-3.5-flash-lite", "p")
+
+    def test_bad_native_tool_config_objects_report_request_errors(self):
+        for config in ([], "invalid", {"functionCallingConfig": []}, {"functionCallingConfig": "invalid"}):
+            with self.subTest(config=config), _settings(), self.assertRaises(SchemaValidationError):
+                native_request_to_variables({"contents": [], "toolConfig": config}, "gemini-3.5-flash-lite", "p")
 
 
 class NativeAssemblerTests(unittest.TestCase):

@@ -813,6 +813,30 @@ async function main() {
     assert.ok(!(await response.text()).includes('ui-cookie-one'));
     await page.waitForFunction(()=>document.querySelector('.c-cookie').value==='' && !document.querySelector('.c-cookie').matches(':disabled'));
     assert.equal(await page.locator('.c-project').first().inputValue(),'cookie-project-one');
+    const firstCookie=page.locator('[data-cookie-index="0"]');
+    const savedCookiePreview=firstCookie.locator('.cookie-secret-preview');
+    assert.equal(await savedCookiePreview.isVisible(),false);
+    pending=responseFor('/api/cookie-accounts/reveal');
+    await firstCookie.getByRole('button',{name:'显示 Cookie',exact:true}).click();
+    response=await pending;
+    assert.equal(response.status(),200);
+    assert.equal(response.headers()['cache-control'],'no-store');
+    await page.waitForFunction(()=>document.querySelector('.cookie-secret-preview').value==='SAPISID=ui-cookie-one; SID=ui-sid-one');
+    assert.equal(await savedCookiePreview.isVisible(),true);
+    assert.equal(await savedCookiePreview.evaluate(el=>el.readOnly),true);
+    assert.equal(await firstCookie.locator('.c-cookie').inputValue(),'');
+    assert.equal(await page.evaluate(()=>consoleForms.dirty()),false);
+    if(screenshots) await firstCookie.screenshot({path:path.join(screenshots,'cookie-saved-desktop.png')});
+    await firstCookie.getByRole('button',{name:'隐藏 Cookie',exact:true}).click();
+    assert.equal(await savedCookiePreview.isVisible(),false);
+    assert.equal(await savedCookiePreview.inputValue(),'');
+    await page.evaluate(()=>Object.defineProperty(navigator,'clipboard',{configurable:true,value:{
+      writeText:async text=>{window.uiCopiedCookie=text;}
+    }}));
+    await firstCookie.getByRole('button',{name:'复制 Cookie',exact:true}).click();
+    await page.waitForFunction(()=>window.uiCopiedCookie==='SAPISID=ui-cookie-one; SID=ui-sid-one');
+    assert.equal(await savedCookiePreview.isVisible(),false);
+    assert.equal(await page.evaluate(()=>consoleForms.dirty()),false);
     await page.locator('.c-project').first().fill('changed-cookie-project');
     await page.locator('.c-enabled').nth(1).uncheck();
     pending=responseFor('/api/cookie-accounts');
@@ -824,6 +848,15 @@ async function main() {
     assert.equal(savedCookies.accounts[0].cookie_configured,true);
     assert.equal(savedCookies.accounts[0].proxy_fallback,false);
     assert.equal(savedCookies.accounts[0].proxies[0],'socks5://cookie-user:private%3Apassword@cookie-proxy.invalid:1080');
+    await page.waitForFunction(()=>!document.querySelector('.c-cookie').matches(':disabled'));
+    await firstCookie.getByRole('button',{name:'显示 Cookie',exact:true}).click();
+    await page.waitForFunction(()=>document.querySelector('.cookie-secret-preview').value==='SAPISID=ui-cookie-one; SID=ui-sid-one');
+    await firstCookie.getByRole('button',{name:'隐藏 Cookie',exact:true}).click();
+    const disabledCookie=page.locator('[data-cookie-index="1"]');
+    await disabledCookie.getByRole('button',{name:'显示 Cookie',exact:true}).click();
+    await page.waitForFunction(()=>document.querySelectorAll('.cookie-secret-preview')[1].value==='SAPISID=ui-cookie-two; SID=ui-sid-two');
+    await disabledCookie.getByRole('button',{name:'隐藏 Cookie',exact:true}).click();
+    check('保存后 Cookie 可显示、隐藏和复制；查看不产生草稿，修改其他字段后保留原值，停用账号仍可查看');
     assert.equal((await (await page.request.get(origin+'/api/settings/runtime')).json()).mode,'mixed');
     for(const selected of ['api_key','web_proxy','mixed']){
       pending=responseFor('/api/settings/mode');
@@ -912,7 +945,17 @@ async function main() {
         await page.evaluate(() => scrollTo(0, 0));
         assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), `${width}px ${tab}: horizontal overflow`);
         if (width === 390 || width === 1440) await screenshot(`${tab}-${width}`);
-        if(tab==='channel'){await page.locator('.account-editor').evaluateAll(items=>items.forEach(el=>el.open=false));assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));}
+        if(tab==='channel'){
+          if(width===390 || width===320){
+            await firstCookie.getByRole('button',{name:'显示 Cookie',exact:true}).click();
+            await page.waitForFunction(()=>!document.querySelector('.cookie-secret-preview').hidden);
+            assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),`${width}px Cookie preview overflow`);
+            if(screenshots && width===390) await firstCookie.screenshot({path:path.join(screenshots,'cookie-saved-mobile.png')});
+            await firstCookie.getByRole('button',{name:'隐藏 Cookie',exact:true}).click();
+          }
+          await page.locator('.account-editor').evaluateAll(items=>items.forEach(el=>el.open=false));
+          assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
+        }
         if(tab==='params'||tab==='runtime'){
           const target=tab==='params'?'model-instructions':'runtime-compatibility';
           await page.click(`#view-${tab} .settings-jump a[href="#${target}"]`);

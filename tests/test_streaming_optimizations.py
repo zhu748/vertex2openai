@@ -326,9 +326,10 @@ class CookieStreamTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(obj.model_dump_json(), before)
 
     async def test_buffered_stream_cancellation_cancels_generation(self):
-        closed = asyncio.Event()
+        started, closed = asyncio.Event(), asyncio.Event()
         async def post(*args, **kwargs):
             try:
+                started.set()
                 await asyncio.Event().wait()
             finally:
                 closed.set()
@@ -338,7 +339,11 @@ class CookieStreamTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(streaming, "HEARTBEAT_INTERVAL", 0.002):
             frames = result.body_iterator
             await anext(frames)
-            await anext(frames)
+            # A heartbeat may precede the media worker reaching POST. Check
+            # cancellation only after the resource under test actually exists.
+            async with asyncio.timeout(2):
+                while not started.is_set():
+                    await anext(frames)
             await frames.aclose()
         self.assertTrue(closed.is_set())
         self.assertEqual(self.stats.success_requests, 0)
