@@ -1,8 +1,11 @@
-"""Cookie tool progress, private-field fallback and first-reply isolation."""
+"""Cookie tool calls: complete-call parsing, failover and first-reply deadlines.
+
+The private batchGraphql endpoint never emits partialArgs fragments (verified
+2026-10-30), so the Cookie channel parses complete function calls directly.
+Fragment assembly remains a Key/Express capability tested elsewhere.
+"""
 import asyncio
-import base64
 from contextlib import asynccontextmanager
-import copy
 import json
 import os
 from pathlib import Path
@@ -23,9 +26,7 @@ from logger import ProxyStats
 from models import OpenAIRequest
 from proxy_failover import ProxyChain, is_proxy_failure
 from response_validation import IncompleteResponseError, ToolStreamError
-from request_tracking import RequestTrace, current_trace
 from runtime_state import app_state
-from tool_stream import ToolStreamAssembler
 from upstreams import cookie_native, cookie_proxy, cookie_request, cookie_response, cookie_transport
 
 MODEL = "gemini-4-argon"
@@ -48,26 +49,11 @@ def fc(**fields):
     return {"functionCall": fields}
 
 
-def partial(text, *, end=False):
-    return fc(partialArgs=[{"jsonPath": "$.text", "stringValue": text, "willContinue": not end}], willContinue=True)
-
-
 def private_fc(**fields):
     # GraphQL projection metadata and unused oneof defaults are not SDK Parts.
     return {**fc(__typename="FunctionCall", unusedPrivateField=None, **fields), "__typename": "Part", "text": None, "thought": False,
             "thoughtSignature": "", "inlineData": {}, "functionResponse": {},
             "videoMetadata": {"startOffset": {"seconds": "0", "nanos": 0}}}
-
-
-def private_tool_events():
-    return [wire({**private_fc(name="reply", id="private-call", willContinue=True),
-                  "thoughtSignature": "c2ln"}),
-            wire(private_fc(partialArgs=[
-                {"jsonPath": "$.text", "stringValue": "hello", "willContinue": False},
-                {"__typename": "PartialArg", "unusedPrivateField": None, "jsonPath": "$.optional", "nullValue": 0},
-                {"jsonPath": "$.enabled", "boolValue": False},
-                {"jsonPath": "$.count", "numberValue": 0}], willContinue=True)),
-            wire(private_fc(willContinue=False), finish="STOP")]
 
 
 def calls_in(body):
@@ -93,48 +79,19 @@ def calls_in(body):
     return complete
 
 
-class WireAssemblyTests(unittest.TestCase):
-    def test_private_part_defaults_and_numeric_null_are_normalized_without_mutation(self):
-        stream = ToolStreamAssembler()
-        source = private_tool_events()
-        before = copy.deepcopy(source)
-        events = [event for obj in source for event in cookie_response.extract_events(obj, tool_stream=stream)]
-        calls = [data for kind, data in events if kind == "function_call"]
+class DirectWireParsingTests(unittest.TestCase):
+    def test_complete_private_graphql_call_yields_function_call_event(self):
+        obj = wire({**private_fc(name="reply", id="private-call", args={"text": "hello"}),
+                    "thoughtSignature": "c2ln"})
+        calls = [data for kind, data in cookie_response.extract_events(obj) if kind == "function_call"]
         self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["args"], {"text": "hello", "optional": None, "enabled": False, "count": 0})
-        self.assertEqual((calls[0]["id"], calls[0]["thought_signature"]), ("private-call", "c2ln"))
-        self.assertEqual(source, before)
-        stream.validate_end()
+        self.assertEqual((calls[0]["name"], calls[0]["args"], calls[0]["id"]),
+                         ("reply", {"text": "hello"}, "private-call"))
 
-    def test_numeric_null_snake_case_alias_is_supported(self):
-        stream = ToolStreamAssembler()
-        parts, _ = stream.restore_wire_parts([fc(name="reply", partial_args=[{"json_path": "$.empty", "null_value": 0}])])
-        self.assertEqual(parts[0]["functionCall"]["args"], {"empty": None})
-
-    def test_invalid_fields_report_locations_without_generated_content(self):
-        with self.assertRaises(IncompleteResponseError) as caught:
-            ToolStreamAssembler().restore_wire_parts([fc(name="reply", partialArgs=[{
-                "jsonPath": "$.secret", "numberValue": {"private-field-name": "private-generated-content"}}])])
-        message = str(caught.exception)
-        self.assertIn("functionCall.partialArgs.0.numberValue", message)
-        for secret in ("private-field-name", "private-generated-content", "$.secret"):
-            self.assertNotIn(secret, message)
-
-    def test_invalid_numeric_null_and_conflicting_actual_values_remain_errors(self):
-        for values in ({"nullValue": 1}, {"nullValue": False}, {"nullValue": 0, "stringValue": "conflict"}):
-            with self.subTest(values=values), self.assertRaises(IncompleteResponseError):
-                ToolStreamAssembler().restore_wire_parts([fc(name="reply", partialArgs=[{"jsonPath": "$.x", **values}])])
-
-    def test_graphql_metadata_filter_does_not_strip_tool_arguments_or_unknown_semantics(self):
-        parts, _ = ToolStreamAssembler().restore_wire_parts([private_fc(name="reply", args={"__typename": "user value"})])
-        self.assertEqual(parts[0]["functionCall"]["args"], {"__typename": "user value"})
-        for fields in ({"private-field-name": "private-generated-content"},
-                       {"partialArgs": [{"jsonPath": "$.x", "private-field-name": "private-generated-content"}]}):
-            with self.subTest(fields=fields), self.assertRaises(IncompleteResponseError) as caught:
-                ToolStreamAssembler().restore_wire_parts([fc(name="reply", **fields)])
-            self.assertIn("unknown_field", str(caught.exception))
-            self.assertNotIn("private-field-name", str(caught.exception))
-            self.assertNotIn("private-generated-content", str(caught.exception))
+    def test_fragment_wire_fails_explicitly_as_incomplete(self):
+        for fields in ({"willContinue": True}, {"partialArgs": [{"jsonPath": "$.text", "stringValue": "x"}]}):
+            with self.subTest(fields=fields), self.assertRaises(IncompleteResponseError):
+                list(cookie_response.extract_events(wire(fc(name="reply", **fields))))
 
     def test_parser_502_is_not_a_proxy_failure(self):
         chain = ProxyChain(candidates=["http://a.test:80", "http://b.test:80"])
@@ -143,44 +100,9 @@ class WireAssemblyTests(unittest.TestCase):
         self.assertFalse(chain.advance(error))
         self.assertEqual(chain.index, 0)
 
-    def test_cookie_proto_defaults_do_not_close_or_erase_inflight_call(self):
-        stream = ToolStreamAssembler()
-        signature = base64.b64encode(b"tool signature").decode()
-        header = {**fc(name="reply", id="a", args={}, willContinue=True), "thoughtSignature": signature}
-        self.assertEqual(stream.restore_wire_parts([header]), ([], True))
-        ordinary = {"text": "between", "functionCall": {}, "inlineData": {}, "thoughtSignature": ""}
-        self.assertEqual(stream.restore_wire_parts([ordinary]), ([], False))
-        stream.restore_wire_parts([partial("first")])
-        stream.restore_wire_parts([partial("last", end=True)])
-        ready, progress = stream.restore_wire_parts([fc()])
-        self.assertFalse(progress)
-        self.assertEqual(ready[0]["functionCall"], {"id": "a", "name": "reply", "args": {"text": "firstlast"}})
-        self.assertEqual(ready[0]["thoughtSignature"], signature)
-        self.assertEqual(ready[1], ordinary)
-        stream.validate_end()
-
-    def test_wire_extractor_has_no_empty_executable_call_for_header(self):
-        stream = ToolStreamAssembler()
-        events = list(cookie_response.extract_events(wire(fc(name="reply", willContinue=True)), tool_stream=stream))
-        self.assertEqual(events, [("tool_progress", True)])
-        list(cookie_response.extract_events(wire(partial("finished", end=True)), tool_stream=stream))
-        events = list(cookie_response.extract_events(wire(fc(), finish="STOP"), tool_stream=stream))
-        self.assertEqual([kind for kind, _ in events], ["function_call", "finish"])
-        self.assertEqual(events[0][1]["args"], {"text": "finished"})
-
-    def test_bad_wire_fields_and_unfinished_arguments_fail_explicitly(self):
-        for fields in ({"name": 1, "willContinue": True}, {"name": "reply", "partialArgs": "bad"}):
-            with self.subTest(fields=fields), self.assertRaises(IncompleteResponseError):
-                ToolStreamAssembler().restore_wire_parts([fc(**fields)])
-        stream = ToolStreamAssembler()
-        stream.restore_wire_parts([fc(name="reply", willContinue=True)])
-        with self.assertRaises(IncompleteResponseError):
-            list(cookie_response.extract_events(wire(finish="STOP"), tool_stream=stream))
-
     def test_signature_only_native_parts_never_count_as_first_reply(self):
         self.assertFalse(cookie_transport._event_has_reply(("native_part", {"thoughtSignature": "c2ln"})))
         self.assertFalse(cookie_transport._event_has_reply(("usage", {"totalTokenCount": 10})))
-        self.assertTrue(cookie_transport._event_has_reply(("tool_progress", True)))
 
 
 class CookieStreamTests(unittest.IsolatedAsyncioTestCase):
@@ -245,36 +167,6 @@ class CookieStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(obj.model_dump_json(), before)
         return body
 
-    async def test_slow_tool_generation_keeps_timeout_and_preserves_complete_call(self):
-        async def respond(attempt):
-            return self.response([wire(fc(name="reply", id="a", willContinue=True)),
-                                  wire(partial("first", end=True)), wire(fc(), finish="STOP")], delay=.06)
-        self.pool(respond)
-        body = await self.openai(model="gemini-3.5-flash-lite")
-        self.assertEqual(len(self.captured), 1)
-        fcc = self.captured[0]["variables"]["toolConfig"]["functionCallingConfig"]
-        self.assertTrue(fcc["streamFunctionCallArguments"])
-        self.assertEqual((fcc["mode"], fcc["allowedFunctionNames"]), ("ANY", ["reply"]))
-        calls = calls_in(body)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual((calls[0]["id"], json.loads(calls[0]["function"]["arguments"])), ("a", {"text": "first"}))
-        self.assertNotIn('"error"', body)
-        self.assertTrue(self.closed[0].is_set())
-
-    async def test_private_graphql_tool_call_streams_without_timeout_or_protocol_downgrade(self):
-        async def respond(attempt):
-            return self.response(private_tool_events(), delay=.06)
-        self.pool(respond)
-        body = await self.openai(model="gemini-3.5-flash-lite")
-        self.assertNotIn('"error"', body)
-        self.assertEqual(len(self.captured), 1)
-        calls = calls_in(body)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(json.loads(calls[0]["function"]["arguments"]),
-                         {"text": "hello", "optional": None, "enabled": False, "count": 0})
-        self.assertEqual(calls[0]["id"], "private-call")
-        self.assertTrue(self.closed[0].is_set())
-
     async def test_parse_failure_with_eleven_proxies_and_retries_stops_after_one_request(self):
         self.settings["retry_max"] = 12
         async def respond(attempt):
@@ -320,49 +212,6 @@ class CookieStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.stats.retry_counts, 1)
         self.assertEqual(json.loads(calls_in(body)[0]["function"]["arguments"]), {"text": "retry"})
 
-    async def test_field_rejection_preserves_tools_and_latches_across_429_retry(self):
-        for graphql in (False, True):
-            with self.subTest(graphql=graphql):
-                self.captured.clear()
-                self.closed.clear()
-                self.settings["retry_max"] = 1
-                async def respond(attempt):
-                    if attempt == 1:
-                        message = 'Field "streamFunctionCallArguments" is not defined by FunctionCallingConfig'
-                        return (httpx.Response(200, json={"results": [{"errors": [{"message": message,
-                            "extensions": {"status": {"code": 3}}}]}]}) if graphql else httpx.Response(400, text=message))
-                    if attempt == 2:
-                        return httpx.Response(429, text="Resource exhausted")
-                    return self.response([wire(fc(name="reply", args={"text": "fallback"}), finish="STOP")])
-                self.pool(respond)
-                body = await self.openai()
-                self.assertEqual(len(self.captured), 3)
-                first = copy.deepcopy(self.captured[0]["variables"])
-                first["toolConfig"]["functionCallingConfig"].pop("streamFunctionCallArguments")
-                self.assertEqual(first, self.captured[1]["variables"])
-                self.assertEqual(first, self.captured[2]["variables"])
-                self.assertEqual(json.loads(calls_in(body)[0]["function"]["arguments"]), {"text": "fallback"})
-
-    async def test_fallback_does_not_disable_or_restart_first_reply_deadline(self):
-        trace = RequestTrace("/test-cookie-tool-deadline")
-        deadlines = []
-        async def respond(attempt):
-            deadlines.append(trace.data["first_reply_deadline"])
-            if attempt == 1:
-                return httpx.Response(400, text="Unknown field stream_function_call_arguments")
-            return self.response([wire(usage=True)], silent=True)
-        self.pool(respond)
-        token = current_trace.set(trace)
-        try:
-            body = await self.openai()
-        finally:
-            current_trace.reset(token)
-        self.assertEqual(len(self.captured), 2)
-        self.assertEqual(deadlines[0], deadlines[1])
-        self.assertIn('"code": 504', body)
-        self.assertEqual(calls_in(body), [])
-        self.assertTrue(self.closed[0].is_set())
-
     async def test_incomplete_tool_cannot_be_reported_as_success(self):
         async def respond(attempt):
             return self.response([wire(fc(name="reply", willContinue=True)), wire(finish="STOP")])
@@ -371,44 +220,10 @@ class CookieStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls_in(body), [])
         self.assertIn('"code": 502', body)
 
-    async def test_visible_partial_call_is_not_retried_or_reported_complete(self):
-        self.settings["retry_max"] = 1
+    async def test_native_bridge_accepts_complete_private_graphql_call(self):
         async def respond(attempt):
-            if attempt == 1:
-                return self.response([wire(fc(name="reply", willContinue=True)), wire(partial("discarded")),
-                    {"error": {"code": 429, "message": "Resource exhausted"}}])
-            return self.response([wire(fc(name="reply", args={"text": "replacement"}), finish="STOP")])
-        self.pool(respond)
-        body = await self.openai()
-        self.assertEqual(len(self.captured), 1)
-        self.assertIn("discarded", body)
-        self.assertIn('"error"', body)
-        self.assertNotIn("replacement", body)
-        self.assertNotIn('"finish_reason": "tool_calls"', body)
-        self.assertEqual(calls_in(body), [])
-
-    async def test_native_bridge_stream_uses_same_progress_and_complete_parts(self):
-        async def respond(attempt):
-            return self.response([wire(fc(name="reply", id="native", willContinue=True)),
-                                  wire(partial("native", end=True)), wire(fc(), finish="STOP")], delay=.06)
-        self.pool(respond)
-        parsed = {"contents": [{"role": "user", "parts": [{"text": "hello"}]}],
-                  "tools": [{"functionDeclarations": [{"name": "reply", "parameters": {"type": "OBJECT"}}]}],
-                  "toolConfig": {"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": ["reply"]}}}
-        before = copy.deepcopy(parsed)
-        result = await cookie_native.handle_native_request(self.request, MODEL, "streamGenerateContent", parsed)
-        body = "".join([frame async for frame in result.body_iterator])
-        self.assertNotIn('"error"', body)
-        calls = [part["functionCall"] for line in body.splitlines() if line.startswith("data: {")
-                 for candidate in json.loads(line[6:]).get("candidates", [])
-                 for part in candidate.get("content", {}).get("parts", []) if part.get("functionCall")]
-        self.assertEqual(calls, [{"name": "reply", "args": {"text": "native"}, "id": "native"}])
-        self.assertTrue(self.captured[0]["variables"]["toolConfig"]["functionCallingConfig"]["streamFunctionCallArguments"])
-        self.assertEqual(parsed, before)
-
-    async def test_native_bridge_accepts_private_fields_and_numeric_null(self):
-        async def respond(attempt):
-            return self.response(private_tool_events(), delay=.06)
+            return self.response([wire({**private_fc(name="reply", id="private-call", args={"text": "hello"}),
+                                        "thoughtSignature": "c2ln"}, finish="STOP")])
         self.pool(respond)
         parsed = {"contents": [{"role": "user", "parts": [{"text": "hello"}]}],
                   "tools": [{"functionDeclarations": [{"name": "reply", "parameters": {"type": "OBJECT"}}]}],
@@ -420,9 +235,10 @@ class CookieStreamTests(unittest.IsolatedAsyncioTestCase):
                  for candidate in json.loads(line[6:]).get("candidates", [])
                  for part in candidate.get("content", {}).get("parts", []) if part.get("functionCall")]
         self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["functionCall"]["args"], {"text": "hello", "optional": None, "enabled": False, "count": 0})
+        self.assertEqual(calls[0]["functionCall"], {"name": "reply", "args": {"text": "hello"}, "id": "private-call"})
         self.assertEqual(calls[0]["thoughtSignature"], "c2ln")
         self.assertEqual(len(self.captured), 1)
+        self.assertNotIn("streamFunctionCallArguments", json.dumps(self.captured[0]["variables"]))
 
     async def test_ordinary_signature_only_parts_do_not_release_native_deadline(self):
         async def respond(attempt):
@@ -445,11 +261,6 @@ class CookieStreamTests(unittest.IsolatedAsyncioTestCase):
                 obj = OpenAIRequest(model=model, stream=stream, tools=tools, tool_choice=choice, messages=[])
                 body = cookie_request.build_request_body("offline", model, obj)
                 self.assertNotIn("streamFunctionCallArguments", str(body))
-        variables = {"tools": [{"functionDeclarations": [{"name": "reply"}]}],
-                     "toolConfig": {"functionCallingConfig": {"mode": "ANY", "streamFunctionCallArguments": False}}}
-        before = copy.deepcopy(variables)
-        self.assertFalse(cookie_request.enable_argument_stream(variables, MODEL))
-        self.assertEqual(variables, before)
 
 
 if __name__ == "__main__":

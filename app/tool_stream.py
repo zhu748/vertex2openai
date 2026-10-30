@@ -1,20 +1,18 @@
-"""Validate native tool fragments and optionally emit OpenAI argument deltas.
+"""Merge official SDK tool-argument fragments into complete calls (Key path).
 
-SDK/native paths assemble complete calls by default. The Cookie OpenAI path
-streams append-only JSON prefixes, validates completion, and must not replay
-a request after exposing the first tool delta.
+Express/API-Key streaming can deliver function-call arguments as partialArgs
+fragments. This module validates them, assembles each call back into a
+complete functionCall before delivery, and preserves IDs, thought signatures
+and interleaved Part order. The Cookie private endpoint never sends these
+fragments (verified 2026-10-30: only complete tool objects arrive), so the
+Cookie channel parses complete calls directly and does not use this module.
 """
 
 import ast
-import base64
-import json
 from collections import deque
 from dataclasses import dataclass, field
 import math
 import re
-
-from google.genai import types
-from pydantic import ValidationError
 
 from response_validation import (
     IncompleteResponseError,
@@ -39,49 +37,6 @@ def _complete_arguments(call):
         return complete_function_arguments(call)
     except IncompleteResponseError as error:
         raise ToolStreamError(str(error)) from error
-
-
-def _wire_sdk_fields(model, value):
-    known = {field_name for name, info in model.model_fields.items()
-             for field_name in (name, info.alias)}
-    # __typename belongs to the GraphQL envelope, not the generated arguments.
-    # Unknown non-null fields still fail explicitly instead of losing semantics.
-    return {key: item for key, item in value.items()
-            if key in known or (key != "__typename" and item is not None)}
-
-
-def _wire_function_call(fc):
-    """Adapt ProtoJSON wire enums before the SDK's narrower literal schema."""
-    fields = _wire_sdk_fields(types.FunctionCall, fc)
-    for key in ("partialArgs", "partial_args"):
-        fragments = fields.get(key)
-        if not isinstance(fragments, list):
-            continue  # Let SDK validation report the field/type, without its value.
-        normalized = []
-        for fragment in fragments:
-            if isinstance(fragment, dict):
-                fragment = _wire_sdk_fields(types.PartialArg, fragment)
-                for null_key in ("nullValue", "null_value"):
-                    value = fragment.get(null_key)
-                    if type(value) is int and value == 0:
-                        fragment[null_key] = "NULL_VALUE"
-            normalized.append(fragment)
-        fields[key] = normalized
-    return types.FunctionCall.model_validate(fields)
-
-
-def _wire_validation_error(error, prefix):
-    # Never include SDK error messages or input values: these can contain the
-    # generated reply, tool arguments, signatures or a private field name.
-    safe_fields = {field_name for model in (types.FunctionCall, types.PartialArg)
-                   for name, info in model.model_fields.items()
-                   for field_name in (name, info.alias)} | {"thought"}
-    details = []
-    for problem in error.errors(include_input=False, include_context=False, include_url=False)[:3]:
-        location = ".".join(str(item) if isinstance(item, int) or item in safe_fields
-                            else "unknown_field" for item in problem["loc"])
-        details.append(f"{prefix}{location} ({problem['type']})")
-    _fail("函数调用分片字段无效：" + "; ".join(details) + "。")
 
 
 def _normalize_string(value):
@@ -135,72 +90,6 @@ class _Node(dict):
         if key not in self:
             self.order.append(key)
         super().__setitem__(key, value)
-
-
-class _JsonPrefix:
-    """Append-only JSON: stream strings, keep mutable containers open until end.
-
-    A later JSONPath may add siblings to any container. Never guess that a
-    nested container has closed. Subsequent outer siblings wait for completion,
-    while the first nested string/array can still stream without reserializing
-    its already-sent prefix on every fragment.
-    """
-    def __init__(self, root):
-        self.stack = [{"value": root, "position": 0, "opened": False}]
-
-    def read(self, *, final=False):
-        output = []
-        while self.stack:
-            frame = self.stack[-1]
-            value = frame["value"]
-            if isinstance(value, _Node):
-                array = bool(value) and isinstance(value.order[0], int)
-                if not frame["opened"]:
-                    output.append("[" if array else "{")
-                    frame["opened"] = True
-                position = frame["position"]
-                if array:
-                    key = position if position in value else None
-                else:
-                    key = value.order[position] if position < len(value.order) else None
-                if key is None:
-                    if not final:
-                        break
-                    output.append("]" if array else "}")
-                    self.stack.pop()
-                    continue
-                if position:
-                    output.append(",")
-                if not array:
-                    output.append(json.dumps(_normalize_string(key), ensure_ascii=False) + ":")
-                frame["position"] += 1
-                self.stack.append({"value": value[key], "position": 0, "opened": False})
-            elif isinstance(value, _String):
-                if not frame["opened"]:
-                    output.append('"')
-                    frame["opened"] = True
-                for fragment in value.parts[frame["position"]:]:
-                    # Normal Chinese/emoji stay UTF-8. Only split surrogate
-                    # fragments need ASCII escapes until their pair arrives.
-                    output.append(json.dumps(fragment, ensure_ascii=bool(_SURROGATES.search(fragment)))[1:-1])
-                frame["position"] = len(value.parts)
-                if value.open:
-                    break
-                output.append('"')
-                self.stack.pop()
-            else:
-                try:
-                    output.append(json.dumps(value, ensure_ascii=True, allow_nan=False))
-                except ValueError:
-                    _fail("数值参数必须是有限数。")
-                self.stack.pop()
-        return "".join(output)
-
-
-@dataclass
-class ToolStreamEvent:
-    kind: str
-    data: dict
 
 
 class _Arguments:
@@ -296,35 +185,17 @@ class _Call:
     part: object
     arguments: _Arguments = field(default_factory=_Arguments)
     complete: object = None
-    stream_index: int = 0
-    writer: object = None
-    id_sent: bool = False
 
 
 class ToolStreamAssembler:
     """Per-attempt state; IDs, signatures and interleaved Part order survive."""
 
-    def __init__(self, *, emit_deltas=False):
-        self.emit_deltas = emit_deltas
+    def __init__(self):
         self.active = {}
         self.queues = {}
         self.ids = {}
         self.bytes = 0
         self.calls = 0
-
-    @staticmethod
-    def _header(queue, index, fc):
-        data = {"index": index, "name": fc.name, "arguments": ""}
-        if fc.id:
-            data["id"] = fc.id
-        queue.append(ToolStreamEvent("tool_delta", data))
-
-    @staticmethod
-    def _end(queue, index, part, id_sent):
-        fc = part.function_call
-        queue.append(ToolStreamEvent("tool_end", {"index": index, "id_sent": id_sent,
-            "name": fc.name, "id": fc.id, "args": fc.args or {},
-            "thought_signature": base64.b64encode(part.thought_signature).decode() if part.thought_signature else None}))
 
     def _account(self, part):
         self.bytes += len(repr(part).encode("utf-8", errors="surrogatepass"))
@@ -358,24 +229,11 @@ class ToolStreamAssembler:
                 seen_ids.add(fc.id)
             if not fc.partial_args and fc.will_continue is not True:
                 _complete_arguments(fc)
-                if self.emit_deltas:
-                    index = self.calls - 1
-                    self._header(queue, index, fc)
-                    queue.append(ToolStreamEvent("tool_delta", {"index": index,
-                        "arguments": json.dumps(fc.args or {}, ensure_ascii=False, allow_nan=False)}))
-                    self._end(queue, index, part, bool(fc.id))
-                else:
-                    queue.append(part)
+                queue.append(part)
                 return
             call = _Call(part)
             active[fc.id] = call
-            if self.emit_deltas:
-                call.stream_index = self.calls - 1
-                call.writer = _JsonPrefix(call.arguments.root)
-                self._header(queue, call.stream_index, fc)
-                call.id_sent = bool(fc.id)
-            else:
-                queue.append(call)
+            queue.append(call)
         else:
             original = call.part.function_call
             if fc.name and fc.name != original.name:
@@ -397,9 +255,6 @@ class ToolStreamAssembler:
             _fail("增量调用混入了完整参数对象。")
         for item in fc.partial_args or []:
             call.arguments.add(item)
-        if self.emit_deltas and fc.id and not call.id_sent:
-            queue.append(ToolStreamEvent("tool_delta", {"index": call.stream_index, "id": fc.id, "arguments": ""}))
-            call.id_sent = True
         if fc.will_continue is not True:
             try:
                 args = call.arguments.finish()
@@ -410,15 +265,6 @@ class ToolStreamAssembler:
             _complete_arguments(complete)
             call.complete = call.part.model_copy(update={"function_call": complete})
             del active[complete.id]
-            if self.emit_deltas:
-                suffix = call.writer.read(final=True)
-                if suffix:
-                    queue.append(ToolStreamEvent("tool_delta", {"index": call.stream_index, "arguments": suffix}))
-                self._end(queue, call.stream_index, call.complete, call.id_sent)
-        elif self.emit_deltas:
-            prefix = call.writer.read()
-            if prefix:
-                queue.append(ToolStreamEvent("tool_delta", {"index": call.stream_index, "arguments": prefix}))
 
     def restore_sdk(self, response):
         candidates = []
@@ -452,56 +298,6 @@ class ToolStreamAssembler:
             parts.append(value)
             queue.popleft()
         return parts
-
-    def restore_wire_parts(self, parts):
-        """Cookie keeps ordinary wire Parts intact; only calls use SDK types.
-
-        A true result denotes real tool-generation progress, never permission
-        to execute an incomplete call. Empty proto defaults on text/signature
-        Parts must not accidentally close an in-flight function.
-        """
-        queue = self.queues.setdefault(0, deque())
-        progress = False
-        for part in parts:
-            if not isinstance(part, dict):
-                _fail("Part 必须是对象。")
-            fc = part.get("functionCall")
-            if fc is not None and not isinstance(fc, dict):
-                _fail("functionCall 必须是对象。")
-            meaningful = fc and any(fc.get(key) for key in ("name", "id", "args", "partialArgs", "willContinue"))
-            closing = (fc is not None and self.active.get(0)
-                       and not any(part.get(key) for key in ("text", "thoughtSignature", "inlineData", "fileData")))
-            if meaningful or closing:
-                self._account(part)
-                signature = part.get("thoughtSignature")
-                if signature:
-                    if not isinstance(signature, str):
-                        _fail("思考签名必须是字符串。")
-                    try:
-                        signature = base64.b64decode(signature, validate=True)
-                    except ValueError:
-                        signature = signature.encode("utf-8")
-                try:
-                    call = _wire_function_call(fc)
-                except ValidationError as error:
-                    _wire_validation_error(error, "functionCall.")
-                try:
-                    # A GraphQL Part includes unrelated oneof defaults and
-                    # private metadata. Only the call and its annotations use
-                    # SDK types; ordinary wire Parts remain untouched.
-                    native_part = types.Part(function_call=call, thought=part.get("thought"),
-                                             thought_signature=signature or None)
-                except ValidationError as error:
-                    _wire_validation_error(error, "")
-                self._feed(0, native_part)
-                progress |= bool(call.name or call.partial_args)
-            else:
-                if queue:
-                    self._account(part)
-                queue.append(part)
-        ready = self._drain(queue)
-        return [part if isinstance(part, (dict, ToolStreamEvent)) else part.model_dump(mode="json", by_alias=True, exclude_none=True)
-                for part in ready], progress
 
     def validate_end(self):
         if any(self.active.values()) or any(self.queues.values()):

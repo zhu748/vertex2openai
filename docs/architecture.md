@@ -51,7 +51,7 @@ Gemini 原生请求通过 Express REST 透传，或经 Cookie 原生桥接交付
 | `app/prefill.py` | 消息注入、预填充兼容、标签守卫与输出去重 |
 | `app/api_helpers.py` | SDK 调用与重试编排；`SDKGeneration` 管理单次请求、流式与非流式交付 |
 | `app/retry_policy.py`、`app/streaming.py` | 重试配置、可重试性、等待、断连检查和流式心跳 |
-| `app/tool_stream.py` | Express / Cookie 工具参数分片的有界合并；保留调用 ID、签名及 Part 顺序，完整校验后交付 |
+| `app/tool_stream.py` | Express（官方 SDK）工具参数分片的有界合并；保留调用 ID、签名及 Part 顺序，完整校验后交付。Cookie 私有接口实测不返回分片，完整调用直接解析 |
 | `app/json_stream.py` | 有界 JSON 对象增量分帧；Cookie 连续对象与原生 JSON 文档复用 |
 | `app/first_reply.py` | 每次尝试的首回复期限、有效输出识别、可重试超时及原生流预读 |
 | `app/request_connection.py` | 请求体结束后独占 ASGI receive，及时广播实际断连 |

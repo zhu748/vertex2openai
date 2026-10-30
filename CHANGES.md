@@ -2,6 +2,14 @@
 
 基于原版 `vertex2openai-main`（2026-09-01），持续完善兼容性、可靠性和代码组织。
 
+## 2026-10-30：移除 Cookie 通道工具参数分片管线（上游实测不支持）
+
+- 用真实 Cookie 直连 batchGraphql 实测（gemini-3.5-flash-lite / gemini-3.8-flash，identity 与 gzip 编码、ANY 强制工具、正文+工具混合共 6 组对照）：**正文逐块流式（约 100-150ms/帧），但工具参数从不分片**——`streamFunctionCallArguments` 被静默接受，`partialArgs`/`willContinue` 一帧未发，完整 `functionCall` 仅在生成结束后整块到达。结论：Cookie 端的分片接收/合并/增量交付管线是永远走不到的死代码，予以移除；Key/Express 通道的参数分片（官方 SDK 支持）完整保留。
+- 移除内容：请求侧 `enable_argument_stream`（不再发送 `streamFunctionCallArguments`）、`ToolStreamAssembler` 的 Cookie wire 适配（`restore_wire_parts`/`_wire_*`）与 OpenAI 增量交付（`emit_deltas`/`tool_delta`/`tool_end`）、`CookieStreamDiagnostics` 分层诊断、字段被拒降级重试（`argument_stream_unsupported`）。Cookie 完整工具调用回归直连解析：`extract_events` 直接产出 `function_call` 事件，GraphQL 私有字段照旧忽略；若上游未来真发分片，按"参数未完成"明确报错而非静默丢弃。
+- `tool_stream.py` 瘦身为 Express（官方 SDK）专用的分片合并器（`restore_sdk`），Key 通道的参数分片、首回复期限与文本传输行为不变（`test_tool_stream_deadline` 18 项全过）。
+- 修复直连解析回归：Cookie 收到 200 后的本地解析/校验错误在传输层包装为 `ToolStreamError`，避免被 `PROXY_FAILURE_STATUSES`（502）误判为坏出口而空转全部代理（沿用 852a840 的排除语义，Key 空流故障转移不受影响）。
+- 测试与文档：删除 `test_cookie_tool_deltas.py`；重写 `test_cookie_tool_stream.py`（保留完整调用解析、故障转移、静默排队超时，新增直连解析与"分片明确报错"断言）；README / architecture 同步更新；真实 Cookie 端到端实测两模型完整工具调用交付正常；`scripts/check_project.py` 63/63 组通过。
+
 ## 2026-10-30：Cookie OpenAI 工具参数增量交付
 
 - 补齐 Cookie 原生工具到 OpenAI `delta.tool_calls` 的真正参数增量。此前仅把工具分片作为首回复进度，交付仍等待完整参数；现在可在上游生成结束前发送函数名称及 JSON 参数前缀，完成后不再重发整份参数。

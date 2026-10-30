@@ -7,7 +7,6 @@ from typing import Any, Optional
 
 import config as app_config
 import model_capabilities as mc
-from anti_truncation import supports_argument_stream
 from channel_capabilities import COOKIE_STRUCTURED_OUTPUT_DISABLED_MESSAGE, cookie_feature_error
 from cookie_auth import (
     STREAM_GENERATE_OPERATION_NAME,
@@ -303,19 +302,6 @@ def _build_tool_config(tool_choice: Any, function_names: list[str]) -> Optional[
     if allowed:
         config["allowedFunctionNames"] = allowed
     return {"functionCallingConfig": config}
-
-
-def enable_argument_stream(variables: dict, model_name: str) -> bool:
-    """Request preview progress without assuming the private schema accepts it."""
-    if mc.get_profile(model_name)["is_image"] or not supports_argument_stream(model_name):
-        return False
-    if not any(tool.get("functionDeclarations") for tool in variables.get("tools", [])):
-        return False
-    fcc = variables.setdefault("toolConfig", {}).setdefault("functionCallingConfig", {})
-    if fcc.get("mode") == "NONE" or fcc.get("streamFunctionCallArguments") is False:
-        return False
-    fcc["streamFunctionCallArguments"] = True
-    return True
 
 
 def _plain_text_of(content: Any) -> str:
@@ -749,10 +735,9 @@ def build_request_body(
         variables["tools"] = [{"functionDeclarations": selected_declarations}]
         function_names = [item["name"] for item in selected_declarations]
         variables["toolConfig"] = _build_tool_config(request.tool_choice, function_names)
-        if request.stream and not app_state.get_setting("fake_streaming", app_config.FAKE_STREAMING_ENABLED):
-            # Private Studio schemas can reject this preview field. The HTTP
-            # transport retries once without it, retaining genuine tools.
-            enable_argument_stream(variables, model_name)
+        # 实测（2026-10-30）：batchGraphql 接受 streamFunctionCallArguments 但从不返回
+        # partialArgs 分片，工具对象只在生成结束后整块到达；不再请求该字段。
+        # Key/Express 通道的参数分片由官方 SDK 支持，不受影响。
     elif use_google_search:
         variables["tools"] = [{"googleSearch": {}}]
         print(f"🔎 [Studio 搜索] {model_name} | 已启用 Google Search 工具（是否执行搜索由模型决定）。")

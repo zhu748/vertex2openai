@@ -62,7 +62,6 @@ from upstreams.cookie_transport import (
     retry_heartbeats,
 )
 from upstreams.cookie_request import (
-    enable_argument_stream,
     COOKIE_STRUCTURED_OUTPUT_DISABLED_MESSAGE,
     _build_request_context,
     _cookie_ui_schema,
@@ -605,8 +604,6 @@ async def _handle_native_request(fastapi_request: Request, model: str, action: s
         return _native_error(400, str(exc), "INVALID_ARGUMENT")
 
     is_stream = action == "streamGenerateContent"
-    if is_stream:
-        enable_argument_stream(body["variables"], model)
     use_sse = fastapi_request.query_params.get("alt") == "sse"
     print(f"🍪 [Cookie 原生桥] {requested_model or model}:{action} | "
           f"{'SSE' if use_sse and is_stream else 'JSON'} | 协议转码")

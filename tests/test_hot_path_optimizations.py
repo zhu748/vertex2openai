@@ -21,7 +21,7 @@ import image_processing
 import request_tracking
 from express_key_manager import ExpressKeyManager
 from response_validation import IncompleteResponseError
-from tool_stream import ToolStreamAssembler, _Arguments
+from tool_stream import _Arguments
 
 
 class ToolArgumentsTests(unittest.TestCase):
@@ -34,16 +34,6 @@ class ToolArgumentsTests(unittest.TestCase):
                 arguments = _Arguments()
                 arguments.add(types.PartialArg.model_validate(fragment))
                 self.assertEqual(arguments.finish(), {"value": None if field == "nullValue" else value})
-
-    def test_graphql_default_nulls_also_allow_path_only_string_terminators(self):
-        stream = ToolStreamAssembler()
-        stream.restore_wire_parts([{"functionCall": {"name": "reply", "willContinue": True}}])
-        stream.restore_wire_parts([{"functionCall": {"partialArgs": [{"jsonPath": "$.text", "stringValue": "hello",
-            "nullValue": None, "numberValue": None, "boolValue": None, "willContinue": True}], "willContinue": True}}])
-        stream.restore_wire_parts([{"functionCall": {"partialArgs": [{"jsonPath": "$.text", "stringValue": None,
-            "nullValue": None, "numberValue": None, "boolValue": None}], "willContinue": True}}])
-        parts, _ = stream.restore_wire_parts([{"functionCall": {}}])
-        self.assertEqual(parts[0]["functionCall"]["args"], {"text": "hello"})
 
     def test_two_actual_oneof_values_still_fail(self):
         for fields in ({"string_value": "x", "null_value": "NULL_VALUE"},
