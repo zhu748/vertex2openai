@@ -9,7 +9,7 @@ import time
 from typing import Any, AsyncGenerator
 
 from cookie_auth import BATCH_GRAPHQL_URL
-from first_reply import FirstReplyGuard, FirstReplyTimeout, timeout_seconds
+from first_reply import FirstReplyGuard, FirstReplyTimeout, native_has_reply, timeout_seconds
 from request_tracking import upstream_attempt, upstream_chunk
 from response_validation import (
     PendingMetadataGate,
@@ -22,6 +22,7 @@ from retry_policy import (
     wait_for_retry,
 )
 from streaming import HEARTBEAT_FRAME
+from tool_stream import ToolStreamAssembler
 from upstream_errors import extract_upstream_error
 from upstreams.cookie_response import (
     RawSampler,
@@ -131,6 +132,26 @@ def is_native_tool_error_response(status_code: int, payload: str) -> bool:
     return has_error_envelope and is_native_tool_error(payload)
 
 
+def _argument_stream_config(body):
+    return body.get("variables", {}).get("toolConfig", {}).get("functionCallingConfig", {})
+
+
+def _argument_stream_rejected(body, code, message):
+    normalized = str(message).lower().replace("_", "")
+    return (bool(_argument_stream_config(body).get("streamFunctionCallArguments"))
+            and code in (400, 422, 500)
+            and "streamfunctioncallarguments" in normalized
+            and any(term in normalized for term in
+                    ("unsupported", "not supported", "unknown", "unrecognized", "not defined", "does not exist", "invalid")))
+
+
+def _event_has_reply(event):
+    kind, data = event
+    if kind == "native_part":
+        return native_has_reply({"candidates": [{"content": {"parts": [data]}}]})
+    return kind in ("text", "thought", "image", "function_call", "tool_progress") and bool(data)
+
+
 # gRPC 状态码 → HTTP：batchGraphql 的 GraphQL 错误块带 extensions.status.code
 # （gRPC 码），结构化信号优先于文本关键词（8=RESOURCE_EXHAUSTED 实测回传）。
 _GRPC_TO_HTTP = {
@@ -214,6 +235,7 @@ async def _execute_stream_request_generator_once(
     """
     has_content = False
     got_finish = False
+    tool_stream = ToolStreamAssembler() if _argument_stream_config(body).get("streamFunctionCallArguments") else None
     try:
         upstream_attempt()
         async with client.stream(
@@ -223,6 +245,9 @@ async def _execute_stream_request_generator_once(
             if response.status_code != 200:
                 error_text = await response.aread()
                 error_msg = error_text.decode("utf-8", errors="replace")[:1000]
+                if _argument_stream_rejected(body, response.status_code, error_msg):
+                    yield "argument_stream_unsupported", StreamRequestError(error_msg, status_code=response.status_code)
+                    return
 
                 # 原生函数 Schema 被拒优先于 Cookie/项目分类（与事件流分支
                 # 的判定顺序一致；旧实现反序，且 "invalid argument" 被归进
@@ -264,14 +289,16 @@ async def _execute_stream_request_generator_once(
             async for obj in iter_json_objects(response):
                 if sampler is not None:
                     sampler.add(obj)
-                events = list(extract_events(obj, preserve_parts=preserve_parts))
+                events = list(extract_events(obj, preserve_parts=preserve_parts, tool_stream=tool_stream))
                 # 「收到首个上游分片」只对真实内容/元数据分片记账：空分片与纯错误
                 # 分片不算——否则 429 场景时间线会先报“收到分片”再报“上游失败”，
                 # 自相矛盾（首个分片常是 streamGenerateContentV2:[] 空壳）。
                 if any(et != "error" for et, _ in events):
                     upstream_chunk()
                 for event_type, data in events:
-                    if event_type in (
+                    if event_type == "tool_progress":
+                        yield event_type, data
+                    elif event_type in (
                         "text",
                         "thought",
                         "image",
@@ -293,6 +320,9 @@ async def _execute_stream_request_generator_once(
                         explicit_code = (
                             data.get("code") if isinstance(data, dict) else None
                         )
+                        if _argument_stream_rejected(body, code, err_msg) and not has_content:
+                            yield "argument_stream_unsupported", error
+                            return
 
                         # 在还没发送任何有效数据前遇到错误，尝试走顶层重试
                         if is_native_tool_error(err_msg) and not has_content:
@@ -325,6 +355,8 @@ async def _execute_stream_request_generator_once(
                         yield "retryable_error" if retryable else "fatal_error", error
                         return
 
+            if tool_stream is not None:
+                tool_stream.validate_end()
             if not got_finish:
                 yield (
                     "fatal_error",
@@ -356,22 +388,34 @@ async def _execute_stream_request_generator_raw(
     preserve_parts: bool = False,
 ) -> AsyncGenerator[tuple[str, Any], None]:
     """Execute native tools, lazily degrading after one clear protocol rejection."""
-    events = _execute_stream_request_generator_once(
-        client, headers, body, sampler, preserve_parts=preserve_parts
-    )
-    try:
-        async for status, data in events:
-            if status != "native_tool_unsupported":
-                yield status, data
-                continue
-            if fallback_body is None:
-                yield "fatal_error", data
+    while True:
+        retry_arguments = False
+        events = _execute_stream_request_generator_once(
+            client, headers, body, sampler, preserve_parts=preserve_parts
+        )
+        try:
+            async for status, data in events:
+                if status == "argument_stream_unsupported":
+                    # The request cache owns this body. Latch the narrow field
+                    # fallback across later retries without removing tools or
+                    # changing ANY/allowedFunctionNames or the deadline.
+                    _argument_stream_config(body).pop("streamFunctionCallArguments", None)
+                    retry_arguments = True
+                    break
+                if status != "native_tool_unsupported":
+                    yield status, data
+                    continue
+                if fallback_body is None:
+                    yield "fatal_error", data
+                    return
+                break
+            else:
                 return
+        finally:
+            await events.aclose()
+        if not retry_arguments:
             break
-        else:
-            return
-    finally:
-        await events.aclose()
+        print("↩️ [Studio 工具参数流] 私有接口拒绝参数流式字段，已移除该字段；保留原生工具和首回复期限。")
 
     # 先归还被拒请求的连接，再构造/启动替代请求。
     # 降级状态由调用方提供的 fallback_body 回调锁定，传输层只执行替代请求。
@@ -430,13 +474,11 @@ async def stream_events(
         try:
             async for item in guard.iterate(
                 source,
-                lambda event: (
-                    event[0]
-                    in ("text", "thought", "image", "function_call", "native_part")
-                    and bool(event[1])
-                ),
+                _event_has_reply,
             ):
                 status, data = item
+                if status == "tool_progress":
+                    continue  # Internal progress only; never a client tool call.
                 if status in (
                     "retryable_error",
                     "fatal_error",

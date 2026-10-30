@@ -197,7 +197,7 @@ def _wire_list(value, label):
     return value
 
 
-def extract_events(obj: dict, *, preserve_parts: bool = False):
+def extract_events(obj: dict, *, preserve_parts: bool = False, tool_stream=None):
     obj = _wire_object(obj, "响应", allow_null=False)
     # 真值判断而非 "error" in obj：该端点的 Proto JSON 会序列化默认空值
     # （同文件 thoughtSignature/functionCall 的空值过滤同理），若某个块
@@ -242,6 +242,10 @@ def extract_events(obj: dict, *, preserve_parts: bool = False):
             candidate = _wire_object(candidate, "candidate", allow_null=False)
             content_obj = _wire_object(candidate.get("content"), "content")
             parts = _wire_list(content_obj.get("parts"), "parts")
+            if tool_stream is not None:
+                parts, progress = tool_stream.restore_wire_parts(parts)
+                if progress:
+                    yield "tool_progress", True
 
             for part in parts:
                 part = _wire_object(part, "part", allow_null=False)
@@ -323,6 +327,8 @@ def extract_events(obj: dict, *, preserve_parts: bool = False):
             # FINISH_REASON_UNSPECIFIED 是流式中间块的枚举默认值（非真实结束），需过滤。
             finish_reason = candidate.get("finishReason")
             if finish_reason and not str(finish_reason).upper().endswith("UNSPECIFIED"):
+                if tool_stream is not None:
+                    tool_stream.validate_end()
                 # 安全分只在最后一块透出：每个流式块都带 safetyRatings，
                 # 逐块附加会把同一份评分重复插进正文。
                 ratings = candidate.get("safetyRatings")

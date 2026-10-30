@@ -5,10 +5,14 @@ calls, never an empty executable call for a native name-only stream header.
 """
 
 import ast
+import base64
 from collections import deque
 from dataclasses import dataclass, field
 import json
 import re
+
+from google.genai import types
+from pydantic import ValidationError
 
 from response_validation import (
     IncompleteResponseError,
@@ -234,18 +238,67 @@ class ToolStreamAssembler:
                     queue.append(part)
             if has_finish_reason(candidate.finish_reason) and self.active.get(index):
                 _fail("函数参数未完成，上游已结束回复。")
-            parts = []
-            while queue:
-                value = queue[0]
-                if isinstance(value, _Call):
-                    if value.complete is None:
-                        break
-                    value = value.complete
-                parts.append(value)
-                queue.popleft()
+            parts = self._drain(queue)
             content = candidate.content.model_copy(update={"parts": parts}) if candidate.content else None
             candidates.append(candidate.model_copy(update={"content": content}))
         return response.model_copy(update={"candidates": candidates})
+
+    @staticmethod
+    def _drain(queue):
+        parts = []
+        while queue:
+            value = queue[0]
+            if isinstance(value, _Call):
+                if value.complete is None:
+                    break
+                value = value.complete
+            parts.append(value)
+            queue.popleft()
+        return parts
+
+    def restore_wire_parts(self, parts):
+        """Cookie keeps ordinary wire Parts intact; only calls use SDK types.
+
+        A true result denotes real tool-generation progress, never permission
+        to execute an incomplete call. Empty proto defaults on text/signature
+        Parts must not accidentally close an in-flight function.
+        """
+        queue = self.queues.setdefault(0, deque())
+        progress = False
+        for part in parts:
+            if not isinstance(part, dict):
+                _fail("Part 必须是对象。")
+            fc = part.get("functionCall")
+            if fc is not None and not isinstance(fc, dict):
+                _fail("functionCall 必须是对象。")
+            meaningful = fc and any(fc.get(key) for key in ("name", "id", "args", "partialArgs", "willContinue"))
+            closing = (fc is not None and self.active.get(0)
+                       and not any(part.get(key) for key in ("text", "thoughtSignature", "inlineData", "fileData")))
+            if meaningful or closing:
+                self._account(part)
+                signature = part.get("thoughtSignature")
+                if signature:
+                    if not isinstance(signature, str):
+                        _fail("思考签名必须是字符串。")
+                    try:
+                        signature = base64.b64decode(signature, validate=True)
+                    except ValueError:
+                        signature = signature.encode("utf-8")
+                try:
+                    call = types.FunctionCall.model_validate(fc)
+                    native_part = types.Part.model_validate({
+                        **part, "functionCall": call, "thoughtSignature": signature or None})
+                except ValidationError:
+                    _fail("函数调用分片字段无效。")
+                self._feed(0, native_part)
+                progress |= bool(call.name or call.partial_args)
+            else:
+                if queue:
+                    self._account(part)
+                queue.append(part)
+        ready = self._drain(queue)
+        return [part if isinstance(part, dict) else part.model_dump(mode="json", by_alias=True, exclude_none=True)
+                for part in ready], progress
 
     def validate_end(self):
         if any(self.active.values()) or any(self.queues.values()):
