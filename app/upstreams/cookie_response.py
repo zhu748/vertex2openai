@@ -10,6 +10,7 @@ from models import file_data_markdown
 
 from response_validation import IncompleteResponseError, complete_function_arguments, validate_generation_finish_reason
 from json_stream import MAX_JSON_OBJECT_BYTES, JsonObjects as _JsonObjects
+from tool_stream import ToolStreamEvent
 from signature_store import SignatureRecord, SignatureState, signature_store
 from thought_signatures import (
     attach_signature_extra,
@@ -59,7 +60,7 @@ def apply_wire_signature(data: dict, ordinary_metadata: list, part_order: list) 
     return signature
 
 
-def openai_tool_call(response_id: str, call_index: int, call: dict) -> dict:
+def openai_tool_call(response_id: str, call_index: int, call: dict, *, include_arguments: bool = True) -> dict:
     name, args = call["name"], call.get("args") or {}
     call_id = call.get("id") or _stable_cookie_tool_call_id(response_id, call_index, name, args)
     signature = signature_bytes_from_wire(call.get("thought_signature"))
@@ -72,14 +73,16 @@ def openai_tool_call(response_id: str, call_index: int, call: dict) -> dict:
     payload = {
         "id": call_id,
         "type": "function",
-        "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+        "function": {"name": name},
     }
+    if include_arguments:
+        payload["function"]["arguments"] = json.dumps(args, ensure_ascii=False)
     attach_signature_extra(payload, signature)
     return payload
 
 
 async def iter_json_objects(
-    response, max_object_bytes: int = MAX_JSON_OBJECT_BYTES
+    response, max_object_bytes: int = MAX_JSON_OBJECT_BYTES, *, on_text_chunk=None
 ) -> AsyncGenerator[dict, None]:
     """解析 batchGraphql 的连续对象，忽略数组分隔符及防 XSSI 前缀。
 
@@ -100,6 +103,8 @@ async def iter_json_objects(
     try:
         async for chunk in aiter:
             if chunk:
+                if on_text_chunk is not None:
+                    on_text_chunk(chunk)
                 for obj in parser.feed(chunk):
                     yield obj
     finally:
@@ -257,6 +262,9 @@ def extract_events(obj: dict, *, preserve_parts: bool = False, tool_stream=None)
                     yield "tool_progress", True
 
             for part in parts:
+                if isinstance(part, ToolStreamEvent):
+                    yield part.kind, part.data
+                    continue
                 part = _wire_object(part, "part", allow_null=False)
                 text = part.get("text", "")
                 if text is not None and not isinstance(text, str):

@@ -71,9 +71,26 @@ def private_tool_events():
 
 
 def calls_in(body):
-    return [call for line in body.splitlines() if line.startswith("data: {")
-            for choice in json.loads(line[6:]).get("choices", [])
-            for call in choice.get("delta", {}).get("tool_calls", [])]
+    calls = {}
+    for line in body.splitlines():
+        if not line.startswith("data: {"):
+            continue
+        for choice in json.loads(line[6:]).get("choices", []):
+            for delta in choice.get("delta", {}).get("tool_calls", []):
+                call = calls.setdefault(delta["index"], {"function": {"arguments": ""}})
+                call.update({key: value for key, value in delta.items() if key != "function"})
+                function = delta.get("function", {})
+                if function.get("name"):
+                    call["function"]["name"] = function["name"]
+                call["function"]["arguments"] += function.get("arguments", "")
+    complete = []
+    for call in calls.values():
+        try:
+            json.loads(call["function"]["arguments"])
+        except ValueError:
+            continue
+        complete.append(call)
+    return complete
 
 
 class WireAssemblyTests(unittest.TestCase):
@@ -354,7 +371,7 @@ class CookieStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls_in(body), [])
         self.assertIn('"code": 502', body)
 
-    async def test_partial_call_before_retry_is_discarded(self):
+    async def test_visible_partial_call_is_not_retried_or_reported_complete(self):
         self.settings["retry_max"] = 1
         async def respond(attempt):
             if attempt == 1:
@@ -363,9 +380,12 @@ class CookieStreamTests(unittest.IsolatedAsyncioTestCase):
             return self.response([wire(fc(name="reply", args={"text": "replacement"}), finish="STOP")])
         self.pool(respond)
         body = await self.openai()
-        self.assertEqual(len(self.captured), 2)
-        self.assertNotIn("discarded", body)
-        self.assertEqual(len(calls_in(body)), 1)
+        self.assertEqual(len(self.captured), 1)
+        self.assertIn("discarded", body)
+        self.assertIn('"error"', body)
+        self.assertNotIn("replacement", body)
+        self.assertNotIn('"finish_reason": "tool_calls"', body)
+        self.assertEqual(calls_in(body), [])
 
     async def test_native_bridge_stream_uses_same_progress_and_complete_parts(self):
         async def respond(attempt):

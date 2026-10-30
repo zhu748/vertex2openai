@@ -578,6 +578,8 @@ class CookieGeneration:
                 sampler = RawSampler()
                 deduper = PrefillDeduper(self.prefill_text)
                 pending_safety_html = ""
+                stream_tool_headers = set()
+                stream_tool_ids = set()
 
                 # 消费实时生成器（原始事件 → 此处格式化为 OpenAI chunk）
                 events = stream_events(
@@ -587,6 +589,7 @@ class CookieGeneration:
                     sampler=sampler,
                     fallback_body=fallback_body,
                     model=self.base_model_name,
+                    emit_tool_deltas=self.native_custom_tools and not self.text_transport,
                 )
                 if self.text_transport:
                     events = self.text_transport.decoder().cookie_stream(events)
@@ -617,7 +620,37 @@ class CookieGeneration:
                             if self.strip_thoughts:
                                 continue  # 不建连、不输出，等真正的正文
 
-                        if status == "function_call":
+                        if status in ("tool_delta", "tool_end"):
+                            if not has_yielded_to_client:
+                                print(f"⚡ [Studio] {self.base_model_name} | 连接建立，正在实时流式输出...")
+                                yield make_openai_chunk(self.response_id, self.model_display, role="assistant")
+                                has_yielded_to_client = True
+                            index = data["index"]
+                            if index not in stream_tool_headers:
+                                stream_tool_headers.add(index)
+                                stream_part_order.append({"type": "tool_call", "index": index})
+                                tool_call_index = max(tool_call_index, index + 1)
+                            tool_payload = {"index": index}
+                            if status == "tool_delta":
+                                tool_payload["function"] = {"arguments": data.get("arguments", "")}
+                                if data.get("name"):
+                                    tool_payload["type"] = "function"
+                                    tool_payload["function"]["name"] = data["name"]
+                                if data.get("id"):
+                                    tool_payload["id"] = data["id"]
+                                    stream_tool_ids.add(index)
+                            else:
+                                complete = openai_tool_call(self.response_id, index, data, include_arguments=False)
+                                if index not in stream_tool_ids:
+                                    tool_payload["id"] = complete["id"]
+                                    stream_tool_ids.add(index)
+                                if complete.get("extra_content"):
+                                    tool_payload["extra_content"] = complete["extra_content"]
+                                got_tool_call = True
+                            if len(tool_payload) > 1:
+                                yield make_openai_chunk(self.response_id, self.model_display, tool_calls=[tool_payload])
+
+                        elif status == "function_call":
                             if not has_yielded_to_client:
                                 print(
                                     f"⚡ [Studio] {self.base_model_name} | 连接建立，正在实时流式输出..."

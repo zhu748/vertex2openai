@@ -29,6 +29,7 @@ from upstreams.cookie_response import (
     extract_events,
     iter_json_objects,
 )
+from upstreams.cookie_stream_diagnostics import CookieStreamDiagnostics
 
 COOKIE_EXPIRED_KEYWORDS = [
     # 短语级匹配：2026-10 收窄——旧的单词级 "denied"/"permission" 会把安全拒绝类
@@ -149,7 +150,7 @@ def _event_has_reply(event):
     kind, data = event
     if kind == "native_part":
         return native_has_reply({"candidates": [{"content": {"parts": [data]}}]})
-    return kind in ("text", "thought", "image", "function_call", "tool_progress") and bool(data)
+    return kind in ("text", "thought", "image", "function_call", "tool_progress", "tool_delta", "tool_end") and bool(data)
 
 
 # gRPC 状态码 → HTTP：batchGraphql 的 GraphQL 错误块带 extensions.status.code
@@ -227,6 +228,7 @@ async def _execute_stream_request_generator_once(
     sampler: "RawSampler | None" = None,
     *,
     preserve_parts: bool = False,
+    emit_tool_deltas: bool = False,
 ) -> AsyncGenerator[tuple[str, Any], None]:
     """
     异步生成器：真正实时地拉取数据，抛出**原始事件**（不做 SSE 格式化）：
@@ -236,12 +238,14 @@ async def _execute_stream_request_generator_once(
     """
     has_content = False
     got_finish = False
-    tool_stream = ToolStreamAssembler() if _argument_stream_config(body).get("streamFunctionCallArguments") else None
+    tool_stream = ToolStreamAssembler(emit_deltas=emit_tool_deltas and not preserve_parts) if _argument_stream_config(body).get("streamFunctionCallArguments") else None
+    diagnostics = CookieStreamDiagnostics(body)
     try:
         upstream_attempt()
         async with client.stream(
             "POST", BATCH_GRAPHQL_URL, headers=headers, json=body
         ) as response:
+            diagnostics.headers(response.status_code)
             # 1. 拦截 HTTP 状态码错误
             if response.status_code != 200:
                 error_text = await response.aread()
@@ -287,7 +291,8 @@ async def _execute_stream_request_generator_once(
                 return
 
             # 2. 实时遍历并抛出流式 JSON 事件块
-            async for obj in iter_json_objects(response):
+            async for obj in iter_json_objects(response, on_text_chunk=diagnostics.text):
+                diagnostics.object(obj)
                 if sampler is not None:
                     sampler.add(obj)
                 events = list(extract_events(obj, preserve_parts=preserve_parts, tool_stream=tool_stream))
@@ -306,6 +311,8 @@ async def _execute_stream_request_generator_once(
                         "function_call",
                         "thought_signature",
                         "native_part",
+                        "tool_delta",
+                        "tool_end",
                     ):
                         has_content = True
                         yield event_type, data
@@ -377,6 +384,8 @@ async def _execute_stream_request_generator_once(
             "retryable_error" if is_retryable else "fatal_error",
             StreamRequestError(err_msg, status_code=code, cause=e),
         )
+    finally:
+        diagnostics.finish()
 
 
 async def _execute_stream_request_generator_raw(
@@ -387,12 +396,13 @@ async def _execute_stream_request_generator_raw(
     fallback_body: Any = None,
     *,
     preserve_parts: bool = False,
+    emit_tool_deltas: bool = False,
 ) -> AsyncGenerator[tuple[str, Any], None]:
     """Execute native tools, lazily degrading after one clear protocol rejection."""
     while True:
         retry_arguments = False
         events = _execute_stream_request_generator_once(
-            client, headers, body, sampler, preserve_parts=preserve_parts
+            client, headers, body, sampler, preserve_parts=preserve_parts, emit_tool_deltas=emit_tool_deltas
         )
         try:
             async for status, data in events:
@@ -427,7 +437,7 @@ async def _execute_stream_request_generator_raw(
         "⚠️ [Studio] 当前模型/协议拒绝原生函数 Schema；本次及后续重试固定降级为文本工具观测。"
     )
     events = _execute_stream_request_generator_once(
-        client, headers, resolved_fallback, sampler, preserve_parts=preserve_parts
+        client, headers, resolved_fallback, sampler, preserve_parts=preserve_parts, emit_tool_deltas=emit_tool_deltas
     )
     try:
         async for fallback_status, fallback_data in events:
@@ -445,6 +455,7 @@ async def stream_events(
     *,
     model="",
     preserve_parts=False,
+    emit_tool_deltas=False,
 ):
     chain = getattr(client, "chain", None)
     # 首回复窗口每请求只读一次设置（while 循环里换出口/重试会反复新建 Guard）。
@@ -468,7 +479,7 @@ async def stream_events(
                 with guard.trace._lock:
                     guard.trace.data["first_reply_deadline"] = time.time() + window
         source = _execute_stream_request_generator_raw(
-            client, headers, body, sampler, fallback_body, preserve_parts=preserve_parts
+            client, headers, body, sampler, fallback_body, preserve_parts=preserve_parts, emit_tool_deltas=emit_tool_deltas
         )
         pending = PendingMetadataGate()
         switch_proxy = False

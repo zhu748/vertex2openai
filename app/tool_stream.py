@@ -1,11 +1,13 @@
-"""Assemble native tool fragments after first-reply progress is observed.
+"""Validate native tool fragments and optionally emit OpenAI argument deltas.
 
-The deadline watches raw SDK chunks. Clients still receive complete, validated
-calls, never an empty executable call for a native name-only stream header.
+SDK/native paths assemble complete calls by default. The Cookie OpenAI path
+streams append-only JSON prefixes, validates completion, and must not replay
+a request after exposing the first tool delta.
 """
 
 import ast
 import base64
+import json
 from collections import deque
 from dataclasses import dataclass, field
 import math
@@ -124,9 +126,86 @@ class _String:
     open: bool = True
 
 
+class _Node(dict):
+    def __init__(self):
+        super().__init__()
+        self.order = []
+
+    def __setitem__(self, key, value):
+        if key not in self:
+            self.order.append(key)
+        super().__setitem__(key, value)
+
+
+class _JsonPrefix:
+    """Append-only JSON: stream strings, keep mutable containers open until end.
+
+    A later JSONPath may add siblings to any container. Never guess that a
+    nested container has closed. Subsequent outer siblings wait for completion,
+    while the first nested string/array can still stream without reserializing
+    its already-sent prefix on every fragment.
+    """
+    def __init__(self, root):
+        self.stack = [{"value": root, "position": 0, "opened": False}]
+
+    def read(self, *, final=False):
+        output = []
+        while self.stack:
+            frame = self.stack[-1]
+            value = frame["value"]
+            if isinstance(value, _Node):
+                array = bool(value) and isinstance(value.order[0], int)
+                if not frame["opened"]:
+                    output.append("[" if array else "{")
+                    frame["opened"] = True
+                position = frame["position"]
+                if array:
+                    key = position if position in value else None
+                else:
+                    key = value.order[position] if position < len(value.order) else None
+                if key is None:
+                    if not final:
+                        break
+                    output.append("]" if array else "}")
+                    self.stack.pop()
+                    continue
+                if position:
+                    output.append(",")
+                if not array:
+                    output.append(json.dumps(_normalize_string(key), ensure_ascii=False) + ":")
+                frame["position"] += 1
+                self.stack.append({"value": value[key], "position": 0, "opened": False})
+            elif isinstance(value, _String):
+                if not frame["opened"]:
+                    output.append('"')
+                    frame["opened"] = True
+                for fragment in value.parts[frame["position"]:]:
+                    # Normal Chinese/emoji stay UTF-8. Only split surrogate
+                    # fragments need ASCII escapes until their pair arrives.
+                    output.append(json.dumps(fragment, ensure_ascii=bool(_SURROGATES.search(fragment)))[1:-1])
+                frame["position"] = len(value.parts)
+                if value.open:
+                    break
+                output.append('"')
+                self.stack.pop()
+            else:
+                try:
+                    output.append(json.dumps(value, ensure_ascii=True, allow_nan=False))
+                except ValueError:
+                    _fail("数值参数必须是有限数。")
+                self.stack.pop()
+        return "".join(output)
+
+
+@dataclass
+class ToolStreamEvent:
+    kind: str
+    data: dict
+
+
 class _Arguments:
     def __init__(self):
-        self.root = {}
+        self.root = _Node()
         self.fields = 0
         self._last_path = None
         self._last_tokens = ()
@@ -142,7 +221,7 @@ class _Arguments:
             self._check_key(node, token)
             if token not in node:
                 self._new_field()
-                node[token] = {}
+                node[token] = _Node()
             node = node[token]
             if not isinstance(node, dict):
                 _fail("参数路径与已有值冲突。")
@@ -217,17 +296,35 @@ class _Call:
     part: object
     arguments: _Arguments = field(default_factory=_Arguments)
     complete: object = None
+    stream_index: int = 0
+    writer: object = None
+    id_sent: bool = False
 
 
 class ToolStreamAssembler:
     """Per-attempt state; IDs, signatures and interleaved Part order survive."""
 
-    def __init__(self):
+    def __init__(self, *, emit_deltas=False):
+        self.emit_deltas = emit_deltas
         self.active = {}
         self.queues = {}
         self.ids = {}
         self.bytes = 0
         self.calls = 0
+
+    @staticmethod
+    def _header(queue, index, fc):
+        data = {"index": index, "name": fc.name, "arguments": ""}
+        if fc.id:
+            data["id"] = fc.id
+        queue.append(ToolStreamEvent("tool_delta", data))
+
+    @staticmethod
+    def _end(queue, index, part, id_sent):
+        fc = part.function_call
+        queue.append(ToolStreamEvent("tool_end", {"index": index, "id_sent": id_sent,
+            "name": fc.name, "id": fc.id, "args": fc.args or {},
+            "thought_signature": base64.b64encode(part.thought_signature).decode() if part.thought_signature else None}))
 
     def _account(self, part):
         self.bytes += len(repr(part).encode("utf-8", errors="surrogatepass"))
@@ -261,11 +358,24 @@ class ToolStreamAssembler:
                 seen_ids.add(fc.id)
             if not fc.partial_args and fc.will_continue is not True:
                 _complete_arguments(fc)
-                queue.append(part)
+                if self.emit_deltas:
+                    index = self.calls - 1
+                    self._header(queue, index, fc)
+                    queue.append(ToolStreamEvent("tool_delta", {"index": index,
+                        "arguments": json.dumps(fc.args or {}, ensure_ascii=False, allow_nan=False)}))
+                    self._end(queue, index, part, bool(fc.id))
+                else:
+                    queue.append(part)
                 return
             call = _Call(part)
             active[fc.id] = call
-            queue.append(call)
+            if self.emit_deltas:
+                call.stream_index = self.calls - 1
+                call.writer = _JsonPrefix(call.arguments.root)
+                self._header(queue, call.stream_index, fc)
+                call.id_sent = bool(fc.id)
+            else:
+                queue.append(call)
         else:
             original = call.part.function_call
             if fc.name and fc.name != original.name:
@@ -287,6 +397,9 @@ class ToolStreamAssembler:
             _fail("增量调用混入了完整参数对象。")
         for item in fc.partial_args or []:
             call.arguments.add(item)
+        if self.emit_deltas and fc.id and not call.id_sent:
+            queue.append(ToolStreamEvent("tool_delta", {"index": call.stream_index, "id": fc.id, "arguments": ""}))
+            call.id_sent = True
         if fc.will_continue is not True:
             try:
                 args = call.arguments.finish()
@@ -297,6 +410,15 @@ class ToolStreamAssembler:
             _complete_arguments(complete)
             call.complete = call.part.model_copy(update={"function_call": complete})
             del active[complete.id]
+            if self.emit_deltas:
+                suffix = call.writer.read(final=True)
+                if suffix:
+                    queue.append(ToolStreamEvent("tool_delta", {"index": call.stream_index, "arguments": suffix}))
+                self._end(queue, call.stream_index, call.complete, call.id_sent)
+        elif self.emit_deltas:
+            prefix = call.writer.read()
+            if prefix:
+                queue.append(ToolStreamEvent("tool_delta", {"index": call.stream_index, "arguments": prefix}))
 
     def restore_sdk(self, response):
         candidates = []
@@ -378,7 +500,7 @@ class ToolStreamAssembler:
                     self._account(part)
                 queue.append(part)
         ready = self._drain(queue)
-        return [part if isinstance(part, dict) else part.model_dump(mode="json", by_alias=True, exclude_none=True)
+        return [part if isinstance(part, (dict, ToolStreamEvent)) else part.model_dump(mode="json", by_alias=True, exclude_none=True)
                 for part in ready], progress
 
     def validate_end(self):
