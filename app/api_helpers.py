@@ -11,7 +11,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import config as app_config
 import model_capabilities as mc
-from anti_truncation import TextTransport
+from anti_truncation import TextTransport, supports_argument_stream
 from express_endpoint import is_location_pin_failure
 from fastapi.responses import JSONResponse, StreamingResponse
 from first_reply import (
@@ -55,6 +55,7 @@ from retry_policy import (
     wait_for_retry,
 )
 from runtime_state import app_state
+from tool_stream import ToolStreamAssembler
 from streaming import disconnected as _request_disconnected
 from upstream_errors import (
     create_openai_error_response,
@@ -474,6 +475,22 @@ class SDKGeneration:
                 credential_describer=self.credential_describer,
             )
         else:
+            # Ask for real generation progress even when a preset puts the
+            # entire reply in a required tool call. Keep the first-reply window:
+            # silent queueing still times out, native tool fragments do not.
+            if (
+                self.text_transport is None
+                and supports_argument_stream(self.request_obj.model)
+                and any(tool.get("function_declarations") for tool in self.gen_config_dict.get("tools", []))
+                and self.gen_config_dict.get("tool_config", {}).get("function_calling_config", {}).get("mode") != "NONE"
+            ):
+                fcc = self.gen_config_dict.setdefault("tool_config", {}).setdefault("function_calling_config", {})
+                fcc["stream_function_call_arguments"] = True
+                print("🔧 [工具参数流] 已启用原生参数分片；真实工具输出算首回复，完整调用合并后交付。")
+            if self.gen_config_dict.get("tool_config", {}).get("function_calling_config", {}).get("stream_function_call_arguments"):
+                # Native partial arguments and SDK automatic tool execution are
+                # mutually exclusive. Clients own execution in both protocols.
+                self.gen_config_dict["automatic_function_calling"] = {"disable": True}
             self.response_id_for_stream = (
                 f"chatcmpl-realstream-{int(time.time())}-{uuid.uuid4().hex[:12]}"
             )
@@ -559,6 +576,12 @@ class SDKGeneration:
                 text_decoder = (
                     self.text_transport.decoder() if self.text_transport else None
                 )
+                tool_assembler = (
+                    ToolStreamAssembler()
+                    if self.text_transport is None
+                    and self.gen_config_dict.get("tool_config", {}).get("function_calling_config", {}).get("stream_function_call_arguments")
+                    else None
+                )
                 deduper = (
                     PrefillDeduper(self.prefill_text)
                     if (self.prefill_text and (self.request_obj.n or 1) == 1)
@@ -641,6 +664,8 @@ class SDKGeneration:
                             finished_candidates.add(index)
                     if text_decoder:
                         chunk_item_call = text_decoder.restore_sdk(chunk_item_call)
+                    if tool_assembler:
+                        chunk_item_call = tool_assembler.restore_sdk(chunk_item_call)
                     num_candidates = len(
                         getattr(chunk_item_call, "candidates", None) or []
                     )
@@ -718,6 +743,8 @@ class SDKGeneration:
                         has_yielded = True
                         yield f"data: {json.dumps(chunk_payload, ensure_ascii=False)}\n\n"
 
+                if tool_assembler:
+                    tool_assembler.validate_end()
                 if text_decoder:
                     text_decoder.validate_end()
                 if seen_candidates - finished_candidates:
@@ -835,7 +862,7 @@ class SDKGeneration:
                     )
                 ):
                     fcc.pop("stream_function_call_arguments", None)
-                    print("↩️ [抗截断] 上游不支持增量参数流，改用完整函数参数还原。")
+                    print("↩️ [工具参数流] 上游不支持增量参数流，退回完整参数；首回复超时仍按配置执行。")
                     continue
 
                 # location 钉定路径不对 → 退回裸模型名再试一次（仅在还没输出内容时）

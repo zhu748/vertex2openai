@@ -193,7 +193,9 @@ class PrefetchedStream:
 def sdk_has_reply(chunk):
     for candidate in getattr(chunk, "candidates", None) or []:
         for part in getattr(getattr(candidate, "content", None), "parts", None) or []:
-            if (getattr(part, "text", None) or getattr(part, "function_call", None)
+            call = getattr(part, "function_call", None)
+            if (getattr(part, "text", None)
+                    or (call and (getattr(call, "name", None) or getattr(call, "partial_args", None)))
                     or getattr(part, "inline_data", None) or getattr(part, "file_data", None)):
                 return True
     return False
