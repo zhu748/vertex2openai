@@ -25,7 +25,8 @@ async function main(){
  Object.defineProperty(w,'scrollY',{get:()=>scrollPosition});
  w.AbortSignal=AbortSignal;w.AbortController=AbortController;w.matchMedia=()=>({matches:false});w.scrollTo=({top})=>{scrollPosition=top;};w.HTMLElement.prototype.scrollIntoView=()=>{};w.confirm=()=>true;
  w.CSS={escape:s=>s};w.HTMLDialogElement.prototype.showModal=function(){this.open=true;};w.HTMLDialogElement.prototype.close=function(){this.open=false;this.dispatchEvent(new w.Event('close'));};
- w.EventSource=class {close(){}};
+ const eventSources=[];
+ w.EventSource=class {constructor(url){this.url=url;eventSources.push(this);}close(){}};
  const clipboardAPI={writeText:async value=>{clipboard.push(value);}};
  Object.defineProperty(w.navigator,'clipboard',{configurable:true,value:clipboardAPI});
  w.fetch=async(url,options={})=>{
@@ -74,6 +75,25 @@ async function main(){
   assert.equal(el('keys-list').querySelector('details').open,false);
   assert.equal(el('key-0').type,'password');
   console.log('✓ Navigation, initial clean state, account masking/collapse, recent metrics');
+
+  w.switchTab('logs');
+  const logSource=eventSources.find(source=>source.url==='/stream-logs');
+  const logwin=el('logwin');let logScrollReads=0;
+  Object.defineProperty(logwin,'scrollHeight',{configurable:true,get(){logScrollReads++;return logwin.childElementCount*20;}});
+  for(let i=0;i<700;i++)logSource.onmessage({data:`burst ${i} <img src=x onerror=alert(1)>`});
+  assert.equal(logwin.childElementCount,0);
+  await new Promise(resolve=>setTimeout(resolve,80));
+  assert.equal(logwin.childElementCount,500);
+  assert(logwin.firstElementChild.textContent.startsWith('burst 200 '));
+  assert(logwin.lastElementChild.textContent.startsWith('burst 699 '));
+  assert.equal(logwin.querySelector('img'),null);assert(logScrollReads<=2);
+  edit('log-level','error');logSource.onmessage({data:'ERROR batch-visible'});
+  await new Promise(resolve=>setTimeout(resolve,80));
+  assert.equal(logwin.querySelectorAll('.log-line:not([hidden])').length,1);
+  logSource.onmessage({data:'must not return after clear'});el('log-clear').click();
+  await new Promise(resolve=>setTimeout(resolve,80));assert.equal(logwin.childElementCount,0);
+  edit('log-level','all');delete logwin.scrollHeight;
+  console.log('✓ Burst logs batch DOM updates, retain newest 500, preserve filters/escaping, clear pending messages');
 
   w.switchTab('channel');
   let cookieRow=el('cookies-list').firstElementChild;

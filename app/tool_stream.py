@@ -8,7 +8,7 @@ import ast
 import base64
 from collections import deque
 from dataclasses import dataclass, field
-import json
+import math
 import re
 
 from google.genai import types
@@ -24,10 +24,20 @@ MAX_TOOL_STREAM_BYTES = 32 * 1024 * 1024
 MAX_TOOL_CALLS = 1024
 MAX_ARGUMENT_FIELDS = 65536
 _PATH_TOKEN = re.compile(r'''\.([^.[\]]+)|\[(0|[1-9][0-9]*)\]|\[("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')\]''')
+_SURROGATES = re.compile("[\ud800-\udfff]")
 
 
 def _fail(message):
     raise IncompleteResponseError(f"上游工具参数流：{message}")
+
+
+def _normalize_string(value):
+    if not _SURROGATES.search(value):
+        return value
+    try:
+        return value.encode("utf-16-le", errors="surrogatepass").decode("utf-16-le")
+    except UnicodeError:
+        _fail("字符串包含未配对的 Unicode 代理项。")
 
 
 def _path_tokens(path):
@@ -67,9 +77,15 @@ class _Arguments:
     def __init__(self):
         self.root = {}
         self.fields = 0
+        self._last_path = None
+        self._last_tokens = ()
 
     def add(self, item):
-        tokens = _path_tokens(item.json_path)
+        if self._last_tokens and item.json_path == self._last_path:
+            tokens = self._last_tokens
+        else:
+            tokens = self._last_tokens = tuple(_path_tokens(item.json_path))
+            self._last_path = item.json_path
         node = self.root
         for token in tokens[:-1]:
             self._check_key(node, token)
@@ -81,13 +97,18 @@ class _Arguments:
                 _fail("参数路径与已有值冲突。")
         key = tokens[-1]
         self._check_key(node, key)
+        previous = node.get(key)
         values = [(name, getattr(item, name)) for name in
-                  ("string_value", "number_value", "bool_value", "null_value")
-                  if getattr(item, name) is not None or
-                  (name == "null_value" and name in item.model_fields_set)]
+                  ("string_value", "number_value", "bool_value")
+                  if getattr(item, name) is not None]
+        # GraphQL can return null for every unselected oneof field. Such nulls
+        # are defaults, not a second value alongside string/number/bool. A
+        # path-only string terminator can contain these same defaults.
+        if item.null_value is not None or (not values and "null_value" in item.model_fields_set
+                and not (isinstance(previous, _String) and previous.open)):
+            values.append(("null_value", None))
         if len(values) > 1:
             _fail("一个参数分片包含多个值类型。")
-        previous = node.get(key)
         if not values:
             # Google also closes a streamed string with a path-only fragment.
             if not isinstance(previous, _String) or not previous.open or item.will_continue:
@@ -125,16 +146,19 @@ class _Arguments:
             if isinstance(value, _String):
                 if value.open:
                     _fail("字符串尚未结束，函数已结束。")
-                return "".join(value.parts)
+                return _normalize_string("".join(value.parts))
             if isinstance(value, dict):
                 if value and isinstance(next(iter(value)), int):
                     if sorted(value) != list(range(len(value))):
                         _fail("数组存在缺失元素。")
                     return [materialize(value[i]) for i in range(len(value))]
-                return {key: materialize(item) for key, item in value.items()}
+                return {_normalize_string(key): materialize(item) for key, item in value.items()}
+            if isinstance(value, float) and not math.isfinite(value):
+                _fail("数值参数必须是有限数。")
             return value
-        # Normalize UTF-16 surrogate pairs split across native string fragments.
-        return json.loads(json.dumps(materialize(self.root), ensure_ascii=True, allow_nan=False))
+        # Fold only strings that need it. Serializing the entire argument tree
+        # through ASCII JSON expands Chinese text sixfold and duplicates it.
+        return materialize(self.root)
 
 
 @dataclass

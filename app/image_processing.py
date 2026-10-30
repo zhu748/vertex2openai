@@ -197,8 +197,6 @@ def fetch_remote_image(url: str, timeout: float = 10.0) -> Optional[Tuple[bytes,
 
 
 def _fetch_remote_image_once(url, timeout, proxy_url, *, deadline=None):
-    from urllib.parse import urlparse
-
     deadline = deadline if deadline is not None else time.monotonic() + timeout
 
     def remaining():
@@ -207,12 +205,18 @@ def _fetch_remote_image_once(url, timeout, proxy_url, *, deadline=None):
             raise TimeoutError("远程图片下载超过总超时时间。")
         return budget
 
+    def destination(value):
+        original = httpx.URL(value)
+        if original.scheme not in ("http", "https"):
+            raise ValueError(f"不支持的 URL 协议：{original.scheme or '(空)'}")
+        if original.username or original.password:
+            raise ValueError("图片 URL 不允许包含认证凭据")
+        return original, _public_image_addresses(original.host)[0]
+
     remaining()
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        raise ValueError(f"不支持的 URL 协议：{parsed.scheme or '(空)'}")
-    if _is_blocked_host(parsed.hostname or ""):
-        raise ValueError("目标地址指向内网/环回/链路本地，已拒绝")
+    # Resolve/check once per hop, then connect to that exact address; another
+    # DNS lookup is unnecessary because the checked address is already pinned.
+    original_url, address = destination(url)
 
     client_args = {"timeout": remaining(), "follow_redirects": False, "trust_env": False}
     if proxy_url:
@@ -221,15 +225,10 @@ def _fetch_remote_image_once(url, timeout, proxy_url, *, deadline=None):
         client_args["verify"] = app_config.SSL_CERT_FILE
 
     with httpx.Client(**client_args) as client:
-        current = url
         for _ in range(MAX_REMOTE_IMAGE_REDIRECTS + 1):
-            original_url = httpx.URL(current)
-            if original_url.username or original_url.password:
-                raise ValueError("图片 URL 不允许包含认证凭据")
             # Pin the checked address for direct and proxy connections,
             # preserving Host and TLS SNI. DNS cannot change between the
             # safety check and the actual connection (DNS rebinding).
-            address = _public_image_addresses(original_url.host)[0]
             pinned_url = original_url.copy_with(host=address)
             image_headers = dict(_IMAGE_FETCH_HEADERS, Host=original_url.netloc.decode("ascii"))
             with client.stream(
@@ -242,12 +241,7 @@ def _fetch_remote_image_once(url, timeout, proxy_url, *, deadline=None):
                 if resp.is_redirect:
                     # 每跳复查，且重定向响应体无需下载。
                     location = resp.headers.get("location", "")
-                    current = str(original_url.join(location)) if location else ""
-                    nxt = urlparse(current)
-                    if nxt.scheme not in ("http", "https"):
-                        raise ValueError(f"重定向到不支持的协议：{nxt.scheme or '(空)'}")
-                    if _is_blocked_host(nxt.hostname or ""):
-                        raise ValueError("重定向指向内网/环回/链路本地，已拒绝")
+                    original_url, address = destination(str(original_url.join(location)) if location else "")
                     continue
 
                 resp.raise_for_status()

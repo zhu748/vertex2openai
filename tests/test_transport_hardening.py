@@ -269,14 +269,21 @@ class ImageTests(unittest.TestCase):
         self.assertEqual(captured[-1].headers["host"], "images.example")
         self.assertEqual(captured[-1].extensions["sni_hostname"], "images.example")
 
-    def test_rebound_private_dns_is_rejected_before_connection(self):
+    def test_connection_stays_pinned_when_later_dns_would_turn_private(self):
         public = [(2, 1, 6, "", ("93.184.216.34", 0))]
         private = [(2, 1, 6, "", ("127.0.0.1", 0))]
-        with mock.patch("socket.getaddrinfo", side_effect=[public, private]), \
+        captured = []
+        def handle(request):
+            captured.append(request)
+            return httpx.Response(200, content=b"image", headers={"content-type": "image/png"})
+        client = httpx.Client(transport=httpx.MockTransport(handle))
+        with mock.patch("socket.getaddrinfo", side_effect=[public, private]) as dns, \
              mock.patch.object(image_processing, "get_effective_proxy_url", return_value=""), \
-             mock.patch.object(image_processing.httpx, "Client") as client:
-            self.assertIsNone(image_processing.fetch_remote_image("https://rebound.example/image"))
-        client.return_value.__enter__.return_value.stream.assert_not_called()
+             mock.patch.object(image_processing.httpx, "Client", return_value=client):
+            self.assertEqual(image_processing.fetch_remote_image("https://rebound.example/image"), (b"image", "image/png"))
+        self.assertEqual(dns.call_count, 1)
+        self.assertEqual(captured[0].url.host, "93.184.216.34")
+        self.assertEqual(captured[0].extensions["sni_hostname"], "rebound.example")
 
     def test_proxy_failure_does_not_fall_back_to_direct_image_fetch(self):
         with mock.patch.object(proxy_resolver, "resolve_proxy_uri", side_effect=proxy_resolver.ProxyResolveError("offline")), \

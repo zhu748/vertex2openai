@@ -52,9 +52,9 @@ class ExpressKeyManager:
         indexed = list(enumerate(records))
         # 有其他 Key 时避开刚失败的那把（软偏好）；单 Key 仍可使用完整重试预算。
         alternatives = [(i, r) for i, r in indexed if r["key"] != exclude_key]
-        indexed = alternatives or indexed
-        _sysrand.shuffle(indexed)
-        original_idx, rec = indexed[0]
+        # Select one item directly: shuffling the whole pool costs one secure
+        # random draw per record even though only the first item is consumed.
+        original_idx, rec = _sysrand.choice(alternatives or indexed)
         print(f"🔑 [密钥选择] 已随机选择第 {original_idx + 1} 个 Express API Key"
               f"（项目：{rec.get('project_id') or '未探测'}）。")
         return dict(rec, index=original_idx)

@@ -395,19 +395,32 @@ class RequestRegistry:
     def list(self, *, status="all", query="", offset=0, limit=50):
         with self._lock:
             self._prune()
-            rows = [trace.snapshot() for trace in reversed(self._records.values())]
-        summary = {"connections": sum(r["http_active"] for r in rows),
-                   "generations": sum(r["generation_active"] for r in rows),
-                   "background": sum(r["generation_active"] and not r["http_active"] for r in rows),
-                   "retry_wait": sum(r["generation_active"] and r["phase"] == "retry_wait" for r in rows),
-                   "active": sum(r["active"] for r in rows)}
+            records = list(reversed(self._records.values()))
+        # Scan only scalar fields for filtering/counts. Build timings and the
+        # full public snapshot for this page alone, outside the registry lock.
+        summary = {key: 0 for key in ("connections", "generations", "background", "retry_wait", "active")}
         query = query.casefold()
-        rows = [r for r in rows if (status == "all" or (status == "active" and r["active"])
-                                   or (status == "completed" and not r["active"])
-                                   or r["status"] == status)
-                and (not query or query in f"{r['id']} {r['model']} {r['generation_id'] or ''}".casefold())]
-        rows.sort(key=lambda r: not r["active"])
-        return {"summary": summary, "total": len(rows), "items": rows[offset:offset + limit],
+        matches = []
+        for trace in records:
+            with trace._lock:
+                data = trace.data
+                connected, generating = data["http_active"], data["generation_active"]
+                active = connected or generating
+                summary["connections"] += connected
+                summary["generations"] += generating
+                summary["background"] += generating and not connected
+                summary["retry_wait"] += generating and data["phase"] == "retry_wait"
+                summary["active"] += active
+                state = "running" if active else data["outcome"]
+                if not (status == "all" or (status == "active" and active)
+                        or (status == "completed" and not active) or state == status):
+                    continue
+                if query and query not in f"{data['id']} {data['model']} {data['generation_id'] or ''}".casefold():
+                    continue
+                matches.append((trace, active))
+        matches.sort(key=lambda row: not row[1])
+        rows = [trace.snapshot() for trace, _ in matches[offset:offset + limit]]
+        return {"summary": summary, "total": len(matches), "items": rows,
                 "offset": offset, "limit": limit, "retention": {"completed": self.max_completed, "seconds": self.ttl_seconds,
                                                                   "bytes": self.max_bytes}}
 
