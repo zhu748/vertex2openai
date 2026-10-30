@@ -212,10 +212,11 @@ async def retry_heartbeats(total_sec: float, hb_interval: float = 3.0, request=N
 class StreamRequestError(str):
     """保持错误字符串兼容性，并把 HTTP 退避信息带到流式重试层。"""
 
-    def __new__(cls, message, retry_after=None, status_code=None):
+    def __new__(cls, message, retry_after=None, status_code=None, *, cause=None):
         value = super().__new__(cls, message)
         value.retry_after = retry_after
         value.status_code = status_code
+        value.cause = cause
         return value
 
 
@@ -374,7 +375,7 @@ async def _execute_stream_request_generator_once(
         code, _ = extract_upstream_error(e)
         yield (
             "retryable_error" if is_retryable else "fatal_error",
-            StreamRequestError(err_msg, status_code=code),
+            StreamRequestError(err_msg, status_code=code, cause=e),
         )
 
 
@@ -490,9 +491,11 @@ async def stream_events(
                         and chain is not None
                         and status in ("retryable_error", "fatal_error")
                     ):
-                        switch_proxy = chain.advance(
-                            status=getattr(data, "status_code", None)
-                        )
+                        # Preserve exception identity. A local parser's 502 is
+                        # not an HTTP 502 returned by the selected proxy.
+                        cause = getattr(data, "cause", None)
+                        switch_proxy = chain.advance(cause,
+                            status=getattr(data, "status_code", None) if cause is None else None)
                         if switch_proxy:
                             break
                     # 错误前已缓冲的元数据（finish/usage/safety）先冲刷再报错，

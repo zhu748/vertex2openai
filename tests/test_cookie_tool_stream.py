@@ -21,7 +21,8 @@ import httpx
 import config
 from logger import ProxyStats
 from models import OpenAIRequest
-from response_validation import IncompleteResponseError
+from proxy_failover import ProxyChain, is_proxy_failure
+from response_validation import IncompleteResponseError, ToolStreamError
 from request_tracking import RequestTrace, current_trace
 from runtime_state import app_state
 from tool_stream import ToolStreamAssembler
@@ -51,6 +52,24 @@ def partial(text, *, end=False):
     return fc(partialArgs=[{"jsonPath": "$.text", "stringValue": text, "willContinue": not end}], willContinue=True)
 
 
+def private_fc(**fields):
+    # GraphQL projection metadata and unused oneof defaults are not SDK Parts.
+    return {**fc(__typename="FunctionCall", unusedPrivateField=None, **fields), "__typename": "Part", "text": None, "thought": False,
+            "thoughtSignature": "", "inlineData": {}, "functionResponse": {},
+            "videoMetadata": {"startOffset": {"seconds": "0", "nanos": 0}}}
+
+
+def private_tool_events():
+    return [wire({**private_fc(name="reply", id="private-call", willContinue=True),
+                  "thoughtSignature": "c2ln"}),
+            wire(private_fc(partialArgs=[
+                {"jsonPath": "$.text", "stringValue": "hello", "willContinue": False},
+                {"__typename": "PartialArg", "unusedPrivateField": None, "jsonPath": "$.optional", "nullValue": 0},
+                {"jsonPath": "$.enabled", "boolValue": False},
+                {"jsonPath": "$.count", "numberValue": 0}], willContinue=True)),
+            wire(private_fc(willContinue=False), finish="STOP")]
+
+
 def calls_in(body):
     return [call for line in body.splitlines() if line.startswith("data: {")
             for choice in json.loads(line[6:]).get("choices", [])
@@ -58,6 +77,55 @@ def calls_in(body):
 
 
 class WireAssemblyTests(unittest.TestCase):
+    def test_private_part_defaults_and_numeric_null_are_normalized_without_mutation(self):
+        stream = ToolStreamAssembler()
+        source = private_tool_events()
+        before = copy.deepcopy(source)
+        events = [event for obj in source for event in cookie_response.extract_events(obj, tool_stream=stream)]
+        calls = [data for kind, data in events if kind == "function_call"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["args"], {"text": "hello", "optional": None, "enabled": False, "count": 0})
+        self.assertEqual((calls[0]["id"], calls[0]["thought_signature"]), ("private-call", "c2ln"))
+        self.assertEqual(source, before)
+        stream.validate_end()
+
+    def test_numeric_null_snake_case_alias_is_supported(self):
+        stream = ToolStreamAssembler()
+        parts, _ = stream.restore_wire_parts([fc(name="reply", partial_args=[{"json_path": "$.empty", "null_value": 0}])])
+        self.assertEqual(parts[0]["functionCall"]["args"], {"empty": None})
+
+    def test_invalid_fields_report_locations_without_generated_content(self):
+        with self.assertRaises(IncompleteResponseError) as caught:
+            ToolStreamAssembler().restore_wire_parts([fc(name="reply", partialArgs=[{
+                "jsonPath": "$.secret", "numberValue": {"private-field-name": "private-generated-content"}}])])
+        message = str(caught.exception)
+        self.assertIn("functionCall.partialArgs.0.numberValue", message)
+        for secret in ("private-field-name", "private-generated-content", "$.secret"):
+            self.assertNotIn(secret, message)
+
+    def test_invalid_numeric_null_and_conflicting_actual_values_remain_errors(self):
+        for values in ({"nullValue": 1}, {"nullValue": False}, {"nullValue": 0, "stringValue": "conflict"}):
+            with self.subTest(values=values), self.assertRaises(IncompleteResponseError):
+                ToolStreamAssembler().restore_wire_parts([fc(name="reply", partialArgs=[{"jsonPath": "$.x", **values}])])
+
+    def test_graphql_metadata_filter_does_not_strip_tool_arguments_or_unknown_semantics(self):
+        parts, _ = ToolStreamAssembler().restore_wire_parts([private_fc(name="reply", args={"__typename": "user value"})])
+        self.assertEqual(parts[0]["functionCall"]["args"], {"__typename": "user value"})
+        for fields in ({"private-field-name": "private-generated-content"},
+                       {"partialArgs": [{"jsonPath": "$.x", "private-field-name": "private-generated-content"}]}):
+            with self.subTest(fields=fields), self.assertRaises(IncompleteResponseError) as caught:
+                ToolStreamAssembler().restore_wire_parts([fc(name="reply", **fields)])
+            self.assertIn("unknown_field", str(caught.exception))
+            self.assertNotIn("private-field-name", str(caught.exception))
+            self.assertNotIn("private-generated-content", str(caught.exception))
+
+    def test_parser_502_is_not_a_proxy_failure(self):
+        chain = ProxyChain(candidates=["http://a.test:80", "http://b.test:80"])
+        error = ToolStreamError("上游工具参数流：函数调用分片字段无效。")
+        self.assertFalse(is_proxy_failure(error))
+        self.assertFalse(chain.advance(error))
+        self.assertEqual(chain.index, 0)
+
     def test_cookie_proto_defaults_do_not_close_or_erase_inflight_call(self):
         stream = ToolStreamAssembler()
         signature = base64.b64encode(b"tool signature").decode()
@@ -176,6 +244,52 @@ class CookieStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('"error"', body)
         self.assertTrue(self.closed[0].is_set())
 
+    async def test_private_graphql_tool_call_streams_without_timeout_or_protocol_downgrade(self):
+        async def respond(attempt):
+            return self.response(private_tool_events(), delay=.06)
+        self.pool(respond)
+        body = await self.openai(model="gemini-3.5-flash-lite")
+        self.assertNotIn('"error"', body)
+        self.assertEqual(len(self.captured), 1)
+        calls = calls_in(body)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]),
+                         {"text": "hello", "optional": None, "enabled": False, "count": 0})
+        self.assertEqual(calls[0]["id"], "private-call")
+        self.assertTrue(self.closed[0].is_set())
+
+    async def test_parse_failure_with_eleven_proxies_and_retries_stops_after_one_request(self):
+        self.settings["retry_max"] = 12
+        async def respond(attempt):
+            return self.response([wire(fc(name=123, willContinue=True))])
+        client = self.pool(respond)
+        client.chain = ProxyChain(candidates=[f"http://proxy{i}.test:80" for i in range(11)])
+        body = await self.openai(model="gemini-3.5-flash-lite")
+        self.assertEqual(len(self.captured), 1)
+        self.assertEqual(client.chain.index, 0)
+        self.assertEqual(self.stats.retry_counts, 0)
+        self.assertIn("functionCall.name", body)
+        self.assertEqual(calls_in(body), [])
+        self.assertTrue(self.closed[0].is_set())
+
+    async def test_real_gateway_and_network_failures_still_switch_proxy(self):
+        for failure in (None, httpx.ReadTimeout("network timeout"), httpx.RemoteProtocolError("truncated transport")):
+            with self.subTest(failure=type(failure).__name__):
+                self.captured.clear()
+                async def respond(attempt):
+                    if attempt == 1:
+                        if failure is not None:
+                            raise failure
+                        return httpx.Response(502, text="Bad gateway")
+                    return self.response([wire(fc(name="reply", args={"text": "recovered"}), finish="STOP")])
+                client = self.pool(respond)
+                client.chain = ProxyChain(candidates=["http://a.test:80", "http://b.test:80"])
+                body = await self.openai()
+                self.assertEqual(len(self.captured), 2)
+                self.assertEqual(client.chain.index, 1)
+                self.assertNotIn('"error"', body)
+                self.assertEqual(json.loads(calls_in(body)[0]["function"]["arguments"]), {"text": "recovered"})
+
     async def test_silent_queue_still_times_out_and_closes_before_retry(self):
         self.settings["retry_max"] = 1
         async def respond(attempt):
@@ -271,6 +385,24 @@ class CookieStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, [{"name": "reply", "args": {"text": "native"}, "id": "native"}])
         self.assertTrue(self.captured[0]["variables"]["toolConfig"]["functionCallingConfig"]["streamFunctionCallArguments"])
         self.assertEqual(parsed, before)
+
+    async def test_native_bridge_accepts_private_fields_and_numeric_null(self):
+        async def respond(attempt):
+            return self.response(private_tool_events(), delay=.06)
+        self.pool(respond)
+        parsed = {"contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+                  "tools": [{"functionDeclarations": [{"name": "reply", "parameters": {"type": "OBJECT"}}]}],
+                  "toolConfig": {"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": ["reply"]}}}
+        result = await cookie_native.handle_native_request(self.request, "gemini-3.5-flash-lite", "streamGenerateContent", parsed)
+        body = "".join([frame async for frame in result.body_iterator])
+        self.assertNotIn('"error"', body)
+        calls = [part for line in body.splitlines() if line.startswith("data: {")
+                 for candidate in json.loads(line[6:]).get("candidates", [])
+                 for part in candidate.get("content", {}).get("parts", []) if part.get("functionCall")]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["functionCall"]["args"], {"text": "hello", "optional": None, "enabled": False, "count": 0})
+        self.assertEqual(calls[0]["thoughtSignature"], "c2ln")
+        self.assertEqual(len(self.captured), 1)
 
     async def test_ordinary_signature_only_parts_do_not_release_native_deadline(self):
         async def respond(attempt):

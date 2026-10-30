@@ -16,6 +16,7 @@ from pydantic import ValidationError
 
 from response_validation import (
     IncompleteResponseError,
+    ToolStreamError,
     complete_function_arguments,
     has_finish_reason,
 )
@@ -28,7 +29,57 @@ _SURROGATES = re.compile("[\ud800-\udfff]")
 
 
 def _fail(message):
-    raise IncompleteResponseError(f"上游工具参数流：{message}")
+    raise ToolStreamError(f"上游工具参数流：{message}")
+
+
+def _complete_arguments(call):
+    try:
+        return complete_function_arguments(call)
+    except IncompleteResponseError as error:
+        raise ToolStreamError(str(error)) from error
+
+
+def _wire_sdk_fields(model, value):
+    known = {field_name for name, info in model.model_fields.items()
+             for field_name in (name, info.alias)}
+    # __typename belongs to the GraphQL envelope, not the generated arguments.
+    # Unknown non-null fields still fail explicitly instead of losing semantics.
+    return {key: item for key, item in value.items()
+            if key in known or (key != "__typename" and item is not None)}
+
+
+def _wire_function_call(fc):
+    """Adapt ProtoJSON wire enums before the SDK's narrower literal schema."""
+    fields = _wire_sdk_fields(types.FunctionCall, fc)
+    for key in ("partialArgs", "partial_args"):
+        fragments = fields.get(key)
+        if not isinstance(fragments, list):
+            continue  # Let SDK validation report the field/type, without its value.
+        normalized = []
+        for fragment in fragments:
+            if isinstance(fragment, dict):
+                fragment = _wire_sdk_fields(types.PartialArg, fragment)
+                for null_key in ("nullValue", "null_value"):
+                    value = fragment.get(null_key)
+                    if type(value) is int and value == 0:
+                        fragment[null_key] = "NULL_VALUE"
+            normalized.append(fragment)
+        fields[key] = normalized
+    return types.FunctionCall.model_validate(fields)
+
+
+def _wire_validation_error(error, prefix):
+    # Never include SDK error messages or input values: these can contain the
+    # generated reply, tool arguments, signatures or a private field name.
+    safe_fields = {field_name for model in (types.FunctionCall, types.PartialArg)
+                   for name, info in model.model_fields.items()
+                   for field_name in (name, info.alias)} | {"thought"}
+    details = []
+    for problem in error.errors(include_input=False, include_context=False, include_url=False)[:3]:
+        location = ".".join(str(item) if isinstance(item, int) or item in safe_fields
+                            else "unknown_field" for item in problem["loc"])
+        details.append(f"{prefix}{location} ({problem['type']})")
+    _fail("函数调用分片字段无效：" + "; ".join(details) + "。")
 
 
 def _normalize_string(value):
@@ -209,7 +260,7 @@ class ToolStreamAssembler:
             if fc.id:
                 seen_ids.add(fc.id)
             if not fc.partial_args and fc.will_continue is not True:
-                complete_function_arguments(fc)
+                _complete_arguments(fc)
                 queue.append(part)
                 return
             call = _Call(part)
@@ -243,7 +294,7 @@ class ToolStreamAssembler:
                 _fail("参数不是有效的 JSON 对象。")
             complete = call.part.function_call.model_copy(update={
                 "args": args, "partial_args": None, "will_continue": None})
-            complete_function_arguments(complete)
+            _complete_arguments(complete)
             call.complete = call.part.model_copy(update={"function_call": complete})
             del active[complete.id]
 
@@ -309,11 +360,17 @@ class ToolStreamAssembler:
                     except ValueError:
                         signature = signature.encode("utf-8")
                 try:
-                    call = types.FunctionCall.model_validate(fc)
-                    native_part = types.Part.model_validate({
-                        **part, "functionCall": call, "thoughtSignature": signature or None})
-                except ValidationError:
-                    _fail("函数调用分片字段无效。")
+                    call = _wire_function_call(fc)
+                except ValidationError as error:
+                    _wire_validation_error(error, "functionCall.")
+                try:
+                    # A GraphQL Part includes unrelated oneof defaults and
+                    # private metadata. Only the call and its annotations use
+                    # SDK types; ordinary wire Parts remain untouched.
+                    native_part = types.Part(function_call=call, thought=part.get("thought"),
+                                             thought_signature=signature or None)
+                except ValidationError as error:
+                    _wire_validation_error(error, "")
                 self._feed(0, native_part)
                 progress |= bool(call.name or call.partial_args)
             else:

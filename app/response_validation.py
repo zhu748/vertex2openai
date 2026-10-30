@@ -88,6 +88,10 @@ class IncompleteResponseError(ValueError):
     code = 502
 
 
+class ToolStreamError(IncompleteResponseError):
+    """Local tool-fragment validation failure, never evidence of a bad proxy."""
+
+
 def complete_function_arguments(call) -> dict:
     """Real tool responses must be complete; private text streaming is decoded first."""
     def field(snake, camel=None):

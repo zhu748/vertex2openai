@@ -2,6 +2,14 @@
 
 基于原版 `vertex2openai-main`（2026-09-01），持续完善兼容性、可靠性和代码组织。
 
+## 2026-10-30：Cookie 工具分片兼容与错误归因修复
+
+- 修复 Cookie 工具流把完整 GraphQL Part 当作 SDK Part 校验的问题；只转换函数调用及其签名/思考标记，避免无关 oneof 默认字段和私有元数据导致工具调用失败，普通 Part 继续原样保留。
+- 兼容 `PartialArg.nullValue=0` 的数值枚举表示，保留原有 `null` / `NULL_VALUE`、路径关闭、布尔 false、数值 0 的语义；只移除协议外层的 `__typename` 与未知 null 默认字段，不修改用户参数，也不忽略实际未知的非空字段。
+- 工具参数校验使用专用 `ToolStreamError`；Cookie 错误事件保留原始异常来源，避免本地 502 触发全代理轮换。真实 HTTP 网关错误、网络异常及已有空响应故障转移继续生效。
+- 字段校验错误携带安全的字段位置和错误类型，例如 `functionCall.partialArgs.0.nullValue (literal_error)`，不记录生成内容或参数值。
+- 新增 10 项 Cookie 回归，覆盖 OpenAI / Gemini 原生桥接、签名、11 个代理与 12 次重试下只请求一次、真实网络错误切换、非法字段边界及源对象不变。Cookie 专项 23 项、全项目 63/63 组检查、服务冒烟 25 项通过；首回复期限与完整参数交付策略不变。详见 `docs/cookie-tool-stream-fix-2026-10-30.md`。
+
 ## 2026-10-30：三协议转换边界与流式完整性
 
 - 补齐 Gemini `MODEL_ARMOR`、`IMAGE_PROHIBITED_CONTENT`、`IMAGE_RECITATION` 的内容过滤映射；无效工具调用和失败的图片生成明确报错，避免被 OpenAI / Claude 转换成正常结束或可执行调用。Gemini 原生路径继续保留原始结束原因。

@@ -17,10 +17,12 @@ PROXY_FAILURE_STATUSES = {407, 502, 503, 504}
 
 def is_proxy_failure(error):
     from first_reply import FirstReplyTimeout
-    if isinstance(error, FirstReplyTimeout):
+    from response_validation import ToolStreamError
+    if isinstance(error, (FirstReplyTimeout, ToolStreamError)):
         # 首回复超时意味着上游连思考分片都没有输出（思考回传开启时思考也算
         # 首回复）：语义上与 429 一样属于“上游无响应”，应交给外层自动重试
-        # （可换 Key），而不是切换出口——不能因为上游不吐字而冤枉当前出口。
+        # （可换 Key），而不是切换出口。已解析响应的本地工具校验错误同样不能
+        # 仅因携带 502/504 就被归因为坏出口。
         return False
     if isinstance(error, ProxyResolveError):
         return True
