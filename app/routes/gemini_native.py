@@ -55,6 +55,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from retry_policy import get_retry_settings, is_retryable_exception, is_retryable_status
 from upstream_errors import extract_upstream_error, google_status_detail
+from usage import merge_usage_metadata
 from response_validation import IncompleteResponseError, has_finish_reason
 from admission import limit_generation, GenerationCapacityError
 from retry_policy import retry_delay as _retry_delay, wait_for_retry as _wait_for_retry
@@ -627,8 +628,7 @@ class _NativeStreamState:
         self.seen, self.finished = set(), set()
         self.received = False
         self.blocked = False
-        # 最后一次出现的 usageMetadata（Gemini 流式会在尾帧携带汇总用量；
-        # 多次出现时后写覆盖前写，与官方 SDK 取末值的口径一致）。
+        # 累积快照按已出现的字段更新；尾帧仅含输出用量时保留先前输入用量。
         self.usage: Optional[dict] = None
 
     def inspect(self, payload):
@@ -640,7 +640,7 @@ class _NativeStreamState:
                 raise NativeStreamError(obj)
             usage = obj.get("usageMetadata")
             if isinstance(usage, dict):
-                self.usage = usage
+                self.usage = merge_usage_metadata(self.usage, usage)
             feedback = obj.get("promptFeedback")
             if isinstance(feedback, dict) and has_finish_reason(feedback.get("blockReason")):
                 self.blocked = True

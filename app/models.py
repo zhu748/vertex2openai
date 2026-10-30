@@ -93,3 +93,9 @@ def message_text(content: Any) -> str:
                 parts.append(p.text)
         return "".join(parts)
     return ""
+
+
+def file_data_markdown(file_uri: str, mime_type: str | None = None) -> str:
+    """Readable OpenAI fallback for Gemini URI media; native paths keep fileData."""
+    image = not mime_type or mime_type.startswith("image/")
+    return f"{'!' if image else ''}[{'Image' if image else 'File'}]({file_uri})"

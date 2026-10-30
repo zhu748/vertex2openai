@@ -24,6 +24,7 @@ from response_validation import (
     complete_function_arguments,
 )
 from runtime_state import app_state
+from models import file_data_markdown
 from signature_store import SignatureState
 from thought_signatures import (
     attach_signature_extra,
@@ -184,7 +185,7 @@ def _build_chunk_payload(
                         text_value is None
                         and getattr(part, "file_data", None) is not None
                     ):
-                        text_value = f"![Image]({part.file_data.file_uri})"
+                        text_value = file_data_markdown(part.file_data.file_uri, getattr(part.file_data, "mime_type", None))
                     text_value = "" if text_value is None else str(text_value)
                     if getattr(part, "inline_data", None) is not None or getattr(part, "file_data", None) is not None:
                         kind = "image"

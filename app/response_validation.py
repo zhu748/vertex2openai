@@ -12,13 +12,22 @@ from tool_arguments import parse_tool_arguments
 # 近似列表，改动极易漂移，现收敛为这一份单一事实源。）
 # ============================================================
 # 内容过滤类：命中即映射为 OpenAI content_filter。
-FINISH_CONTENT_FILTER = ("SAFETY", "PROHIBITED_CONTENT", "RECITATION", "BLOCKLIST", "SPII", "IMAGE_SAFETY")
+FINISH_CONTENT_FILTER = ("SAFETY", "PROHIBITED_CONTENT", "RECITATION", "BLOCKLIST", "SPII", "IMAGE_SAFETY",
+                         "MODEL_ARMOR", "IMAGE_PROHIBITED_CONTENT", "IMAGE_RECITATION")
+# These are model-generation failures, not completed executable calls or stops.
+FINISH_GENERATION_ERRORS = ("MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "NO_IMAGE", "IMAGE_OTHER")
 # 工具调用类：命中即映射为 OpenAI tool_calls。
 FINISH_TOOL_CALLS = ("TOOL_CODE", "FUNCTION_CALL")
 # 截断/过滤类：抗截断传输视为「可提前收尾」的白名单。
 FINISH_TRUNCATING = ("MAX_TOKENS",) + FINISH_CONTENT_FILTER
 # 全部已知合法原因（抗截断白名单的超集）。
 FINISH_KNOWN = ("STOP",) + FINISH_TRUNCATING + FINISH_TOOL_CALLS
+
+
+def validate_generation_finish_reason(reason) -> None:
+    value = str(getattr(reason, "value", reason) or "").upper()
+    if value in FINISH_GENERATION_ERRORS:
+        raise IncompleteResponseError(f"上游生成异常结束：{value}。")
 
 
 def map_finish_reason_to_openai(
@@ -34,6 +43,7 @@ def map_finish_reason_to_openai(
         value = str(raw.name).upper()
     else:
         value = str(raw or "").upper()
+    validate_generation_finish_reason(value)
     if value == "STOP":
         return "tool_calls" if has_tool_calls else "stop"
     if value == "MAX_TOKENS":
@@ -114,6 +124,7 @@ def has_finish_reason(reason) -> bool:
 def require_finish_reason(reason) -> None:
     if not has_finish_reason(reason):
         raise IncompleteResponseError("上游连接已结束，但回复缺少结束标记，内容可能不完整。")
+    validate_generation_finish_reason(reason)
 
 
 def require_complete_response(response) -> None:

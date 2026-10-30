@@ -96,6 +96,49 @@ def map_usage(metadata: Any) -> dict[str, int]:
     return usage
 
 
+def merge_usage_metadata(previous: dict | None, metadata: Any) -> dict:
+    """Merge cumulative Gemini snapshots without treating omitted counters as zero."""
+    if isinstance(metadata, dict):
+        incoming = metadata
+    elif callable(getattr(metadata, "model_dump", None)):
+        incoming = metadata.model_dump(by_alias=True, exclude_none=True)
+    else:
+        incoming = {}
+    merged = dict(previous or {})
+    counters = {
+        "prompt_token_count": "promptTokenCount",
+        "tool_use_prompt_token_count": "toolUsePromptTokenCount",
+        "candidates_token_count": "candidatesTokenCount",
+        "thoughts_token_count": "thoughtsTokenCount",
+        "cached_content_token_count": "cachedContentTokenCount",
+        "total_token_count": "totalTokenCount",
+    }
+    # Preserve native-only details (e.g. modality breakdowns), also as snapshots.
+    merged.update({key: value for key, value in incoming.items()
+                   if key not in counters and key not in counters.values() and value is not None})
+    updated = set()
+    changed = set()
+    for snake, camel in counters.items():
+        value = incoming.get(camel, incoming.get(snake))
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            count = max(0, int(value))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if count != merged.get(camel, merged.get(snake)):
+            changed.add(camel)
+        merged.pop(snake, None)
+        merged[camel] = count
+        updated.add(camel)
+    # A previous total becomes stale when a component changes without a new total.
+    if changed.intersection({"promptTokenCount", "toolUsePromptTokenCount",
+                             "candidatesTokenCount", "thoughtsTokenCount"}) and "totalTokenCount" not in updated:
+        merged.pop("totalTokenCount", None)
+        merged.pop("total_token_count", None)
+    return merged
+
+
 def wants_usage(request_obj: Any) -> bool:
     """客户端是否通过 stream_options.include_usage 要求在流末尾附带用量（P1-8）。"""
     opts = getattr(request_obj, "stream_options", None)

@@ -216,6 +216,7 @@ def _claude_stream_response(response: StreamingResponse, display_model: str, *,
 
     async def event_stream():
         failed = False
+        done = False
         delivered = False  # message_stop 已完整发出（客户端断开/异常时不算完成）
         producer = asyncio.create_task(_produce_frames())
         try:
@@ -234,17 +235,21 @@ def _claude_stream_response(response: StreamingResponse, display_model: str, *,
                     raise item
                 frame = item
                 text = frame.decode("utf-8", errors="replace")
-                if text.lstrip().startswith(":"):
+                data_events = list(_sse_data_lines(text))
+                if not data_events and text.lstrip().startswith(":"):
                     # 上游心跳注释帧 → Anthropic ping 事件（防客户端空闲超时）
                     yield PING_EVENT
                     continue
-                for data in _sse_data_lines(text):
-                    if data.strip() == "[DONE]":
+                for data in data_events:
+                    if not data.strip():
                         continue
+                    if data.strip() == "[DONE]":
+                        done = True
+                        break
                     try:
                         payload = json.loads(data)
                     except (ValueError, TypeError):
-                        continue
+                        raise IncompleteResponseError("上游 OpenAI 流包含无效 JSON 事件。") from None
                     if isinstance(payload, dict) and payload.get("error"):
                         # 流中错误帧：转成 Anthropic error 事件后终止
                         err_type = anthropic_error_type(502)
@@ -253,16 +258,18 @@ def _claude_stream_response(response: StreamingResponse, display_model: str, *,
                         failed = True
                         break
                     if not isinstance(payload, dict):
-                        continue
+                        raise IncompleteResponseError("上游 OpenAI 流事件必须是 JSON 对象。")
                     choices = payload.get("choices")
                     if not choices and isinstance(payload.get("usage"), dict):
                         state.feed_usage(payload["usage"])
                         continue
                     for event in state.feed_openai_chunk(payload):
                         yield event
-                if failed:
+                if failed or done:
                     break
             if not failed:
+                if not state.finish:
+                    raise IncompleteResponseError("上游 OpenAI 流缺少结束原因，回复可能不完整。")
                 for event in state.finish_events():
                     yield event
                 delivered = True
@@ -397,7 +404,9 @@ def _sse_data_lines(frame_text: str):
     for line in frame_text.splitlines():
         if line.startswith("data:"):
             data_parts.append(line[len("data:"):].lstrip(" "))
-        elif line.startswith(":") or not line.strip():
+        elif line.startswith(":"):
+            continue  # SSE comments do not dispatch or split the current event.
+        elif not line.strip():
             if data_parts:
                 yield "\n".join(data_parts)
                 data_parts = []

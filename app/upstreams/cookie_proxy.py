@@ -89,6 +89,7 @@ from usage import (
     estimate_usage,
     make_usage_chunk,
     map_usage,
+    merge_usage_metadata,
     messages_prompt_text,
     wants_usage,
 )
@@ -321,7 +322,7 @@ async def _collect_full_response(
                     elif et == "blocked":
                         blocked_msg = data
                     elif et == "usage":
-                        usage_meta = data
+                        usage_meta = merge_usage_metadata(usage_meta, data)
                     elif et == "error":
                         api_error_status, api_error = api_error_details(data)
                         break
@@ -736,7 +737,7 @@ class CookieGeneration:
                                     }
                                 )
                                 stream_ordinary_metadata.append(
-                                    ordinary_part_metadata("text", data, None)
+                                    ordinary_part_metadata("image", "", None)
                                 )
                                 yield make_openai_chunk(
                                     self.response_id, self.model_display, content=data
@@ -769,7 +770,7 @@ class CookieGeneration:
                             # 正文尾段**之前**，把安全块嵌进正文中间（2026-10 修复）。
                             pending_safety_html = _safety_html_if_enabled(data)
                         elif status == "usage":
-                            usage_meta = data
+                            usage_meta = merge_usage_metadata(usage_meta, data)
                         elif status == "blocked":
                             blocked_msg = data
 
@@ -1136,7 +1137,7 @@ class CookieGeneration:
                                 {"type": "ordinary", "index": len(ordinary_metadata)}
                             )
                             ordinary_metadata.append(
-                                ordinary_part_metadata("text", data, None)
+                                ordinary_part_metadata("image", "", None)
                             )
                         elif event_type == "function_call":
                             part_order.append(
@@ -1162,7 +1163,7 @@ class CookieGeneration:
                         elif event_type == "blocked":
                             blocked_msg = data
                         elif event_type == "usage":
-                            usage_meta = data
+                            usage_meta = merge_usage_metadata(usage_meta, data)
                         elif event_type == "error":
                             api_error_status, api_error = api_error_details(data)
                             break

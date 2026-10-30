@@ -83,7 +83,7 @@ from upstreams.express_response import (
 from upstreams.express_response import (
     is_gemini_response_valid as is_gemini_response_valid,
 )
-from usage import make_usage_chunk, map_usage, wants_usage
+from usage import make_usage_chunk, map_usage, merge_usage_metadata, wants_usage
 
 
 def _keepalive_frame(model_name: str) -> str:
@@ -617,6 +617,7 @@ class SDKGeneration:
                 # Claude 生态的 cache_read_input_tokens 与 thinking 细分
                 # 在真流式下永远缺失（2026-10 修复）。
                 final_usage: dict = {}
+                usage_metadata: dict = {}
                 seen_candidates, finished_candidates = set(), set()
                 received_chunks = 0
                 content_chars, reasoning_chars, tool_deltas = 0, 0, 0
@@ -645,7 +646,8 @@ class SDKGeneration:
                             f"📥 [首个上游分片] {self.request_obj.model}：第 {attempt + 1} 次尝试等待 {elapsed:.1f} 秒收到分片；分片可能仅含思考或用量。"
                         )
                     if getattr(chunk_item_call, "usage_metadata", None):
-                        final_usage = map_usage(chunk_item_call.usage_metadata)
+                        usage_metadata = merge_usage_metadata(usage_metadata, chunk_item_call.usage_metadata)
+                        final_usage = map_usage(usage_metadata)
                         record_usage(
                             final_usage
                         )  # 与旧 _extract_usage 一致：trace 用量口径

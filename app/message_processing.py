@@ -15,7 +15,7 @@ from image_processing import (
     optimize_image_bytes,
 )
 from tool_arguments import parse_tool_arguments
-from models import OpenAIMessage, message_text, normalize_content_part
+from models import OpenAIMessage, file_data_markdown, message_text, normalize_content_part
 from response_validation import map_finish_reason_to_openai, complete_function_arguments
 from runtime_state import app_state
 from signature_store import SignatureState
@@ -796,7 +796,7 @@ def parse_gemini_response_for_reasoning_and_content(
                 file_data = part_item.file_data
                 if hasattr(file_data, "file_uri"):
                     file_uri = file_data.file_uri
-                    part_text = f"![Image]({file_uri})"
+                    part_text = file_data_markdown(file_uri, getattr(file_data, "mime_type", None))
 
             part_is_thought = (
                 hasattr(part_item, "thought") and part_item.thought is True
@@ -902,7 +902,7 @@ def process_gemini_response_to_openai_dict(
                 elif (
                     text_value is None and getattr(part, "file_data", None) is not None
                 ):
-                    text_value = f"![Image]({part.file_data.file_uri})"
+                    text_value = file_data_markdown(part.file_data.file_uri, getattr(part.file_data, "mime_type", None))
                 text_value = "" if text_value is None else str(text_value)
                 if getattr(part, "inline_data", None) is not None or getattr(part, "file_data", None) is not None:
                     ordinary_kind = "image"
@@ -945,7 +945,7 @@ def process_gemini_response_to_openai_dict(
                 google["part_order"] = order_descriptors
 
             choice_item = {
-                "index": i,
+                "index": candidate.index if getattr(candidate, "index", None) is not None else i,
                 "message": message_payload,
                 "finish_reason": openai_finish_reason,
             }

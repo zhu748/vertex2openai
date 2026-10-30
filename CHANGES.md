@@ -2,6 +2,16 @@
 
 基于原版 `vertex2openai-main`（2026-09-01），持续完善兼容性、可靠性和代码组织。
 
+## 2026-10-30：三协议转换边界与流式完整性
+
+- 补齐 Gemini `MODEL_ARMOR`、`IMAGE_PROHIBITED_CONTENT`、`IMAGE_RECITATION` 的内容过滤映射；无效工具调用和失败的图片生成明确报错，避免被 OpenAI / Claude 转换成正常结束或可执行调用。Gemini 原生路径继续保留原始结束原因。
+- 非流式 OpenAI 响应保留上游 candidate index，与真流式对齐；索引缺省时才使用候选位置。
+- Express、Cookie、Cookie 原生桥接及原生透传诊断按实际出现字段合并累计用量，补齐 Claude 输出专用用量更新的输入/缓存保留；显式零值可更新，累计值不重复相加，过期总量重新按分项计算。
+- Claude SSE 收到 `[DONE]` 即结束并回收生产者；缺少结束原因、损坏 JSON 和非对象事件返回错误，不再补发成功结束。兼容注释与多行 data 混合、空 data 保活。
+- Cookie 解析保留 `fileData`；原生桥接保留 URI、MIME、displayName 和签名，OpenAI 使用图片/文件链接展示，与 Express 流式和非流式采用同一规则。
+- 修复 Cookie 图片签名误挂到前面文字、图片元数据重复保存 base64 的问题，覆盖图片与文字交错后的双通道历史回放。
+- 新增 23 项转换边界回归；全项目 63/63 组检查、25/25 项服务冒烟通过。范围与保真边界见 `docs/protocol-review-2026-10-30.md`。
+
 ## 2026-10-30：请求热路径与控制台性能优化
 
 - 工具参数按字符串处理 Unicode 代理项，移除整棵参数树的 ASCII JSON 往返；重复 JSONPath 只缓存最近一次解析，继续检查未闭合字符串、数组缺口与非有限数值。

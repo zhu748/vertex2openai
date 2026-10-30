@@ -912,6 +912,7 @@ class ClaudeStreamState:
         self._open: Optional[dict] = None       # 当前打开的块 {"kind","index",...}
         self._tools: dict[int, dict] = {}        # OpenAI tool index → {id,name,parts}（按到达序）
         self.usage: dict = {"input_tokens": 0, "output_tokens": 0}
+        self._usage_fields: dict = {}
         self.finish: Optional[str] = None
         self.has_tools = False
         self._tool_ids = {}
@@ -1068,8 +1069,27 @@ class ClaudeStreamState:
         return events
 
     def feed_usage(self, usage: Any) -> None:
-        if isinstance(usage, dict):
-            self.usage = _anthropic_usage(usage)
+        if not isinstance(usage, dict):
+            return
+        # Usage chunks are cumulative snapshots, but an update may contain
+        # only output tokens. Missing input/cache counters must not become 0.
+        for canonical, alias in (("prompt_tokens", "input_tokens"), ("completion_tokens", "output_tokens")):
+            value = usage.get(canonical, usage.get(alias))
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                try:
+                    self._usage_fields[canonical] = max(0, int(value))
+                except (ValueError, OverflowError):
+                    pass
+        for field, key in (("prompt_tokens_details", "cached_tokens"),
+                           ("completion_tokens_details", "reasoning_tokens")):
+            detail = usage.get(field)
+            value = detail.get(key) if isinstance(detail, dict) else None
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                try:
+                    self._usage_fields[field] = {key: max(0, int(value))}
+                except (ValueError, OverflowError):
+                    pass
+        self.usage = _anthropic_usage(self._usage_fields)
 
     # ---- 收尾 ----
     def finish_events(self) -> list[str]:

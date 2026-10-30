@@ -6,8 +6,9 @@ import json
 import re
 import time
 from typing import Any, AsyncGenerator, Optional
+from models import file_data_markdown
 
-from response_validation import IncompleteResponseError, complete_function_arguments
+from response_validation import IncompleteResponseError, complete_function_arguments, validate_generation_finish_reason
 from json_stream import MAX_JSON_OBJECT_BYTES, JsonObjects as _JsonObjects
 from signature_store import SignatureRecord, SignatureState, signature_store
 from thought_signatures import (
@@ -48,6 +49,10 @@ def apply_wire_signature(data: dict, ordinary_metadata: list, part_order: list) 
         return None
     if ordinary_metadata:
         ordinary_metadata[-1]["thought_signature"] = encode_thought_signature(signature)
+        if data.get("part_kind") == "image":
+            # The media already lives in content; metadata retains its exact
+            # slot/signature instead of duplicating the base64 as plain text.
+            ordinary_metadata[-1].update(kind="image", text="")
     elif data.get("part_kind") == "signature_only":
         part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
         ordinary_metadata.append(ordinary_part_metadata("signature_only", "", signature))
@@ -240,6 +245,10 @@ def extract_events(obj: dict, *, preserve_parts: bool = False, tool_stream=None)
             if isinstance(candidate, dict) and candidate.get("index", 0) not in (None, 0):
                 raise IncompleteResponseError("Cookie 上游返回非零候选索引，当前桥接无法无损转换。")
             candidate = _wire_object(candidate, "candidate", allow_null=False)
+            if not preserve_parts:
+                # Validate before yielding calls from the same failing chunk.
+                # Gemini-native consumers retain their original finishReason.
+                validate_generation_finish_reason(candidate.get("finishReason"))
             content_obj = _wire_object(candidate.get("content"), "content")
             parts = _wire_list(content_obj.get("parts"), "parts")
             if tool_stream is not None:
@@ -290,17 +299,6 @@ def extract_events(obj: dict, *, preserve_parts: bool = False, tool_stream=None)
                                 "thought_signature": part.get("thoughtSignature") or None,
                             },
                         )
-                elif part.get("thoughtSignature") and not preserve_parts:
-                    yield (
-                        "thought_signature",
-                        {
-                            "value": part["thoughtSignature"],
-                            "part_kind": "thought"
-                            if is_thought_part(part)
-                            else ("text" if text else "signature_only"),
-                        },
-                    )
-
                 inline_data = _wire_object(part.get("inlineData"), "inlineData")
                 if inline_data:
                     mime_type = inline_data.get("mimeType", "")
@@ -312,6 +310,30 @@ def extract_events(obj: dict, *, preserve_parts: bool = False, tool_stream=None)
                         if not preserve_parts:
                             image_md = f"![Generated Image](data:{mime_type};base64,{b64})"
                             yield ("image", image_md)
+
+                file_data = _wire_object(part.get("fileData"), "fileData")
+                if file_data:
+                    uri, mime_type = file_data.get("fileUri", ""), file_data.get("mimeType", "")
+                    uri = "" if uri is None else uri
+                    mime_type = "" if mime_type is None else mime_type
+                    if not isinstance(uri, str) or not isinstance(mime_type, str):
+                        raise IncompleteResponseError("上游 fileData 的 fileUri / mimeType 必须是字符串。")
+                    if uri:
+                        native_part["fileData"] = dict(file_data)
+                        if not preserve_parts:
+                            kind = "image" if not mime_type or mime_type.startswith("image/") else "text"
+                            yield kind, file_data_markdown(uri, mime_type)
+
+                if part.get("thoughtSignature") and not (name and name.strip()) and not preserve_parts:
+                    # Signatures describe this Part. Emit them after its media
+                    # event, so consumers cannot attach them to preceding text.
+                    media = "inlineData" in native_part or ("fileData" in native_part
+                        and (not mime_type or mime_type.startswith("image/")))
+                    yield "thought_signature", {
+                        "value": part["thoughtSignature"],
+                        "part_kind": "thought" if is_thought_part(part)
+                        else "image" if media else "text" if text else "signature_only",
+                    }
 
                 if preserve_parts:
                     signature = part.get("thoughtSignature")

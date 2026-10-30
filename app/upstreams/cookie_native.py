@@ -55,6 +55,7 @@ from runtime_state import app_state
 from schema_validation import SchemaValidationError
 from streaming import HEARTBEAT, HEARTBEAT_FRAME, with_heartbeats
 from tool_policy import has_search_suffix
+from usage import merge_usage_metadata
 from upstreams.cookie_response import RawSampler
 from upstreams.cookie_transport import (
     stream_events,
@@ -406,7 +407,7 @@ class NativeAssembler:
         elif kind == "finish":
             self.finish = data
         elif kind == "usage":
-            self.usage = data if isinstance(data, dict) else None
+            self.usage = merge_usage_metadata(self.usage, data)
         elif kind == "safety":
             self.safety = data
         elif kind == "blocked":
