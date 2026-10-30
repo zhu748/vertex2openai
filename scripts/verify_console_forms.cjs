@@ -8,6 +8,7 @@ const root=path.resolve(__dirname,'..');
 const tick=()=>new Promise(r=>setTimeout(r,20));
 async function main(){
  const errors=[],requests=[],clipboard=[];
+ let passed=0;const check=label=>{passed++;console.log('✓ '+label);};
  const virtualConsole=new VirtualConsole();virtualConsole.on('jsdomError',e=>errors.push(e.message));
  const dom=new JSDOM(fs.readFileSync(path.join(root,'app/templates/dashboard.html'),'utf8'),{url:'http://console.test/',runScripts:'dangerously',pretendToBeVisual:true,virtualConsole});
  const w=dom.window,d=w.document;
@@ -74,7 +75,7 @@ async function main(){
   assert.equal(el('roundrobin'),null);
   assert.equal(el('keys-list').querySelector('details').open,false);
   assert.equal(el('key-0').type,'password');
-  console.log('✓ Navigation, initial clean state, account masking/collapse, recent metrics');
+  check('Navigation, initial clean state, account masking/collapse, recent metrics');
 
   w.switchTab('logs');
   const logSource=eventSources.find(source=>source.url==='/stream-logs');
@@ -93,7 +94,7 @@ async function main(){
   logSource.onmessage({data:'must not return after clear'});el('log-clear').click();
   await new Promise(resolve=>setTimeout(resolve,80));assert.equal(logwin.childElementCount,0);
   edit('log-level','all');delete logwin.scrollHeight;
-  console.log('✓ Burst logs batch DOM updates, retain newest 500, preserve filters/escaping, clear pending messages');
+  check('Burst logs batch DOM updates, retain newest 500, preserve filters/escaping, clear pending messages');
 
   w.switchTab('channel');
   let cookieRow=el('cookies-list').firstElementChild;
@@ -133,7 +134,7 @@ async function main(){
   assert.equal(clipboard.length,copiesBeforeRemoval);
   w.consoleForms.discard('cookies');assert.equal(w.consoleForms.dirty(),false);
   assert.equal(cookiePreview().hidden,true);assert.equal(cookiePreview().value,'');
-  console.log('✓ Saved Cookie reveal/hide/copy, HTTP clipboard fallback, session errors and stale-row isolation');
+  check('Saved Cookie reveal/hide/copy, HTTP clipboard fallback, session errors and stale-row isolation');
 
   w.switchTab('channel');edit('key-note-0','切换保留 Key 草稿');edit('cookie-note-0','切换保留 Cookie 草稿');
   const credentialWrites=requests.filter(r=>r.method==='POST'&&['/api/express-keys','/api/cookie-accounts'].includes(r.path)).length;
@@ -153,7 +154,7 @@ async function main(){
   assert.equal(mode,'mixed');modeVisible('mixed');assert.equal(d.querySelector('input[name=mode]:checked').value,'mixed');
   assert.equal(requests.filter(r=>r.method==='POST'&&['/api/express-keys','/api/cookie-accounts'].includes(r.path)).length,credentialWrites);
   w.consoleForms.discard('keys');w.consoleForms.discard('cookies');assert.equal(w.consoleForms.dirty(),false);
-  console.log('✓ Three channel modes show matching credential lists, preserve drafts and roll back failed saves');
+  check('Three channel modes show matching credential lists, preserve drafts and roll back failed saves');
 
   for(const link of d.querySelectorAll('.settings-jump a')){
    w.history.replaceState(null,'',link.href);w.navigateHash();
@@ -165,7 +166,7 @@ async function main(){
   w.history.replaceState(null,'','#main-content');w.navigateHash();assert.equal(el('mobile-nav').value,'runtime');
   w.history.replaceState(null,'','#global-settings');w.navigateHash();assert.equal(el('mobile-nav').value,'runtime');
   await tick();
-  console.log('✓ Section deep links, mobile navigation, page scroll restoration and skip link');
+  check('Section deep links, mobile navigation, page scroll restoration and skip link');
 
   w.switchTab('params');edit('model-sel','text');edit('first_reply_timeout_seconds','35');await save('btn-scope-save');
   const first=requests.filter(r=>r.path==='/api/model-overrides/text').at(-1).body;
@@ -182,7 +183,7 @@ async function main(){
   w.discardModelDraft();assert.equal(el('first_reply_timeout_seconds').value,'15');
   assert.equal(el('image-controls').hidden,true);
   assert.equal(el('thinking_g3_level').querySelector('[value=minimal]').disabled,true);
-  console.log('✓ Sparse model save, per-field inheritance, capability options and model drafts');
+  check('Sparse model save, per-field inheritance, capability options and model drafts');
 
   edit('first_reply_timeout_seconds','25');edit('first_reply_timeout_seconds','15');
   assert.equal(w.consoleForms.dirty(),false);
@@ -206,20 +207,20 @@ async function main(){
   w.setFieldInheritance('default_top_p',true);assert.equal(el('default_top_p').value,'');await save('btn-scope-save');
   delete builtins.text.default_top_p;delete overrides.image;settings.image_aspect_ratio='16:9';settings.default_top_p=null;
   await w.loadParams();
-  console.log('✓ Reverted edits, deliberate pins, obsolete override cleanup and exact inherited values');
+  check('Reverted edits, deliberate pins, obsolete override cleanup and exact inherited values');
 
   edit('model-sel','__global__');edit('default_top_p','2');await save('btn-scope-save');
   assert.equal(el('default_top_p').getAttribute('aria-invalid'),'true');
   assert(el('default_top_p-error'));
   edit('default_top_p','');assert.equal(el('default_top_p-error'),null);w.discardModelDraft();
   w.switchTab('runtime');const help=d.querySelector('[aria-controls=h_ccf]');help.click();assert.equal(el('h_ccf').hidden,false);help.click();assert.equal(el('h_ccf').hidden,true);
-  console.log('✓ Persistent field validation and accessible help disclosure');
+  check('Persistent field validation and accessible help disclosure');
   edit('retry_max','12');assert.equal(w.consoleForms.dirty(),true);
   await w.loadParams();assert.equal(el('retry_max').value,'12');
   w.consoleForms.discard('runtime');assert.equal(el('retry_max').value,'10');
   edit('retry_max','13');d.querySelector('button[onclick*="saveSettings"]').click();await tick();
   assert.equal(settings.retry_max,13);assert.equal(w.consoleForms.dirty(),false);
-  console.log('✓ Runtime draft reload preservation, save and undo');
+  check('Runtime draft reload preservation, save and undo');
 
   assert.equal(el('cookie_auto_refresh').checked,true);
   edit('cookie_auto_refresh',true);edit('cookie_refresh_interval_seconds','900');
@@ -233,7 +234,7 @@ async function main(){
   const beforeInvalid=requests.length;d.querySelector('button[onclick*="saveSettings"]').click();await tick();
   assert.equal(requests.length,beforeInvalid);assert.equal(el('cookie_refresh_interval_seconds').getAttribute('aria-invalid'),'true');
   w.consoleForms.discard('runtime');assert.equal(el('cookie_refresh_interval_seconds').value,'900');
-  console.log('✓ Cookie refresh controls save, reload, validate limits and undo');
+  check('Cookie refresh controls save, reload, validate limits and undo');
 
   edit('cookie_auto_refresh',false);d.querySelector('button[onclick*="saveSettings"]').click();await tick();
   const settingsWrites=requests.filter(r=>r.path==='/api/settings'&&r.method==='POST').length;
@@ -257,7 +258,7 @@ async function main(){
   await w.refreshCookies(0);assert(el('cookie-refresh-result').textContent.includes('Cookie 正在刷新'));
   assert.equal(requests.filter(r=>r.path==='/api/settings'&&r.method==='POST').length,settingsWrites);
   assert.equal(w.consoleForms.dirty(),false);
-  console.log('✓ Manual Cookie refresh works with auto off, escapes results, prevents duplicates and preserves drafts');
+  check('Manual Cookie refresh works with auto off, escapes results, prevents duplicates and preserves drafts');
 
   w.switchTab('channel');w.consoleForms.openAccount('key',0);edit('key-note-0','新备注');
   assert.equal(w.consoleForms.dirty(),true);assert.equal(d.querySelector('.account-name').textContent,'新备注');
@@ -268,7 +269,7 @@ async function main(){
   w.consoleForms.discard('keys');assert.equal(el('keys-list').children.length,1);
   edit('credential-strategy','roundrobin');await tick();assert.equal(settings.roundrobin,true);assert.equal(w.consoleForms.dirty(),false);
   edit('proxy-input','http://proxy.test:80');await w.saveProxy();assert.equal(w.consoleForms.dirty(),false);
-  console.log('✓ Credential drafts, filters, add/undo, immediate strategy and proxy save state');
+  check('Credential drafts, filters, add/undo, immediate strategy and proxy save state');
 
   let probed={...keys[0],project_id:'detected-project',project_source:'auto'};
   keys=[probed];w.mergeProbeResults([{key:probed.key,ok:true,project_id:probed.project_id}],keys);
@@ -283,7 +284,7 @@ async function main(){
   w.consoleForms.discard('keys');assert.equal(el('project-0').value,'new-detected-project');
   assert.equal(el('key-note-0').value,'主账号');assert.equal(w.consoleForms.dirty(),false);
   w.addKeyRow();assert.equal(w.consoleForms.dirty(),true);w.consoleForms.discard('keys');
-  console.log('✓ Persisted probe results rebase saved state without swallowing credential drafts');
+  check('Persisted probe results rebase saved state without swallowing credential drafts');
 
   transport=target=>{if(target.pathname==='/api/express-keys'){transport=null;return new Response(JSON.stringify({keys,revision:'r1'}));}};
   await w.loadExpressKeys();
@@ -306,7 +307,7 @@ async function main(){
   assert.equal(el('key-note-0').value,'冲突时保留的草稿');assert.equal(w.consoleForms.dirty(),true);
   assert(el('channel-load-error').textContent.includes('草稿已保留'));
   await w.loadExpressKeys();
-  console.log('✓ Probe revisions rebase expected metadata only; repeated probes cannot bypass conflicts or discard drafts');
+  check('Probe revisions rebase expected metadata only; repeated probes cannot bypass conflicts or discard drafts');
 
   let resolveOldProxy;
   transport=target=>{if(target.pathname==='/api/proxy/test'){transport=null;return new Promise(resolve=>{resolveOldProxy=resolve;});}};
@@ -323,7 +324,7 @@ async function main(){
   resolveStoppedProxy(new Response(JSON.stringify({ok:true,message:'late cancelled pass'})));await stoppedProxyJob;
   assert.equal(el('proxy-result-0').dataset.state,'cancelled');
   assert(el('proxy-job-state').textContent.includes('通过 0 / 1'));w.closeProxyEditor(true);
-  console.log('✓ Closed and cancelled proxy probes cannot overwrite newer results or import cancelled passes');
+  check('Closed and cancelled proxy probes cannot overwrite newer results or import cancelled passes');
 
   w.switchTab('requests');await tick();const row=el('request-rows').firstElementChild;
   await w.requestMonitor.refresh();assert.equal(el('request-rows').firstElementChild,row);
@@ -355,10 +356,10 @@ async function main(){
   const detailState=el('request-detail-state').textContent;rejectDetail(new Error('outdated detail failure'));await tick();
   assert.equal(el('request-detail-id').textContent,'new-record');assert.equal(el('request-detail-state').textContent,detailState);
   el('request-dialog').close();
-  console.log('✓ Retained-page clamping, stale response isolation and paused retry messages');
+  check('Retained-page clamping, stale response isolation and paused retry messages');
   const ids=[...d.querySelectorAll('[id]')].map(e=>e.id);assert.equal(new Set(ids).size,ids.length);
   assert.deepEqual(errors,[]);
-  console.log('✓ Stable request rows, pause/resume, pagination and unique DOM IDs');
+  check('Stable request rows, pause/resume, pagination and unique DOM IDs');
   await w.loadParams();w.switchTab('runtime');
   const retryBefore=Number(el('retry_max').value),keepaliveBefore=Number(el('keepalive_interval').value);
   settings.retry_max=retryBefore+1;
@@ -376,8 +377,8 @@ async function main(){
   assert.equal(settings.thinking_g3_level,oldThinking==='high'?'low':'high');
   edit('thinking_g3_level','medium');await save('btn-scope-save');
   assert(el('toast').textContent.includes('另一页面'));w.discardModelDraft();
-  console.log('✓ Cross-tab sparse runtime/global saves and same-field conflict preservation');
-  console.log('16 groups of console DOM checks passed. Layout requires the browser suite.');
+  check('Cross-tab sparse runtime/global saves and same-field conflict preservation');
+  console.log(`${passed} groups of console DOM checks passed. Layout requires the browser suite.`);
  }finally{dom.window.close();}
 }
 main().catch(error=>{console.error(error);process.exitCode=1;});
