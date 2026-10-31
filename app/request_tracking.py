@@ -26,14 +26,17 @@ _RE_URL_CREDS = re.compile(r"(?i)(?<![a-z0-9+.-])([a-z][a-z0-9+.-]{0,31})://[^/\
 _RE_QUERY_KEY = re.compile(r"(?i)([?&](?:key|api_key|access_token)=)[^&\s'\"]+")
 _RE_BEARER = re.compile(r"(?i)(bearer[ \t]+)[^\s'\",;]+")
 _RE_GOOGLE_KEY = re.compile(r"AIza[\w\-]{20,}")
+_RE_SURROGATES = re.compile(r"[\ud800-\udfff]")
 
 
 def numeric_usage(usage):
-    return {k: v for k, v in usage.items() if isinstance(v, int) or isinstance(v, float) and math.isfinite(v)}
+    return {redact(k)[:100]: v for k, v in usage.items() if isinstance(v, int) or isinstance(v, float) and math.isfinite(v)}
 
 
 def redact(text):
     text = str(text)
+    if not text.isascii():
+        text = _RE_SURROGATES.sub("\ufffd", text)
     text = _RE_URL_CREDS.sub(r"\1://***@", text)
     text = _RE_QUERY_KEY.sub(r"\1***", text)
     text = _RE_BEARER.sub(r"\1***", text)
@@ -81,7 +84,7 @@ class RequestTrace:
                         "thinking_level", "include_thoughts", "max_output_tokens", "upstream_model", "project_id"):
                 if key in values:
                     value = values[key]
-                    self.data[key] = value[:500] if isinstance(value, str) else value
+                    self.data[key] = redact(value[:500]) if isinstance(value, str) else value
 
     def _append(self, target, item):
         def size(entry):
@@ -202,7 +205,7 @@ class RequestTrace:
             reasoning += len(delta.get("reasoning_content") or "")
             tools += len(delta.get("tool_calls") or [])
             if choice.get("finish_reason"):
-                reasons.append(str(choice["finish_reason"]))
+                reasons.append(redact(choice["finish_reason"])[:100])
         for candidate in payload.get("candidates") or []:
             for part in (candidate.get("content") or {}).get("parts") or []:
                 if part.get("thought"):
@@ -212,7 +215,7 @@ class RequestTrace:
                 tools += int(bool(part.get("functionCall")))
                 media |= bool(part.get("inlineData") or part.get("fileData"))
             if candidate.get("finishReason"):
-                reasons.append(str(candidate["finishReason"]))
+                reasons.append(redact(candidate["finishReason"])[:100])
         with self._lock:
             if sent:
                 self.data["sent_content_chars"] += content

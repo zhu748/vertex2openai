@@ -3,6 +3,26 @@
 from fastapi.responses import JSONResponse
 
 
+def ingress_error_response(path: str, code: int, message: str) -> JSONResponse:
+    if path == "/v1/messages" or path.startswith("/v1/messages/"):
+        from routes.claude_api import claude_error
+        from claude_protocol import anthropic_error_type
+        response = claude_error(code, anthropic_error_type(code), message)
+    elif path.startswith(("/v1/models/", "/v1beta/models/")):
+        from routes.gemini_native import _native_error
+        response = _native_error(code, message, status_detail="DEADLINE_EXCEEDED" if code == 408 else None)
+    else:
+        response = JSONResponse(status_code=code, content={
+            "detail": message,
+            "error": {"message": message, "type": "authentication_error" if code == 401 else
+                      "overloaded_error" if code == 503 else "invalid_request_error", "code": code},
+        })
+    response.headers["Cache-Control"] = "no-store"
+    if code == 503:
+        response.headers["Retry-After"] = "1"
+    return response
+
+
 def declared_body_exceeds(value: str, limit: int) -> bool:
     """Compare an ASCII Content-Length without converting an untrusted integer.
 

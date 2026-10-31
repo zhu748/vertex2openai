@@ -3,7 +3,8 @@ import asyncio
 
 import anyio
 from request_connection import BodyTooLargeError, ClientConnection, ConnectionReceiver
-from request_errors import body_too_large_response, declared_body_exceeds
+from request_errors import body_too_large_response, declared_body_exceeds, ingress_error_response
+from request_ingress import IngressError, IngressReceive, current_ingress, early_generation_auth
 from request_tracking import PayloadObserver, current_trace, request_registry
 from starlette.requests import ClientDisconnect
 
@@ -19,23 +20,6 @@ MAX_CHAT_BODY_BYTES = 32 * 1024 * 1024
 # 是内存放大面，而这里无需鉴权即可触达。口令本身就是短字符串，256KB 绰绰有余。
 LOGIN_BODY_BYTES = 256 * 1024
 MANAGEMENT_BODY_BYTES = 8 * 1024 * 1024
-
-
-class _BodyLimitReceive:
-    """Bound management uploads before JSON parsing, including chunked bodies."""
-
-    def __init__(self, receive, max_bytes: int):
-        self._receive = receive
-        self._max_bytes = max_bytes
-        self._seen = 0
-
-    async def __call__(self):
-        message = await self._receive()
-        if message.get("type") == "http.request":
-            self._seen += len(message.get("body") or b"")
-            if self._seen > self._max_bytes:
-                raise BodyTooLargeError(self._max_bytes)
-        return message
 
 
 class StatsMiddleware:
@@ -58,11 +42,21 @@ class StatsMiddleware:
             if declared_body_exceeds(declared_length, limit):
                 await body_too_large_response(path, limit)(scope, receive, send)
                 return
-            limited = _BodyLimitReceive(receive, limit)
+            limited = None
+            ingress_token = None
             try:
+                limited = IngressReceive(receive, limit)
+                ingress_token = current_ingress.set(limited)
                 await self.app(scope, limited, send)
             except BodyTooLargeError:
                 await body_too_large_response(path, limit)(scope, receive, send)
+            except IngressError as exc:
+                await ingress_error_response(path, exc.status_code, exc.detail)(scope, receive, send)
+            finally:
+                if limited is not None:
+                    limited.close()
+                if ingress_token is not None:
+                    current_ingress.reset(ingress_token)
             return
         if not tracked:
             return await self.app(scope, receive, send)
@@ -78,6 +72,8 @@ class StatsMiddleware:
         observer = None
         send_failed = False
         error_counted = False
+        ingress = None
+        ingress_token = None
         connection = ClientConnection()
         scope.setdefault("state", {})["client_connection"] = connection
         receiver = ConnectionReceiver(receive, connection, lambda: trace.end_connection(disconnected=True),
@@ -118,7 +114,19 @@ class StatsMiddleware:
                     observer.feed(message.get("body", b""), final=completed)
 
         try:
+            denied = await early_generation_auth(scope)
+            if denied is not None:
+                await denied(scope, receive, relay)
+                return
+            ingress = IngressReceive(receive, MAX_CHAT_BODY_BYTES)
+            ingress_token = current_ingress.set(ingress)
+            receiver.receive = ingress
             await self.app(scope, receiver, relay)
+        except IngressError as exc:
+            if started or send_failed:
+                raise
+            await ingress_error_response(path, exc.status_code, exc.detail)(scope, receive, relay)
+            return
         except BodyTooLargeError as exc:
             # chunked 请求体在 receive 层超限：响应尚未开始，统一回 413。
             # 旧实现只能在应用层全量读完后检查，拦不住无长度头的流式上传。
@@ -144,6 +152,10 @@ class StatsMiddleware:
             trace.fail(str(exc))
             raise
         finally:
+            if ingress is not None:
+                ingress.close()
+            if ingress_token is not None:
+                current_ingress.reset(ingress_token)
             connection.finish(send_failed or not completed)
             trace.end_connection(disconnected=send_failed or not completed)
             try:

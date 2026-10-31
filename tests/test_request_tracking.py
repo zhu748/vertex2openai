@@ -128,7 +128,9 @@ class MiddlewareErrorTests(unittest.IsolatedAsyncioTestCase):
             pass
         with mock.patch.object(middleware, "request_registry", registry):
             with self.assertRaises(OSError):
-                await middleware.StatsMiddleware(app, stats)({"type": "http", "method": "POST", "path": "/v1/chat/completions"}, noop, noop)
+                await middleware.StatsMiddleware(app, stats)({
+                    "type": "http", "method": "POST", "path": "/v1/chat/completions", "query_string": b"",
+                    "headers": [(b"authorization", b"Bearer " + config.API_KEY.encode())]}, noop, noop)
         self.assertEqual(stats.error_requests, 1)
         self.assertEqual(registry.list()["items"][0]["status"], "error")
 

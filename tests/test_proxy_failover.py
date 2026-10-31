@@ -150,8 +150,8 @@ class ChainTests(unittest.IsolatedAsyncioTestCase):
             raise httpx.ConnectError("offline")
         with mock.patch("proxy_failover.resolve_proxy_uri_async", side_effect=resolve):
             with self.assertRaises(httpx.ConnectError):
-                await ProxyChain(candidates=["broken", "last"]).run(operation)
-        self.assertEqual(calls, ["last"])
+                await ProxyChain(candidates=["broken", "http://last:80"]).run(operation)
+        self.assertEqual(calls, ["http://last:80"])
 
     async def test_auth_quota_and_local_pool_errors_do_not_switch_proxies(self):
         for status in (400, 401, 403, 404, 429):
@@ -617,7 +617,7 @@ class CurlRemoteDNSTests(unittest.TestCase):
 
         app_state.update_settings({"cookie_impersonate": "chrome"})
         try:
-            with mock.patch("curl_cffi.requests.AsyncSession", _FakeSession):
+            with mock.patch("curl_transport.CancellationSafeSession", _FakeSession):
                 impersonate._create_upstream_client(
                     {"proxy": "socks5://user:pass@38.154.185.97:6370", "timeout": 5})
         finally:

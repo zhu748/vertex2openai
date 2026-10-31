@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import httpx
 
-from proxy_resolver import ProxyResolveError, mask_proxy_uri, resolve_proxy_uri_async
+from proxy_resolver import ProxyResolveError, mask_proxy_uri, resolve_proxy_uri_async, resolved_proxy_scope
 from runtime_state import get_effective_proxy_uris_for_account
 
 PROXY_FAILURE_STATUSES = {407, 502, 503, 504}
@@ -73,7 +73,8 @@ class ProxyChain:
         while True:
             try:
                 resolved = await resolve_proxy_uri_async(self.current)
-                return factory(self.current, resolved)
+                with resolved_proxy_scope(self.current, resolved):
+                    return factory(self.current, resolved)
             except Exception as exc:
                 if not self.advance(exc):
                     raise
@@ -90,7 +91,8 @@ class ProxyChain:
                         from request_tracking import upstream_attempt
                         upstream_attempt()
                     attempted = True
-                    result = await operation(self.current, resolved)
+                    with resolved_proxy_scope(self.current, resolved):
+                        result = await operation(self.current, resolved)
             except Exception as exc:
                 if self.advance(exc):
                     continue

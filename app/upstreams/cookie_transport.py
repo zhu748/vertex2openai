@@ -9,6 +9,7 @@ import time
 from typing import Any, AsyncGenerator
 
 from cookie_auth import BATCH_GRAPHQL_URL
+from http_io import read_upstream_bytes
 from first_reply import FirstReplyGuard, FirstReplyTimeout, native_has_reply, timeout_seconds
 from request_tracking import upstream_attempt, upstream_chunk
 from response_validation import (
@@ -104,6 +105,8 @@ def is_native_tool_error(error_msg: str) -> bool:
     tool_terms = (
         "functiondeclaration",
         "function declaration",
+        "functionresponse",
+        "function response",
         "functioncallingconfig",
         "function calling",
         "toolconfig",
@@ -114,6 +117,7 @@ def is_native_tool_error(error_msg: str) -> bool:
         "unsupported",
         "not supported",
         "unknown field",
+        "not defined",
         "unrecognized",
         "invalid argument",
         "invalid value",
@@ -231,7 +235,7 @@ async def _execute_stream_request_generator_once(
         ) as response:
             # 1. 拦截 HTTP 状态码错误
             if response.status_code != 200:
-                error_text = await response.aread()
+                error_text = await read_upstream_bytes(response)
                 error_msg = error_text.decode("utf-8", errors="replace")[:1000]
 
                 # 原生函数 Schema 被拒优先于 Cookie/项目分类（与事件流分支
@@ -333,8 +337,9 @@ async def _execute_stream_request_generator_once(
                         # and decides whether replay is still safe.
                         retryable = (
                             is_retryable_status(code)
-                            if isinstance(explicit_code, int)
-                            and 400 <= explicit_code <= 599
+                            if (isinstance(explicit_code, int)
+                                and 400 <= explicit_code <= 599)
+                            or grpc_status_code(data) in _GRPC_TO_HTTP
                             else is_retryable_error(err_msg)
                         )
                         yield "retryable_error" if retryable else "fatal_error", error
@@ -396,7 +401,7 @@ async def _execute_stream_request_generator_raw(
     if hasattr(resolved_fallback, "__await__"):
         resolved_fallback = await resolved_fallback
     print(
-        "⚠️ [Studio] 当前模型/协议拒绝原生函数 Schema；本次及后续重试固定降级为文本工具观测。"
+        "⚠️ [Studio] 当前模型/协议拒绝原生工具字段；本次及后续重试固定降级为文本工具观测，图片保留为视觉输入。"
     )
     events = _execute_stream_request_generator_once(
         client, headers, resolved_fallback, sampler, preserve_parts=preserve_parts

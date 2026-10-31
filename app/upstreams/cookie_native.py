@@ -52,7 +52,7 @@ from response_validation import IncompleteResponseError
 from resumable import request_timeout_seconds
 from retry_policy import get_retry_settings, retry_delay
 from runtime_state import app_state
-from schema_validation import SchemaValidationError
+from schema_validation import SchemaValidationError, sanitize_for_gemini, validate_json_schema
 from streaming import HEARTBEAT, HEARTBEAT_FRAME, with_heartbeats
 from tool_policy import has_search_suffix
 from usage import merge_usage_metadata
@@ -216,7 +216,17 @@ def _native_tools_to_variables(tools: Any) -> tuple[list[dict], bool, list[str]]
             converted = {"name": str(decl["name"])}
             if decl.get("description") is not None:
                 converted["description"] = decl["description"]
-            converted["parameters"] = _cookie_ui_schema(decl.get("parameters") or {"type": "object"})
+            parameters = decl.get("parameters")
+            json_schema = decl.get("parametersJsonSchema")
+            if parameters is not None and json_schema is not None:
+                raise SchemaValidationError("函数不能同时声明 parameters 与 parametersJsonSchema。")
+            if json_schema is not None:
+                validate_json_schema(json_schema, label=f"{decl['name']}.parametersJsonSchema")
+                parameters = sanitize_for_gemini(json_schema)
+            elif parameters is not None and not isinstance(parameters, dict):
+                raise SchemaValidationError("函数 parameters 必须是 JSON 对象。")
+            converted["parameters"] = _cookie_ui_schema(
+                parameters if parameters is not None else {"type": "object"})
             declarations.append(converted)
     return declarations, use_search, [d["name"] for d in declarations]
 
@@ -269,6 +279,12 @@ def native_request_to_variables(parsed: dict, model_name: str, project_id: str,
 
     gen = parsed.get("generationConfig")
     gen = dict(gen) if isinstance(gen, dict) else {}
+    if "responseJsonSchema" in gen:
+        if gen.get("responseSchema") is not None:
+            raise SchemaValidationError("不能同时声明 responseSchema 与 responseJsonSchema。")
+        schema = gen.pop("responseJsonSchema")
+        validate_json_schema(schema, label="generationConfig.responseJsonSchema")
+        gen["responseSchema"] = sanitize_for_gemini(schema)
     if gen.get("candidateCount", 1) != 1:
         raise SchemaValidationError("Cookie 通道暂不支持 candidateCount != 1。")
     if gen.get("responseLogprobs") or "logprobs" in gen:
@@ -663,10 +679,9 @@ async def _handle_native_request(fastapi_request: Request, model: str, action: s
                 assembler.feed(kind, data)
         payload = assembler.payload()
     except NativeBridgeError as exc:
-        stats.add_error()
+        # Non-streaming HTTP errors are counted by StatsMiddleware once.
         return _native_error(exc.code, exc.message)
     except Exception as exc:
-        stats.add_error()
         return _native_error(502, str(exc)[:1024], "UNAVAILABLE")
     stats.add_success()
     credential_manager.record_cookie_success(account_id, credential=record)

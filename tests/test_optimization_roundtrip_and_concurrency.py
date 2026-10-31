@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 from fastapi.testclient import TestClient
 from google.genai import types
 from PIL import Image
+from pydantic import ValidationError
 
 import client_pool
 import console_auth
@@ -171,9 +172,11 @@ class CapabilityTests(unittest.TestCase):
         self.assertIsNone(cookie_feature_error(request(n=1, logprobs=False)))
 
     def test_unsupported_model_candidate_count_is_rejected(self):
-        for n in (0, -1, 2):
-            with self.subTest(n=n), self.assertRaises(SchemaValidationError):
-                validate_openai_request(request(model="gemini-3.8-flash", n=n))
+        for n in (0, -1):
+            with self.subTest(n=n), self.assertRaises(ValidationError):
+                request(model="gemini-3.8-flash", n=n)
+        with self.assertRaises(SchemaValidationError):
+            validate_openai_request(request(model="gemini-3.8-flash", n=2))
         validate_openai_request(request(n=2))
 
     def test_native_cookie_rejects_features_before_upstream(self):

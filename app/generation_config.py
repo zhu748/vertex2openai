@@ -150,8 +150,7 @@ def _configure_images(config: dict, request: OpenAIRequest, settings: dict, prof
         config.pop(key, None)
 
     # 生图仅保留明确声明且未被禁用的搜索，不下发自定义函数。
-    declared_search = any(is_builtin_search_tool(tool, include_function_aliases=True)
-                          for tool in request.tools or [])
+    declared_search = any(is_builtin_search_tool(tool) for tool in request.tools or [])
     disabled = isinstance(request.tool_choice, str) and request.tool_choice.lower() == "none"
     return (
         [{"google_search": {}}] if declared_search and not disabled and profile.get("supports_search") else []

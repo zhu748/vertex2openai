@@ -21,6 +21,7 @@ import threading
 import time
 import weakref
 from contextvars import ContextVar
+from contextlib import contextmanager
 from typing import Optional
 
 from proxies.protocols import (
@@ -51,6 +52,21 @@ from proxy_config import (
 )
 
 current_proxy_usage = ContextVar("current_proxy_usage", default=None)
+_resolved_proxy = ContextVar("resolved_proxy", default=None)
+
+
+@contextmanager
+def resolved_proxy_scope(raw, resolved):
+    """Pin the asynchronously resolved outlet during client construction/IO.
+
+    A bridge dying after warmup is a transport failure, never a reason to launch
+    a blocking replacement on the event loop. The next attempt resolves afresh.
+    """
+    token = _resolved_proxy.set((normalize_proxy_uri(str(raw or "")), resolved))
+    try:
+        yield
+    finally:
+        _resolved_proxy.reset(token)
 
 
 class ProxyUsage:
@@ -952,6 +968,9 @@ def resolve_proxy_uri(uri: Optional[str]) -> str:
         raise ProxyResolveError(str(exc)) from None
     if not value or value.lower() in DIRECT_TOKENS:
         return ""
+    prepared = _resolved_proxy.get()
+    if prepared is not None and prepared[0] == value:
+        return prepared[1]
     kind = classify_proxy_uri(value)
     if kind == "native":
         return value
@@ -993,4 +1012,11 @@ async def resolve_proxy_uri_async(uri: Optional[str]) -> str:
     cached = manager._cached_local_socks5(value)
     if cached is not None:
         return cached
-    return await asyncio.to_thread(resolve_proxy_uri, value)
+    # Async resolution explicitly asks for a fresh liveness check. A nested
+    # operation may inherit a pinned construction scope from its caller; don't
+    # let that old outlet bypass the worker's restart when the process died.
+    token = _resolved_proxy.set(None)
+    try:
+        return await asyncio.to_thread(resolve_proxy_uri, value)
+    finally:
+        _resolved_proxy.reset(token)

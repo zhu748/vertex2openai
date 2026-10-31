@@ -23,6 +23,8 @@ _GEMINI_ANY_TYPES = ("string", "number", "integer", "boolean", "null", "object",
 class SchemaValidationError(ValueError):
     """A client schema is malformed or exceeds defensive complexity limits."""
 
+    code = 400
+
 
 def validate_json_schema(schema: Any, *, label: str = "schema") -> None:
     if not isinstance(schema, dict):

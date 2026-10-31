@@ -608,7 +608,7 @@ class SDKGeneration:
                         ],
                     }
                     for ci in range(max(1, self.request_obj.n or 1))
-                ]
+                ] if self.prefill_text else []
 
                 final_p_tk, final_c_tk, final_t_tk = 0, 0, 0
                 # 完整 usage dict（含 prompt_tokens_details.cached_tokens /

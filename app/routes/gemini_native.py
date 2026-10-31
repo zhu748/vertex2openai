@@ -52,6 +52,7 @@ import anyio
 import httpx
 from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from request_ingress import hold_ingress
 
 from retry_policy import get_retry_settings, is_retryable_exception, is_retryable_status
 from upstream_errors import extract_upstream_error, google_status_detail
@@ -69,6 +70,7 @@ from request_errors import declared_body_exceeds
 import first_reply as first_reply_module
 from first_reply import FirstReplyGuard, native_has_reply
 from json_stream import MAX_JSON_OBJECT_BYTES, JsonObjects
+from http_io import buffer_upstream_response, read_upstream_bytes
 from streaming import prepare_sse
 from runtime_state import app_state
 import config as app_config
@@ -311,7 +313,13 @@ async def _passthrough_once(client: httpx.AsyncClient, express_key: str,
         "POST", url, content=payload,
         headers=build_direct_headers(express_key),
     )
-    return await client.send(req, stream=stream)
+    response = await client.send(req, stream=True)
+    if stream:
+        return response
+    try:
+        return await buffer_upstream_response(response)
+    finally:
+        await _close_upstream(response)
 
 
 def _looks_like_pin_failure(status_code: int, body: bytes) -> bool:
@@ -542,7 +550,7 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
                                   if k.lower() == "retry-after"}
             # 读错误正文供重试诊断；取消和读取失败也必须释放响应。
             try:
-                last_error_body = await upstream.aread()
+                last_error_body = await read_upstream_bytes(upstream)
             except Exception:
                 last_error_body = _native_error(
                     upstream.status_code, "上游错误响应未完整传输。").body
@@ -572,7 +580,7 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
         headers = {k: v for k, v in upstream.headers.items()
                    if k.lower() == "retry-after"}
         try:
-            body = await upstream.aread()
+            body = await read_upstream_bytes(upstream)
         except Exception:
             # 已知的 HTTP 错误码仍保留，但空正文不能冒充完整错误响应。
             status = status if status >= 400 else 502
@@ -658,6 +666,8 @@ class _NativeStreamState:
                 index = candidate.get("index", index)
                 if not isinstance(index, int) or index < 0:
                     raise IncompleteResponseError("上游候选 index 格式错误。")
+                if index in self.finished and parts:
+                    raise IncompleteResponseError("上游候选已结束，却继续返回内容。")
                 if parts:
                     self.seen.add(index)
                 if has_finish_reason(candidate.get("finishReason")):
@@ -925,14 +935,14 @@ async def _resumable_native(request, api_key, model, action, query, payload, par
                 if buf.done:
                     await close_response(response)
                     return _native_error(buf.status_code, buf.error or "响应缓冲已释放。")
-                task = asyncio.create_task(within_request_deadline(buf, lambda: pump(response)))
+                task = hold_ingress(asyncio.create_task(within_request_deadline(buf, lambda: pump(response))))
                 task.add_done_callback(lambda _task: resumable_store.schedule_cleanup(lambda: close_response(response)))
                 resumable_store.register_pump(buf.id, task, buffer=buf)
                 return response
             except Exception as exc:
                 await buf.fail(str(exc), getattr(exc, "code", 502))
                 raise
-        task = asyncio.create_task(within_request_deadline(buf, setup))
+        task = hold_ingress(asyncio.create_task(within_request_deadline(buf, setup)))
         resumable_store.register_pump(buf.id, task, buffer=buf)
         done, _ = await asyncio.wait({task}, timeout=0.05)
         if done:

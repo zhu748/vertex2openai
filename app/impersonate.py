@@ -13,6 +13,7 @@ import threading
 from typing import Any, AsyncIterator, Callable
 
 import httpx
+from http_io import BoundedAsyncClient, buffer_upstream_response
 from proxy_tls import build_httpx_proxy
 
 from runtime_state import app_state
@@ -193,9 +194,13 @@ class _CurlClientShim:
         self._stream_timeout = stream_timeout
 
     async def post(self, url: str, *, headers=None, json=None):
-        resp = await self._s.post(url, headers=headers, json=json,
-                                  timeout=self._post_timeout)
-        return _CurlRespShim(resp, from_stream=False)
+        resp = await self._s.request("POST", url, headers=headers, json=json,
+                                     timeout=self._post_timeout, stream=True)
+        response = _CurlRespShim(resp, from_stream=True)
+        try:
+            return await buffer_upstream_response(response)
+        finally:
+            await response.aclose()
 
     def stream(self, method: str, url: str, *, headers=None, json=None):
         return self._stream_ctx(method, url, headers=headers, json=json)
@@ -308,9 +313,9 @@ def _create_upstream_client(client_kwargs: dict):
         options = dict(client_kwargs)
         if isinstance(options.get("proxy"), str):
             options["proxy"] = build_httpx_proxy(options["proxy"], verify=options.get("verify", True))
-        return httpx.AsyncClient(**options)
+        return BoundedAsyncClient(**options)
 
-    from curl_cffi.requests import AsyncSession
+    from curl_transport import CancellationSafeSession
 
     proxy = client_kwargs.get("proxy")
     post_timeout, stream_timeout = _httpx_timeout_to_curl(client_kwargs.get("timeout"))
@@ -325,7 +330,7 @@ def _create_upstream_client(client_kwargs: dict):
     }
     if proxy:
         session_kwargs["proxy"] = _curl_remote_dns_proxy(proxy)
-    return _CurlClientShim(AsyncSession(**session_kwargs), post_timeout, stream_timeout)
+    return _CurlClientShim(CancellationSafeSession(**session_kwargs), post_timeout, stream_timeout)
 
 
 # ============================================================

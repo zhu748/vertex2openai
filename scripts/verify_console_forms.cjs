@@ -231,8 +231,9 @@ async function main(){
   await w.loadParams();assert.equal(el('cookie_auto_refresh').checked,true);
   assert.equal(el('cookie_refresh_interval_seconds').value,'900');
   edit('cookie_refresh_interval_seconds','299');
-  const beforeInvalid=requests.length;d.querySelector('button[onclick*="saveSettings"]').click();await tick();
-  assert.equal(requests.length,beforeInvalid);assert.equal(el('cookie_refresh_interval_seconds').getAttribute('aria-invalid'),'true');
+  const runtimeWrites=()=>requests.filter(r=>r.path==='/api/settings'&&r.method==='POST').length;
+  const beforeInvalid=runtimeWrites();d.querySelector('button[onclick*="saveSettings"]').click();await tick();
+  assert.equal(runtimeWrites(),beforeInvalid);assert.equal(el('cookie_refresh_interval_seconds').getAttribute('aria-invalid'),'true');
   w.consoleForms.discard('runtime');assert.equal(el('cookie_refresh_interval_seconds').value,'900');
   check('Cookie refresh controls save, reload, validate limits and undo');
 

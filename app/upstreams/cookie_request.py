@@ -1,5 +1,6 @@
 """Cookie batchGraphql 请求构造：消息、工具、模型参数与协议字段。"""
 
+import base64
 import json
 import time
 import uuid
@@ -15,7 +16,7 @@ from cookie_auth import (
 )
 from media_tasks import run_media_task
 from tool_arguments import parse_tool_arguments
-from message_processing import _coerce_tool_response, openai_content_to_wire_parts
+from message_processing import is_multimodal_tool_error, openai_content_to_wire_parts, tool_response_with_media
 from models import OpenAIRequest, normalize_content_part
 from runtime_state import app_state
 from schema_validation import SchemaValidationError, sanitize_for_gemini
@@ -427,8 +428,14 @@ def _convert_messages_to_contents(messages: list, model_name: str = "", native_t
         if role in ("tool", "function"):
             call_id = (msg.tool_call_id or "").partition(LEGACY_THOUGHT_SEP)[0]
             name = msg.name or call_names.get(msg.tool_call_id or "") or call_names.get(call_id)
+            output, media = tool_response_with_media(content, model_name, error_content=is_multimodal_tool_error(msg))
+            media_parts = [{"inlineData": {"mimeType": mime,
+                           "data": base64.b64encode(raw).decode("ascii"), "displayName": display}}
+                           for raw, mime, display in media]
             if native_tools and name:
-                response = {"name": name, "response": _coerce_tool_response(content)}
+                response = {"name": name, "response": output}
+                if media_parts:
+                    response["parts"] = media_parts
                 if call_id:
                     response["id"] = call_id
                 contents.append(
@@ -438,9 +445,10 @@ def _convert_messages_to_contents(messages: list, model_name: str = "", native_t
                     }
                 )
             else:
-                body = _plain_text_of(content)
+                body = json.dumps(output, ensure_ascii=False) if media else _plain_text_of(content)
                 contents.append(
-                    {"role": "user", "parts": [{"text": f"[工具执行结果 · {name or 'tool'}]\n{body}"}]}
+                    {"role": "user", "parts": [{"text": f"[工具执行结果 · {name or 'tool'}]\n{body}"},
+                        *media_parts]}
                 )
             continue
 

@@ -7,7 +7,10 @@ from config import API_KEY
 
 def constant_time_equal(candidate: str, expected: str) -> bool:
     """UTF-8 字节比较，避免 compare_digest(str) 遇到非 ASCII 口令抛异常。"""
-    return secrets.compare_digest(candidate.encode("utf-8"), expected.encode("utf-8"))
+    try:
+        return secrets.compare_digest(candidate.encode("utf-8"), expected.encode("utf-8"))
+    except UnicodeEncodeError:
+        return False
 
 
 def validate_api_key(api_key_to_validate: str) -> bool:

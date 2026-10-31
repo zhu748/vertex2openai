@@ -71,6 +71,7 @@ from client_pool import get_pooled_express_client
 from request_tracking import configure as track_configure
 from response_validation import IncompleteResponseError
 from request_connection import BodyTooLargeError
+from request_ingress import IngressError
 from routes.chat_api import _call_upstream
 from runtime_state import app_state
 from streaming import sse_frames
@@ -137,7 +138,7 @@ async def _parse_json_body(fastapi_request: Request) -> dict:
     """手动解析 JSON 体：让 400 错误保持 Anthropic 形状（而非 FastAPI 422）。"""
     try:
         body = await fastapi_request.json()
-    except BodyTooLargeError:
+    except (BodyTooLargeError, IngressError):
         raise
     except Exception:
         raise ClaudeRequestError("invalid JSON request body") from None
@@ -252,7 +253,13 @@ def _claude_stream_response(response: StreamingResponse, display_model: str, *,
                         raise IncompleteResponseError("上游 OpenAI 流包含无效 JSON 事件。") from None
                     if isinstance(payload, dict) and payload.get("error"):
                         # 流中错误帧：转成 Anthropic error 事件后终止
-                        err_type = anthropic_error_type(502)
+                        error = payload["error"]
+                        code = error.get("code") if isinstance(error, dict) else None
+                        try:
+                            code = int(code)
+                        except (ValueError, TypeError, OverflowError):
+                            code = 502
+                        err_type = anthropic_error_type(code)
                         message = _openai_error_message(payload, "上游流式响应出错。")
                         yield error_event(err_type, message)
                         failed = True

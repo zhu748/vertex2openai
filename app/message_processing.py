@@ -17,6 +17,7 @@ from image_processing import (
 from tool_arguments import parse_tool_arguments
 from models import OpenAIMessage, file_data_markdown, message_text, normalize_content_part
 from response_validation import map_finish_reason_to_openai, complete_function_arguments
+from schema_validation import SchemaValidationError
 from runtime_state import app_state
 from signature_store import SignatureState
 from thought_signatures import (
@@ -164,8 +165,90 @@ def _coerce_tool_response(content: Any) -> Dict[str, Any]:
     return {"result": content}
 
 
+def tool_response_with_media(content: Any, model_name: str = "", *, error_content=False) -> tuple[dict, list]:
+    """Replace tool image blocks with references to bounded native image blobs.
+
+    Both Anthropic image blocks and OpenAI image_url blocks are accepted.
+    Error-result wrappers are retained, and ordinary JSON results are untouched.
+    Gemini 3+ supports these blobs inside FunctionResponse.parts.
+    """
+    response = _coerce_tool_response(content)
+    media = []
+    total_bytes = 0
+
+    def convert(blocks):
+        nonlocal total_bytes
+        converted = []
+        for block in blocks:
+            block = normalize_content_part(block)
+            if not isinstance(block, dict) or block.get("type") not in ("image", "image_url"):
+                converted.append(block)
+                continue
+            version = re.search(r"gemini-(\d+)", model_name, re.I)
+            if version and int(version[1]) < 3:
+                raise SchemaValidationError("工具图片结果需要 Gemini 3 或更新模型。")
+            if len(media) >= 32:
+                raise SchemaValidationError("单条工具结果最多包含 32 张图片。")
+            if block["type"] == "image":
+                source = block.get("source") or {}
+                if not isinstance(source, dict):
+                    raise SchemaValidationError("工具图片 source 必须是对象。")
+                if source.get("type") == "base64":
+                    url = f"data:{source.get('media_type', '')};base64,{source.get('data', '')}"
+                elif source.get("type") == "url":
+                    url = source.get("url")
+                else:
+                    raise SchemaValidationError("工具图片 source.type 必须是 base64 或 url。")
+            else:
+                image = block.get("image_url")
+                url = image.get("url") if isinstance(image, dict) else image
+            if not isinstance(url, str):
+                raise SchemaValidationError("工具图片缺少有效地址。")
+            try:
+                if url.startswith("data:"):
+                    match = re.fullmatch(r"data:([^;]+);base64,(.+)", url, re.DOTALL)
+                    if not match:
+                        raise ValueError("无效的图片 data URL。")
+                    mime, encoded = match.groups()
+                    raw = decode_data_url_image(encoded)
+                elif url.startswith(("http://", "https://")):
+                    fetched = fetch_remote_image(url)
+                    if fetched is None:
+                        raise ValueError("工具图片无法下载。")
+                    raw, mime = fetched
+                else:
+                    raise ValueError("工具图片仅支持 data URL 或 HTTP(S) 地址。")
+                raw, mime = optimize_image_bytes(raw, mime)
+                if mime not in ("image/png", "image/jpeg", "image/webp"):
+                    raise ValueError("工具图片仅支持 PNG、JPEG 或 WebP。")
+            except (ValueError, TypeError) as exc:
+                raise SchemaValidationError(f"工具图片无法处理：{exc}") from None
+            total_bytes += len(raw)
+            if total_bytes > 32 * 1024 * 1024:
+                raise SchemaValidationError("单条工具结果图片总量超过 32 MiB 上限。")
+            name = f"tool-image-{len(media) + 1}"
+            media.append((raw, mime, name))
+            converted.append({"$ref": name})
+        return converted
+
+    # Only a real content-block list or an explicitly marked Claude error
+    # wrapper is multimodal. A JSON string can contain arbitrary application
+    # records with type=image; parsing it must never trigger image IO.
+    response = dict(response)
+    keys = ("result",) if isinstance(content, list) else ("error",) if error_content else ()
+    for key in keys:
+        if isinstance(response.get(key), list):
+            response[key] = convert(response[key])
+    return response, media
+
+
+def is_multimodal_tool_error(message: OpenAIMessage) -> bool:
+    metadata = (message.extra_content or {}).get("anthropic")
+    return isinstance(metadata, dict) and metadata.get("tool_result_is_error") is True
+
+
 def _tool_result_parts(
-    message: OpenAIMessage, tool_name_by_id: dict
+    message: OpenAIMessage, tool_name_by_id: dict, model_name: str = ""
 ) -> list[types.Part]:
     """Restore tool results as user Parts; function responses never carry signatures."""
     parts = []
@@ -176,12 +259,16 @@ def _tool_result_parts(
         or tool_name_by_id.get(tool_call_id_str)
         or tool_name_by_id.get(real_tool_id)
     )
+    tool_output_data, media = tool_response_with_media(
+        message.content, model_name, error_content=is_multimodal_tool_error(message))
 
     if not function_name:
         # 既没有显式 name，也无法从前面的 assistant.tool_calls 关联时才降级。
         # content 可能是 str / 分段 list / dict：统一归一成文本，避免
         # list 直接被 f-string 嵌成 Python repr。
         fallback_text = message_text(message.content)
+        if media:
+            fallback_text = json.dumps(tool_output_data, ensure_ascii=False)
         if (
             not fallback_text
             and message.content is not None
@@ -193,12 +280,15 @@ def _tool_result_parts(
                 fallback_text = str(message.content)
         mock_text = f"[System Observation - Tool Result]:\n{fallback_text}"
         parts.append(types.Part.from_text(text=mock_text))
+        parts.extend(types.Part.from_bytes(data=raw, mime_type=mime) for raw, mime, _name in media)
     else:
         # FunctionResponse is always a Gemini ``user`` Content and never
         # carries a thought signature. Signatures belong on model Parts.
-        tool_output_data = _coerce_tool_response(message.content)
-
         func_resp_kwargs = {"name": function_name, "response": tool_output_data}
+        if media:
+            func_resp_kwargs["parts"] = [types.FunctionResponsePart(
+                inline_data=types.FunctionResponseBlob(data=raw, mime_type=mime, display_name=name)
+            ) for raw, mime, name in media]
         if real_tool_id:
             func_resp_kwargs["id"] = real_tool_id
 
@@ -207,6 +297,8 @@ def _tool_result_parts(
                 function_response=types.FunctionResponse(**func_resp_kwargs)
             )
         except Exception as e:
+            if media:
+                raise SchemaValidationError("当前 SDK 无法构造工具图片结果。") from e
             print(f"⚠️ [工具调用] 构造 FunctionResponse 失败，将回退为基础形式：{e}")
             resp_part = types.Part.from_function_response(
                 name=function_name, response=tool_output_data
@@ -534,7 +626,7 @@ def create_gemini_prompt(
         if message.role in ("system", "developer"):
             continue  # These instructions are sent in system_instruction.
         if message.role in ("tool", "function"):
-            role, parts = "user", _tool_result_parts(message, tool_name_by_id)
+            role, parts = "user", _tool_result_parts(message, tool_name_by_id, model_name)
         elif message.role in ("assistant", "model") and message.tool_calls:
             for call in message.tool_calls:
                 call_id = str(call.get("id") or "")

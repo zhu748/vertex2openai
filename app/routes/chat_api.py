@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from request_ingress import hold_ingress
 from starlette.background import BackgroundTask
 from models import OpenAIRequest
 from auth import get_api_key, get_api_key_flexible
@@ -504,7 +505,7 @@ async def _resumable_stream(fastapi_request: Request, request_obj: OpenAIRequest
                 await close()
             return JSONResponse(status_code=buf.status_code, content=buf.payload or
                                 create_openai_error_response(503, "响应缓冲已释放。", "buffer_evicted"))
-        pump_task = asyncio.create_task(within_request_deadline(buf, lambda: pump_stream(buf, resp.body_iterator)))
+        pump_task = hold_ingress(asyncio.create_task(within_request_deadline(buf, lambda: pump_stream(buf, resp.body_iterator))))
         # 泵结束的收尾必须走 resp.aclose（若可用）而不是只关 body_iterator：
         # resp 是 ManagedStreamingResponse，只有 aclose 才会执行 cleanup 链
         # （case B 下会取消 setup 任务并关闭内层上游流；只关 body_iterator 会让
@@ -516,7 +517,7 @@ async def _resumable_stream(fastapi_request: Request, request_obj: OpenAIRequest
         print(f"📦 [续传缓冲] {stream_id}（{id_src}）：后台泵已启动，上游读取与前端连接解绑。")
         return resp
 
-    setup_task = asyncio.create_task(within_request_deadline(buf, start_stream))
+    setup_task = hold_ingress(asyncio.create_task(within_request_deadline(buf, start_stream)))
     resumable_store.register_pump(stream_id, setup_task, buffer=buf)
     # Fast setup errors keep their HTTP status. Slow preparation gets an SSE
     # reader immediately, so image downloads/proxy setup cannot leave it idle.
@@ -607,7 +608,7 @@ async def _resumable_json(fastapi_request: Request, request_obj: OpenAIRequest, 
         await buf.finish("done" if 200 <= status < 300 else "error",
                          payload=payload, status_code=status)
 
-    pump_task = asyncio.create_task(within_request_deadline(buf, _pump_json))
+    pump_task = hold_ingress(asyncio.create_task(within_request_deadline(buf, _pump_json)))
     resumable_store.register_pump(stream_id, pump_task, buffer=buf)
 
     # 当前连接等待缓冲完成（等同于原来的直通等待；断线不影响后台泵）。

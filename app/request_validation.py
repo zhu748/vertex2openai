@@ -1,7 +1,7 @@
 """Validate loose OpenAI extension dictionaries before either upstream uses them."""
 
 import model_capabilities as mc
-from models import normalize_content_part
+from models import MAX_CANDIDATES, normalize_content_part
 from tool_arguments import parse_tool_arguments
 from schema_validation import SchemaValidationError, validate_request_schemas
 from tool_policy import (
@@ -42,8 +42,8 @@ def validate_openai_request(request):
         elif not is_builtin_search_tool(tool):
             raise SchemaValidationError(f"tools[{index}] has an unsupported tool type")
     if request.n is not None:
-        if request.n < 1:
-            raise SchemaValidationError("n must be an integer >= 1")
+        if isinstance(request.n, bool) or not isinstance(request.n, int) or not 1 <= request.n <= MAX_CANDIDATES:
+            raise SchemaValidationError(f"n must be an integer between 1 and {MAX_CANDIDATES}")
         if request.n > 1 and "candidate_count" not in mc.get_profile(request.model)["allowed_sampling"]:
             raise SchemaValidationError("This model does not support n > 1")
     choice = request.tool_choice

@@ -483,9 +483,10 @@ class ConnectionAndSettingsTests(unittest.IsolatedAsyncioTestCase):
             pass
         with mock.patch.object(middleware, "request_registry", registry):
             task = asyncio.create_task(middleware.StatsMiddleware(app, stats)(
-                {"type": "http", "method": "POST", "path": "/v1/chat/completions"}, incoming.get, send))
+                {"type": "http", "method": "POST", "path": "/v1/chat/completions", "query_string": b"",
+                 "headers": [(b"authorization", b"Bearer " + config.API_KEY.encode())]}, incoming.get, send))
             try:
-                await started.wait()
+                await asyncio.wait_for(started.wait(), 1)
                 await incoming.put({"type": "http.disconnect"})
                 for _ in range(50):
                     if registry.list()["summary"]["connections"] == 0:

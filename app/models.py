@@ -1,7 +1,8 @@
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from typing import Any, Literal
 
 # Define data models
+MAX_CANDIDATES = 8
 class ImageUrl(BaseModel):
     url: str
 
@@ -66,7 +67,7 @@ class OpenAIRequest(BaseModel):
     top_logprobs: int | None = None
     response_logprobs: bool | None = None
     response_format: dict[str, Any] | None = None # 兼容强制 JSON 格式化输出
-    n: int | None = None 
+    n: int | None = Field(default=None, ge=1, le=MAX_CANDIDATES, strict=True)
     tools: list[dict[str, Any]] | None = None
     tool_choice: str | dict[str, Any] | None = None
     # 流式用量开关（OpenAI: {"include_usage": true}）

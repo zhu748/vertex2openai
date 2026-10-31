@@ -1224,9 +1224,6 @@ class CookieGeneration:
                         finish_raw, has_tool_calls=bool(tool_calls)
                     )
                     stats.add_success()
-                    credential_manager.record_cookie_success(
-                        self.account_id, credential=self.record
-                    )
                     print(
                         f"✅ [Studio] {self.base_model_name} | {len(full_text)} 字符 | {elapsed:.1f}s"
                     )

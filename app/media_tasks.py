@@ -7,6 +7,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 from admission import GenerationCapacityError
+from request_ingress import current_ingress
 
 
 _executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="media")
@@ -40,6 +41,12 @@ async def run_media_task(function, *args, **kwargs):
     token = _budget.set((time.monotonic() + PREPARATION_TIMEOUT_SECONDS, cancelled))
     context = contextvars.copy_context()
     _budget.reset(token)
+    ingress = current_ingress.get()
+    try:
+        release_ingress = ingress.retain() if ingress is not None else lambda: None
+    except BaseException:
+        slots.release()
+        raise
 
     def run():
         check_media_budget()
@@ -51,8 +58,10 @@ async def run_media_task(function, *args, **kwargs):
         future = _executor.submit(context.run, run)
     except BaseException:
         slots.release()
+        release_ingress()
         raise
     future.add_done_callback(lambda _: slots.release())
+    future.add_done_callback(lambda _: release_ingress())
     wrapped = asyncio.wrap_future(future)
     # A cancelled waiter must still retrieve any late worker exception.
     wrapped.add_done_callback(lambda done: None if done.cancelled() else done.exception())

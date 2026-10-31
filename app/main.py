@@ -12,7 +12,8 @@ from lifecycle import lifespan
 from logger import stats
 from middleware import StatsMiddleware
 from request_connection import BodyTooLargeError
-from request_errors import body_too_large_response, validation_error_response
+from request_errors import body_too_large_response, ingress_error_response, validation_error_response
+from request_ingress import IngressError
 from routes import (
     chat_api,
     claude_api,
@@ -59,6 +60,11 @@ async def _body_too_large_error_handler(request, exc: BodyTooLargeError):
     # 处理器渲染错误形状，客户端不再拿到两套不一致的 413 文案。
     path = getattr(getattr(request, "url", None), "path", "") or ""
     return body_too_large_response(path, exc.limit)
+
+
+@app.exception_handler(IngressError)
+async def _ingress_error_handler(request, exc: IngressError):
+    return ingress_error_response(request.url.path, exc.status_code, exc.detail)
 
 
 @app.exception_handler(gemini_native.NativeAPIError)

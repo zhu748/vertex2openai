@@ -87,6 +87,7 @@ def anthropic_error_type(status: int) -> str:
         401: "authentication_error",
         403: "permission_error",
         404: "not_found_error",
+        408: "invalid_request_error",
         413: "invalid_request_error",
         429: "rate_limit_error",
         500: "api_error",
@@ -376,6 +377,7 @@ def _append_user_blocks(label: str, content: list, openai_messages: list) -> Non
                 role="tool",
                 content=result,
                 tool_call_id=tool_use_id,
+                extra_content={"anthropic": {"tool_result_is_error": True}} if is_error else None,
             ))
         else:
             raise ClaudeRequestError(f"{block_label} has unsupported type {btype!r}")
