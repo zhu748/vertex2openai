@@ -24,7 +24,7 @@ from cookie_auth import BATCH_GRAPHQL_URL, build_headers
 from credential_manager import credential_manager
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from first_reply import timed_call, timeout_seconds
+from first_reply import timed_call
 from impersonate import open_upstream_client
 from logger import stats
 from message_processing import _create_safety_ratings_html
@@ -242,7 +242,6 @@ async def _collect_full_response(
         prefill_active=prefill_active,
         force_search=force_search,
     )
-    fr_seconds = timeout_seconds(base_model_name)
     for attempt in range(retry_max + 1):
         if await fastapi_request.is_disconnected():
             return {"kind": "error", "message": "客户端已断开连接。"}
@@ -263,13 +262,13 @@ async def _collect_full_response(
                     }
             async with open_upstream_client(client_kwargs) as client:
                 upstream_attempt()
-                # 整取响应（生图假流式路径）：首回复窗口按整调用预算放宽，
-                # 否则生图 30-120s 会在默认 15s 窗口下永远超时。
+                # 整取响应（生图假流式路径）：不参与首回复计时（2026-11
+                # 语义，见 first_reply.timed_call）；挂起由 httpx read 超时
+                # （180s）与整轮期限兑底。
                 response = await timed_call(
                     base_model_name,
                     client.post(BATCH_GRAPHQL_URL, headers=req_headers, json=body),
                     whole_call=True,
-                    seconds=fr_seconds,
                 )
 
             if is_retryable_status(response.status_code) and attempt < retry_max:
@@ -1026,8 +1025,7 @@ class CookieGeneration:
             force_search=self.force_builtin_search,
         )
 
-        # 非流式整取：首回复窗口按整调用预算放宽（生图/长思考）。
-        fr_seconds = timeout_seconds(self.base_model_name)
+        # 非流式整取：不参与首回复计时（2026-11 语义，见 first_reply.timed_call）。
         for attempt in range(self.retry_max + 1):
             # 客户端已断开则立即停止，避免无谓的上游调用与重试
             if await self.fastapi_request.is_disconnected():
@@ -1065,7 +1063,6 @@ class CookieGeneration:
                         self.base_model_name,
                         client.post(BATCH_GRAPHQL_URL, headers=req_headers, json=body),
                         whole_call=True,
-                        seconds=fr_seconds,
                     )
                     if fallback_body is not None and is_native_tool_error_response(
                         response.status_code, response.text
@@ -1085,7 +1082,6 @@ class CookieGeneration:
                                 json=resolved_fallback,
                             ),
                             whole_call=True,
-                            seconds=fr_seconds,
                         )
                         fallback_body = None
 

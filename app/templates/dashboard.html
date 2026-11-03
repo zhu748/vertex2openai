@@ -793,11 +793,11 @@
          </select>
         </div>
 <div class="mt-3">
-         <label class="lbl mb-1" for="first_reply_timeout_seconds">模型首回复超时（秒，0=关闭）</label>
+         <label class="lbl mb-1" for="first_reply_timeout_seconds">模型首回复超时（秒，0=关闭，仅真流式生效）</label>
          <input class="inp" id="first_reply_timeout_seconds" max="7200" min="0" type="number" step="any"/>
          <details class="field-help">
-          <summary>首回复如何计时？假流式该怎么设置？</summary>
-          <p class="text-xs text-neutral-500 mt-2 leading-relaxed">默认 15 秒，每次上游尝试独立计时。思考、正文、工具调用、图片均算首回复；心跳、纯用量和签名不算。超时沿用下方重试预算。假流式和非流式需等待完整上游响应，可按模型调大或设为 0。</p>
+          <summary>首回复如何计时？假流式和非流式为什么不受影响？</summary>
+          <p class="text-xs text-neutral-500 mt-2 leading-relaxed">默认 15 秒，每次上游尝试独立计时。思考、正文、工具调用、图片均算首回复；心跳、纯用量和签名不算。超时沿用下方重试预算。本窗口仅约束真流式请求；假流式与非流式为整取路径，不参与首回复计时（无首回复超时），上游挂起由传输层读超时（Express 600 秒 / Cookie 180 秒）与整轮期限兜底，无需为它们调大或关闭本值。</p>
          </details>
         </div>
         <p class="text-xs text-neutral-500 mt-2" id="anti-truncation-note">默认仅 4 Argon / 3.8 Flash 提供抗截断后缀；普通无后缀名称始终不启用。</p>
@@ -1233,7 +1233,7 @@
           <input class="inp" id="resumable_max_total_mb" max="8192" min="1" type="number"/>
          </div>
         </div>
-        <p class="text-xs text-neutral-500 mt-2">最后一个客户端断开后，窗口内相同请求续接；超过窗口再发时取消旧任务并重新生成。0=断开后不再复用。有其他客户端连接时继续共享。</p>
+        <p class="text-xs text-neutral-500 mt-2">最后一个客户端断开后，窗口内相同请求续接；超过窗口再发时取消旧任务并重新生成。0=断开后不再复用。有其他客户端连接时继续共享。断开超过窗口且无人续接时（轮询会把窗口向后滑动），仍在运行的后台生成会被直接取消，不再空烧上游。</p>
        </div>
 <div class="card settings-card settings-wide" id="runtime-delivery">
         <h3 class="settings-card-title">交付与运行开关</h3>

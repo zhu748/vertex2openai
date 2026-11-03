@@ -218,6 +218,8 @@ class ResumablePollGuardTests(unittest.IsolatedAsyncioTestCase):
                               snapshot=lambda s, l: [],
                               payload=None, status_code=200,
                               owner_key_digest=hashlib.sha256(owner_key.encode()).hexdigest())
+        # 轮询端点把每次轮询记为客户端活动（滑动续传窗口）；桩缓冲无窗口状态，空实现即可。
+        buf.note_client_activity = lambda horizon=0.0: None
 
         async def fake_wait_for(seq, timeout):
             return True

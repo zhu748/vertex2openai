@@ -197,14 +197,17 @@ class FirstReplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('"error"', body)
         self.assertEqual(self.stats.retry_counts, 0)
 
-    async def test_nonstream_and_fake_stream_retry_inside_existing_budget(self):
+    async def test_nonstream_and_fake_stream_skip_first_reply_window(self):
+        """整取路径（非流式 / 假流式）不参与首回复计时（2026-11 语义）：
+        窗口远小于上游耗时时不超时、不重试、一次成功——首回复窗口只
+        约束真流式（首个有效分片），整取要等完整响应才有首回复可言，
+        把窗口套上去等于用 15s 卡整段生成时间（慢思考/长输出必 504）。"""
         for stream in (False, True):
             calls = 0
             async def generate(**kwargs):
                 nonlocal calls
                 calls += 1
-                if calls == 1:
-                    await asyncio.Event().wait()
+                await asyncio.sleep(.3)  # 远超 0.02s 窗口；完整响应最后才到
                 return text_chunk()
             client = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(generate_content=generate)))
             obj = api_helpers.OpenAIRequest(model="gemini-test", messages=[], stream=stream)
@@ -212,7 +215,8 @@ class FirstReplyTests(unittest.IsolatedAsyncioTestCase):
             response = await api_helpers.execute_gemini_call(client, obj.model, lambda messages: [], {}, obj)
             body = ''.join([chunk async for chunk in response.body_iterator]) if stream else response.body.decode()
             self.assertIn('answer', body)
-            self.assertEqual(calls, 2)
+            self.assertEqual(calls, 1)
+            self.assertEqual(self.stats.retry_counts, 0)
 
     async def test_cookie_timeout_becomes_retryable_event_and_closes_source(self):
         closed = asyncio.Event()

@@ -759,6 +759,9 @@ async def resumable_poll(stream_id: str, fastapi_request: Request,
             status_code=404,
             content=create_openai_error_response(
                 404, f"未找到响应缓冲 {stream_id}（可能已过期被清理）。", "not_found"))
+    # 轮询即客户端活动：断线后的缓冲凭轮询滑动续传窗口，不会被「断开
+    # 超窗取消上游」误伤（长轮询按声明的 wait 预支在途窗口）。
+    buf.note_client_activity(min(wait, 25.0))
     limit = max(1, min(limit, 500))
     if wait > 0 and not buf.done:
         await buf.wait_for(max(0, from_), min(wait, 25.0))

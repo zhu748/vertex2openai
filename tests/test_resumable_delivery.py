@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from models import OpenAIRequest
+from request_connection import ClientConnection
 import resumable
 from routes import chat_api
 
@@ -321,6 +322,148 @@ class BufferLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await resumable.pump_stream(buf, source)
         source.__aiter__.assert_not_called()
         source.aclose.assert_awaited_once()
+
+
+class GraceExpiryTests(unittest.IsolatedAsyncioTestCase):
+    """断开超过续传窗口且无人续接：直接取消在飞上游（2026-11 语义）。
+
+    旧行为是 resume_expired() 只在懒检查点生效（重连 410 / 同指纹替换 /
+    面板 meta），断开超窗后无人再来时后台泵会把上游跑到自然结束，最长
+    吃满整轮 request_timeout_seconds（默认 1800 秒）——纯浪费配额。"""
+
+    async def asyncSetUp(self):
+        self.store = resumable.ResumableStore()
+        self.addAsyncCleanup(self.store.aclose)
+        patch = mock.patch.object(chat_api, "resumable_store", self.store)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    async def buffer(self):
+        return (await self.store.get_or_create_request(
+            "grace", model="m", kind="stream", fingerprint_key="f"))[0]
+
+    async def immortal_worker(self, buf):
+        """注册一个「永远不会自己结束」的泵任务，返回 (任务, 取消标记)。"""
+        started, cancelled = asyncio.Event(), asyncio.Event()
+
+        async def worker():
+            try:
+                started.set()
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        task = asyncio.create_task(worker())
+        self.store.register_pump(buf.id, task, buffer=buf)
+        await asyncio.wait_for(started.wait(), 1)
+        return task, cancelled
+
+    async def test_grace_expiry_cancels_running_upstream_and_keeps_buffer(self):
+        buf = await self.buffer()
+        connection = ClientConnection()
+        buf.attach_client(connection)
+        task, cancelled = await self.immortal_worker(buf)
+        with mock.patch.object(resumable, "disconnect_grace_seconds", return_value=0.05):
+            connection.finish(True)
+            await asyncio.wait_for(cancelled.wait(), 1)
+        self.assertTrue(task.cancelled())
+        self.assertEqual(buf.status, "error")
+        self.assertEqual(buf.status_code, 410)
+        self.assertIn("续传窗口", buf.error)
+        # 缓冲本体保留：晚到的重连仍是 410 语义（懒检查口径不变），
+        # 容量回收仍归 TTL 清扫——取消只终结上游消耗。
+        self.assertIs(await self.store.get_exact(buf.id), buf)
+
+    async def test_reconnect_within_grace_disarms_timer(self):
+        buf = await self.buffer()
+        first = ClientConnection()
+        buf.attach_client(first)
+        task, cancelled = await self.immortal_worker(buf)
+        with mock.patch.object(resumable, "disconnect_grace_seconds", return_value=0.12):
+            first.finish(True)
+            await asyncio.sleep(0.03)
+            second = ClientConnection()
+            buf.attach_client(second)      # 窗口内重连：撤销断开计时
+        await asyncio.sleep(0.15)           # 越过原窗口
+        self.assertFalse(task.done())
+        self.assertFalse(cancelled.is_set())
+        self.assertIsNone(buf.last_disconnect_monotonic)
+        second.finish(True)                 # 再次断开才重新起表
+        self.assertIsNotNone(buf.last_disconnect_monotonic)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    async def test_poll_activity_slides_grace_window(self):
+        buf = await self.buffer()
+        connection = ClientConnection()
+        buf.attach_client(connection)
+        task, cancelled = await self.immortal_worker(buf)
+        with mock.patch.object(resumable, "disconnect_grace_seconds", return_value=0.15):
+            connection.finish(True)          # 原窗口到 t≈0.15
+            await asyncio.sleep(0.06)
+            buf.note_client_activity(0.0)    # 轮询把窗口滑到 t≈0.21
+            await asyncio.sleep(0.10)        # t≈0.16：原窗口已过、滑动窗口未到
+        self.assertFalse(task.done())        # 轮询中的客户端不被误取消
+        await asyncio.wait_for(cancelled.wait(), 1)
+        self.assertTrue(task.cancelled())
+        self.assertEqual(buf.status_code, 410)
+
+    async def test_long_poll_horizon_prepays_window(self):
+        buf = await self.buffer()
+        connection = ClientConnection()
+        buf.attach_client(connection)
+        task, cancelled = await self.immortal_worker(buf)
+        with mock.patch.object(resumable, "disconnect_grace_seconds", return_value=0.1):
+            connection.finish(True)
+            buf.note_client_activity(0.3)   # 长轮询声明在途 0.3s：取消点 ≈ 0.4s
+            await asyncio.sleep(0.2)        # 越过 0.1s 原窗口，仍处声明的在途期
+        self.assertFalse(task.done())
+        await asyncio.wait_for(cancelled.wait(), 1)
+        self.assertTrue(task.cancelled())
+
+    async def test_completed_generation_is_not_cancelled_after_grace(self):
+        buf = await self.buffer()
+        connection = ClientConnection()
+        buf.attach_client(connection)
+        await buf.append(resumable.frame_with_id(0, 'data: {"text":"done"}\n\n'))
+        await buf.finish()
+        with mock.patch.object(resumable, "disconnect_grace_seconds", return_value=0.05):
+            connection.finish(True)          # 完成后断开：只记标记，不起取消
+            await asyncio.sleep(0.12)
+        self.assertEqual(buf.status, "done")
+        self.assertIs(await self.store.get_exact(buf.id), buf)
+        self.assertTrue(buf.resume_expired())  # 懒检查口径不变（晚到重连仍 410）
+
+    async def test_disconnected_json_request_cancels_upstream_after_grace(self):
+        """用户原始场景：非流式请求断开超窗 → 取消挂起的上游而不是后台跑完。"""
+        connection = ClientConnection()
+        req = SimpleNamespace(headers={}, query_params={},
+                              scope={"state": {"client_connection": connection}})
+        obj = OpenAIRequest(model="gemini-test", messages=[], stream=False)
+        cancelled = asyncio.Event()
+
+        async def upstream(*args):
+            try:
+                await asyncio.Event().wait()   # 模拟挂起的整取上游调用
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        async def disconnect_soon():
+            await asyncio.sleep(0.02)
+            connection.finish(True)
+
+        with mock.patch.object(chat_api, "_call_upstream", side_effect=upstream) as call, \
+             mock.patch.object(resumable, "disconnect_grace_seconds", return_value=0.05):
+            disconnector = asyncio.create_task(disconnect_soon())
+            response = await asyncio.wait_for(
+                chat_api._resumable_json(req, obj, "test-key"), 2)
+            await disconnector
+        await asyncio.wait_for(cancelled.wait(), 1)
+        self.assertEqual(call.await_count, 1)   # 单次调用即取消，无重试风暴
+        body = json.loads(response.body)
+        self.assertEqual(response.status_code, 410)
+        self.assertIn("续传窗口", body["error"]["message"])
 
 
 if __name__ == "__main__":

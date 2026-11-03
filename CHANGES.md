@@ -2,6 +2,22 @@
 
 基于原版 `vertex2openai-main`（2026-09-01），持续完善兼容性、可靠性和代码组织。
 
+## 2026-11-03（第七轮）：断开超窗后直接取消上游（不再后台空烧）
+
+- 背景：用户指出「断开连接之后，超过了断连续传的时间，已经连不上了，应该直接取消请求上游，而不是在后台浪费请求」。属实——旧实现里 `resume_expired()` 只在懒检查点生效（重连 410 / 同指纹新请求替换 / 面板 meta），断开超窗后无人再来时，后台泵任务会把上游跑到自然结束，最长吃满整轮 `request_timeout_seconds`（默认 1800 秒）：慢思考/长生成请求的配额就这样替一个永远不会回来的客户端烧掉（README 旧文甚至明说「窗口不是后台任务的自动取消定时器」）。非流式路径最典型：HTTP 处理器挂在 `buf.wait_for` 等整取结果，连接早已死亡，上游却照常跑完。
+- 修复：`ResumableBuffer` 在最后一个读者断开时启动续传窗口计时器（`_arm_grace_timer`，宽限取断开时刻快照、晚挂连接按观测断开时间回算 remaining）；到点复核 `resume_expired()` 仍成立且生成仍在运行时，经 store 注入的 `on_grace_expired` 钩子调用新增的 `ResumableStore.cancel_generation`：先给缓冲落 410 终态（`error_type=superseded`，trace 记「已取消」，面板可见），再取消在飞泵任务——setup 阶段直接取消 `_call_upstream`，泵阶段经 `pump_stream` finally / ManagedStreamingResponse 清理链关闭上游连接。缓冲本体保留：晚到重连仍是既有 410 懒检查语义，容量回收仍归 TTL 清扫；同指纹新请求的替换路径不受影响（泵已弹出，无需再等 5 秒释放）。
+- 轮询防误伤：`/v1/resumable/{id}` 轮询是断线后的合法续接方式（短连接天生抗抖动），新增 `ResumableBuffer.note_client_activity(horizon)` 把窗口从最后一次轮询向后滑动（长轮询按声明的 wait 预支在途时间，封顶 25 秒），仍在轮询的客户端不会被超窗取消；客户端消失后，最后一次活动 + 窗口即为取消时点。重连（`attach_client`）、完整交付（`mark_delivered`）与生成完成（`finish`/`fail`）都会撤销计时器（`_cancel_grace_timer` 带 `current_task` 守卫，防止取消路径把「正在执行的自己」标成待取消而误伤收尾 await）。
+- 文档：README「取消与重新生成」一节与设置表、控制台「断连续传窗口」帮助文案改写为新语义（窗口到点即取消，轮询滑动续期）；`resumable.py` 模块 docstring 同步。
+- 测试：`test_resumable_delivery` 新增 `GraceExpiryTests` 六项契约（超窗取消并保留缓冲 / 窗口内重连撤销计时 / 轮询滑动窗口 / 长轮询预支 / 完成后不取消 / 非流式断开超窗端到端：上游挂起→断开→单次调用即取消、无重试风暴→410）；`test_review_round2` 轮询桩缓冲补 `note_client_activity` 接口。相关 13 个套件 272 项通过，与改动前仅有的 6 项跨文件状态污染失败（原始 HEAD 同批次同样失败，与本次无关）完全一致。
+
+## 2026-11-03（第六轮）：整取路径退出首回复计时（假流式 / 非流式）
+
+- 背景：用户核实「当前项目的假流式和非流式好像都会计入首字超时，这个不应该」。属实，且比表象更广——全部 6 条整取路径（Express 非流式/假流式、Cookie 非流式/假流式/生图整取、Gemini 原生非流式透传）都把**整段生成时间**套进 15s 首回复窗口，而真流式只计到首个有效分片：同一「慢但有效」的思考模型（首思考分片立即到、总生成超窗口），真流式成功、非流式/假流式必然 `FirstReplyTimeout` → 判可重试 → 同一请求原样重发仍超不过窗口 → `retry_max` 次空烧配额后 504。旧版只给生图模型放宽到 300s（`WHOLE_CALL_MIN_SECONDS`），文本思考模型照挂，且假流式/生图保护是服务端强制路径，客户端无法通过改请求规避（`scripts/repro_first_reply_wholecall.py` 三模式对照复现）。
+- 修复（语义修正，非调参）：`first_reply.timed_call` 的 `whole_call` 分支不再计时（窗口强制置 0，`guard.wait` 直接放行），首回复窗口回归本职——只约束真流式（`guard.iterate` / `prefetch` 首个有效分片）。生图 300s 特例（`WHOLE_CALL_MIN_SECONDS` / `_is_image_model`）随之移除；`gemini_native` 非流式透传同规则（guard seconds 置 0）。整取路径挂起兜底不变：传输层读超时（Express httpx read=600s / Cookie read=180s）+ 整轮 `request_timeout_seconds`（默认 1800s）+ 断连检测。
+- trace / 面板口径：整取请求 trace 记录 `first_reply_timeout_seconds=0`（请求监控不再显示首回复倒计时），成功仍记 `first_reply` 里程碑（完整响应到达即首回复）；控制台 FAQ 与设置标签、README 均注明「窗口仅约束真流式」。
+- 调用点清理：`api_helpers`（假流式/非流式）与 `cookie_proxy`（生图整取/非流式/降级重发）不再预读 `fr_seconds`、不再传 `seconds`（每请求少一次设置树读取，`cookie_proxy` 的 `timeout_seconds` 导入随之移除）；真流式路径（`stream_frames` / `cookie_transport.stream_events` / 原生流式 prefetch / `proxy_attempt` 出口窗口）语义不变。
+- 测试：`test_retry_windows` 旧契约「小窗口可约束挂起的非流式尝试（超时→重试→成功）」按新语义重写为「窗口小于上游耗时时不超时、不重试、一次成功」；`test_proxy_failover` 直接驱动 `timed_call`（不带 `whole_call`）的代理出口窗口契约不受影响；复现脚本三模式（真流式/假流式/非流式）全部通过。
+
 ## 2026-11-03（第五轮）：整取收集期驻留治理 + 后缀次序无关化
 
 - 背景：第四轮收尾后按「开始进行全面优化」再通读生图全链路，深挖前三轮未覆盖的**响应收集段**与请求侧后缀组合次序。详见 `docs/optimization-2026-11-03-image.md` 第五轮一节。

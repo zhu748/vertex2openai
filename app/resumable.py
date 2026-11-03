@@ -6,7 +6,9 @@ identifies one logical operation. SSE event IDs contain generation + sequence,
 and X-Resume-Id directly addresses the retained generation, bound to its body.
 
 Frontend disconnects do not cancel admitted generation immediately. Repeating
-the request after its disconnect grace cancels and replaces that generation.
+the request after its disconnect grace cancels and replaces that generation;
+a generation still running past that grace with no reconnected or polling
+client is cancelled outright instead of collecting to the total deadline.
 TTL, byte budgets and a total execution deadline bound retention. Upstream loss cannot reconstruct an
 unreceived tail; it is reported as an error. ASGI send completion acknowledges
 server delivery only, not application-level receipt. Buffers are not shared
@@ -278,6 +280,11 @@ class ResumableBuffer:
         # 全局总预算（resumable_max_total_mb）仍实时读，保证放宽后立即生效。
         self.max_buffer_bytes = _byte_limit("resumable_max_buffer_mb", 64)
         self._cond = asyncio.Condition()
+        # 断连续传窗口计时（见 _arm_grace_timer）：最后一个读者断开后启动，
+        # 到点仍无人续接（重连 / 轮询）就取消在飞上游。store 经 _attach 注入
+        # on_grace_expired 钩子；无 store 的裸缓冲（测试）保持 None 即不动作。
+        self._grace_task: Optional[asyncio.Task] = None
+        self.on_grace_expired = None
 
     # ---------- 写入端（后台泵任务持有） ----------
 
@@ -321,6 +328,9 @@ class ResumableBuffer:
             if status_code is not None:
                 self.status_code = status_code
             self.finished_at = time.time()
+            # 生成已结束：断开窗口计时失去对象（取消只针对在飞上游），
+            # 已完成未交付的缓冲沿用懒检查 410 与 TTL 回收。
+            self._cancel_grace_timer()
             self._cond.notify_all()
 
     def event_frame(self, frame: str) -> str:
@@ -359,6 +369,7 @@ class ResumableBuffer:
             self.bytes_stored += size
             self.status, self.error, self.status_code = "error", message[:1024], code
             self.finished_at = time.time()
+            self._cancel_grace_timer()
             self._cond.notify_all()
 
     # ---------- 读取端（可以有多个、可以中途离开再回来） ----------
@@ -366,6 +377,8 @@ class ResumableBuffer:
     def attach_client(self, connection):
         client = object()
         self.clients.add(client)
+        # 有客户端在线（新连接或窗口内重连）：撤销断开计时并清除断开标记。
+        self._cancel_grace_timer()
         self.last_disconnect_monotonic = None
         self.last_disconnected_at = None
         self.last_disconnect_grace_seconds = None
@@ -386,6 +399,8 @@ class ResumableBuffer:
                 # Snapshot settings at the last reader's disconnect, just as
                 # each upstream attempt snapshots its first-reply deadline.
                 self.last_disconnect_grace_seconds = disconnect_grace_seconds()
+                # 最后一个读者走了：启动续传窗口计时，到点无人续接即取消上游。
+                self._arm_grace_timer()
             update_meta()
         update_meta()
         connection.listen(closed)
@@ -393,6 +408,74 @@ class ResumableBuffer:
     def resume_expired(self):
         return (not self.clients and not self.fully_delivered and self.last_disconnect_monotonic is not None
                 and time.monotonic() - self.last_disconnect_monotonic >= self.last_disconnect_grace_seconds)
+
+    def _cancel_grace_timer(self):
+        task, self._grace_task = self._grace_task, None
+        # current_task 守卫：缓冲终态化可能正由计时器自身的取消路径驱动
+        # （cancel_generation → buf.fail），不能把「正在执行的自己」标成
+        # 待取消——否则收尾阶段首个 await 会意外再抛 CancelledError。
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+
+    def _arm_grace_timer(self):
+        """按当前断开标记启动续传窗口计时：到点仍无人续接就取消在飞上游。
+
+        remaining 由断开时刻回算（晚挂的客户端连接按观测到的断开时间算），
+        已超窗的旧断开立即触发而不是再等满窗口。重连（attach_client）、
+        完整交付（mark_delivered）与生成完成（finish / fail）都会撤销计时；
+        轮询活动经 note_client_activity 滑动窗口后重挂。"""
+        if self.done or self.fully_delivered or self.last_disconnect_monotonic is None:
+            return
+        self._cancel_grace_timer()
+        grace = self.last_disconnect_grace_seconds or 0.0
+        remaining = self.last_disconnect_monotonic + grace - time.monotonic()
+
+        async def expire():
+            try:
+                await asyncio.sleep(max(0.001, remaining))
+            except asyncio.CancelledError:
+                raise
+            # 到点复核：窗口内重连 / 已交付 / 已完成后直接退出，取消只针对
+            # 「仍在运行且确实无人续接」的生成。
+            if self.done or not self.resume_expired():
+                return
+            hook = self.on_grace_expired
+            if hook is None:
+                return
+            try:
+                await hook(self)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f"⚠️ [续传缓冲] {self.id} 超窗取消上游失败（已忽略）：{type(exc).__name__} - {exc}")
+
+        try:
+            self._grace_task = asyncio.create_task(expire())
+        except RuntimeError:
+            # 无运行事件循环（同步测试上下文）：懒检查路径仍兑底。
+            self._grace_task = None
+
+    def note_client_activity(self, horizon: float = 0.0):
+        """短连接客户端活动（/v1/resumable/{id} 轮询）：滑动续传窗口。
+
+        轮询是断线后的合法续接方式（短连接天生抗抖动）：客户端还在轮询就
+        视为「还连得上」，不因 SSE 断开超窗而取消仍在运行的上游。horizon
+        为本次声明的在途等待（长轮询 wait，封顶 25 秒）：窗口滑到
+        max(现有截止, 现在 + horizon)；客户端消失后，最后一次活动 + 窗口
+        即为取消时点。"""
+        if self.done or self.fully_delivered or self.last_disconnect_monotonic is None:
+            return
+        now = time.monotonic()
+        target = max(self.last_disconnect_monotonic, now + max(0.0, min(horizon, 25.0)))
+        if target <= self.last_disconnect_monotonic:
+            return
+        self.last_disconnect_monotonic = target
+        self.last_disconnected_at = time.time() + (target - now)
+        if self.owner_trace:
+            with self.owner_trace._lock:
+                self.owner_trace.data["resume_expires_at"] = (
+                    self.last_disconnected_at + self.last_disconnect_grace_seconds)
+        self._arm_grace_timer()
 
     @property
     def next_seq(self) -> int:
@@ -443,6 +526,7 @@ class ResumableBuffer:
         """读者已把终止帧交付出去：下一次同指纹请求应视为新生成，而不是重放。"""
         self.fully_delivered = True
         self.last_access = time.time()
+        self._cancel_grace_timer()
 
     def meta(self) -> dict:
         return {
@@ -495,6 +579,7 @@ class ResumableStore:
             self._bytes_used += size
             return True
         buf._account_bytes = account
+        buf.on_grace_expired = self._grace_expired
 
     async def get_exact(self, stream_id: str) -> Optional[ResumableBuffer]:
         async with self._lock:
@@ -583,6 +668,32 @@ class ResumableStore:
             await self._evict_locked(allow_running=True)
             return buf, True
 
+    async def _grace_expired(self, buf: ResumableBuffer) -> None:
+        """断开超过续传窗口且无人续接：直接取消仍在运行的后台上游请求。"""
+        grace = buf.last_disconnect_grace_seconds or 0.0
+        print(f"🚫 [续传缓冲] {buf.id}：客户端断开已超过续传窗口（{grace:g} 秒）且无人续接，"
+              "已取消后台上游请求，不再等待整轮期限。")
+        await self.cancel_generation(buf, "客户端断开已超过续传窗口，本轮上游请求已取消。")
+
+    async def cancel_generation(self, buf: ResumableBuffer, reason: str) -> bool:
+        """取消缓冲对应的在飞泵任务；缓冲本体保留（与 _discard_locked 的差异）。
+
+        用途：断连续传窗口耗尽（无人续接）时终结上游消耗，避免后台空烧到
+        整轮期限。先落 410 终态再取消任务——within_request_deadline 的
+        CancelledError 分支会再 fail 一次，幂等守卫保证「超窗取消」是唯一
+        口径；晚到的重连仍按 resume_expired 懒检查得到 410，容量回收仍由
+        TTL 清扫负责。返回是否确有在飞泵任务被取消。"""
+        async with self._lock:
+            if self._buffers.get(buf.id) is not buf or buf.done:
+                return False
+            task = self._pumps.pop(buf.id, None)
+            await buf.fail(reason, 410, "superseded")
+        if (task is not None and task is not asyncio.current_task()
+                and not task.done() and not task.cancelling()):
+            task.cancel()
+            return True
+        return task is not None
+
     async def drop(self, stream_id: str, *, expected: Optional[ResumableBuffer] = None,
                    reason="响应缓冲已删除。", superseded=False) -> bool:
         async with self._lock:
@@ -599,6 +710,7 @@ class ResumableStore:
         if buf is not None:
             self._bytes_used = max(0, self._bytes_used - buf.bytes_stored)
             buf._account_bytes = None
+            buf._cancel_grace_timer()
             if self._requests.get(buf.request_key) == stream_id:
                 self._requests.pop(buf.request_key, None)
             if not buf.done:

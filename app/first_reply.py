@@ -11,21 +11,17 @@ from response_validation import IncompleteResponseError
 
 _active_wait = ContextVar("first_reply_wait", default=None)
 
-# 生图模型的整调用最低预算：生图请求（两条通道都被强制走假流式/整取
-# 路径）常需 30-120s，首回复窗口（默认 15s）会把它们打成"每次尝试都超
-# 时→重试空烧→最终 504"（FirstReplyTimeout 是 TimeoutError 子类会被判
-# 可重试）。用户无法通过改请求规避（路径是服务强制选的），故对生图模型
-# 把整调用预算抬到 max(窗口, 300s)；文本模型维持配置窗口语义——用户与
-# 测试可以用小窗口约束挂起的非流式尝试（test_retry_windows 依赖此契约）。
-WHOLE_CALL_MIN_SECONDS = 300.0
-
-
-def _is_image_model(model: str) -> bool:
-    try:
-        from model_capabilities import get_profile
-        return bool(get_profile(model).get("is_image"))
-    except Exception:
-        return False
+# 整调用（非流式 / 假流式 / 生图整取）不参与首回复计时（2026-11 语义修正）：
+# 首回复窗口的本职是「真流式下检测上游是否开始吐有效分片」——思考、
+# 正文、工具调用、图片任一到达即算回复，此后不再受窗口约束。整取路径
+# 要等完整响应才有“首回复”可言，把窗口套上去等于用 15s 卡整段生成
+# 时间：慢思考/长输出模型必然 FirstReplyTimeout → 被判可重试 → 同一请求
+# 原样重发仍超不过窗口 → retry_max 次空烧配额后 504，且路径由服务端强制
+# 选择（假流式开关/生图保护），客户端无法通过改请求规避。旧版仅对生图
+# 模型放宽到 max(窗口, 300s) 的补丁（WHOLE_CALL_MIN_SECONDS）由本规则
+# 整体取代并移除。整取路径的挂起检测兜底：传输层读超时（Express httpx
+# read=600s / Cookie read=180s）+ 整轮 request_timeout_seconds（默认
+# 1800s）+ 断连检测照常生效。
 
 
 @asynccontextmanager
@@ -219,17 +215,15 @@ def native_has_reply(payload):
 async def timed_call(model, operation, *, whole_call=False, seconds=None):
     """whole_call：该操作要等完整响应（非流式 generate_content / 整取 POST）。
 
-    生图模型在此路径把预算抬到 max(窗口, WHOLE_CALL_MIN_SECONDS)（见常量
-    注释）；文本模型严格用配置窗口（保留"小窗口约束挂起尝试"的既有契约）。"""
+    整调用不参与首回复计时（2026-11 语义，见模块头注释）：窗口强制置 0
+    （guard.wait 直接放行，trace 记录 0 = 已禁用，面板不再显示倒计时），
+    成功仍记 first_reply 里程碑（整取的完整响应到达即首回复）。窗口语义
+    只保留给真流式路径：guard.iterate / prefetch，以及不带 whole_call 的
+    本调用——test_proxy_failover 直接用它驱动代理出口首回复窗口，不受本
+    规则影响。"""
+    if whole_call:
+        seconds = 0.0
     guard = FirstReplyGuard(model, seconds=seconds)
-    if whole_call and guard.seconds and _is_image_model(model):
-        guard.seconds = max(guard.seconds, WHOLE_CALL_MIN_SECONDS)
-        guard.deadline = guard.started + guard.seconds
-        guard.initial_deadline = guard.deadline
-        if guard.trace:
-            with guard.trace._lock:
-                guard.trace.data["first_reply_timeout_seconds"] = guard.seconds
-                guard.trace.data["first_reply_deadline"] = time.time() + guard.seconds
     result = await guard.wait(operation)
     if getattr(result, "status_code", 200) < 400:
         guard.accept()

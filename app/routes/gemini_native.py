@@ -510,7 +510,12 @@ async def _passthrough_request(fastapi_request: Request, model: str, action: str
         prefetched = None
         try:
             upstream_attempt()
-            first_reply = FirstReplyGuard(model, seconds=fr_seconds)
+            # 非流式透传是整取路径：不参与首回复计时（2026-11 语义，见
+            # first_reply.timed_call）——窗口置 0 后 wait 直接放行，挂起由
+            # 传输层读超时（read=600s）与整轮期限兜底；真流式保持窗口语义
+            # （响应头到达 + prefetch 首个有效帧都在窗口内）。
+            first_reply = FirstReplyGuard(
+                model, seconds=fr_seconds if is_stream else 0.0)
             async def send(raw, resolved):
                 return await _passthrough_once(
                     client_for(raw, resolved), express_key, model_path, action, query, payload,

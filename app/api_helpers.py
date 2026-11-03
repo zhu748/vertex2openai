@@ -229,10 +229,9 @@ async def gemini_fake_stream_generator(
     # P1-6：不再使用 tenacity 的硬编码 20 次，改为与真流式/非流式一致的手写退避，
     # 读取控制台的 retry_max / retry_backoff_seconds / retry_jitter_seconds
     # （固定间隔 + 抖动，不随次数放大），并在等待期间检测客户端断开。
+    # 注：整取路径不参与首回复计时（2026-11 语义，见 first_reply.timed_call），
+    # 此处无需预读首回复窗口。
     max_retries, backoff_sec, jitter_sec = get_retry_settings()
-    # 首回复窗口每请求只读一次设置：重试循环里每次 timed_call 都重复
-    # 深拷贝整棵设置树（含全部 model_overrides），重试风暴下放大浪费。
-    fr_seconds = timeout_seconds(request_obj.model)
 
     outer_keep_alive_interval = app_state.get_setting(
         "fake_streaming_interval", app_config.FAKE_STREAMING_INTERVAL_SECONDS
@@ -280,8 +279,8 @@ async def gemini_fake_stream_generator(
                         contents=prompt_for_api_call,
                         config=gen_config_dict_for_api_call,
                     ),
+                    # 整取（假流式）不参与首回复计时。
                     whole_call=True,
-                    seconds=fr_seconds,
                 )
             )
 
@@ -1003,7 +1002,6 @@ class SDKGeneration:
         track_configure(mode="json", upstream_model=self.model_to_call)
         # 手动退避重试循环（替代 tenacity），以便在每次重试前检测客户端断开
         max_retries, backoff_sec, jitter_sec = get_retry_settings()
-        fr_seconds = timeout_seconds(self.request_obj.model)
         response_obj_call = None
         # 总尝试次数 = retry_max + 1，retry_max=0 时仍会请求一次
         attempt = 0
@@ -1036,8 +1034,8 @@ class SDKGeneration:
                         contents=self.actual_prompt_for_call,
                         config=self.gen_config_dict,
                     ),
+                    # 整取（非流式）不参与首回复计时。
                     whole_call=True,
-                    seconds=fr_seconds,
                 )
                 upstream_chunk()
                 break
