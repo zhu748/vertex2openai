@@ -37,6 +37,33 @@ from usage import map_usage
 
 SUPPORTED_ROLES = ["user", "model", "function"]
 
+# 超大 content 的 SSE 分帧阈值（4K 生图的 base64 data URL 单张可达 13~40MB）。
+# 单帧发射时 json.dumps + f"data:..." + ASGI encode 会在同一瞬间再造三份
+# 全量拷贝，叠加转换链后 512MB 容器（Render 免费/入门档）实测被 OOMKill
+# （进程级 SIGKILL，无任何 Python 异常，表现为"收到首个上游分片后服务
+# 直接崩溃重启"）。超过阈值的 content 切成 256KiB 增量帧：客户端按
+# OpenAI 语义拼接 delta 后与单帧输出逐字节一致，仅中转帧体积更小。
+GIANT_CONTENT_THRESHOLD = 1 << 20  # 1 MiB：正常文本（含长思考）永不触发
+GIANT_CONTENT_SLICE = 1 << 18      # 256 KiB：单帧 SSE 事件的安全体积
+
+
+def slice_giant_content(
+    text: str,
+    *,
+    threshold: int = GIANT_CONTENT_THRESHOLD,
+    size: int = GIANT_CONTENT_SLICE,
+) -> list[str]:
+    """超大 content（生图 base64）→ 多帧切片，拼接结果与原文逐字节一致。
+
+    小于等于阈值时原样单元素返回（保持"整图单帧"的既有假流式 UX——
+    1MB 以内的图片/markdown 帧一次到达，前端无中间渲染闪烁）。切片
+    总量与原文等大（一份拷贝，与旧单帧的 json.dumps 拷贝同量级），
+    循环结束即释放。
+    """
+    if len(text) <= threshold:
+        return [text]
+    return [text[i : i + size] for i in range(0, len(text), size)]
+
 
 def logprobs_payload_from_candidate(candidate: Any) -> Optional[Dict[str, Any]]:
     """把 SDK Candidate 的 logprobs_result 转成 OpenAI choices[].logprobs 结构。
@@ -836,10 +863,14 @@ def _create_safety_ratings_html(safety_ratings: list) -> str:
 
 
 def _convert_image_to_markdown(image_data: bytes, mime_type: str) -> str:
+    # 内存关键路径：4K 生图的 base64 单张可达数十 MB。旧实现先拼
+    # data_url 再包 markdown（b64 bytes / b64 str / data_url / markdown
+    # 四份全量拷贝同时驻留），512MB 容器（Render 免费档）叠加上游解析
+    # 与 SSE 分帧会被直接 OOMKill。一步拼出最终串，b64encode 的中间
+    # bytes 在 .decode() 后即刻释放，峰值驻留减半（b64 str + markdown）。
     try:
         b64_data = base64.b64encode(image_data).decode("utf-8")
-        data_url = f"data:{mime_type};base64,{b64_data}"
-        return f"![Image]({data_url})"
+        return f"![Image](data:{mime_type};base64,{b64_data})"
     except Exception as e:
         print(f"⚠️ [图片处理] 将 Gemini 图片转换为 Markdown 失败：{e}")
         return "[Image could not be displayed]"

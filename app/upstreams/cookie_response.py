@@ -7,6 +7,7 @@ import re
 import time
 from typing import Any, AsyncGenerator, Optional
 from models import file_data_markdown
+from message_processing import slice_giant_content
 
 from response_validation import IncompleteResponseError, complete_function_arguments, validate_generation_finish_reason
 from json_stream import MAX_JSON_OBJECT_BYTES, JsonObjects as _JsonObjects
@@ -398,3 +399,31 @@ def make_openai_chunk(
         ],
     }
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+
+def make_openai_content_chunks(
+    response_id: str,
+    model: str,
+    content: str,
+    role: str = None,
+) -> list[str]:
+    """超大 content（4K 生图 base64）→ 多帧 SSE 列表。
+
+    单帧发射时 json.dumps + f"data:..." + ASGI encode 会瞬间再造三份
+    全量拷贝，叠加解析链后 512MB 容器（Render 免费档）会被 OOMKill
+    （进程级 SIGKILL，无 Python 异常，表现为"收到首个上游分片后服务
+    直接崩溃重启"）。超过 1MiB 的 content 走 message_processing.
+    slice_giant_content 切成 256KiB 增量帧：客户端按 OpenAI 语义拼接
+    delta 后与单帧输出逐字节一致；小图保持整图单帧（前端无中间渲染
+    闪烁）。role 只注入首帧（对齐官方帧序）。
+    """
+    pieces = slice_giant_content(content) if content else []
+    return [
+        make_openai_chunk(
+            response_id,
+            model,
+            content=piece,
+            role=role if i == 0 else None,
+        )
+        for i, piece in enumerate(pieces)
+    ]

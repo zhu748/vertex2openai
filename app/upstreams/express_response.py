@@ -14,9 +14,11 @@ from typing import Any, Dict, Optional
 import config as app_config
 
 from message_processing import (
+    GIANT_CONTENT_THRESHOLD,
     _create_safety_ratings_html,
     logprobs_payload_from_candidate,
     parse_gemini_response_for_reasoning_and_content,
+    slice_giant_content,
 )
 from prefill import PrefillDeduper, strip_prefill_overlap
 from response_validation import (
@@ -409,20 +411,32 @@ async def _chunk_openai_response_dict_for_sse(
         if actual_content is not None:
             content_to_chunk = actual_content
             # Keep generated images whole; chunk ordinary text for fake-stream UX.
-            if "![Image](data:image/" in content_to_chunk:
-                chunk_size = max(1, len(content_to_chunk))
+            # 超大 content（4K 生图 base64）优先按内存分帧：单帧发射会在
+            # json.dumps + f"data:..." + ASGI encode 同一瞬间再造三份全量
+            # 拷贝，叠加转换链后 512MB 容器（Render 免费档）直接 OOMKill
+            # ——进程级 SIGKILL，无 Python 异常，表现为“收到首个上游分片
+            # 后服务崩溃重启”。切片拼接结果与单帧逐字节一致（见
+            # message_processing.slice_giant_content）。
+            if len(content_to_chunk) > GIANT_CONTENT_THRESHOLD:
+                pieces = slice_giant_content(content_to_chunk)
+            elif "![Image](data:image/" in content_to_chunk:
+                pieces = [content_to_chunk] if content_to_chunk else []
             else:
                 chunk_size = (
                     max(1, math.ceil(len(content_to_chunk) / 10))
                     if content_to_chunk
                     else 1
                 )
+                pieces = [
+                    content_to_chunk[i : i + chunk_size]
+                    for i in range(0, len(content_to_chunk), chunk_size)
+                ]
             if not content_to_chunk and not reasoning_content:
                 yield _sse({"content": ""})
             else:
-                for i in range(0, len(content_to_chunk), chunk_size):
-                    yield _sse({"content": content_to_chunk[i : i + chunk_size]})
-                    if len(content_to_chunk) > chunk_size:
+                for piece in pieces:
+                    yield _sse({"content": piece})
+                    if len(pieces) > 1:
                         await asyncio.sleep(0.01)
 
         for tc_item_idx, tool_call_item in enumerate(message.get("tool_calls") or []):

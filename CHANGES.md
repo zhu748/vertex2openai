@@ -2,6 +2,16 @@
 
 基于原版 `vertex2openai-main`（2026-09-01），持续完善兼容性、可靠性和代码组织。
 
+## 2026-11-03：修复 4K 生图在 512MB 容器（Render 等）被 OOMKill 的崩溃
+
+- 症状：Express Key 通道请求 4K 生图，等待 30-120 秒后监控面板出现「收到首个上游分片」里程碑，随即整个进程死亡重启（渲染页面刷新即见服务崩溃）；1K/2K 正常，4K 一张都出不来，全程无任何 Python 异常或错误日志。
+- 根因：4K 图片单张 10-25MB，响应落地后的应用层转换链对其做 6 份以上全量驻留拷贝——SDK 解析（body bytes + base64 str + 解码 bytes）→ `_convert_image_to_markdown` 的 4 连拷贝（b64 bytes/str、data_url、markdown）→ 整图单帧 SSE 发射的 `json.dumps` + `f"data:..."` + ASGI `encode` 三连拷贝。实测 25MB 图旧链路峰值 RSS +250MB（忠实生命周期模拟，25MB → 328MB），叠加 FastAPI/uvicorn/SDK 基线后突破 512MB 容器限额，内核 OOMKill 直接 SIGKILL 进程——这正是"首个分片到达即崩溃、无异常日志"的机制。
+- 修复一（转换拷贝减半）：`_convert_image_to_markdown` 不再先拼 `data_url` 再包 markdown，base64 一步拼出最终串，峰值驻留从 4 份降到 2 份（b64 str + markdown）；输出格式逐字节不变。
+- 修复二（超大 content 分帧）：新增 `message_processing.slice_giant_content`（阈值 1MiB、切片 256KiB，拼接结果与原文逐字节一致）。Express 假流式 `_chunk_openai_response_dict_for_sse` 与 Cookie 通道（流式 `image` 事件 + 整取假流式，新增 `make_openai_content_chunks`）对超过 1MiB 的生图 content 改发 256KiB 增量帧：客户端按 OpenAI delta 拼接语义无感，单帧 `json.dumps`/`encode` 不再产生全量拷贝，同时消除了此前 13-33MB 的巨型单 SSE 事件对客户端/代理缓冲的压力。≤1MiB 的小图保持整图单帧，假流式 UX 不变。
+- 修复三（提前释放 SDK 响应）：Express 假流式与非流式路径在 `convert_to_openai_format` + 用量记录完成后，立即置空 `raw_gemini_response`/`api_call_task`/`response_obj_call` 引用，让响应持有的图片原始 bytes（0.75× base64 体积）先行释放，不与后续分帧字符串叠加驻留。
+- 实测（忠实生命周期模拟，含 SDK 解析，基准 77MB）：12MB 图 206→157MB；25MB 图 328→227MB（-31%），且分帧发射阶段不再新增峰值。512MB 容器叠加 ~150MB 应用基线后，25MB 4K 单请求峰值约 280MB，恢复生存空间；多请求并发或图生图（历史含图回传）仍建议 ≥1GB 实例。
+- 测试：新增 `tests/test_image_memory_framing.py` 10 项回归（切片字节一致性、Unicode 边界、Express/Cookie 分帧拼接、role 只在首帧、小图单帧不变、markdown 格式不变）；全项目测试与 lint 基线对比无新增失败。
+
 ## 2026-10-31：请求稳定性与资源回收
 
 - 修复 curl_cffi 在响应头到达前取消请求时遗留后台下载任务与连接的问题。按请求追踪底层句柄，取消或首回复超时后等待生产者归还连接，保留共享会话及其他活跃请求；覆盖流式、非流式和等待连接池时的取消。

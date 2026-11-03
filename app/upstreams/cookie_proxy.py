@@ -76,6 +76,7 @@ from upstreams.cookie_response import (
     extract_events,
     iter_json_objects,
     make_openai_chunk,
+    make_openai_content_chunks,
     openai_tool_call,
 )
 from upstreams.cookie_transport import (
@@ -498,10 +499,14 @@ class CookieGeneration:
                     self.model_display,
                     reasoning_content=res["reasoning_text"],
                 )
-            # 关键：整张图作为单个 chunk 发出，绝不分块
-            yield make_openai_chunk(
+            # 整张图作为单个 chunk 发出（≤1MiB 小图）；超大 4K base64
+            # 改为 256KiB 增量帧：单帧会在序列化/编码瞬间再造三份全量拷贝，
+            # 512MB 容器（Render 免费档）叠加解析链会被 OOMKill。切片拼接
+            # 结果与单帧逐字节一致，客户端按 delta 拼接语义无感。
+            for _frame in make_openai_content_chunks(
                 self.response_id, self.model_display, content=full_text or " "
-            )
+            ):
+                yield _frame
             stats.add_success()
             credential_manager.record_cookie_success(
                 self.account_id, credential=self.record
@@ -739,9 +744,12 @@ class CookieGeneration:
                                 stream_ordinary_metadata.append(
                                     ordinary_part_metadata("image", "", None)
                                 )
-                                yield make_openai_chunk(
+                                # 超大生图 base64 分帧发射（同整取路径，见
+                                # make_openai_content_chunks 注释）；小图保持单帧。
+                                for _frame in make_openai_content_chunks(
                                     self.response_id, self.model_display, content=data
-                                )
+                                ):
+                                    yield _frame
                             else:  # text（经过预填充去重器）
                                 got_text = True
                                 out = deduper.feed(data)

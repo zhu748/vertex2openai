@@ -360,6 +360,13 @@ async def gemini_fake_stream_generator(
         )
         _prepend_prefill(openai_response_dict, prefill_text)
         _record_usage(raw_gemini_response)
+        # 4K 生图内存关键点：响应对象持有整张图的原始 bytes（0.75× base64
+        # 体积），且 api_call_task 的结果仍引用着它；转换完成后两个引用
+        # 都立即释放，避免与后续 SSE 分帧的全量字符串拷贝叠加驻留
+        # （实测 25MB 图旧链路峰值 RSS +345MB，Render 512MB 容器被
+        # OOMKill，进程级 SIGKILL 无任何 Python 异常）。
+        raw_gemini_response = None
+        api_call_task = None
         async for chunk_sse in _chunk_openai_response_dict_for_sse(
             openai_response_dict=openai_response_dict
         ):
@@ -1106,6 +1113,9 @@ class SDKGeneration:
         openai_response_content = convert_to_openai_format(
             response_obj_call, self.request_obj.model
         )
+        # 与假流式路径同因：释放 SDK 响应（持有图片原始 bytes），
+        # 避免与 JSONResponse 序列化拷贝叠加驻留。
+        response_obj_call = None
         _prepend_prefill(openai_response_content, self.prefill_text)
         print(f"✅ [Express] {self.request_obj.model} | 非流式响应完成")
         return JSONResponse(content=openai_response_content)
