@@ -30,6 +30,75 @@ from message_processing import GIANT_CONTENT_THRESHOLD  # noqa: E402
 
 RUNS = 5
 
+# Cookie 生图整取收集峰值的子进程脚本（与回归测试同构的离线桩）：
+# 子进程先完成导入、构造响应文本并记录水位，再跑 _collect_full_response，
+# 高水位差即「解析→事件消费→正文拼接」整段的收集期新增峰值。
+_CHILD_COLLECT = r"""
+import asyncio, json, resource, sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[2]) / "app"))
+import upstreams.cookie_proxy as cp
+
+mb = int(sys.argv[1])
+b64 = "QkFTRTY0" * (mb * 1024 * 1024 // 8)
+body = {"results": [{"data": {"candidates": [{
+    "content": {"parts": [{"text": "这是生成的图："}, {"inlineData": {"mimeType": "image/png", "data": b64}}, {"text": "（完）"}]},
+    "finishReason": "STOP"}]}}]}
+
+class FakeResponse:
+    status_code = 200
+    headers = {}
+    text = json.dumps(body)
+
+class FakeClient:
+    async def post(self, *a, **k):
+        return FakeResponse()
+
+class FakeCM:
+    async def __aenter__(self): return FakeClient()
+    async def __aexit__(self, *exc): return False
+
+class FakeReq:
+    async def is_disconnected(self): return False
+
+async def fake_timed_call(model, op, *, whole_call=False, seconds=None):
+    return await op
+
+from unittest import mock
+patches = [
+    mock.patch.object(cp, "open_upstream_client", return_value=FakeCM()),
+    mock.patch.object(cp, "timed_call", side_effect=fake_timed_call),
+    mock.patch.object(cp, "build_headers", return_value={"auth": "1"}),
+    mock.patch.object(cp, "build_request_body_async", mock.AsyncMock(return_value={"contents": []})),
+    mock.patch.object(cp, "stats"),
+]
+def maxrss():
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+with patches[0], patches[1], patches[2], patches[3], patches[4]:
+    before = maxrss()
+    result = asyncio.run(cp._collect_full_response(
+        "proj-1", "gemini-3.1-flash-image", mock.Mock(), "cookie", {},
+        retry_max=0, backoff_sec=0, jitter_sec=0, fastapi_request=FakeReq()))
+    after = maxrss()
+assert result["kind"] == "ok", result
+print(after - before)
+"""
+
+
+def bench_cookie_collect(root: Path):
+    print(f"== Cookie 生图整取收集期新增峰值 RSS（{RUNS} 次中位数；含返回的 full_text 驻留）==")
+    for mb in (12, 48):
+        results = []
+        for _ in range(RUNS):
+            proc = subprocess.run(
+                [sys.executable, "-c", _CHILD_COLLECT, str(mb), str(root)],
+                capture_output=True, text=True, check=True,
+            )
+            results.append(int(proc.stdout.strip()) / 1024)
+        results.sort()
+        print(f"  单对象 base64 {mb:2d}MB → 收集期新增峰值 {results[RUNS // 2]:7.1f}MB")
+
+
 _CHILD = r"""
 import io, resource, sys
 from PIL import Image, ImageOps
@@ -144,8 +213,11 @@ def bench_pacing():
 
 
 def main():
+    root = Path(__file__).resolve().parents[1]
     print(f"Python {sys.version.split()[0]}\n")
     bench_flatten()
+    print()
+    bench_cookie_collect(root)
     print()
     bench_pacing()
 

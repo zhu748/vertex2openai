@@ -2,6 +2,18 @@
 
 基于原版 `vertex2openai-main`（2026-09-01），持续完善兼容性、可靠性和代码组织。
 
+## 2026-11-03（第五轮）：整取收集期驻留治理 + 后缀次序无关化
+
+- 背景：第四轮收尾后按「开始进行全面优化」再通读生图全链路，深挖前三轮未覆盖的**响应收集段**与请求侧后缀组合次序。详见 `docs/optimization-2026-11-03-image.md` 第五轮一节。
+- 拉取式解析游标（内存）：完整正文路径旧用生成器消费——生成器在 yield 挂起期间其帧局部仍持有刚解析出的巨型 dict（4K inlineData 单张 30-90MB），消费方 `del obj` 无济于事；叠加采样器无差别留存，收集期恒驻 3 份全量。新增 `cookie_response.CompleteTextObjectCursor`：`next_object()` 返回后不持任何引用，配合消费方 `del obj` 让解析副本在事件消费前释放。解析语义与旧实现逐字节一致；`iter_json_objects` 的 TextSource 分支委托游标，其余调用方不变。
+- 64MB 单对象上限误拒修正（正确性）：非流式完整正文沿用流式解析器的 `MAX_JSON_OBJECT_BYTES=64MB`——完整正文早已整体驻留，上限在此不设防任何东西，却把 base64 可达 53-93MB 的 4K 高细节 PNG 整单拒绝（用户可见失败）。游标取 `max(limit, len(text))`；**流式解析器上限语义不变**（那里真正防解析缓冲无界增长，回归测试固定分叉）。
+- 诊断采样器「正文即停留存」（内存）：`RawSampler` 只服务「无正文」日志，却在成功路径把含巨型 inlineData 的对象钉到函数返回。新增 `stop_retaining()`（幂等，计数继续累计），`BODY_EVENT_TYPES`（text/image/function_call/native_part）到达即丢弃样本；无正文路径（含只有思考）样本照常保留、`dump()` 不变。生图整取、非流式整取、流式传输器（原生桥共享）三处接入；流式侧不 del obj（流式解析器仍是生成器，帧局部钉住，注释记录）。
+- 收集拼接改「片段表 + 一次 join」（内存/CPU）：`full_text += data` 逐事件重建整串——生图响应常见「导语 + 巨型图片 + 尾文本」，尾文本一次多拷一份 40MB 级全量、多图 O(n²)。两条整取路径均改片段表 + join，拼接逐字节一致（回归保证）。
+- collect_response 响应释放（内存，第三轮遗漏）：第三轮只修了生图假流式路径；非流式生图请求（`stream=false`）走 `collect_response`，httpx bytes 缓冲与解码 str 仍全程双驻留。补上同构的「text 取本地引用后置 None」。
+- -search 与分辨率后缀任意次序生效（正确性）：目录从不叠加两种变体，但手打名两种次序都必须全生效——旧实现固定「先 -search 后档位」单次剥离：`model-search-4k` 残留 `-search` 发上游 404、`model-4k-search` 档位提示不可见（搜索生效但静默回落 1K）。`image_resolution_suffix` 允许档位后再跟 -search（resolve_image_size 的原名兜底两种次序都能读到档位）；新增 `strip_image_and_search_suffixes` 循环剥离，Express `_normalize_model_name` 与 Cookie `_prepare_cookie_generation` 统一接入；文本模型 -search 行为不变。
+- 基准：`benchmark_image_path.py` 新增「Cookie 生图整取收集期新增峰值」子进程高水位差测量——48MB base64（4K 高细节档）收集期新增峰值 145.9 → 97.3MB（-33%，3 份→2 份）。
+- 测试：`test_image_path_optimization` 新增契约 8-13 共 10 项（游标化释放 refcount 计量、采样器停留存/无正文保留、拼接逐字节一致、两种后缀次序的解析/剥离/Express 归一/档位兜底、64MB 上限分叉、collect_response 集成释放与拼接）；释放与采样器两条行为测试经「临时禁用→FAIL」验证非空转；`test_model_retry` 的 Cookie 桩迁移到游标（36 项全绿）。
+
 ## 2026-11-03（第四轮）：分辨率后缀目录可发现性 + 原生透传支持 + 测试隔离治本
 
 - 背景：用户核实「分辨率此前只在控制台调、`/v1/models` 里生图模型后面没有分辨率」。属实：请求侧 `-1k/-2k/-4k/-512` 模型名后缀第三轮起已端到端生效，但三套模型目录（OpenAI / Anthropic / Gemini 原生）都不列出这些变体——GUI 客户端下拉选不到、只能手打，与 `-search` 变体「既支持调用、也列目录」的口径漂移；且 Gemini 原生透传对该后缀会直接 404（透传侧从不剥离）。详见 `docs/optimization-2026-11-03-image.md` 第四轮一节。

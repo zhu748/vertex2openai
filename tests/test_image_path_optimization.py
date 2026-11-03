@@ -1,6 +1,6 @@
 """生图链路全面优化回归（2026-11-03，不限于 4K）。
 
-覆盖七项契约：
+覆盖契约（第五轮新增 8-13）：
 1. 模型名分辨率别名（-1k/-2k/-4k/-512）端到端生效：档位转成
    imageConfig.imageSize（Express 与 Cookie 两通道），且从发往上游的
    模型名里剥离（目录无此 ID，原样发送 404）；
@@ -15,7 +15,19 @@
 6. 别名剥离只对生图档案生效：文本模型名原样保留；
 7. 分辨率后缀目录可发现性：三套模型目录（OpenAI / Anthropic /
    Gemini 原生）同源列出 -1k/-2k/-4k/-512 变体，Gemini 原生透传
-   剥后缀并注入 imageConfig.imageSize（与 -search 变体同模式）。
+   剥后缀并注入 imageConfig.imageSize（与 -search 变体同模式）；
+8. 拉取式解析游标：next_object() 返回后不持有对象引用，配合消费方
+   del obj 让解析出的巨型 dict（含整份 base64）在事件消费前释放；
+9. 诊断采样器正文即停留存：BODY_EVENT_TYPES 事件到达后丢弃已存样本、
+   停止留存但保留计数；无正文路径（含只有思考）样本照常保留；
+10. 非流式整取（collect_response）与生图假流式同构：解析前释放
+    httpx 响应对象；图片事件经片段表 + 一次 join 拼接；
+11. 正文收集用「片段表 + join」替代逐事件 +=（导语+图片+尾声拼接
+    逐字节一致）；
+12. -search 与分辨率后缀叠加时两种次序都全生效（-4k-search 与
+    -search-4k 均解析出档位、剥净 -search、搜索标记成立）；
+13. 非流式完整正文的单对象上限按实际正文长度放行（64MB 上限不误拒
+    4K 高细节 PNG）；流式解析器上限语义不变。
 """
 
 import asyncio
@@ -322,19 +334,18 @@ class GiantFramePacingTests(unittest.TestCase):
 
 
 class CookieCollectReleaseTests(unittest.TestCase):
-    """契约 5/6：生图整取在解析前释放 httpx 响应对象。"""
+    """契约 5/6/8/11：生图整取的响应释放、游标化解析与拼接一致性。"""
 
     def test_response_buffer_released_before_parsing(self):
         import upstreams.cookie_proxy as cp
 
         seen_refcounts = []
 
-        real_iter = cp.iter_json_objects
-
-        async def spying_iter(text_source):
-            seen_refcounts.append(sys.getrefcount(self._fake_response))
-            async for obj in real_iter(text_source):
-                yield obj
+        class SpyingCursor(cp.CompleteTextObjectCursor):
+            # 解析入口（游标构造）时记录 fake_response 的引用计数。
+            def __init__(cursor_self, text, limit=None):
+                seen_refcounts.append(sys.getrefcount(self._fake_response))
+                super().__init__(text)
 
         image_b64 = "QkFTRTY0" * 64
         body = {
@@ -342,7 +353,9 @@ class CookieCollectReleaseTests(unittest.TestCase):
                 "data": {
                     "candidates": [{
                         "content": {"parts": [
+                            {"text": "导语"},
                             {"inlineData": {"mimeType": "image/png", "data": image_b64}},
+                            {"text": "尾声"},
                         ]},
                         "finishReason": "STOP",
                     }]
@@ -396,13 +409,15 @@ class CookieCollectReleaseTests(unittest.TestCase):
              mock.patch.object(cp, "build_headers", return_value={"auth": "1"}), \
              mock.patch.object(cp, "build_request_body_async",
                                mock.AsyncMock(return_value={"contents": []})), \
-             mock.patch.object(cp, "iter_json_objects", spying_iter), \
-             mock.patch.object(cp, "stats"):
+             mock.patch.object(cp, "stats"), \
+             mock.patch.object(cp, "CompleteTextObjectCursor", SpyingCursor):
             result = asyncio.run(run())
 
+        expected_md = f"![Generated Image](data:image/png;base64,{image_b64})"
         self.assertEqual(result["kind"], "ok", str(result))
-        self.assertIn("data:image/png;base64,", result["full_text"])
-        # 解析开始时（iter_json_objects 被调用）：本地 response 已置 None。
+        # 契约 11（片段表 + 一次 join）：导语 + 图片 + 尾声拼接逐字节一致。
+        self.assertEqual(result["full_text"], "导语" + expected_md + "尾声")
+        # 解析开始时（游标构造）：本地 response 已置 None。
         # 此刻 fake_response 的引用 = 测试局部变量 + self._fake_response +
         # getrefcount 的临时引用 = 3；若 _collect_full_response 仍持有
         # response 局部变量则为 4。
@@ -490,6 +505,329 @@ class CatalogDiscoverabilityTests(unittest.TestCase):
         self.assertIn("imageSize=4K", entry["description"])
         plain = _native_model_entry("gemini-3.1-flash-image")
         self.assertNotIn("imageSize", plain["description"])
+
+
+class CombinedSuffixOrderTests(unittest.TestCase):
+    """契约 12：-search 与分辨率后缀叠加时两种次序都全生效（第五轮）。
+
+    目录从不叠加两种变体，但手打名 "model-search-4k"（档位剥离后残留
+    -search 发上游 404）与 "model-4k-search"（档位提示不可见，静默回落
+    1K）都必须与目录变体语义一致。"""
+
+    def test_resolution_suffix_parses_both_orders(self):
+        self.assertEqual(
+            mc.image_resolution_suffix("gemini-3.1-flash-image-4k-search"),
+            ("gemini-3.1-flash-image", "4K"))
+        name, tier = mc.image_resolution_suffix("gemini-3.1-flash-image-search-4k")
+        self.assertEqual((name, tier), ("gemini-3.1-flash-image-search", "4K"))
+
+    def test_strip_loop_removes_both_orders(self):
+        for combined, want_search in (
+            ("gemini-3.1-flash-image-4k-search", True),
+            ("gemini-3.1-flash-image-search-4k", True),
+            ("gemini-3.1-flash-image-4k", False),
+        ):
+            with self.subTest(name=combined):
+                base, is_search = mc.strip_image_and_search_suffixes(combined)
+                self.assertEqual(
+                    (base, is_search), ("gemini-3.1-flash-image", want_search))
+        # 文本模型的 -search 别名行为不变
+        self.assertEqual(
+            mc.strip_image_and_search_suffixes("gemini-3.8-flash-search"),
+            ("gemini-3.8-flash", True))
+        # 文本模型名（即使以 -4k 结尾）不剥离档位后缀，原样透传
+        self.assertEqual(
+            mc.strip_image_and_search_suffixes("gemini-3.8-flash-4k"),
+            ("gemini-3.8-flash-4k", False))
+
+    def test_express_normalize_both_orders(self):
+        for combined in ("gemini-3.1-flash-image-4k-search",
+                         "gemini-3.1-flash-image-search-4k"):
+            with self.subTest(name=combined):
+                base, is_search, err = _normalize_model_name(combined)
+                self.assertEqual((base, is_search, err),
+                                 ("gemini-3.1-flash-image", True, None))
+
+    def test_resolve_image_size_reads_tier_in_both_orders(self):
+        # 通道已把上游模型名剥成基础名：档位从请求原始模型名兜底解析，
+        # 两种次序都要能读到（否则 -search 叠加时静默回落 1K）。
+        for combined, tier in (
+            ("gemini-3.1-flash-image-4k-search", "4K"),
+            ("gemini-3.1-flash-image-search-4k", "4K"),
+            ("gemini-3.1-flash-image-2k", "2K"),
+        ):
+            with self.subTest(name=combined):
+                size = mc.resolve_image_size(
+                    "gemini-3.1-flash-image", _request(combined), {})
+                self.assertEqual(size, tier)
+
+
+class CompleteTextCursorLimitTests(unittest.TestCase):
+    """契约 13：非流式整取的单对象上限按实际正文长度放行；流式上限不变。"""
+
+    def test_complete_text_lifts_per_object_cap_to_text_size(self):
+        # 4K 高细节 PNG 的 base64 可达 53-93MB，超过 64MB 流式上限；非流式
+        # 正文早已整体驻留，上限在此不设防任何东西，只能误拒合法响应。
+        from upstreams.cookie_response import CompleteTextObjectCursor
+
+        text = '{"data": "' + "A" * 64 + '"}   [tail]'
+        cursor = CompleteTextObjectCursor(text, limit=8)  # 上限远小于对象
+        self.assertEqual(cursor.next_object(), {"data": "A" * 64})
+        self.assertIsNone(cursor.next_object())
+
+    def test_streaming_parser_keeps_per_object_cap(self):
+        # 流式解析器的上限语义不变：仍防解析缓冲无界增长。
+        from json_stream import JsonObjects
+        from response_validation import IncompleteResponseError
+
+        parser = JsonObjects(limit=8)
+        with self.assertRaises(IncompleteResponseError):
+            list(parser.feed('{"data": "' + "A" * 32 + '"}'))
+
+
+def _cookie_collect_harness(body_builder, patches_extra=()):
+    """生图整取离线桩：返回 (run, patches, fake_response)，与释放测试同构。
+
+    body_builder 返回 dict（单对象响应）或 list（多对象响应，逐个 dumps 拼接）。"""
+    import upstreams.cookie_proxy as cp
+
+    body = body_builder()
+    if isinstance(body, list):
+        response_text = "\n".join(json.dumps(item) for item in body)
+    else:
+        response_text = json.dumps(body)
+
+    class FakeResponse:
+        status_code = 200
+        headers = {}
+        text = response_text
+
+    fake_response = FakeResponse()
+
+    class FakeClient:
+        async def post(self, *args, **kwargs):
+            return fake_response
+
+    class FakeCM:
+        async def __aenter__(self):
+            return FakeClient()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    fastapi_request = mock.Mock()
+    fastapi_request.is_disconnected = mock.AsyncMock(return_value=False)
+
+    async def run():
+        return await cp._collect_full_response(
+            "proj-1", "gemini-3.1-flash-image", mock.Mock(), "cookie", {},
+            retry_max=0, backoff_sec=0, jitter_sec=0,
+            fastapi_request=fastapi_request)
+
+    async def fake_timed_call(model, operation, *, whole_call=False, seconds=None):
+        return await operation
+
+    base_patches = [
+        mock.patch.object(cp, "open_upstream_client", return_value=FakeCM()),
+        mock.patch.object(cp, "timed_call", side_effect=fake_timed_call),
+        mock.patch.object(cp, "build_headers", return_value={"auth": "1"}),
+        mock.patch.object(cp, "build_request_body_async",
+                          mock.AsyncMock(return_value={"contents": []})),
+        mock.patch.object(cp, "stats"),
+    ]
+    return run, base_patches + list(patches_extra), fake_response
+
+
+class CookieCollectMemoryContractTests(unittest.TestCase):
+    """契约 8/9：整取收集期不再钉住解析副本与诊断样本（第五轮）。"""
+
+    def test_parsed_object_released_before_event_consumption(self):
+        # del obj + 拉取式游标：事件消费钩子（upstream_chunk）触发时，
+        # 解析出的对象除测试自有引用外应无其他强引用（getrefcount == 2：
+        # 测试捕获 + getrefcount 临时项）。生成器形态的旧实现会由
+        # async-for 变量 + 两层生成器帧局部 + 采样器留存多钉住至少 3 份，
+        # 此测试会 FAIL。（dict 实例不支持 weakref，故用 refcount 计量。）
+        import upstreams.cookie_proxy as cp
+
+        captured = []
+        real_extract = cp.extract_events
+
+        def spying_extract(obj):
+            captured.append(obj)
+            return real_extract(obj)
+
+        chunk_checks = []
+
+        def spying_chunk():
+            # 用下标访问（captured[i]）而非迭代：迭代变量本身会钉住一份引用
+            chunk_checks.append(
+                [sys.getrefcount(captured[i]) for i in range(len(captured))])
+            real_chunk()
+
+        real_chunk = cp.upstream_chunk
+
+        run, patches, _ = _cookie_collect_harness(lambda: {
+            "results": [{"data": {"candidates": [{
+                "content": {"parts": [
+                    {"inlineData": {"mimeType": "image/png", "data": "QkFTRTY0" * 64}},
+                ]},
+                "finishReason": "STOP",
+            }]}}]
+        }, [
+            mock.patch.object(cp, "extract_events", spying_extract),
+            mock.patch.object(cp, "upstream_chunk", spying_chunk),
+        ])
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        result = asyncio.run(run())
+
+        self.assertEqual(result["kind"], "ok", str(result))
+        self.assertTrue(captured, "extract_events 未被调用")
+        # 每个 upstream_chunk（事件消费开始）时刻：除测试捕获与 getrefcount
+        # 临时项外无其他引用（旧实现 ≥5：async-for 变量+两层生成器帧+采样器）
+        self.assertTrue(all(ref == 2 for check in chunk_checks for ref in check),
+                        f"解析对象在事件消费前未释放: {chunk_checks}")
+
+    def test_sampler_stops_retaining_on_body_but_keeps_count(self):
+        import upstreams.cookie_proxy as cp
+
+        created = []
+
+        class SpySampler(cp.RawSampler):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                created.append(self)
+
+        run, patches, _ = _cookie_collect_harness(lambda: [
+            {"results": [{"data": {"candidates": [{
+                "content": {"parts": [
+                    {"inlineData": {"mimeType": "image/png", "data": "QkFTRTY0" * 64}},
+                ]},
+                "finishReason": "STOP",
+            }]}}]},
+            {"results": [{"data": {"candidates": [{"finishReason": "STOP"}]}}]},
+        ], [mock.patch.object(cp, "RawSampler", SpySampler)])
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        result = asyncio.run(run())
+
+        self.assertEqual(result["kind"], "ok", str(result))
+        sampler = created[0]
+        # 计数保留（诊断的「共 N 个对象」口径不变），引用不再留存
+        self.assertEqual(sampler.count, 2)
+        self.assertEqual(sampler._head, [])
+        self.assertEqual(sampler._tail, [])
+        self.assertFalse(sampler._retaining)
+
+    def test_sampler_retains_samples_when_no_body(self):
+        # 无正文（只有思考）路径的 dump 诊断不受停止留存影响：样本照常保留。
+        import upstreams.cookie_proxy as cp
+
+        created = []
+
+        class SpySampler(cp.RawSampler):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                created.append(self)
+
+        run, patches, _ = _cookie_collect_harness(lambda: {
+            "results": [{"data": {"candidates": [{
+                "content": {"parts": [{"text": "内心独白", "thought": True}]},
+                "finishReason": "STOP",
+            }]}}]
+        }, [mock.patch.object(cp, "RawSampler", SpySampler)])
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        result = asyncio.run(run())
+
+        self.assertEqual(result["kind"], "error")
+        sampler = created[0]
+        self.assertTrue(sampler._retaining)
+        self.assertEqual(len(sampler._head), 1)
+        self.assertIn("共 1 个对象", sampler.dump())
+
+
+class CookieCollectResponsePathTests(unittest.TestCase):
+    """契约 10：非流式整取（collect_response）与生图假流式同构的内存行为。"""
+
+    def test_collect_response_releases_buffer_and_joins_image_events(self):
+        import upstreams.cookie_proxy as cp
+
+        image_b64 = "QkFTRTY0" * 32
+        body = {
+            "results": [{"data": {"candidates": [{
+                "content": {"parts": [
+                    {"text": "导语"},
+                    {"inlineData": {"mimeType": "image/png", "data": image_b64}},
+                    {"text": "尾声"},
+                ]},
+                "finishReason": "STOP",
+            }]}}]
+        }
+
+        class FakeResponse:
+            status_code = 200
+            headers = {}
+            text = json.dumps(body)
+
+        fake_response = FakeResponse()
+        seen_refcounts = []
+
+        class SpyingCursor(cp.CompleteTextObjectCursor):
+            def __init__(cursor_self, text, limit=None):
+                seen_refcounts.append(sys.getrefcount(fake_response))
+                super().__init__(text)
+
+        gen = cp.CookieGeneration(
+            request_obj=mock.Mock(stream=False, model="gemini-3.1-flash-image",
+                                  messages=[], max_tokens=None),
+            fastapi_request=mock.Mock(
+                is_disconnected=mock.AsyncMock(return_value=False)),
+            record=None, account_id="", cookie_str="c", project_id="p",
+            base_model_name="gemini-3.1-flash-image",
+            model_display="gemini-3.1-flash-image",
+            response_id="chatcmpl-test", client_kwargs={},
+            retry_max=0, backoff_sec=0, jitter_sec=0, start_time=time.time(),
+            prefill_text="", prefill_active=False, force_builtin_search=False,
+            native_custom_tools=False, text_transport=None, strip_thoughts=False,
+            want_usage=False, cookie_debug=False, is_stream=False, is_image=True,
+        )
+
+        class FakeClient:
+            async def post(self, *args, **kwargs):
+                return fake_response
+
+        class FakeCM:
+            async def __aenter__(self):
+                return FakeClient()
+
+            async def __aexit__(self, *exc):
+                return False
+
+        async def fake_timed_call(model, operation, *, whole_call=False, seconds=None):
+            return await operation
+
+        async def run():
+            with mock.patch.object(cp, "open_upstream_client",
+                                   return_value=FakeCM()), \
+                 mock.patch.object(cp, "timed_call", side_effect=fake_timed_call), \
+                 mock.patch.object(cp, "credential_manager"), \
+                 mock.patch.object(cp, "build_request_body_async",
+                                   mock.AsyncMock(return_value={"variables": {}})), \
+                 mock.patch.object(cp, "CompleteTextObjectCursor", SpyingCursor):
+                return await gen.collect_response()
+
+        response = asyncio.run(run())
+        payload = json.loads(response.body)
+        expected_md = f"![Generated Image](data:image/png;base64,{image_b64})"
+        # 图片事件走片段表 + join：导语 + 图片 + 尾声逐字节一致
+        self.assertEqual(payload["choices"][0]["message"]["content"],
+                         "导语" + expected_md + "尾声")
+        # 解析开始时 httpx 响应对象已置 None（引用只剩测试局部 + getrefcount 临时项）
+        self.assertEqual(seen_refcounts, [2])
 
 
 if __name__ == "__main__":

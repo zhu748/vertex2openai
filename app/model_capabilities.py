@@ -442,14 +442,27 @@ def image_resolution_suffix(name: str) -> tuple[str, Optional[str]]:
     ——别名“认得出、不生效”（2026-11 修复）。
 
     仅当去掉后缀后的基础名仍是生图档案时才剥离，避免误伤未来真以
-    -4k 结尾命名的文本模型；与 _strip_known_suffixes 的家族识别口径一致。
+    -4k 结尾命名的文本模型；与 _strip_known_suffixes 的家族识别口径
+    一致。
+
+    组合次序（2026-11 第五轮）：允许档位后缀后再跟 -search
+    （"model-4k-search"）——两通道名归一只剩“先 -search 后档位”，这种
+    次序下档位提示对 resolve_image_size 不可见（静默回落 1K）。目录
+    虽从不叠加两种变体，手打名两种次序都应解析出档位；返回的基础名
+    保留原始大小写（发往上游）。
     """
     if not name:
         return name, None
     lowered = name.lower()
+    # 尾部 -search 先剥再找档位（保持返回基础名不含该后缀）；返回基础名
+    # 仍带 -search 时由 strip_image_and_search_suffixes 继续循环处理。
+    search_len = 0
+    if lowered.endswith("-search") and len(lowered) > len("-search"):
+        search_len = len("-search")
+    probe = lowered[: len(lowered) - search_len] if search_len else lowered
     for suffix in ("-4k", "-2k", "-1k", "-512"):
-        if lowered.endswith(suffix) and len(lowered) > len(suffix):
-            base = name[: -len(suffix)]
+        if probe.endswith(suffix) and len(probe) > len(suffix):
+            base = name[: len(name) - search_len - len(suffix)]
             if get_profile(base)["is_image"]:
                 return base, suffix[1:].upper()   # "-4k"→"4K"、"-512"→"512"
     return name, None
@@ -458,6 +471,29 @@ def image_resolution_suffix(name: str) -> tuple[str, Optional[str]]:
 def strip_image_resolution_suffix(name: str) -> str:
     """通道侧便捷封装：只取剥离后的基础名（发往上游）。"""
     return image_resolution_suffix(name)[0]
+
+
+def strip_image_and_search_suffixes(name: str) -> tuple[str, bool]:
+    """按任意顺序循环剥离生图档位后缀与 -search，返回 (基础名, 是否带 -search)。
+
+    两通道名归一此前固定「先 -search 后档位」的单次剥离（2026-11 第五轮）：
+    "model-search-4k" 的 -search 对尾部检查不可见，档位剥离后基础名残留
+    "-search" 发往上游 → 404。本助手循环剥离两种后缀直到不再变化，
+    档位剥离仍以「剩余名是生图档案」为前提（文本模型的 -search 别名
+    行为不变，不存在档位后缀的文本模型名原样透传）。
+    """
+    is_search = False
+    while True:
+        lowered = name.lower()
+        if lowered.endswith("-search") and len(lowered) > len("-search"):
+            name = name[: -len("-search")]
+            is_search = True
+            continue
+        stripped = image_resolution_suffix(name)[0]
+        if stripped != name:
+            name = stripped
+            continue
+        return name, is_search
 
 
 # 档位阶梯（与 resolve_image_size 的回退阶梯同序）：目录变体按 512→4K 排列。

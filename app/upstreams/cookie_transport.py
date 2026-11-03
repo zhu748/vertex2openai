@@ -27,6 +27,7 @@ from retry_policy import (
 from streaming import HEARTBEAT_FRAME
 from upstream_errors import extract_upstream_error
 from upstreams.cookie_response import (
+    BODY_EVENT_TYPES,
     RawSampler,
     extract_events,
     iter_json_objects,
@@ -284,6 +285,15 @@ async def _execute_stream_request_generator_once(
                     events = list(extract_events(obj, preserve_parts=preserve_parts))
                 except IncompleteResponseError as error:
                     raise ToolStreamError(str(error)) from error
+                # 正文/工具内容已到即停止留存诊断样本（样本只服务「无正文」
+                # 日志，正文已到则 dump 永不触发）：留存会把含巨型
+                # inlineData 的流式块钉到流结束。注意这里与两条整取路径
+                # 不同，不 del obj——流式解析器是生成器，挂起期间其帧局部
+                # 仍持本对象引用，del 只掉消费方一侧（无效）。
+                if sampler is not None and any(
+                    et in BODY_EVENT_TYPES for et, _ in events
+                ):
+                    sampler.stop_retaining()
                 # 「收到首个上游分片」只对真实内容/元数据分片记账：空分片与纯错误
                 # 分片不算——否则 429 场景时间线会先报“收到分片”再报“上游失败”，
                 # 自相矛盾（首个分片常是 streamGenerateContentV2:[] 空壳）。

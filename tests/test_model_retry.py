@@ -352,8 +352,14 @@ class CookieRetryTests(unittest.IsolatedAsyncioTestCase):
         async def open_client(kwargs):
             yield self.client
 
-        async def objects(response):
-            yield {}
+        class FakeTextCursor:
+            """拉取式解析游标桩：复刻旧 iter_json_objects 桩（产一个空对象后结束）。"""
+
+            def __init__(self, text, limit=None):
+                self._objs = [{}]
+
+            def next_object(self):
+                return self._objs.pop(0) if self._objs else None
 
         for patch in (
             mock.patch.object(cookie_proxy, "stats", self.stats),
@@ -362,7 +368,7 @@ class CookieRetryTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(cookie_proxy, "build_headers", return_value={"authorization": "test-auth"}),
             mock.patch.object(cookie_proxy, "open_upstream_client", side_effect=open_client),
             mock.patch.object(cookie_proxy, "build_request_body_async", return_value={"variables": {}}),
-            mock.patch.object(cookie_proxy, "iter_json_objects", side_effect=objects),
+            mock.patch.object(cookie_proxy, "CompleteTextObjectCursor", FakeTextCursor),
             mock.patch.object(cookie_proxy, "extract_events", return_value=[("error", {"code": 429, "message": "quota exhausted"})]),
             mock.patch.object(cookie_proxy.app_state, "get_setting",
                               side_effect=lambda key, default=None: self.settings.get(key, default)),

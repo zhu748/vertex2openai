@@ -9,6 +9,10 @@
 > 「分辨率此前只在控制台调、模型列表里看不到分辨率变体」后补齐的
 > 目录可发现性与 Gemini 原生透传支持。
 
+> 第五轮（同日续，见文末「收集期驻留与后缀次序」一节）：用户要求
+> 「开始进行全面优化」后的第二轮全链路通读，落点集中在 Cookie 响应
+> 收集期的三处驻留与请求侧后缀次序缺陷。
+
 ## 审查范围
 
 | 环节 | 文件 | 本轮落点 |
@@ -205,3 +209,113 @@ setUp 均改为快照-恢复全局通道/凭据/并发设置。全量失败数 3
 | test_protocol_alignment（目录展开断言更新 + 新增 ImageSizeVariantPassthroughTests 端到端 4 项） | 31 项通过 |
 | 全量回归 vs HEAD 基线 | 失败 34 → 13，剩余项与基线逐条一致，零新增 |
 | 受影响文件隔离运行（audit / concurrent / alignment / image_path / anti_truncation / native_fix / native_stats_retry） | 全部通过 |
+
+---
+
+# 第五轮（同日续）：收集期驻留与后缀次序
+
+## 背景与审查
+
+第四轮结束后按「开始进行全面优化」再走一遍全链路（入口/并发闸 → 两条
+通道的请求构建 → 上游调用 → **响应收集** → 转换/分帧 → SSE 发射），
+前三轮已覆盖输入侧、请求侧与发射侧；本轮深挖**响应收集段**，发现三处
+仍在钉住全量内存副本的结构性问题，与一处请求侧的正确性缺口：
+
+1. **生成器帧钉住解析副本**：整取路径用 `async for obj in
+   iter_json_objects(TextSource(...))` 消费。生成器在 yield 挂起期间，
+   其帧局部变量仍持有刚解析出的对象（含 4K inlineData 的巨型 dict，
+   单张 30-90MB）——消费方处理完整个对象的所有事件之前它不释放，
+   消费方 `del obj` 也无济于事。叠加 `RawSampler`（无正文诊断用）
+   对每个对象的无条件留存，收集期恒驻 3 份全量：解析 dict、
+   markdown 串、拼接后的正文。
+2. **诊断采样器无差别留存**：`RawSampler` 只服务「无正文」日志样本，
+   却在正文已到的成功路径把含巨型 inlineData 的对象一直钉到函数返回。
+3. **`full_text += data` 逐事件重建**：生图响应常见「导语文本 + 巨型
+   图片 + 尾文本」，尾文本一次就多拷一份 40MB 级全量；多图 O(n²)。
+4. **非流式整取（`collect_response`）未释放 httpx 响应对象**：第三轮
+   只修了生图假流式路径（`_collect_full_response`）；非流式生图请求
+   （`stream=false`）走 `collect_response`，bytes 缓冲与解码 str 仍
+   全程双驻留。
+5. **64MB 单对象上限误拒 4K 高细节 PNG**：非流式完整正文路径沿用流式
+   解析器的 `MAX_JSON_OBJECT_BYTES=64MB` 上限。该上限在流式侧防的是
+   解析缓冲无界增长；完整正文早已整体驻留内存，上限在此不设防任何
+   东西，却把 base64 可达 53-93MB 的 4K 高细节 PNG 整单拒绝
+   （IncompleteResponseError → 用户可见失败）。
+6. **-search 与分辨率后缀叠加次序敏感**：目录从不叠加两种变体，但手打
+   名两种次序都必须全生效，旧实现固定「先 -search 后档位」的单次剥离：
+   `"model-search-4k"` 的 -search 对尾部检查不可见，档位剥离后基础名
+   残留 `-search` 发往上游 → 404；`"model-4k-search"` 的档位提示对
+   `resolve_image_size` 不可见 → 搜索生效但**静默回落 1K**。
+
+## 已实施改进
+
+### 9. 拉取式解析游标（cookie_response.CompleteTextObjectCursor）
+
+替代完整正文路径的生成器消费：`next_object()` 返回后**不持有任何引用**，
+消费方 `del obj` 即可让解析出的巨型 dict（含整份 base64）在事件消费
+（markdown 拼接/SSE 分帧）前释放。解析语义与旧 `_complete_json_objects`
+逐字节一致（ASCII 字符差零拷贝快路径、非 ASCII 精确编码计数、防 XSSI
+前缀跳过均不变）。`iter_json_objects` 的 TextSource 分支委托游标，
+其余调用方（completion 审计、结构化输出探测、流式解析）行为不变。
+
+单对象上限随游标修正：`max(limit, len(text))`——完整正文路径按实际
+长度放行（64MB 上限在此只能误拒合法 4K 响应）；**流式解析器
+（json_stream.JsonObjects）的 64MB 上限语义不变**（那里上限真正
+防住解析缓冲无界增长，回归测试固定该分叉）。
+
+### 10. 诊断采样器「正文即停留存」（cookie_response.RawSampler）
+
+新增 `stop_retaining()`：`BODY_EVENT_TYPES`（text/image/function_call/
+native_part）事件到达即丢弃已存样本并停止留存——正文已到则「无正文」
+dump 永不触发，样本只剩钉住整份 base64 的副作用。计数继续累计
+（诊断日志的「共 N 个对象」口径不变）；**无正文路径（含只有思考）
+样本照常保留**，`dump()` 行为不变。
+
+三处消费方接入：生图整取、非流式整取、流式传输器（cookie_transport，
+Gemini 原生桥接共享）。流式侧不 `del obj`——流式解析器仍是生成器，
+挂起期间帧局部持有本对象，del 只掉消费方一侧（无效），注释记录原因。
+
+### 11. 两条整取路径的收集与释放同构（cookie_proxy）
+
+- 生图整取（`_collect_full_response`）与非流式整取（`collect_response`）
+  均改游标消费 + 事件消费前 `del obj` + 正文即停采样；
+- `collect_response` 补上第三轮遗漏的响应释放：`response_text` 取本地
+  引用后置 `None`，bytes 缓冲在解析前回收（与生图假流式路径同构）；
+- 正文/思考收集改「片段表 + 一次 join」：拼接逐字节一致（回归保证），
+  尾文本不再多拷一份全量，多图从 O(n²) 拷贝降为一次 join。
+
+### 12. -search 与分辨率后缀任意次序生效（model_capabilities）
+
+- `image_resolution_suffix` 允许档位后再跟 `-search`（先剥尾部 -search
+  再找档位，返回基础名保留原始大小写）——`resolve_image_size` 从请求
+  原始模型名兜底解析时两种次序都能读到档位；
+- 新增 `strip_image_and_search_suffixes`：循环剥离 `-search` 与档位后缀
+  直到不再变化（搜索标记由循环持有），Express `_normalize_model_name`
+  与 Cookie `_prepare_cookie_generation` 的名归一统一改用它；
+- 文本模型的 `-search` 别名行为不变；不存在档位后缀的文本模型名
+  （如 `gemini-3.8-flash-4k`）原样透传，不误伤。
+
+## 本机基准
+
+`python scripts/benchmark_image_path.py` 新增「Cookie 生图整取收集期
+新增峰值」子进程高水位差测量（与回归测试同构的离线桩）：
+
+| 用例（单对象 base64） | 旧 | 新 |
+| --- | ---: | ---: |
+| 48MB（4K 高细节档）收集期新增峰值 RSS | 145.9MB | 97.3MB（-33%，3 份→2 份） |
+| 12MB（1K/2K 档） | 36.2MB | 36.5MB（持平，见注） |
+
+注：12MB 档持平是 glibc 动态 mmap 阈值的测量现象（首块释放后阈值升到
+该尺寸，后续大分配改走堆，高水位不再回落），两版同样 3×；48MB 超过
+阈值上限（32MB）始终走 mmap，干净反映「解析副本在事件消费前释放」
+的真实收益。生产 4K 场景（25-40MB 原图 → 33-53MB base64）介于两者
+之间、按比例受益。
+
+## 验证结果
+
+| 检查 | 结果 |
+| --- | --- |
+| test_image_path_optimization（契约 8-13 新增 10 项，含游标化释放/采样器契约/两种后缀次序/64MB 上限分叉/collect_response 集成） | 36 项通过 |
+| 释放与采样器两条行为测试的检出能力 | 临时禁用 `del obj`、`stop_retaining` 各 1 次均 FAIL（非空转测试）后还原 |
+| test_model_retry（游标桩迁移后 Cookie 重试全链路） | 36 项通过 |
+| 全量统一检查（语法/静态/工作流/模块边界 + 64 个测试文件 + SDK 档案兼容）vs HEAD 基线 | 69/69 组通过，零新增失败 |

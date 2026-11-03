@@ -70,11 +70,11 @@ from upstreams.cookie_request import (
     search_suffix_has_priority,
 )
 from upstreams.cookie_response import (
+    BODY_EVENT_TYPES,
+    CompleteTextObjectCursor,
     RawSampler,
-    TextSource,
     apply_wire_signature,
     extract_events,
-    iter_json_objects,
     make_openai_chunk,
     iter_openai_content_chunks,
     openai_tool_call,
@@ -306,24 +306,41 @@ async def _collect_full_response(
             finish_raw, blocked_msg = None, None
             safety_html = ""
             sampler = RawSampler()
+            # 正文/思考收集改「片段表 + 一次 join」（2026-11 第五轮）：生图响应
+            # 常见「导语文本 + 巨型图片 + 尾文本」，旧 `full_text += data` 对
+            # 每个事件都重建整串（尾文本一次就多拷一份 40MB 级全量；多图场景
+            # O(n²)）；join 恰好一次拷贝，片段表只持引用。
+            text_pieces: list[str] = []
+            thought_pieces: list[str] = []
 
-            async for obj in iter_json_objects(TextSource(response_text)):
+            # 拉取式游标：生成器形态在 yield 挂起期间其帧局部会把解析出的
+            # 巨型 dict（含整份 base64）钉到本对象消费完之后，del 也无济于事；
+            # 游标返回后不持引用，配合 del obj 让解析副本在事件消费前释放。
+            cursor = CompleteTextObjectCursor(response_text)
+            while True:
+                obj = cursor.next_object()
+                if obj is None:
+                    break
                 sampler.add(obj)
                 # 一旦拿到错误事件就停止解析剩余响应：生图响应可达数 MB base64，
                 # 错误分支的返回值不依赖后续对象，继续拼接是纯浪费。
                 if api_error:
                     break
                 events = list(extract_events(obj))
+                # 正文已到即停止留存诊断样本（样本只服务「无正文」日志）：
+                # 留存会把含巨型 inlineData 的本对象钉到函数返回，收集期
+                # 恒多一份全量驻留（2026-11 第五轮）。
+                if any(et in BODY_EVENT_TYPES for et, _ in events):
+                    sampler.stop_retaining()
+                del obj
                 # 与流式路径同口径：空分片/纯错误分片不计入「收到首个上游分片」。
                 if any(et != "error" for et, _ in events):
                     upstream_chunk()
                 for et, data in events:
-                    if et == "text":
-                        full_text += data
+                    if et == "text" or et == "image":
+                        text_pieces.append(data)
                     elif et == "thought":
-                        reasoning_text += data
-                    elif et == "image":
-                        full_text += data
+                        thought_pieces.append(data)
                     elif et == "finish":
                         finish_raw = data
                     elif et == "safety":
@@ -335,6 +352,13 @@ async def _collect_full_response(
                     elif et == "error":
                         api_error_status, api_error = api_error_details(data)
                         break
+                events = None
+            full_text = "".join(text_pieces)
+            reasoning_text = "".join(thought_pieces)
+            # 片段表与游标立即释放：join 后它们只是全量拷贝的额外钉子。
+            text_pieces = None
+            thought_pieces = None
+            cursor = None
 
             if (
                 api_error
@@ -1111,16 +1135,28 @@ class CookieGeneration:
                 finish_raw = None
                 blocked_msg = None
                 sampler = RawSampler()
+                # 与生图整取路径同构的「片段表 + join」收集（2026-11 第五轮）；
+                # ordinary_metadata 对图片 kind 只记槽位，不产生全量钉子。
+                text_pieces: list[str] = []
+                thought_pieces: list[str] = []
 
-                fake_resp = TextSource(response.text)
+                # 生图内存（2026-11 第五轮，与 _collect_full_response 同构）：
+                # httpx 整取同时持有 content bytes 与解码 str，解析全程两者
+                # 并存；text 取本地引用后置 None，bytes 缓冲在解析前回收。
+                # （非流式文本模型响应体积小，收益集中在非流式生图请求。）
+                response_text = response.text
+                response = None
                 text_decoder = (
                     self.text_transport.decoder() if self.text_transport else None
                 )
-                async for obj in iter_json_objects(fake_resp):
+                cursor = CompleteTextObjectCursor(response_text)
+                while True:
+                    obj = cursor.next_object()
+                    if obj is None:
+                        break
                     sampler.add(obj)
                     # error 即停：后续对象不再解析（生图响应可达数 MB，
                     # 白烧事件循环 CPU），且首个 error 不被后续 error 覆盖。
-                    # 生图路径（_collect_full_response）同构修复已验证。
                     if api_error:
                         break
                     events = extract_events(obj)
@@ -1129,12 +1165,17 @@ class CookieGeneration:
                     # list() 物化：extract_events / cookie_events 是生成器，
                     # 下方 any() 与 for 各消费一次，不物化后者会拿到空。
                     events = list(events)
+                    # 正文/工具内容已到即停止留存诊断样本（样本只服务
+                    # 「无正文」日志；留存会钉住含巨型 inlineData 的对象）。
+                    if any(et in BODY_EVENT_TYPES for et, _ in events):
+                        sampler.stop_retaining()
+                    del obj
                     # 与流式路径同口径：空分片/纯错误分片不计入「收到首个上游分片」。
                     if any(et != "error" for et, _ in events):
                         upstream_chunk()
                     for event_type, data in events:
                         if event_type == "text":
-                            full_text += data
+                            text_pieces.append(data)
                             part_order.append(
                                 {"type": "ordinary", "index": len(ordinary_metadata)}
                             )
@@ -1142,7 +1183,8 @@ class CookieGeneration:
                                 ordinary_part_metadata("text", data, None)
                             )
                         elif event_type == "thought":
-                            reasoning_text += data  # 先收集（供诊断判断），输出时按 strip 决定是否附带
+                            # 先收集（供诊断判断），输出时按 strip 决定是否附带
+                            thought_pieces.append(data)
                             part_order.append(
                                 {"type": "ordinary", "index": len(ordinary_metadata)}
                             )
@@ -1150,7 +1192,7 @@ class CookieGeneration:
                                 ordinary_part_metadata("thought", data, None)
                             )
                         elif event_type == "image":
-                            full_text += data
+                            text_pieces.append(data)
                             part_order.append(
                                 {"type": "ordinary", "index": len(ordinary_metadata)}
                             )
@@ -1185,6 +1227,13 @@ class CookieGeneration:
                         elif event_type == "error":
                             api_error_status, api_error = api_error_details(data)
                             break
+                    events = None
+                full_text = "".join(text_pieces)
+                reasoning_text = "".join(thought_pieces)
+                text_pieces = None
+                thought_pieces = None
+                cursor = None
+                response_text = None
 
                 if (
                     api_error
@@ -1483,10 +1532,16 @@ def _prepare_cookie_generation(
     is_grounded_search = base_model_name.endswith("-search")
     if is_grounded_search:
         base_model_name = base_model_name[: -len("-search")]
-    # 生图分辨率别名（-1k/-2k/-4k/-512）从上游模型名剥离（目录无此 ID，
-    # 原样发送会 404）；档位由 resolve_image_size 从请求原始名解析
-    #（仅生图档案生效，与 Express 通道同口径，2026-11）。
-    base_model_name = mc.strip_image_resolution_suffix(base_model_name)
+    # 生图分辨率别名（-1k/-2k/-4k/-512）与 -search 按任意顺序循环剥离
+    #（2026-11 第五轮）：目录从不叠加两种变体，但手打名两种次序都应全生效
+    #——旧实现固定「先 -search 后档位」："model-search-4k" 的 -search 对尾部
+    # 检查不可见，档位剥离后残留 "-search" 发往上游（404）；"model-4k-search"
+    # 的档位提示则对 resolve_image_size 不可见（静默回落 1K）。档位由
+    # resolve_image_size 从请求原始名解析（仅生图档案生效）。
+    base_model_name, _search_seen = mc.strip_image_and_search_suffixes(
+        base_model_name
+    )
+    is_grounded_search = is_grounded_search or _search_seen
     # Persist the parsed selection for every delivery/retry path. Inspecting the
     # raw request model later misses whitespace and combined transport aliases.
     force_builtin_search = force_builtin_search or is_grounded_search or _forced_search

@@ -90,8 +90,9 @@ async def iter_json_objects(
     对象边界只扫描一遍，避免对大图片的每个小块重复解析整个未完成对象。
     """
     if isinstance(response, TextSource):
-        # 非流式正文已完整，直接使用 C 解码器，省去分块边界扫描。
-        for obj in _complete_json_objects(response.text, max_object_bytes):
+        # 非流式正文已完整驻留：交由拉取式游标解析（limit 语义见其注释）。
+        cursor = CompleteTextObjectCursor(response.text, max_object_bytes)
+        while (obj := cursor.next_object()) is not None:
             yield obj
         return
     parser = _JsonObjects(max_object_bytes)
@@ -114,22 +115,58 @@ async def iter_json_objects(
     parser.finish()
 
 
-def _complete_json_objects(text: str, limit: int):
-    decoder = json.JSONDecoder()
-    # 整串 ASCII 标志是 O(1)（CPython 的 str 内部位标志）：纯 ASCII 响应
-    # （JSON 结构 + base64，最常见形态）下字符差即字节差，完全零拷贝；
-    # 非 ASCII 文本退回逐对象切片 + 精确编码，上限语义不变。
-    ascii_text = text.isascii()
-    position = 0
-    while (start := text.find("{", position)) >= 0:
+# 非流式正文里这些事件类型说明响应已有正文/工具内容：诊断采样器应停止留存
+# （「无正文」样本只对失败路径有价值，正文已到则 dump 永不触发；生图响应
+# 的单个对象可达 30-90MB inlineData，留存即钉住整份 base64 到函数返回）。
+BODY_EVENT_TYPES = frozenset({"text", "image", "function_call", "native_part"})
+
+
+class CompleteTextObjectCursor:
+    """非流式完整正文的拉取式 JSON 对象解析游标。
+
+    为什么不用生成器（2026-11 第五轮）：生成器形态在 yield 挂起期间，其帧
+    局部变量会把刚解析出的对象（含 4K inlineData 的巨型 dict）钉到消费方
+    处理完整个对象之后——消费方 `del obj` 也无济于事。拉取式游标在
+    next_object() 返回后不持有任何引用，消费方 del obj 即可让解析出的
+    dict（含整份 base64）在事件消费（markdown 拼接/SSE 分帧）前释放，
+    生图整取的收集期峰值全量驻留从 3 份降到 2 份。
+
+    单对象上限：流式解析器（json_stream.JsonObjects）用它防止解析缓冲
+    无界增长；完整正文早已整体驻留内存，上限在此不设防任何东西，却会把
+    4K 高细节 PNG（base64 可达 53-93MB，超过 64MB 上限）的合法响应整单
+    误拒为 IncompleteResponseError。因此取 max(limit, len(text))。
+    解析语义与旧 _complete_json_objects 完全一致（含 ASCII 字符差零拷贝
+    快路径与非 ASCII 精确编码计数）。
+    """
+
+    def __init__(self, text: str, limit: int = MAX_JSON_OBJECT_BYTES):
+        self._text = text
+        self._limit = max(int(limit), len(text))
+        self._position = 0
+        self._decoder = json.JSONDecoder()
+        self._ascii = text.isascii()
+
+    def next_object(self):
+        """返回下一个对象；没有更多对象时返回 None；无效 JSON 抛 IncompleteResponseError。"""
+        text = self._text
+        start = text.find("{", self._position)
+        if start < 0:
+            return None
         try:
-            obj, position = decoder.raw_decode(text, start)
+            obj, self._position = self._decoder.raw_decode(text, start)
         except (json.JSONDecodeError, RecursionError) as exc:
             raise IncompleteResponseError("上游返回无效或不完整的 JSON 对象。") from exc
-        span_bytes = (position - start) if ascii_text else len(text[start:position].encode("utf-8"))
-        if span_bytes > limit:
+        # 整串 ASCII 标志是 O(1)（CPython 的 str 内部位标志）：纯 ASCII 响应
+        # （JSON 结构 + base64，最常见形态）下字符差即字节差；
+        # 非 ASCII 文本退回逐对象切片 + 精确编码，上限语义不变。
+        span_bytes = (
+            (self._position - start)
+            if self._ascii
+            else len(text[start : self._position].encode("utf-8"))
+        )
+        if span_bytes > self._limit:
             raise IncompleteResponseError("上游单个 JSON 对象超过字节上限。")
-        yield obj
+        return obj
 
 
 def _summ_obj(obj: dict, width: int = 700) -> str:
@@ -163,6 +200,12 @@ class RawSampler:
     推迟到 dump() 才做。旧实现在 add() 里对**每个**对象都先序列化一遍、
     随即丢弃（生图响应单个对象可达数 MB，等于在事件循环上做无谓的
     全量序列化再扔掉）。
+
+    留存停止（2026-11 第五轮）：样本只服务「无正文」诊断，正文/工具内容
+    一旦到达，dump 永不触发，而留存会把含巨型 inlineData 的对象（4K
+    单张 30-90MB）钉到函数返回。见到 BODY_EVENT_TYPES 事件即调
+    stop_retaining()：丢弃已存引用且后续只计数不再留存；无正文路径
+    （含「只有思考」）不受影响，样本照常保留。
     """
 
     def __init__(self, keep: int = 2):
@@ -170,15 +213,24 @@ class RawSampler:
         self._head: list = []
         self._tail: list = []
         self.count = 0
+        self._retaining = True
 
     def add(self, obj: dict):
         self.count += 1
+        if not self._retaining:
+            return
         if len(self._head) < self.keep:
             self._head.append(obj)
         else:
             self._tail.append(obj)
             if len(self._tail) > self.keep:
                 self._tail.pop(0)
+
+    def stop_retaining(self):
+        """正文已到：立即丢弃已存样本并停止留存（幂等；count 继续累计）。"""
+        self._retaining = False
+        self._head.clear()
+        self._tail.clear()
 
     def dump(self) -> str:
         if self.count == 0:
