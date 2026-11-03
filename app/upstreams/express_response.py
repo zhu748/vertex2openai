@@ -14,11 +14,12 @@ from typing import Any, Dict, Optional
 import config as app_config
 
 from message_processing import (
+    GIANT_CONTENT_SLICE,
     GIANT_CONTENT_THRESHOLD,
     _create_safety_ratings_html,
+    iter_giant_content,
     logprobs_payload_from_candidate,
     parse_gemini_response_for_reasoning_and_content,
-    slice_giant_content,
 )
 from prefill import PrefillDeduper, strip_prefill_overlap
 from response_validation import (
@@ -357,6 +358,55 @@ def convert_chunk_to_openai(
     return f"data: {json.dumps(_build_chunk_payload(chunk, model_name, response_id, candidate_index, indexer), ensure_ascii=False)}\n\n"
 
 
+def split_giant_chunk_payload(chunk_payload: dict) -> list[dict]:
+    """真流式巨帧防护：delta.content 超阈值的 chunk 拆成多个增量帧。
+
+    生图模型被强制假流式，正常不走这里；但文本模型叠加
+    responseModalities（或未来任何直出 inline_data 的路径）会把整张
+    4K base64 塞进单个 delta，json.dumps + f"data:..." + ASGI encode
+    瞬间三份全量拷贝足以 OOMKill 512MB 容器。拆分后：
+    - 各帧 delta.content 为 256KiB 切片，拼接与原 content 逐字节一致；
+    - 其余 delta 键（role/reasoning_content/tool_calls…）保留在首帧；
+    - finish_reason 只挂在尾帧（官方帧序语义：中间帧必须为 null）；
+    - 未超阈值的 payload 原样单元素返回（零行为变化）。
+    """
+    try:
+        choices = chunk_payload.get("choices") or []
+        if not choices:
+            return [chunk_payload]
+        choice = choices[0]
+        delta = choice.get("delta") or {}
+        content = delta.get("content")
+        if not isinstance(content, str) or len(content) <= GIANT_CONTENT_THRESHOLD:
+            return [chunk_payload]
+        # 切片惰性产出：不物化整张切片表（那又是一份全量拷贝），
+        # 总片数由长度直接算出，用于判定首尾帧。
+        total = max(1, -(-len(content) // GIANT_CONTENT_SLICE))
+        payloads = []
+        for i, piece in enumerate(iter_giant_content(content, size=GIANT_CONTENT_SLICE)):
+            first, last = i == 0, i == total - 1
+            sub_delta = ({k: v for k, v in delta.items() if k != "content"} if first else {})
+            sub_delta["content"] = piece
+            sub_choice = {
+                "index": choice.get("index", 0),
+                "delta": sub_delta,
+                # OpenAI 帧序：中间帧 finish_reason 必须为 null，尾帧承接原值。
+                "finish_reason": choice.get("finish_reason") if last else None,
+            }
+            for extra_key in (k for k in choice if k not in ("index", "delta", "finish_reason")):
+                if last:
+                    sub_choice[extra_key] = choice[extra_key]
+            sub_payload = {
+                k: (v if k != "choices" else [sub_choice])
+                for k, v in chunk_payload.items()
+            }
+            payloads.append(sub_payload)
+        return payloads
+    except Exception:
+        # 防护层绝不能改变正常帧语义：任何结构意外都回退原帧。
+        return [chunk_payload]
+
+
 async def _chunk_openai_response_dict_for_sse(
     openai_response_dict: Dict[str, Any],
     response_id_override: Optional[str] = None,
@@ -417,10 +467,18 @@ async def _chunk_openai_response_dict_for_sse(
             # ——进程级 SIGKILL，无 Python 异常，表现为“收到首个上游分片
             # 后服务崩溃重启”。切片拼接结果与单帧逐字节一致（见
             # message_processing.slice_giant_content）。
+            #
+            # 惰性发射（2026-11 第二轮）：旧实现 pieces = slice_giant_content(...)
+            # 会先把全部切片物化成第二份全量拷贝（原文仍被
+            # openai_response_dict 引用），发射阶段恒驻 2×content；改为
+            # iter_giant_content 按需产片，每帧只在 yield 瞬间存在一个
+            # 256KiB 切片，峰值降为 1×+256KiB。
             if len(content_to_chunk) > GIANT_CONTENT_THRESHOLD:
-                pieces = slice_giant_content(content_to_chunk)
+                pieces: Any = iter_giant_content(content_to_chunk)
+                multi_frame = True
             elif "![Image](data:image/" in content_to_chunk:
                 pieces = [content_to_chunk] if content_to_chunk else []
+                multi_frame = False
             else:
                 chunk_size = (
                     max(1, math.ceil(len(content_to_chunk) / 10))
@@ -431,12 +489,13 @@ async def _chunk_openai_response_dict_for_sse(
                     content_to_chunk[i : i + chunk_size]
                     for i in range(0, len(content_to_chunk), chunk_size)
                 ]
+                multi_frame = len(pieces) > 1
             if not content_to_chunk and not reasoning_content:
                 yield _sse({"content": ""})
             else:
                 for piece in pieces:
                     yield _sse({"content": piece})
-                    if len(pieces) > 1:
+                    if multi_frame:
                         await asyncio.sleep(0.01)
 
         for tc_item_idx, tool_call_item in enumerate(message.get("tool_calls") or []):

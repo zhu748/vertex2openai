@@ -2,6 +2,17 @@
 
 基于原版 `vertex2openai-main`（2026-09-01），持续完善兼容性、可靠性和代码组织。
 
+## 2026-11-03（第二轮）：4K 生图崩溃的第二层根因——续传缓冲驻留 + 并发叠加 + 发射期碎片
+
+- 背景：第一轮把单请求转换链峰值从 +250MB 压到 +150MB 后，用户场景（Render 免费档 512MB）仍会「成功几张图后突然崩溃、之后一段时间持续闪崩」。第二轮排查定位了三个叠加层：
+- 根因四（续传缓冲全量驻留）：`resumable` 弱网可靠传输默认把**每条**响应完整缓冲在进程内（单流预算 64MB / 全局 256MB / TTL 30 分钟）。一张 4K 图（25MB+ base64）成功交付后仍要在 ResumableStore 里驻留半小时，几张开下来叠加转换链直接 OOMKill——这解释了「有时能出几张图，随后连一张都出不来」的时间累积特征。修复：生图模型默认绕过续传缓冲直通交付（`resumable.image_bypass_enabled`，新设置 `resumable_image_streams` 默认 false，内存充裕的部署可打开恢复生图断线重连）；chat 通道与 Gemini 原生透传通道同口径。文本流维持续传能力不变。
+- 根因五（并发叠加）：`upstream_max_concurrency`（默认 32）对生图没有任何区分——两路 4K 并发生图即 +300MB 叠加。新增生图专用并发闸 `image_max_concurrency`（默认 2，控制台可热调，满时 503 快速失败）：`admission.GenerationLimiter` 参数化（设置键/默认值/满员消息/是否记 trace），`chat_api._call_upstream` 拆为闸门层 + `_dispatch_upstream` 分发层，生图流式响应把生图名额挂到最内层 `body_iterator`（随流 EOF/断开/取消释放，与全局闸同生命周期语义），非流式与异常路径立即释放；Claude 协议复用同闸（`traced=False` 避免双层租约重复记里程碑/双计 payload 观测）。
+- 根因六（发射期驻留碎片）：第一轮的切片分帧仍先物化整张切片帧表（原文 + 切片表 ≈ 2×content 同瞬驻留），且实测**每张图发射完成后 RSS 残留 +25MB 不归还 OS**（glibc 对大量 256KiB 中小块的 arena 碎片），连发数张 RSS 阶梯式爬升直到限额。修复：切片全部惰性化——`message_processing.iter_giant_content` 生成器（`slice_giant_content` 保留为 list 包装，逐字节等价）；Express 假流式与 Cookie 两处热路径（`iter_openai_content_chunks`，`make_openai_content_chunks` 保留 list 形态）改按需产帧，每帧只在 yield 瞬间存在一份 256KiB 切片；发射完毕置空转换产物引用并针对巨帧触发一次 `gc.collect()`（毫秒级，回收 SDK/pydantic 引用环）。
+- 附带（真流式巨帧防护）：`split_giant_chunk_payload` 把任何 >1MiB 的真流式 delta.content（文本模型叠加 responseModalities、未来直出 inline_data 的路径）拆成 256KiB 增量帧——finish_reason 只挂尾帧、其余 delta 键保留首帧、结构异常原样回退；`stream_frames` 的直接下发与首回复暂存（pending_metadata）两条路径都已接入。
+- 评估后放弃（记录结论）：非流式「预序列化替代 JSONResponse」实测无收益——CPython json C 编码器的内部累积缓冲峰值本身就 ≈ 2.2×content，提前释放 dict 不改变峰值，保持 JSONResponse（`scripts/measure_emission_memory.py` 可复测）。
+- 实测（77MB 基线，25MB base64 档）：发射阶段增量 +48MB → +1MB（tracemalloc）；全链路 RSS 峰值 164 → 145MB，且回收后 **102 → 77MB（零残留，完全回落基线）**——旧链路每张图 +25MB 的 RSS 阶梯爬升被消除；真流式巨帧单帧路径 78 → 54MB。叠加根因四/五的修复，512MB 容器上 4K 生图从「必崩/几张后崩」变为单请求峰值 ~220MB 且请求结束后内存完全回收。
+- 测试：新增 `tests/test_image_lifecycle_hardening.py` 19 项回归（惰性切片与 list 版逐字节等价、Cookie 惰性帧等价、真流式巨帧拆分拓扑与回退、生图绕过续传缓冲的三态谓词、生图并发闸的非流式/流式/异常/文本不占名额/满员 503/计数幂等）；全项目测试与基线对比无新增失败（34 项环境依赖型失败与 HEAD 完全一致）。
+
 ## 2026-11-03：修复 4K 生图在 512MB 容器（Render 等）被 OOMKill 的崩溃
 
 - 症状：Express Key 通道请求 4K 生图，等待 30-120 秒后监控面板出现「收到首个上游分片」里程碑，随即整个进程死亡重启（渲染页面刷新即见服务崩溃）；1K/2K 正常，4K 一张都出不来，全程无任何 Python 异常或错误日志。

@@ -263,6 +263,14 @@ DEFAULT_SETTINGS = {
     "resumable_max_total_mb": 256,       # 全部已登记副本的编码字节预算
     "request_timeout_seconds": 1800,    # 一轮准备、重试及读取的总期限
     "upstream_max_concurrency": 32,     # 后台任务也占用生成名额；满时明确返回 503
+    # ===== 生图内存治理（512MB 小容器适配，2026-11 第二轮）=====
+    # 4K 生图 base64 单张 13-40MB，转换链峰值 +150~200MB；两项默认在
+    # Render 免费档（512MB）上以「先活命」为优先：
+    "image_max_concurrency": 2,        # 生图并发闸门：满时 503（文本流不受影响）
+    # 生图流是否进续传缓冲：默认关（一张 4K 图 25MB+ 在 resumable store
+    # 里驻留 TTL 30 分钟，叠加转换链足以 OOMKill）；内存充裕的部署打开
+    # 可恢复生图断线重连
+    "resumable_image_streams": False,
     # ===== 出站保活（见 keepalive.py）=====
     # 定期 GET 这个 URL：保活自身部署（填自己的 /healthz）或驱动外部监控。
     # 环境变量仅作初始值，控制台「运行设置」页可热改；留空 = 不启动。

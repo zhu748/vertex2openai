@@ -5,9 +5,9 @@ import hashlib
 import json
 import re
 import time
-from typing import Any, AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Iterator, Optional
 from models import file_data_markdown
-from message_processing import slice_giant_content
+from message_processing import iter_giant_content
 
 from response_validation import IncompleteResponseError, complete_function_arguments, validate_generation_finish_reason
 from json_stream import MAX_JSON_OBJECT_BYTES, JsonObjects as _JsonObjects
@@ -401,29 +401,43 @@ def make_openai_chunk(
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
 
+def iter_openai_content_chunks(
+    response_id: str,
+    model: str,
+    content: str,
+    role: "str | None" = None,
+) -> Iterator[str]:
+    """惰性版 make_openai_content_chunks：按需产出 SSE 帧，不物化整张帧表。
+
+    list 版会先把全部切片序列化成完整帧列表——原文/切片表/序列化帧
+    三份全量拷贝同时在内存里（4K 生图 base64 单张 13-40MB，512MB 容器
+    上叠加解析链直接 OOMKill）。生成器版每帧只在 yield 瞬间存在一个
+    256KiB 切片 + 一条序列化帧；切片与单帧输出逐字节一致（客户端按
+    delta 拼接语义无感）。role 只注入首帧（对齐官方帧序）。
+    """
+    if not content:
+        return
+    first = True
+    for piece in iter_giant_content(content):
+        yield make_openai_chunk(
+            response_id,
+            model,
+            content=piece,
+            role=role if first else None,
+        )
+        first = False
+
+
 def make_openai_content_chunks(
     response_id: str,
     model: str,
     content: str,
-    role: str = None,
+    role: "str | None" = None,
 ) -> list[str]:
     """超大 content（4K 生图 base64）→ 多帧 SSE 列表。
 
-    单帧发射时 json.dumps + f"data:..." + ASGI encode 会瞬间再造三份
-    全量拷贝，叠加解析链后 512MB 容器（Render 免费档）会被 OOMKill
-    （进程级 SIGKILL，无 Python 异常，表现为"收到首个上游分片后服务
-    直接崩溃重启"）。超过 1MiB 的 content 走 message_processing.
-    slice_giant_content 切成 256KiB 增量帧：客户端按 OpenAI 语义拼接
-    delta 后与单帧输出逐字节一致；小图保持整图单帧（前端无中间渲染
-    闪烁）。role 只注入首帧（对齐官方帧序）。
+    语义与 iter_openai_content_chunks 完全一致（见其 docstring）；保留
+    list 形态供需要 len()/索引的调用方与既有测试使用。热路径（两处
+    cookie 发射循环）已改用惰性版。
     """
-    pieces = slice_giant_content(content) if content else []
-    return [
-        make_openai_chunk(
-            response_id,
-            model,
-            content=piece,
-            role=role if i == 0 else None,
-        )
-        for i, piece in enumerate(pieces)
-    ]
+    return list(iter_openai_content_chunks(response_id, model, content, role=role))

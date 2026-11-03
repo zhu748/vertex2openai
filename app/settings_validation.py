@@ -35,6 +35,9 @@ _SETTING_NUMERIC_RANGE = {
     "resumable_max_total_mb": (1, 8192),
     "request_timeout_seconds": (30, 7200),
     "upstream_max_concurrency": (1, 1000),
+    # 生图并发闸门：4K 生图单次峰值 RSS 可达 150-200MB，512MB 容器
+    # 并发叠加即 OOMKill；默认 2，内存充裕的部署可调大
+    "image_max_concurrency": (1, 64),
     "keepalive_interval": (5, 86400),
     # Cookie 短期令牌轮换间隔：Google 实测节奏 600s，下限 300 防误配成高频打点
     "cookie_refresh_interval_seconds": (300, 86400),

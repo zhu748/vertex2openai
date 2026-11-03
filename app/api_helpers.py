@@ -1,6 +1,7 @@
 """SDK 调用、响应转换与 OpenAI 流式输出编排。"""
 
 import asyncio
+import gc
 import inspect
 import json
 import time
@@ -27,6 +28,7 @@ from google.genai import types
 from logger import stats
 from media_tasks import run_media_task
 from message_processing import (
+    GIANT_CONTENT_THRESHOLD,
     convert_to_openai_format,
 )
 from models import OpenAIMessage, OpenAIRequest
@@ -73,6 +75,9 @@ from upstreams.express_response import (
 )
 from upstreams.express_response import (
     _dedup_chunk_payload as _dedup_chunk_payload,
+)
+from upstreams.express_response import (
+    split_giant_chunk_payload as split_giant_chunk_payload,
 )
 from upstreams.express_response import (
     _prepend_prefill as _prepend_prefill,
@@ -186,6 +191,18 @@ def _warn_bad_credential(
                 f"👉 请及时前往控制台「通道与凭证」页检查、删除或更换。原因：{str(error)[:300]}"
             )
     return True
+
+
+def _response_has_giant_content(openai_response_dict: Optional[Dict[str, Any]]) -> bool:
+    """响应任一 choice 的 content 超过巨帧阈值（4K 生图 base64）。"""
+    try:
+        for choice in (openai_response_dict or {}).get("choices") or []:
+            content = ((choice.get("message") or {}).get("content"))
+            if isinstance(content, str) and len(content) > GIANT_CONTENT_THRESHOLD:
+                return True
+    except Exception:
+        pass
+    return False
 
 
 async def gemini_fake_stream_generator(
@@ -367,6 +384,8 @@ async def gemini_fake_stream_generator(
         # OOMKill，进程级 SIGKILL 无任何 Python 异常）。
         raw_gemini_response = None
         api_call_task = None
+        # 巨帧标记：发射完成后据此触发针对性 GC（见下）。
+        _giant = _response_has_giant_content(openai_response_dict)
         async for chunk_sse in _chunk_openai_response_dict_for_sse(
             openai_response_dict=openai_response_dict
         ):
@@ -377,6 +396,15 @@ async def gemini_fake_stream_generator(
                     openai_response_dict.get("usage", {}),
                 )
             yield chunk_sse
+        # 发射完毕先断开本帧对 25MB+ content 的最后一处本地引用（走引用
+        # 计数即时释放主体），再触发 GC 回收引用环。
+        openai_response_dict = None
+        if _giant:
+            # 巨帧（4K 生图 base64）发射完毕后主动回收：大字符串/bytes 靠
+            # 引用计数即时释放，但 SDK 响应树与转换链上的 pydantic 对象
+            # 可能成环拖住 arenas 不还给 OS；一次针对性 gc.collect（毫秒
+            # 级）让 RSS 尽快回落，给下一张图/别的请求腾出余量。
+            gc.collect()
         print(
             f"✅ [Express] {request_obj.model} | 假流式传输完成 | 耗时 {time.monotonic() - fake_stream_started:.1f}s"
         )
@@ -733,11 +761,14 @@ class SDKGeneration:
                             continue
                         if not first_reply.ready:
                             # 序列化一次复用：测量与最终下发共用同一份字符串
-                            # （旧实现每个元数据 chunk 序列化两次）。
-                            frame_text = json.dumps(chunk_payload, ensure_ascii=False)
-                            pending_metadata.add(
-                                frame_text, len(frame_text.encode("utf-8"))
-                            )
+                            # （旧实现每个元数据 chunk 序列化两次）；巨帧
+                            # （>1MiB delta.content，生图/未来直出路径）先拆
+                            # 成 256KiB 增量帧再落缓冲，避免单帧三份全量拷贝。
+                            for _sub in split_giant_chunk_payload(chunk_payload):
+                                frame_text = json.dumps(_sub, ensure_ascii=False)
+                                pending_metadata.add(
+                                    frame_text, len(frame_text.encode("utf-8"))
+                                )
                             continue
                         for metadata in pending_metadata.drain():
                             yield f"data: {metadata}\n\n"
@@ -750,7 +781,10 @@ class SDKGeneration:
                                 f"⚡ [Express] {self.request_obj.model} | 连接建立，正在实时流式输出…"
                             )
                         has_yielded = True
-                        yield f"data: {json.dumps(chunk_payload, ensure_ascii=False)}\n\n"
+                        # 巨帧拆分（同上）：单帧 json.dumps + f-string + ASGI
+                        # encode 瞬间三份全量拷贝，512MB 容器叠加即 OOMKill。
+                        for _sub in split_giant_chunk_payload(chunk_payload):
+                            yield f"data: {json.dumps(_sub, ensure_ascii=False)}\n\n"
 
                 if tool_assembler:
                     tool_assembler.validate_end()
@@ -1114,9 +1148,16 @@ class SDKGeneration:
             response_obj_call, self.request_obj.model
         )
         # 与假流式路径同因：释放 SDK 响应（持有图片原始 bytes），
-        # 避免与 JSONResponse 序列化拷贝叠加驻留。
+        # 避免与 JSON 序列化拷贝叠加驻留。
         response_obj_call = None
         _prepend_prefill(openai_response_content, self.prefill_text)
+        # 巨帧（4K 生图）主动回收 SDK/pydantic 引用环（同假流式路径）。
+        # 注：曾评估过"预序列化再 encode"替代 JSONResponse（期望省一份
+        # 拷贝），实测 CPython json C 编码器的内部累积缓冲峰值本身就达
+        # content+输出+缓冲 ≈ 2.2×content，提前释放 dict 不改变峰值，
+        # 故保持 JSONResponse（scripts/measure_emission_memory.py 可复测）。
+        if _response_has_giant_content(openai_response_content):
+            gc.collect()
         print(f"✅ [Express] {self.request_obj.model} | 非流式响应完成")
         return JSONResponse(content=openai_response_content)
 

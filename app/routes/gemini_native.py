@@ -83,7 +83,7 @@ from proxy_failover import ProxyChain
 from proxy_tls import build_httpx_proxy
 from streaming import sse_frames, with_heartbeats, HEARTBEAT, HEARTBEAT_FRAME
 from resumable import (resumable_store, resolve_buffer, ResumeRequestError, BufferCapacityError,
-                       DetachedRequest, sse_from_buffer, within_request_deadline,
+                       DetachedRequest, sse_from_buffer, within_request_deadline, image_bypass_enabled,
                        request_timeout_seconds, is_enabled as resumable_enabled)
 
 router = APIRouter()
@@ -1086,7 +1086,10 @@ def _passthrough_endpoint():
                       or bool(request.query_params.get("resume_from", "").strip()))
             if resume and not sse:
                 return _native_error(400, "原生续传需要 streamGenerateContent?alt=sse。")
-            if sse and resume and resumable_enabled():
+            if sse and resume and resumable_enabled() and not image_bypass_enabled(model):
+                # 生图默认绕过续传缓冲（512MB 容器内存治理，见
+                # resumable.image_bypass_enabled）：4K base64 的全量驻留
+                # 会叠加 OOMKill，直通交付（落到下方直通分支）。
                 return await _resumable_native(request, _auth, model, action, query, raw_body, parsed)
             async def execute():
                 async with asyncio.timeout(request_timeout_seconds()):

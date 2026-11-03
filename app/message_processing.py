@@ -5,6 +5,7 @@ import json
 import re
 import time
 import uuid
+from collections.abc import Iterator
 from typing import Any, Dict, List, Optional, Tuple
 
 import config as app_config
@@ -47,6 +48,27 @@ GIANT_CONTENT_THRESHOLD = 1 << 20  # 1 MiB：正常文本（含长思考）永�
 GIANT_CONTENT_SLICE = 1 << 18      # 256 KiB：单帧 SSE 事件的安全体积
 
 
+def iter_giant_content(
+    text: str,
+    *,
+    threshold: int = GIANT_CONTENT_THRESHOLD,
+    size: int = GIANT_CONTENT_SLICE,
+) -> Iterator[str]:
+    """惰性版 slice_giant_content：按需产出切片，不物化整张切片表。
+
+    发射阶段原实现（list 版）在原文仍被 openai_response_dict 引用时又
+    造一份全量拷贝（切片表 = 原文等大），4K 生图在 512MB 容器上发射
+    阶段恒驻 2×content。生成器版每帧只在 yield 瞬间存在一个 256KiB
+    切片，发射阶段峰值从 2× 降到 1×+256KiB。拼接语义与 list 版逐
+    字节一致（见 slice_giant_content）。
+    """
+    if len(text) <= threshold:
+        yield text
+        return
+    for i in range(0, len(text), size):
+        yield text[i : i + size]
+
+
 def slice_giant_content(
     text: str,
     *,
@@ -60,9 +82,7 @@ def slice_giant_content(
     总量与原文等大（一份拷贝，与旧单帧的 json.dumps 拷贝同量级），
     循环结束即释放。
     """
-    if len(text) <= threshold:
-        return [text]
-    return [text[i : i + size] for i in range(0, len(text), size)]
+    return list(iter_giant_content(text, threshold=threshold, size=size))
 
 
 def logprobs_payload_from_candidate(candidate: Any) -> Optional[Dict[str, Any]]:

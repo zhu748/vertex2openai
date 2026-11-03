@@ -15,18 +15,39 @@ class GenerationCapacityError(RuntimeError):
 
 
 class GenerationLimiter:
-    def __init__(self):
+    """计数控并发闸：满时快速失败（503），不做队列等待。
+
+    参数化（2026-11 第二轮）：除全局 upstream_max_concurrency 外，生图
+    另有独立的 image_limiter（image_max_concurrency，默认 2）——4K 生图
+    单次峰值 RSS +150~200MB，两路并发叠加即可 OOMKill 512MB 容器，
+    需要比文本流紧得多的闸门。
+    """
+
+    def __init__(
+        self,
+        *,
+        setting_key: str = "upstream_max_concurrency",
+        default_limit: int = 32,
+        full_message: str = "上游生成并发已满，请稍后重试。",
+        traced: bool = True,
+    ):
+        self.setting_key = setting_key
+        self.default_limit = default_limit
+        self.full_message = full_message
+        # traced=False：纯计数闸（生图内存闸与全局闸同请求叠加时，里程碑/
+        # start_generation/end_generation 只由全局闸记一次，避免重复）。
+        self.traced = traced
         self.active = 0
         self._lock = threading.Lock()
 
     def reserve(self):
-        trace = current_trace.get()
+        trace = current_trace.get() if self.traced else None
         with self._lock:
             # limit 的读取必须在临界区内：控制台热调 upstream_max_concurrency
             # 的瞬间，锁外读取会让并发 reserve 沿用旧值（TOCTOU，2026-10 修复）。
-            limit = max(1, int(app_state.get_setting("upstream_max_concurrency", 32)))
+            limit = max(1, int(app_state.get_setting(self.setting_key, self.default_limit)))
             if self.active >= limit:
-                raise GenerationCapacityError("上游生成并发已满，请稍后重试。")
+                raise GenerationCapacityError(self.full_message)
             self.active += 1
         try:
             if trace:
@@ -60,12 +81,28 @@ class GenerationLimiter:
 
 generation_limiter = GenerationLimiter()
 
+# 生图专用并发闸（内存闸门）：与全局闸独立计数、同请求叠加生效——
+# 一路生图同时占用一个全局名额 + 一个生图名额。traced=False：trace
+# 里程碑由全局闸统一记录，这里只管名额（双层 LeasedIterator 也不会
+# 双计 payload 观测）。
+image_limiter = GenerationLimiter(
+    setting_key="image_max_concurrency",
+    default_limit=2,
+    full_message="生图并发已达上限（image_max_concurrency，控制台可调）；"
+    "4K 生图内存占用大，请等当前生成完成后再试。",
+    traced=False,
+)
+
 
 class LeasedIterator:
-    def __init__(self, source, lease, *, sse=True):
+    def __init__(self, source, lease, *, sse=True, observe=True):
         self.source = source.__aiter__()
         self.lease = lease
-        self.observer = PayloadObserver(lease.trace, sse=sse) if lease.trace else None
+        # 双层租约（全局闸 + 生图闸）同流包装时只让最外层记账，
+        # 否则 sent_frames/bytes 会被双计。
+        self.observer = (
+            PayloadObserver(lease.trace, sse=sse) if (lease.trace and observe) else None
+        )
 
     def __aiter__(self):
         return self

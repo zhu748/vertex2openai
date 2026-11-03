@@ -184,6 +184,26 @@ def is_enabled() -> bool:
     return bool(_setting("resumable_enabled"))
 
 
+def image_bypass_enabled(model: str) -> bool:
+    """生图模型的回复是否默认绕过续传缓冲（512MB 容器内存治理）。
+
+    一张 4K 生图的 base64 SSE 帧合计 25MB+，落进 ResumableStore 后要
+    驻留到 TTL（默认 30 分钟）才回收；单流预算 64MB / 全局 256MB 的
+    默认值在 Render 免费档（512MB）上叠加上游解析链与转换链峰值
+    （+150~200MB）足以 OOMKill——表现为"生图后服务崩溃重启，之后
+    一段时间内持续闪崩"。生图默认直通（放弃断线重连的奢侈），内存
+    充裕的部署可开 resumable_image_streams 恢复缓冲。无法识别的
+    模型按文本处理（维持既有行为）。
+    """
+    if _setting("resumable_image_streams"):
+        return False
+    try:
+        from model_capabilities import get_profile
+        return bool(get_profile(model).get("is_image"))
+    except Exception:
+        return False
+
+
 def ttl_seconds() -> float:
     try:
         return max(30.0, float(_setting("resumable_ttl_seconds")))
