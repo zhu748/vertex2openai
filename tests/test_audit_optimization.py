@@ -54,6 +54,15 @@ async def fake_events(*args, preserve_parts=False, **kwargs):
 
 class NativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        # 快照全局通道/凭据/并发设置，tearDown 恢复——旧实现只设置不还原，
+        # web_proxy + Cookie 记录泄漏到同进程的后续测试文件（如
+        # test_protocol_alignment 的透传测试会被改道 Cookie 桥接而失败）。
+        self._saved = (
+            app_state.get_channel_mode(),
+            app_state.get_express_keys(),
+            app_state.get_cookie_accounts(),
+            app_state.get_settings().get("upstream_max_concurrency"),
+        )
         app_state.set_channel_mode("web_proxy")
         app_state.set_express_keys([])
         app_state.set_cookie_accounts([RECORD])
@@ -70,6 +79,12 @@ class NativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
             item.stop()
         await self.client.aclose()
         self.assertEqual(generation_limiter.active, 0, "generation lease leaked")
+        mode, keys, cookies, concurrency = self._saved
+        app_state.set_channel_mode(mode)
+        app_state.set_express_keys(keys)
+        app_state.set_cookie_accounts(cookies)
+        if concurrency is not None:
+            app_state.update_settings({"upstream_max_concurrency": concurrency})
 
     async def post(self, action, query=""):
         return await self.client.post(f"/v1beta/models/{MODEL}:{action}{query}", json=BODY)

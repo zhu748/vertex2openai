@@ -460,6 +460,32 @@ def strip_image_resolution_suffix(name: str) -> str:
     return image_resolution_suffix(name)[0]
 
 
+# 档位阶梯（与 resolve_image_size 的回退阶梯同序）：目录变体按 512→4K 排列。
+_IMAGE_SIZE_LADDER = ("512", "1K", "2K", "4K")
+
+
+def image_size_variant_ids(model_name: str) -> list[str]:
+    """生图模型应在目录列出的分辨率后缀变体（含 "-"，小写，按档位阶梯排序）。
+
+    可发现性缺口（2026-11 补齐）：请求侧 image_resolution_suffix 早已支持
+    -1k/-2k/-4k/-512 别名（档位转 imageConfig.imageSize、上游名剥后缀），
+    但三套模型目录都不列出这些变体——GUI 客户端（酒馆等）从 /v1/models
+    下拉里选不到，能力"能用却看不见"。与 -search 变体"既支持调用、也列
+    目录"的口径对齐，本函数是目录展开（OpenAI / Anthropic / Gemini 原生
+    三套共用）的单一事实源。
+
+    非生图档案、或白名单仅单档（flash-lite 只有 1K，裸名即该档，列出
+    -1k 只是噪声）返回空列表。
+    """
+    prof = get_profile(model_name)
+    if not prof.get("is_image"):
+        return []
+    sizes = prof.get("image_sizes") or set()
+    if len(sizes) <= 1:
+        return []
+    return [f"-{s.lower()}" for s in _IMAGE_SIZE_LADDER if s in sizes]
+
+
 def _size_param_hint(request: Any) -> Optional[str]:
     """从 OpenAI images 风格 size 推断生图档位，仅接受无歧义的意图。
 

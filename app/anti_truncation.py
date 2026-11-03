@@ -68,19 +68,31 @@ def search_variant_available(model_id: str) -> bool:
     /v1beta/models 三套目录共用的单一事实源——三种协议的请求侧都支持
     -search 后缀（OpenAI/Claude 走统一管线剥后缀强制搜索；Gemini 原生
     透传在 gemini_native 里剥后缀并注入 google_search 工具）。
+
+    生图判定按模型档案而非 "image" 子串（2026-11 修正）：nano-banana
+    家族名字里没有 "image"，旧判据漏网——目录误列 gemini-nano-banana-2.1
+    -search（原生透传侧还会给生图请求注入搜索工具）。档案判定与
+    image_size_variant_ids / 家族识别同源，未来新命名形态自动正确。
     """
     lowered = (model_id or "").lower()
-    return ("gemini" in lowered and "image" not in lowered
-            and not lowered.endswith("-search"))
+    if "gemini" not in lowered or lowered.endswith("-search"):
+        return False
+    from model_capabilities import get_profile
+    return not get_profile(lowered)["is_image"]
 
 
 def catalog_variant_ids(model_id: str, settings: dict) -> list[str]:
     """一个目录基底模型展开出的全部模型 ID（含自身）。
 
     与 OpenAI /v1/models 的展开口径逐字一致（models_api 复用本函数）：
-    - 裸模型：[base, base-search?, 已开启的抗截断后缀...]
+    - 裸模型：[base, base-search?, 生图分辨率变体(-1k/-2k/...)?, 已开启的抗截断后缀...]
     - 自带抗截断后缀的条目：该后缀开启时仅 [自身]，未开启时不列出
     settings 为该模型的有效设置（app_state.get_effective_settings 结果）。
+
+    生图分辨率变体（2026-11）：请求侧 image_resolution_suffix 支持在模型名
+    尾部带 -1k/-2k/-4k/-512 指定档位，目录同源列出使其可被 GUI 客户端发现；
+    按模型白名单展开（flash=4 档、pro/nano=3 档、单档的 flash-lite 不列），
+    不与 -search（生图不可用）或抗截断后缀（生图恒空）叠加。
     """
     plain_id, mode = split_model_alias(model_id)
     available = listed_suffixes(plain_id, settings)
@@ -89,6 +101,9 @@ def catalog_variant_ids(model_id: str, settings: dict) -> list[str]:
     suffixes = [""]
     if search_variant_available(model_id):
         suffixes.append("-search")
+    # 惰性导入避免循环（model_capabilities 顶层不导入本模块，反向同理）。
+    from model_capabilities import image_size_variant_ids
+    suffixes.extend(image_size_variant_ids(plain_id))
     suffixes.extend(available)
     return [f"{model_id}{suffix}" for suffix in suffixes]
 

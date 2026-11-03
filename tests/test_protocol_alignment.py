@@ -50,9 +50,31 @@ class CatalogVariantTests(unittest.TestCase):
         ids = anti_truncation.catalog_variant_ids("gemini-3.8-flash", {})
         self.assertEqual(ids, ["gemini-3.8-flash", "gemini-3.8-flash-search"])
 
-    def test_image_model_has_no_search_variant(self):
-        self.assertEqual(anti_truncation.catalog_variant_ids("gemini-image-gen", {}), ["gemini-image-gen"])
+    def test_image_model_has_no_search_variant_but_lists_resolution_tiers(self):
+        # 生图无 -search；2026-11 起目录展开分辨率后缀变体（gemini-image-gen
+        # 走 pro/未知生图档案：1K/2K/4K 三档；flash 档案另含 512）。
+        self.assertEqual(
+            anti_truncation.catalog_variant_ids("gemini-image-gen", {}),
+            ["gemini-image-gen", "gemini-image-gen-1k", "gemini-image-gen-2k",
+             "gemini-image-gen-4k"],
+        )
         self.assertFalse(anti_truncation.search_variant_available("nano-banana-2.1"))
+        # flash 生图含 512 档；单档模型（flash-lite 仅 1K）不展开。
+        self.assertEqual(
+            anti_truncation.catalog_variant_ids("gemini-3.1-flash-image", {}),
+            ["gemini-3.1-flash-image", "gemini-3.1-flash-image-512",
+             "gemini-3.1-flash-image-1k", "gemini-3.1-flash-image-2k",
+             "gemini-3.1-flash-image-4k"],
+        )
+        self.assertEqual(
+            anti_truncation.catalog_variant_ids("gemini-3.1-flash-lite-image", {}),
+            ["gemini-3.1-flash-lite-image"],
+        )
+        # 文本模型不展开分辨率变体（与 -search 互不影响）。
+        self.assertEqual(
+            anti_truncation.catalog_variant_ids("gemini-3.8-flash", {}),
+            ["gemini-3.8-flash", "gemini-3.8-flash-search"],
+        )
 
     def test_suffixed_raw_entry_lists_itself_only_when_enabled(self):
         raw = "gemini-3.8-flash-antitruncation-nonstream"
@@ -65,6 +87,13 @@ class CatalogVariantTests(unittest.TestCase):
         self.assertTrue(anti_truncation.search_variant_available("gemini-3-pro"))
         self.assertFalse(anti_truncation.search_variant_available("gemini-3-pro-search"))
         self.assertFalse(anti_truncation.search_variant_available("claude-sonnet-4-5"))
+
+    def test_search_rule_excludes_image_family_by_profile(self):
+        # 生图按档案判定而非 "image" 子串：nano-banana 家族名字里没有
+        # "image"，旧判据漏网误列 -search（2026-11 修正）。
+        self.assertFalse(anti_truncation.search_variant_available("gemini-nano-banana-2.1"))
+        self.assertFalse(anti_truncation.search_variant_available("gemini-3.1-flash-image"))
+        self.assertTrue(anti_truncation.search_variant_available("gemini-3.8-flash"))
 
 
 # ============================================================
@@ -111,12 +140,23 @@ class NativeCatalogTests(unittest.IsolatedAsyncioTestCase):
         return request
 
     async def test_native_catalog_ids_rule(self):
-        ids = gemini_native._native_catalog_ids(["gemini-3-pro", "nano-banana-2.1", "gemini-3-pro-search"])
+        ids = gemini_native._native_catalog_ids(
+            ["gemini-3-pro", "nano-banana-2.1", "gemini-3-pro-search",
+             "gemini-3.1-flash-image", "gemini-3.1-flash-lite-image",
+             "gemini-nano-banana-2.1"])
         self.assertIn("gemini-3-pro", ids)
         self.assertIn("gemini-3-pro-search", ids)
         self.assertIn("nano-banana-2.1", ids)
         self.assertNotIn("nano-banana-2.1-search", ids)
         self.assertEqual(ids.count("gemini-3-pro-search"), 1)  # 去重
+        # 生图分辨率变体与 -search 同源展开；单档模型不列。
+        self.assertIn("gemini-3.1-flash-image-4k", ids)
+        self.assertIn("gemini-3.1-flash-image-512", ids)
+        self.assertNotIn("gemini-3.1-flash-image-4k-search", ids)
+        self.assertNotIn("gemini-3.1-flash-lite-image-1k", ids)
+        self.assertNotIn("nano-banana-2.1-search-4k", ids)
+        # 带 gemini 前缀的 nano-banana（生图档案）不再误列 -search。
+        self.assertNotIn("gemini-nano-banana-2.1-search", ids)
 
     async def test_native_list_models_contains_search_variants(self):
         with mock.patch.object(gemini_native, "get_express_models",
@@ -234,6 +274,54 @@ class SearchVariantPassthroughTests(unittest.TestCase):
             content=raw)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.requests[0].content, raw)  # 字节级透传不被破坏
+
+
+# ============================================================
+# 4b. 透传生图分辨率后缀变体（剥后缀 + 注入 imageConfig.imageSize）
+# ============================================================
+class ImageSizeVariantPassthroughTests(SearchVariantPassthroughTests):
+    """复用 -search 透传测试的全部基建（同一上游 MockTransport / 补丁）。"""
+
+    def test_generate_content_strips_suffix_and_injects_image_size(self):
+        response = self.client.post(
+            "/v1beta/models/gemini-3.1-flash-image-4k:generateContent",
+            headers={"x-goog-api-key": "client-key"}, json={"contents": [{"role": "user"}]})
+        self.assertEqual(response.status_code, 200)
+        sent = self.requests[0]
+        self.assertIn("/models/gemini-3.1-flash-image:generateContent", str(sent.url))
+        self.assertNotIn("-4k", str(sent.url))
+        body = json.loads(sent.content)
+        self.assertEqual(body["generationConfig"]["imageConfig"]["imageSize"], "4K")
+        self.assertIn("contents", body)  # 原字段保留
+
+    def test_explicit_image_size_wins_over_suffix(self):
+        response = self.client.post(
+            "/v1beta/models/gemini-3.1-flash-image-4k:generateContent",
+            headers={"x-goog-api-key": "client-key"},
+            json={"contents": [], "generationConfig": {"imageConfig": {"imageSize": "1K"}}})
+        self.assertEqual(response.status_code, 200)
+        body = json.loads(self.requests[0].content)
+        self.assertEqual(body["generationConfig"]["imageConfig"]["imageSize"], "1K")
+
+    def test_count_tokens_strips_suffix_without_body_rewrite(self):
+        response = self.client.post(
+            "/v1beta/models/gemini-3.1-flash-image-2k:countTokens",
+            headers={"x-goog-api-key": "client-key"}, json={"contents": [{"role": "user"}]})
+        self.assertEqual(response.status_code, 200)
+        sent = self.requests[0]
+        self.assertIn("/models/gemini-3.1-flash-image:countTokens", str(sent.url))
+        self.assertEqual(json.loads(sent.content), {"contents": [{"role": "user"}]})
+
+    def test_text_model_with_tier_like_suffix_is_forwarded_verbatim(self):
+        # 文本模型名即使以 -4k 结尾也不改写（上游自然 404，与旧行为一致）。
+        raw = b'{"contents":[{"role":"user"}]}'
+        response = self.client.post(
+            "/v1beta/models/gemini-3.8-flash-4k:generateContent",
+            headers={"x-goog-api-key": "client-key", "content-type": "application/json"},
+            content=raw)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("/models/gemini-3.8-flash-4k:generateContent", str(self.requests[0].url))
+        self.assertEqual(self.requests[0].content, raw)
 
 
 # ============================================================

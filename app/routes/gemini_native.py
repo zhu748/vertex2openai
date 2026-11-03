@@ -162,8 +162,15 @@ def _native_error(status: int, message: str, status_detail: Optional[str] = None
 
 def _native_model_entry(model_id: str) -> dict:
     """Gemini 原生 models.list / models.get 共用的目录条目。"""
-    variant_note = "（Google 搜索增强变体：请求时注入 google_search 工具）" \
-        if model_id.lower().endswith("-search") else ""
+    lowered = model_id.lower()
+    if lowered.endswith("-search"):
+        variant_note = "（Google 搜索增强变体：请求时注入 google_search 工具）"
+    else:
+        # 生图分辨率后缀变体（-1k/-2k/-4k/-512）：与 -search 同为目录列出的
+        # 本服务扩展名，透传侧剥后缀并注入 imageConfig.imageSize。
+        from model_capabilities import image_resolution_suffix
+        tier = image_resolution_suffix(model_id)[1]
+        variant_note = f"（生图分辨率变体：等价 imageConfig.imageSize={tier}）" if tier else ""
     return {
         "name": f"models/{model_id}",
         "displayName": model_id,
@@ -175,22 +182,30 @@ def _native_model_entry(model_id: str) -> dict:
 
 
 def _native_catalog_ids(raw_models: list) -> list[str]:
-    """原生目录 ID 列表：裸模型 + -search 变体（与 OpenAI / Anthropic 目录
-    同源，规则来自 anti_truncation.search_variant_available）。
+    """原生目录 ID 列表：裸模型 + -search 变体 + 生图分辨率变体
+    （与 OpenAI / Anthropic 目录同源，规则来自 anti_truncation.
+    search_variant_available 与 model_capabilities.image_size_variant_ids）。
 
     抗截断后缀不列入：其解码/重建语义只在 OpenAI 兼容端点的统一管线里
     实现，原生透传无法承载（保持「透明目录」的老约束，测试也断言这一点）。
+    分辨率变体可列：透传侧 _strip_image_size_variant 做剥后缀 + 注入
+    imageConfig.imageSize 的最小改写（与 -search 同模式）。
     """
     from anti_truncation import search_variant_available
+    from model_capabilities import image_size_variant_ids
 
     ids: list[str] = []
     seen: set[str] = set()
     for model_id in sorted(raw_models):
-        for candidate in (model_id, f"{model_id}-search"):
+        extra: list[str] = []
+        if search_variant_available(model_id):
+            extra.append(f"{model_id}-search")
+        # 生图模型无 -search 变体，两类后缀互斥，不会叠出 -4k-search。
+        extra.extend(f"{model_id}{suffix}" for suffix in image_size_variant_ids(model_id))
+        for candidate in (model_id, *extra):
             if candidate not in seen:
                 seen.add(candidate)
-                if candidate == model_id or search_variant_available(model_id):
-                    ids.append(candidate)
+                ids.append(candidate)
     return ids
 
 
@@ -246,6 +261,44 @@ def _strip_search_variant(model: str, action: str, parsed: dict) -> tuple[str, O
         parsed["tools"] = [*tools, {"google_search": {}}]
     else:
         return base, None  # tools 非法：原样透传，让上游报真实错误
+    body = json.dumps(parsed, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base, body
+
+
+def _strip_image_size_variant(model: str, action: str, parsed: dict) -> tuple[str, Optional[bytes]]:
+    """生图分辨率后缀变体的最小改写：返回 (基础模型名, 重组后的请求体或 None)。
+
+    与 -search 变体同一模式（目录列出 -1k/-2k/-4k/-512 别名，本服务扩展名、
+    Google 无此模型 ID，原样透传会 404）：剥后缀并把档位写进
+    generationConfig.imageConfig.imageSize——客户端已显式设置 imageSize 时
+    不覆盖（与 resolve_image_size 的优先级链一致：请求级 > 模型名后缀）。
+
+    - 生成动作（generateContent / streamGenerateContent）：注入 imageSize
+      （generationConfig / imageConfig 非法时只剥后缀，交给上游报真实错误）；
+    - countTokens / embedContent：只剥后缀（body 与模型无关，无需重组）。
+    body 为 None 表示未做任何改写，调用方继续用原始字节。
+    """
+    from model_capabilities import image_resolution_suffix
+
+    base, tier = image_resolution_suffix(model)
+    if tier is None:
+        return model, None
+    if action not in ("generateContent", "streamGenerateContent"):
+        return base, None
+    gen = parsed.get("generationConfig")
+    if gen is None:
+        # 极简调用可以不带 generationConfig：创建后再注入，否则档位意图
+        # 会随剥后缀一起丢失（-search 对 tools 缺失同样创建）。
+        gen = parsed["generationConfig"] = {}
+    if not isinstance(gen, dict):
+        return base, None
+    img_cfg = gen.get("imageConfig")
+    if img_cfg is None:
+        img_cfg = gen["imageConfig"] = {}
+    if not isinstance(img_cfg, dict) or img_cfg.get("imageSize"):
+        # 非法结构 → 原样透传报真实错误；已有档位 → 尊重请求级显式设置。
+        return base, None
+    img_cfg["imageSize"] = tier
     body = json.dumps(parsed, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return base, body
 
@@ -1011,6 +1064,17 @@ def _passthrough_endpoint():
                 raw_body = rebuilt
                 print(f"🔎 [Gemini 透传] {model} | -search 变体：已注入 google_search 工具"
                       "（body 最小重组；普通模型仍字节级透传）。")
+
+        # 生图分辨率后缀变体（-1k/-2k/-4k/-512，目录已列出）：剥后缀 +
+        # 注入 imageConfig.imageSize。与 -search 互斥（生图无 -search 变体），
+        # 二者尾部形态不同不会同时命中。仅生图档案生效，文本模型名原样透传。
+        from model_capabilities import image_resolution_suffix
+        if image_resolution_suffix(model)[1]:
+            model, rebuilt = _strip_image_size_variant(model, action, parsed)
+            if rebuilt is not None:
+                raw_body = rebuilt
+                print(f"🔎 [Gemini 透传] {model} | 分辨率后缀变体：已注入"
+                      " imageConfig.imageSize（body 最小重组；普通模型仍字节级透传）。")
 
         # 通道选择（尊重控制台的通道模式开关，与 chat_api 的选路语义对齐）：
         # - web_proxy（Cookie 模式）：配置了 Cookie 账号就走 Cookie 通道**协议级桥接**

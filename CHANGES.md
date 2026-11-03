@@ -2,6 +2,15 @@
 
 基于原版 `vertex2openai-main`（2026-09-01），持续完善兼容性、可靠性和代码组织。
 
+## 2026-11-03（第四轮）：分辨率后缀目录可发现性 + 原生透传支持 + 测试隔离治本
+
+- 背景：用户核实「分辨率此前只在控制台调、`/v1/models` 里生图模型后面没有分辨率」。属实：请求侧 `-1k/-2k/-4k/-512` 模型名后缀第三轮起已端到端生效，但三套模型目录（OpenAI / Anthropic / Gemini 原生）都不列出这些变体——GUI 客户端下拉选不到、只能手打，与 `-search` 变体「既支持调用、也列目录」的口径漂移；且 Gemini 原生透传对该后缀会直接 404（透传侧从不剥离）。详见 `docs/optimization-2026-11-03-image.md` 第四轮一节。
+- 目录可发现性：新增 `mc.image_size_variant_ids`（按模型白名单的目录变体单一事实源：flash 生图 4 档含 -512、pro/nano 3 档、单档模型与文本模型不列），`anti_truncation.catalog_variant_ids`（OpenAI + Anthropic 共用）与 `gemini_native._native_catalog_ids`（Gemini 原生）同源展开，原生目录条目附「等价 imageConfig.imageSize 档位」注记；与 -search / 抗截断后缀互不叠加。
+- -search 规则生图误判修正（既有缺陷，顺手修复）：`search_variant_available` 只按 `"image" not in name` 排除生图，nano-banana 家族（名字不含 image）漏网——目录一直误列 `gemini-nano-banana-2.1-search`，原生透传侧还会给生图请求注入搜索工具。改为按模型档案判定（与分辨率变体/家族识别同源），文本模型的 -search 不受影响。
+- Gemini 原生透传支持：新增 `_strip_image_size_variant`（与 -search 同模式的最小改写）——剥后缀并把档位注入 `generationConfig.imageConfig.imageSize`；客户端已显式设置时不覆盖（对齐 resolve_image_size 优先级链）；缺 `generationConfig` 时创建后注入（极简调用不丢档位意图）；countTokens 等只剥后缀；结构非法只剥后缀交上游报真实错误；Cookie 桥接路径经 parsed 原地注入自动携带；文本模型名（即使以 -4k 结尾）原样透传不变。
+- 测试隔离治本（既有缺陷，顺手修复）：`test_audit_optimization.py::NativeLifecycleTests` 的 asyncSetUp 设置 `web_proxy`+Cookie 记录不恢复，与 `test_concurrent_console_updates.py` 泄漏的 Cookie 账号组合后，同进程后续的原生透传测试被改道 Cookie 桥接（Express Mock 桩失效）而失败——该泄漏在 HEAD 上即可复现，波及 `test_gemini_native_stats_retry` 18 项与 `test_protocol_alignment` 3 项。两处 setUp 改为快照-恢复全局通道/凭据/并发设置；全量失败 34 → 13，剩余 13 项与 HEAD 基线逐条一致、零新增。
+- 测试：`test_image_path_optimization` 新增契约 7（变体白名单、目录变体与解析器口径一致性、原生改写注入/不覆盖显式值/countTokens 只剥/文本模型不动/条目注记）；`test_protocol_alignment` 目录断言更新并新增 `ImageSizeVariantPassthroughTests` 端到端 4 项（注入、显式优先、countTokens、文本模型逐字节透传）。
+
 ## 2026-11-03（第三轮）：生图链路全面优化（不限 4K）
 
 - 背景：前两轮解决 4K 输出 OOMKill 后，通读生图全链路（输入摄取/压缩 → 档位与比例解析 → 两通道请求构建 → 响应收集/发射），覆盖 512/1K/2K/4K 全档位。详见 `docs/optimization-2026-11-03-image.md`。

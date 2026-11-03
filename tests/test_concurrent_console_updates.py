@@ -25,6 +25,11 @@ from runtime_state import AppState, app_state
 class CookieSaveConcurrencyTests(unittest.TestCase):
     def setUp(self):
         self.old = {"id": "account", "cookie": "SAPISID=old; SIDCC=old", "project_id": "project", "note": "old"}
+        # 快照-恢复：注册的 Cookie 账号不能泄漏到后续测试文件（与
+        # 其他文件残留的 web_proxy 模式组合会把原生透传测试改道
+        # Cookie 桥接）。
+        self._saved_accounts = app_state.get_cookie_accounts()
+        self.addCleanup(app_state.set_cookie_accounts, self._saved_accounts)
         app_state.set_cookie_accounts([self.old])
         self.client = TestClient(main.app)
         self.addCleanup(self.client.close)

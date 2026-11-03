@@ -1,6 +1,6 @@
 """生图链路全面优化回归（2026-11-03，不限于 4K）。
 
-覆盖六项契约：
+覆盖七项契约：
 1. 模型名分辨率别名（-1k/-2k/-4k/-512）端到端生效：档位转成
    imageConfig.imageSize（Express 与 Cookie 两通道），且从发往上游的
    模型名里剥离（目录无此 ID，原样发送 404）；
@@ -12,11 +12,15 @@
    帧拼接逐字节一致；
 5. Cookie 生图整取在 JSON 解析开始前释放 httpx 响应对象（bytes
    缓冲不再与 .text 双驻留）；
-6. 别名剥离只对生图档案生效：文本模型名原样保留。
+6. 别名剥离只对生图档案生效：文本模型名原样保留；
+7. 分辨率后缀目录可发现性：三套模型目录（OpenAI / Anthropic /
+   Gemini 原生）同源列出 -1k/-2k/-4k/-512 变体，Gemini 原生透传
+   剥后缀并注入 imageConfig.imageSize（与 -search 变体同模式）。
 """
 
 import asyncio
 import io
+import json
 import os
 import sys
 import tempfile
@@ -403,6 +407,89 @@ class CookieCollectReleaseTests(unittest.TestCase):
         # getrefcount 的临时引用 = 3；若 _collect_full_response 仍持有
         # response 局部变量则为 4。
         self.assertEqual(seen_refcounts, [3], "解析期间 httpx 响应对象未被释放")
+
+
+class CatalogDiscoverabilityTests(unittest.TestCase):
+    """契约 7/7：分辨率后缀目录可发现性与 Gemini 原生透传改写。"""
+
+    def test_variant_ids_follow_profile_whitelist(self):
+        # 目录变体单一事实源：flash 4 档全列、pro/nano 3 档、
+        # 单档 lite 不列、文本模型不列。
+        self.assertEqual(
+            mc.image_size_variant_ids("gemini-3.1-flash-image"),
+            ["-512", "-1k", "-2k", "-4k"],
+        )
+        self.assertEqual(
+            mc.image_size_variant_ids("gemini-nano-banana-2.1"),
+            ["-1k", "-2k", "-4k"],
+        )
+        self.assertEqual(
+            mc.image_size_variant_ids("gemini-3-pro-image"),
+            ["-1k", "-2k", "-4k"],
+        )
+        # 单档模型（flash-lite 生图档案仅 1K）与文本模型不列。
+        # 注：lite 分支的判据是 "flash-lite" 子串，命中形态如
+        # gemini-3.1-flash-lite-image（flash-image-lite 中间隔了 image，
+        # 归 flash 档案、四档全列）。
+        self.assertEqual(mc.image_size_variant_ids("gemini-3.1-flash-lite-image"), [])
+        self.assertEqual(mc.image_size_variant_ids("gemini-3.8-flash"), [])
+
+    def test_variant_ids_match_resolution_suffix_parser(self):
+        # 目录列出的每个变体都必须能被请求侧 image_resolution_suffix 解析
+        #（档位一致）——否则会出现“目录里能选、选了却不生效”的漂移。
+        for base in ("gemini-3.1-flash-image", "gemini-3-pro-image",
+                     "gemini-nano-banana-2.1"):
+            for suffix in mc.image_size_variant_ids(base):
+                with self.subTest(name=base + suffix):
+                    stripped, tier = mc.image_resolution_suffix(base + suffix)
+                    self.assertEqual(stripped, base)
+                    self.assertEqual(tier, suffix[1:].upper())
+
+    def test_native_strip_injects_size_and_creates_missing_config(self):
+        from routes.gemini_native import _strip_image_size_variant
+
+        parsed = {"contents": [{"role": "user"}]}
+        base, body = _strip_image_size_variant(
+            "gemini-3.1-flash-image-4k", "generateContent", parsed)
+        self.assertEqual(base, "gemini-3.1-flash-image")
+        rebuilt = json.loads(body)
+        self.assertEqual(
+            rebuilt["generationConfig"]["imageConfig"]["imageSize"], "4K")
+        self.assertIn("contents", rebuilt)  # 原字段保留
+
+    def test_native_strip_respects_explicit_request_size(self):
+        from routes.gemini_native import _strip_image_size_variant
+
+        parsed = {"generationConfig": {"imageConfig": {"imageSize": "1K"}}}
+        base, body = _strip_image_size_variant(
+            "gemini-3.1-flash-image-4k", "generateContent", parsed)
+        self.assertEqual((base, body), ("gemini-3.1-flash-image", None))
+        # 非法 imageConfig 结构：只剥后缀，交给上游报真实错误。
+        parsed = {"generationConfig": {"imageConfig": "bogus"}}
+        base, body = _strip_image_size_variant(
+            "gemini-3.1-flash-image-4k", "generateContent", parsed)
+        self.assertEqual((base, body), ("gemini-3.1-flash-image", None))
+
+    def test_native_strip_count_tokens_and_text_models(self):
+        from routes.gemini_native import _strip_image_size_variant
+
+        # countTokens：只剥后缀（body 与模型无关）。
+        base, body = _strip_image_size_variant(
+            "gemini-3.1-flash-image-2k", "countTokens", {"contents": []})
+        self.assertEqual((base, body), ("gemini-3.1-flash-image", None))
+        # 文本模型名（即使以 -4k 结尾）：完全不动，原样透传。
+        base, body = _strip_image_size_variant(
+            "gemini-3.8-flash-4k", "generateContent", {"contents": []})
+        self.assertEqual((base, body), ("gemini-3.8-flash-4k", None))
+
+    def test_native_model_entry_notes_tier(self):
+        from routes.gemini_native import _native_model_entry
+
+        entry = _native_model_entry("gemini-3.1-flash-image-4k")
+        self.assertEqual(entry["name"], "models/gemini-3.1-flash-image-4k")
+        self.assertIn("imageSize=4K", entry["description"])
+        plain = _native_model_entry("gemini-3.1-flash-image")
+        self.assertNotIn("imageSize", plain["description"])
 
 
 if __name__ == "__main__":
