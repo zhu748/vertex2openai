@@ -18,7 +18,7 @@ class GenerationLimiter:
     """计数控并发闸：满时快速失败（503），不做队列等待。
 
     参数化（2026-11 第二轮）：除全局 upstream_max_concurrency 外，生图
-    另有独立的 image_limiter（image_max_concurrency，默认 2）——4K 生图
+    另有独立的 image_limiter（image_max_concurrency，默认 1）——4K 生图
     单次峰值 RSS +150~200MB，两路并发叠加即可 OOMKill 512MB 容器，
     需要比文本流紧得多的闸门。
     """
@@ -87,7 +87,7 @@ generation_limiter = GenerationLimiter()
 # 双计 payload 观测）。
 image_limiter = GenerationLimiter(
     setting_key="image_max_concurrency",
-    default_limit=2,
+    default_limit=1,
     full_message="生图并发已达上限（image_max_concurrency，控制台可调）；"
     "4K 生图内存占用大，请等当前生成完成后再试。",
     traced=False,

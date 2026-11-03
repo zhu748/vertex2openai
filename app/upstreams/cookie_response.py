@@ -361,7 +361,8 @@ def extract_events(obj: dict, *, preserve_parts: bool = False):
                     if mime_type and b64:
                         native_part["inlineData"] = {"mimeType": mime_type, "data": b64}
                         if not preserve_parts:
-                            image_md = f"![Generated Image](data:{mime_type};base64,{b64})"
+                            from image_delivery import image_markdown
+                            image_md = image_markdown(b64, mime_type, encoded=True, label="Generated Image")
                             yield ("image", image_md)
 
                 file_data = _wire_object(part.get("fileData"), "fileData")

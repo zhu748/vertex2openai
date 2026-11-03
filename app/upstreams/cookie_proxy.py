@@ -467,7 +467,7 @@ class CookieGeneration:
         if await self.fastapi_request.is_disconnected():
             return
         print(
-            f"🖼️ [生图保护] 图片模型 {self.base_model_name} 已自动切换为假流式输出（Cookie 通道），避免分块 base64 卡死前端。"
+            f"🖼️ [生图保护] 图片模型 {self.base_model_name} 已自动切换为假流式输出（Cookie 通道），生成期间持续保活。"
         )
         # 生图和重试等待期间也持续发心跳，避免前端或中间层按空闲超时断开。
         # 首心跳行为与 stream_frames / buffered_frames 保持一致。

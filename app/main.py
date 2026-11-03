@@ -11,6 +11,7 @@ from express_key_manager import ExpressKeyManager
 from lifecycle import lifespan
 from logger import stats
 from middleware import StatsMiddleware
+from image_delivery import ImageDeliveryMiddleware
 from request_connection import BodyTooLargeError
 from request_errors import body_too_large_response, ingress_error_response, validation_error_response
 from request_ingress import IngressError
@@ -20,6 +21,7 @@ from routes import (
     console,
     credentials_api,
     gemini_native,
+    generated_images,
     models_api,
     settings_api,
     system_api,
@@ -32,6 +34,7 @@ app.state.express_key_manager = ExpressKeyManager()
 app.mount("/static", ConsoleStaticFiles(directory=Path(__file__).parent / "static"), name="static")
 
 app.add_middleware(StatsMiddleware, stats=lambda: stats)
+app.add_middleware(ImageDeliveryMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -87,5 +90,6 @@ for router in (
     chat_api.router,
     claude_api.router,
     gemini_native.router,
+    generated_images.router,
 ):
     app.include_router(router)

@@ -43,7 +43,7 @@ Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风
   - **上游错误如实透传**：模型在当前项目/区域不可用（404）、权限不足（403）、参数非法（400）等，会以对应 HTTP 状态码 + OpenAI 错误格式返回，而非笼统的 500。
   - Google Search 增强：**文本模型**在模型名后加 `-search` 后缀按需开启。
   - 自动保留 Gemini 思考过程（Thinking），以 `reasoning_content` 返回。
-  - 生图模型：输入图压缩、按模型的比例白名单校验、4K 等分辨率、图片输出转 Markdown data URL；生图强制"假流式"整块输出，避免超大 base64 卡死前端。
+  - 生图模型：输入图压缩、按模型的比例白名单校验、4K 等分辨率；OpenAI 聊天接口默认返回 Markdown 图片下载链接，避免客户端在聊天文本中拼接和渲染巨量 Base64。生图等待期间保留假流式心跳。
   - **按模型能力自动裁剪参数**：不同模型支持的参数不同，代理会自动移除目标模型不支持的参数以避免 400（详见"控制台与模型参数"）。
   - **自动重试（固定间隔 + 抖动）**：两条通道均内置 429/拥堵自动重试，**次数、间隔与抖动均可在
     控制台调整**（`retry_max` 默认 10 次、`retry_backoff_seconds` 默认 5 秒、
@@ -398,6 +398,8 @@ TCP+TLS 握手（每次约省 100~300ms 与相应 CPU）；429 重试场景收�
 | `UPSTREAM_MODE` | 否 | 自动 | `api_key`（仅 Key）、`web_proxy`（仅 Cookie）、`mixed`（混合）。首次启动同时配置两类凭证时自动使用混合模式；已有控制台通道选择继续保留。 |
 | `ROUNDROBIN` | 否 | `false` | Key / Cookie 账号轮询(`true`)或随机(`false`)；混合模式下两类账号共同参与。可在控制台热改。 |
 | `FAKE_STREAMING` | 否 | `false` | 先非流式取回再模拟流式；生图模型始终强制启用。可在控制台热改。 |
+| `IMAGE_OUTPUT_MODE` | 否 | `url` | OpenAI 聊天接口的图片默认保存为文件、返回短链接；设为 `inline` 恢复 Base64 data URL（大图可能使客户端内存不足）。Express / Cookie、流式 / 非流式均生效。Gemini 原生接口不变。 |
+| `IMAGE_PUBLIC_BASE_URL` | 否 | 自动 | 对外服务根地址，例如 `https://example.onrender.com`，不要加 `/v1`。未设置时优先用 Render 的 `RENDER_EXTERNAL_URL`，否则从请求地址推导；反代子路径部署应显式指定含前缀的地址。 |
 | `FAKE_STREAMING_INTERVAL` | 否 | `1.0` | 假流式等待期间 keep-alive 间隔秒数。可在控制台热改。 |
 | `MODELS_CONFIG_URL` | 否 | 仓库 `vertexModels.json` | 远程模型列表地址；改远程文件即可刷新，无需重部署。 |
 | `SAFETY_SCORE` | 否 | `false` | 是否把 Gemini safety ratings 附加到输出。可在控制台热改。 |
@@ -419,6 +421,25 @@ TCP+TLS 握手（每次约省 100~300ms 与相应 CPU）；429 重试场景收�
 | `SINGBOX_IDLE_MINUTES` | 否 | `30` | sing-box 空闲实例回收阈值（分钟；`0` = 永不回收）。每个代理链接占一个本地端口与一个子进程，长时间不用自动回收、下次请求时秒级重启。 |
 | `KEEPALIVE_URL` | 否 | 空 | 出站保活：定期 GET 该 URL（默认 60 秒一次）。填自己的 `https://你的域名/healthz` 可防止免费托管平台（Render / HF Space 等）冻结闲置实例，也可驱动外部监控。留空 = 不启动；请求直连出站、不走出站代理。仅作初始值，控制台「运行设置」页可热改。 |
 | `KEEPALIVE_INTERVAL` | 否 | `60` | 保活请求间隔（秒），下限 5，上限 86400。仅作初始值，控制台可热改。 |
+
+### Render 生图与客户端内存
+
+RikkaHub 等聊天客户端收到几十 MB 的 Markdown Base64 时，可能在 SSE 拼接、
+Markdown 重解析或图片解码期间耗尽内存，即使代理已经记录了上游成功。
+默认的链接交付将原图写入 `STATE_DIR/generated-images`，再由客户端独立下载；
+不缩小分辨率，不重新编码图片。服务端仍需承受上游 SDK / JSON 解析的内存开销，
+客户端仍需解码原图，因此不能保证任意内存配置都能生成和显示 4K。
+
+图片链接携带随机访问凭证，持有链接即可下载，无需在图片请求中附带 API Key。
+文件最长保留 7 天，总大小限制 512 MiB，容量满时先删除最旧图片；单图上限 64 MiB。
+Render 未挂持久磁盘时，文件会随实例重建或重新部署丢失，历史链接可能失效，
+需要长期保留的图片请及时下载。多实例部署需要共享该目录或改用对象存储。
+
+小内存 Render 实例建议在控制台将 `image_max_concurrency` 设为 **1**；
+新安装默认值已改为 1，升级保留已有设置，需自行检查。
+如返回链接使用了错误域名，设置 `IMAGE_PUBLIC_BASE_URL=https://你的服务域名`。
+服务重启是否由 OOM 引起，应结合 Render 的内存图表和退出日志确认；
+上游成功日志只能证明代理取得了结果，不能证明客户端已成功显示。
 
 ### 多账号与混合模式配置
 

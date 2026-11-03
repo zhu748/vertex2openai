@@ -883,6 +883,9 @@ def _create_safety_ratings_html(safety_ratings: list) -> str:
 
 
 def _convert_image_to_markdown(image_data: bytes, mime_type: str) -> str:
+    from image_delivery import image_base_url, image_markdown
+    if image_base_url.get():
+        return image_markdown(image_data, mime_type)
     # 内存关键路径：4K 生图的 base64 单张可达数十 MB。旧实现先拼
     # data_url 再包 markdown（b64 bytes / b64 str / data_url / markdown
     # 四份全量拷贝同时驻留），512MB 容器（Render 免费档）叠加上游解析

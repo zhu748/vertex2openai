@@ -215,9 +215,12 @@ class ImageConcurrencyGateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(chat_api.image_limiter.active, 0)
 
     async def test_full_limiter_fails_fast_503(self):
-        # 手动占满名额（默认 2）
-        leases = [chat_api.image_limiter.reserve() for _ in range(2)]
+        # 按当前配置占满，默认串行；同时允许管理员覆盖并发上限。
+        limit = chat_api.app_state.get_setting("image_max_concurrency", 1)
+        leases = []
         try:
+            for _ in range(limit):
+                leases.append(chat_api.image_limiter.reserve())
             called = []
 
             async def fake_dispatch(request_obj, fastapi_request):
@@ -243,7 +246,7 @@ class ImageConcurrencyGateTests(unittest.IsolatedAsyncioTestCase):
             full_message="满",
             traced=False,
         )
-        # app_state 里已保存的 image_max_concurrency（默认 2）会盖过构造
+        # app_state 里已保存的 image_max_concurrency 会盖过构造
         # 参数：单测里钉住设置值，只验证闸门自身的计数/幂等/无 trace 语义。
         with mock.patch.object(
             __import__("admission").app_state, "get_setting", return_value=1
