@@ -611,9 +611,14 @@ def build_request_body(
         if img_cfg:
             gen_config["imageConfig"] = img_cfg
         # 生图思考档位：三模型默认 HIGH（用户决策 2026-10-13）
-        # Nano Banana 家族专属：media_resolution=HIGH（用户决策 2026-10-13）
+        # Nano Banana 家族专属：media_resolution=HIGH（用户决策 2026-10-13）。
+        # 枚举值必须是 GraphQL 枚举成员全名 MEDIA_RESOLUTION_HIGH：私有接口
+        # 的类型 google_cloud_aiplatform_ui_GenerationConfig_MediaResolution
+        # 只接受 UNSPECIFIED/LOW/MEDIUM/HIGH 四个全名成员，发 "HIGH" 会触发
+        # "Invalid value for variable $generationConfig"（与官方 REST/SDK 的
+        # types.MediaResolution.MEDIA_RESOLUTION_HIGH 取值一致）。
         if "nano-banana" in (model_name or "").lower():
-            gen_config["mediaResolution"] = "HIGH"
+            gen_config["mediaResolution"] = "MEDIA_RESOLUTION_HIGH"
     else:
         # 文本/多模态：仅注入该模型支持、且被显式设置（请求或控制台）的采样参数。
         # 与标准（Express）通道对齐：都未设置时**不发**该参数，交给模型默认——
