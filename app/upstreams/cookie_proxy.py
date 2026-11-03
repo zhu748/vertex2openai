@@ -293,13 +293,21 @@ async def _collect_full_response(
                     "message": f"HTTP {response.status_code}: {response.text[:300]}",
                 }
 
+            # 生图内存（2026-11 第三轮）：状态码/重试判断完成后立即释放
+            # 响应对象——httpx 整取会同时持有 content bytes 与 .text 解码
+            # 出的 str（4K 单图各 ~30-50MB），旧实现解析全程两者并存，
+            # 叠加 JSON 解出的 data 串、markdown 与 full_text 后收集期
+            # 4-5 份全量。text 提前取本地引用，bytes 缓冲即可回收。
+            response_text = response.text
+            response = None
+
             full_text, reasoning_text, api_error, usage_meta = "", "", None, None
             api_error_status = 502
             finish_raw, blocked_msg = None, None
             safety_html = ""
             sampler = RawSampler()
 
-            async for obj in iter_json_objects(TextSource(response.text)):
+            async for obj in iter_json_objects(TextSource(response_text)):
                 sampler.add(obj)
                 # 一旦拿到错误事件就停止解析剩余响应：生图响应可达数 MB base64，
                 # 错误分支的返回值不依赖后续对象，继续拼接是纯浪费。
@@ -1475,6 +1483,10 @@ def _prepare_cookie_generation(
     is_grounded_search = base_model_name.endswith("-search")
     if is_grounded_search:
         base_model_name = base_model_name[: -len("-search")]
+    # 生图分辨率别名（-1k/-2k/-4k/-512）从上游模型名剥离（目录无此 ID，
+    # 原样发送会 404）；档位由 resolve_image_size 从请求原始名解析
+    #（仅生图档案生效，与 Express 通道同口径，2026-11）。
+    base_model_name = mc.strip_image_resolution_suffix(base_model_name)
     # Persist the parsed selection for every delivery/retry path. Inspecting the
     # raw request model later misses whitespace and combined transport aliases.
     force_builtin_search = force_builtin_search or is_grounded_search or _forced_search

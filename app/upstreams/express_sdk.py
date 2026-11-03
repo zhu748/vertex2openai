@@ -66,6 +66,12 @@ def _normalize_model_name(model_name: str) -> tuple[str, bool, str | None]:
     if is_grounded_search:
         base_model_name = base_model_name[: -len("-search")]
 
+    # 生图分辨率别名（-1k/-2k/-4k/-512）：从发往上游的模型名里剥离
+    #（目录里不存在这些 ID，原样发送会 404），档位提示由
+    # mc.resolve_image_size 从请求原始模型名里解析。仅在剥离后仍是
+    # 生图档案时生效，文本模型名不受影响（2026-11）。
+    base_model_name = mc.strip_image_resolution_suffix(base_model_name)
+
     if not base_model_name.strip():
         return base_model_name, False, "模型名称不能为空。"
 

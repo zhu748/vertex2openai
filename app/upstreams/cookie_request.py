@@ -587,6 +587,10 @@ def build_request_body(
     error = cookie_feature_error(request, structured_output=app_state.get_setting("cookie_structured_output", False))
     if error:
         raise SchemaValidationError(error)
+    # 生图分辨率别名（-1k/-2k/-4k/-512）从上游模型路径剥离（目录无此 ID，
+    # 原样发送会 404）；幂等——调用方（cookie_proxy 解析处）已剥过也不受
+    # 影响。档位由 resolve_image_size 从请求原始模型名解析（2026-11）。
+    model_name = mc.strip_image_resolution_suffix(model_name)
     contents, system_text = _convert_messages_to_contents(
         request.messages, model_name=model_name, native_tools=native_tools
     )

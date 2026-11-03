@@ -74,12 +74,34 @@ def optimize_image_bytes(
             # Compression drops EXIF metadata. Apply camera orientation first
             # so portrait photos do not silently turn sideways upstream.
             img = ImageOps.exif_transpose(img)
-            # 抹平透明通道以防转成 JPEG 时报错
-            if img.mode in ("RGBA", "LA", "P"):
-                background = Image.new("RGB", img.size, (255, 255, 255))
-                rgba = img.convert("RGBA")
-                background.paste(rgba, mask=rgba.getchannel("A"))
-                img = background
+            # 抹平透明通道以防转成 JPEG 时报错（2026-11 内存优化）：
+            # 旧实现无论入图什么模式都先 convert("RGBA") 再建白底再 paste，
+            # 一张 40MP RGBA PNG 会同时驻留 RGBA 原图 + RGBA 拷贝 + 白底
+            # RGB 三份全量（≈160+160+120MB），512MB 容器单图即近 OOM。
+            # 现按模式与实际透明度分流：
+            #   - P 无 transparency / 其它非 RGB 模式 → 直接 convert("RGB")
+            #    （调色板 LUT 转换，单份输出，无白底合成）；
+            #   - 全不透明（alpha 恒 255，网页截图/导出图常见）→ 丢通道即可，
+            #     省掉白底 + 掩码 paste 的两份全量；
+            #   - 全透明（alpha 恒 0）→ 结果本就是纯白，直接建白底；
+            #   - 真半透明 → 才做白底 + alpha 掩码 paste（此时才物化掩码）。
+            if img.mode == "P":
+                if "transparency" in img.info:
+                    img = img.convert("RGBA")
+                else:
+                    img = img.convert("RGB")
+            if img.mode in ("RGBA", "LA"):
+                # 多波段 getextrema() 直接取末波段（A）极值，不物化整条
+                # 24MB 级的掩码通道；只有真半透明分支才需要掩码做 paste。
+                lo, hi = img.getextrema()[-1]
+                if lo == 255:                       # 全不透明：丢通道
+                    img = img.convert("RGB")
+                elif hi == 0:                       # 全透明：结果恒为白底
+                    img = Image.new("RGB", img.size, (255, 255, 255))
+                else:
+                    background = Image.new("RGB", img.size, (255, 255, 255))
+                    background.paste(img, mask=img.getchannel("A"))
+                    img = background
             elif img.mode != "RGB":
                 img = img.convert("RGB")
 

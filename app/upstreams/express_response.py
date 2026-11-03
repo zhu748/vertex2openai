@@ -473,12 +473,20 @@ async def _chunk_openai_response_dict_for_sse(
             # openai_response_dict 引用），发射阶段恒驻 2×content；改为
             # iter_giant_content 按需产片，每帧只在 yield 瞬间存在一个
             # 256KiB 切片，峰值降为 1×+256KiB。
+            #
+            # 步进节奏（2026-11 第三轮）：巨帧切片不再逐帧 sleep 0.01——
+            # data URL 对前端不可增量渲染（收完才能显示），步进是纯延迟
+            #（4K ≈52-160 帧 → 0.5-1.6s，2K ≈16 帧 → 160ms），且 Cookie
+            # 通道同路径从不步进。改 sleep(0) 仅让出事件循环，慢客户端由
+            # TCP 背压自然限速；文本假流式的 10 段节奏保持 0.01 不变。
             if len(content_to_chunk) > GIANT_CONTENT_THRESHOLD:
                 pieces: Any = iter_giant_content(content_to_chunk)
                 multi_frame = True
+                frame_pause = 0.0
             elif "![Image](data:image/" in content_to_chunk:
                 pieces = [content_to_chunk] if content_to_chunk else []
                 multi_frame = False
+                frame_pause = 0.01
             else:
                 chunk_size = (
                     max(1, math.ceil(len(content_to_chunk) / 10))
@@ -490,13 +498,14 @@ async def _chunk_openai_response_dict_for_sse(
                     for i in range(0, len(content_to_chunk), chunk_size)
                 ]
                 multi_frame = len(pieces) > 1
+                frame_pause = 0.01
             if not content_to_chunk and not reasoning_content:
                 yield _sse({"content": ""})
             else:
                 for piece in pieces:
                     yield _sse({"content": piece})
                     if multi_frame:
-                        await asyncio.sleep(0.01)
+                        await asyncio.sleep(frame_pause)
 
         for tc_item_idx, tool_call_item in enumerate(message.get("tool_calls") or []):
             tool_delta = {

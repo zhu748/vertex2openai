@@ -46,6 +46,20 @@ _PRO_IMAGE_ARS = {"1:1", "3:2", "2:3", "3:4", "1:4", "4:1", "4:3", "4:5", "5:4",
 _FLASH_IMAGE_ARS = _PRO_IMAGE_ARS
 _NANO_BANANA_ARS = _PRO_IMAGE_ARS
 
+# OpenAI images 风格 size（dall-e-2/3、gpt-image-1）→ Gemini 宽高比。
+# 旧实现只映射 1024x1024/1024x768/768x1024 三个值：dall-e-3 与
+# gpt-image-1 的竖版/横版（1536x1024 等 4 个）会落到“无比例”分支，
+# 客户端明确选择的构图被静默丢弃（2026-11 补全）。
+_SIZE_AR_MAP = {
+    "1024x1024": "1:1",
+    "1024x768": "4:3",
+    "768x1024": "3:4",
+    "1536x1024": "3:2",
+    "1024x1536": "2:3",
+    "1792x1024": "16:9",
+    "1024x1792": "9:16",
+}
+
 # ---- 思考档位阶梯（由低到高）----
 # 出处：Agent Platform → Get started with Gemini 3（核对于 2026-07-26）
 #   MINIMAL 仅 Gemini 3 Flash / 3.1 Flash-Lite 有；
@@ -419,14 +433,80 @@ def sanitize_sampling(config: Dict[str, Any], profile: Dict[str, Any]) -> Dict[s
     return config
 
 
+def image_resolution_suffix(name: str) -> tuple[str, Optional[str]]:
+    """拆掉生图模型名尾部的分辨率后缀（-1k/-2k/-4k/-512），返回 (基础名, 档位)。
+
+    旧实现只在 _strip_known_suffixes（家族识别）里剥这些后缀：客户端发
+    gemini-3.1-flash-image-4k 时档案判定正确，但完整模型名原样发给上游
+    （目录里不存在该 ID → 404），后缀也从未转成 imageConfig.imageSize
+    ——别名“认得出、不生效”（2026-11 修复）。
+
+    仅当去掉后缀后的基础名仍是生图档案时才剥离，避免误伤未来真以
+    -4k 结尾命名的文本模型；与 _strip_known_suffixes 的家族识别口径一致。
+    """
+    if not name:
+        return name, None
+    lowered = name.lower()
+    for suffix in ("-4k", "-2k", "-1k", "-512"):
+        if lowered.endswith(suffix) and len(lowered) > len(suffix):
+            base = name[: -len(suffix)]
+            if get_profile(base)["is_image"]:
+                return base, suffix[1:].upper()   # "-4k"→"4K"、"-512"→"512"
+    return name, None
+
+
+def strip_image_resolution_suffix(name: str) -> str:
+    """通道侧便捷封装：只取剥离后的基础名（发往上游）。"""
+    return image_resolution_suffix(name)[0]
+
+
+def _size_param_hint(request: Any) -> Optional[str]:
+    """从 OpenAI images 风格 size 推断生图档位，仅接受无歧义的意图。
+
+    长边 ≥2048（gpt-image-1 的 2048 档）→ 就近 2K/4K；长边 ≤640
+    （dall-e-2 的 512/256）→ 512。其余（1024/1536/1792）返回 None，
+    保持既有默认 1K——dall-e-3 客户端按 1792 拿 1K 是今天的既定行为，
+    不应因为补映射而悄悄放大 4 倍像素成本。auto/未知格式同样返回 None。
+    """
+    size_param = _extra(request, "size")
+    if not isinstance(size_param, str):
+        return None
+    m = re.fullmatch(r"\s*(\d{2,5})\s*[xX×]\s*(\d{2,5})\s*", size_param)
+    if not m:
+        return None
+    long_edge = max(int(m.group(1)), int(m.group(2)))
+    if long_edge >= 3072:
+        return "4K"
+    if long_edge >= 2048:
+        return "2K"
+    if 256 <= long_edge <= 640:
+        return "512"
+    return None
+
+
 def resolve_image_size(model_name: str, request: Any, settings: Dict[str, Any]) -> Optional[str]:
-    """确定生图分辨率（大写 1K/2K/4K/512），按模型白名单校验，缺省回退。"""
+    """确定生图分辨率（大写 1K/2K/4K/512），按模型白名单校验，缺省回退。
+
+    优先级：请求 image_size 字段 > 模型名分辨率后缀（-4k 等，2026-11）>
+    OpenAI size 参数（仅 ≥2048/≤640 的明确档位意图）> 控制台设置 > 1K。
+    """
     prof = get_profile(model_name)
     if not prof["is_image"]:
         return None
     sizes = prof["image_sizes"]
     settings = settings or {}
-    raw = _extra(request, "image_size") or settings.get("image_size") or "1K"
+    raw = _extra(request, "image_size")
+    if not raw:
+        # 通道可能已把后缀从模型名里剥掉（发上游用基础名）；两处都查，
+        # 哪边带后缀都能取到档位提示。
+        raw = (
+            image_resolution_suffix(model_name)[1]
+            or image_resolution_suffix(getattr(request, "model", "") or "")[1]
+        )
+    if not raw:
+        raw = _size_param_hint(request)
+    if not raw:
+        raw = settings.get("image_size") or "1K"
     size = str(raw).upper().replace("0.5K", "512").replace("512PX", "512")
     if size in sizes:
         return size
@@ -486,13 +566,11 @@ def resolve_aspect_ratio(model_name: str, request: Any, settings: Dict[str, Any]
     if not raw:
         size_param = _extra(request, "size")
         if isinstance(size_param, str):
-            if size_param == "1024x1024":
-                raw = "1:1"
-            elif size_param == "1024x768":
-                raw = "4:3"
-            elif size_param == "768x1024":
-                raw = "3:4"
-            elif ":" in size_param:
+            # OpenAI images 风格 size → 比例映射（含 dall-e-3 / gpt-image-1
+            # 的竖横版，2026-11 补全）；“a:b” 形态继续原样透传。
+            normalized = size_param.strip().lower()
+            raw = _SIZE_AR_MAP.get(normalized)
+            if not raw and ":" in size_param:
                 raw = size_param
     if not raw:
         raw = _prompt_aspect_ratio(request)
