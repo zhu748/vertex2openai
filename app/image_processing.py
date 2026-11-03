@@ -73,7 +73,10 @@ def optimize_image_bytes(
         with Image.open(io.BytesIO(image_data)) as img:
             # Compression drops EXIF metadata. Apply camera orientation first
             # so portrait photos do not silently turn sideways upstream.
-            img = ImageOps.exif_transpose(img)
+            # The default returns a full pixel copy even without EXIF rotation.
+            # The original context-manager image then stays alive until exit,
+            # adding a whole decoded image throughout conversion and resizing.
+            ImageOps.exif_transpose(img, in_place=True)
             # 抹平透明通道以防转成 JPEG 时报错（2026-11 内存优化）：
             # 旧实现无论入图什么模式都先 convert("RGBA") 再建白底再 paste，
             # 一张 40MP RGBA PNG 会同时驻留 RGBA 原图 + RGBA 拷贝 + 白底

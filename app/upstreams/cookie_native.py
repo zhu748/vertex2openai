@@ -38,7 +38,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 import config as app_config
 import model_capabilities as mc
-from admission import GenerationCapacityError, limit_generation
+from json_encoding import LargeJSONResponse, iter_json_bytes
+from admission import GenerationCapacityError, limit_generation, run_with_image_limit
 from cookie_auth import (
     STREAM_GENERATE_OPERATION_NAME,
     build_headers,
@@ -374,6 +375,33 @@ def _image_part(markdown: str) -> dict:
     return {"text": markdown}
 
 
+def _part_json_size(part: dict) -> int:
+    """Measure the existing JSON wire format without copying giant string values.
+
+    JSON string escaping is additive across chunks. Replace large values with
+    empty strings in a small skeleton, then count their escaped UTF-8 contents
+    in 64 KiB slices. Quotes, separators, and non-string values are still
+    measured by the standard encoder, preserving the response budget exactly.
+    """
+    extra = 0
+    chunk_chars = 64 * 1024
+
+    def shrink(value):
+        nonlocal extra
+        if isinstance(value, str) and len(value) > chunk_chars:
+            for start in range(0, len(value), chunk_chars):
+                extra += len(json.dumps(value[start:start + chunk_chars], ensure_ascii=False).encode("utf-8")) - 2
+            return ""
+        if isinstance(value, dict):
+            return {key: shrink(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [shrink(item) for item in value]
+        return value
+
+    skeleton = shrink(part)
+    return len(json.dumps(skeleton, ensure_ascii=False).encode("utf-8")) + extra
+
+
 class NativeAssembler:
     """把 cookie 通道事件流拼装成 Gemini 原生响应。
 
@@ -428,7 +456,7 @@ class NativeAssembler:
         elif kind == "blocked":
             self.blocked = str(data).split("（")[0].split("(")[0].strip() or "BLOCKED"
         if part is not None:
-            size = len(json.dumps(part, ensure_ascii=False).encode("utf-8"))
+            size = _part_json_size(part)
             self.response_bytes = self.response_bytes + size if self.retain_parts else size
             if self.response_bytes > MAX_RESPONSE_BYTES:
                 raise NativeBridgeError(502, "上游响应超过允许的大小。")
@@ -603,6 +631,15 @@ async def handle_native_request(fastapi_request: Request, model: str, action: st
 @limit_generation
 async def _handle_native_request(fastapi_request: Request, model: str, action: str,
                                  parsed: dict, *, requested_model: str, deadline: float):
+    return await run_with_image_limit(
+        model if action in ("generateContent", "streamGenerateContent") else "",
+        lambda: _handle_native_request_impl(fastapi_request, model, action, parsed,
+                                           requested_model=requested_model, deadline=deadline),
+    )
+
+
+async def _handle_native_request_impl(fastapi_request: Request, model: str, action: str,
+                                      parsed: dict, *, requested_model: str, deadline: float):
     if action not in ("generateContent", "streamGenerateContent"):
         return _native_error(400, f"Cookie 通道暂不支持 :{action}，请配置 Express API Key。", "INVALID_ARGUMENT")
     record = credential_manager.get_cookie_record()
@@ -629,14 +666,22 @@ async def _handle_native_request(fastapi_request: Request, model: str, action: s
             assembler = NativeAssembler(requested_model or model, retain_parts=False)
             first = True
 
-            def encode(payload):
+            def encode(payload, *, fragmented=False):
                 nonlocal first
-                data = json.dumps(payload, ensure_ascii=False)
                 if use_sse:
-                    return "data: " + data + "\n\n"
-                prefix = "" if first else ","
-                first = False
-                return prefix + data
+                    prefix, suffix = b"data: ", b"\n\n"
+                else:
+                    prefix, suffix = (b"" if first else b","), b""
+                    first = False
+                if not fragmented:
+                    # Keep ordinary token/tool events as one text frame.
+                    yield prefix.decode("ascii") + json.dumps(payload, ensure_ascii=False) + suffix.decode("ascii")
+                    return
+                yield prefix
+                # These are byte fragments of ONE SSE event/array element.
+                # Never turn an inlineData string into multiple model Parts.
+                yield from iter_json_bytes(payload)
+                yield suffix
 
             yield HEARTBEAT_FRAME if use_sse else "["
             try:
@@ -647,8 +692,11 @@ async def _handle_native_request(fastapi_request: Request, model: str, action: s
                             continue
                         part = assembler.stream_event(kind, data)
                         if part is not None:
-                            yield encode({"candidates": [{"content": {"role": "model", "parts": [part]}, "index": 0}]})
-                yield encode(assembler.terminal())
+                            for chunk in encode({"candidates": [{"content": {"role": "model", "parts": [part]}, "index": 0}]},
+                                                fragmented=assembler.response_bytes > 1024 * 1024):
+                                yield chunk
+                for chunk in encode(assembler.terminal()):
+                    yield chunk
                 stats.add_success()
                 credential_manager.record_cookie_success(account_id, credential=record)
                 print(f"✅ [Cookie 原生桥] {model} | 流式完成 | {assembler.part_count} parts")
@@ -658,14 +706,17 @@ async def _handle_native_request(fastapi_request: Request, model: str, action: s
                 if exc.code == 499:
                     return
                 stats.add_error()
-                yield encode(_google_error_body(exc.code, exc.message))
+                for chunk in encode(_google_error_body(exc.code, exc.message)):
+                    yield chunk
             except IncompleteResponseError as exc:
                 stats.add_error()
-                yield encode(_google_error_body(502, str(exc), "UNAVAILABLE"))
+                for chunk in encode(_google_error_body(502, str(exc), "UNAVAILABLE")):
+                    yield chunk
             except Exception as exc:
                 stats.add_error()
-                yield encode(_google_error_body(502, f"Cookie 通道桥接异常：{type(exc).__name__}: {exc}"[:1024],
-                                                "UNAVAILABLE"))
+                for chunk in encode(_google_error_body(502, f"Cookie 通道桥接异常：{type(exc).__name__}: {exc}"[:1024],
+                                                       "UNAVAILABLE")):
+                    yield chunk
             if not use_sse:
                 yield "]"
 
@@ -686,4 +737,5 @@ async def _handle_native_request(fastapi_request: Request, model: str, action: s
     stats.add_success()
     credential_manager.record_cookie_success(account_id, credential=record)
     print(f"✅ [Cookie 原生桥] {model} | 非流式完成 | {assembler.part_count} parts")
-    return JSONResponse(content=payload)
+    response_class = LargeJSONResponse if mc.get_profile(model)["is_image"] else JSONResponse
+    return response_class(content=payload)

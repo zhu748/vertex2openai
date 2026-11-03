@@ -26,6 +26,7 @@ from google.genai import types
 
 # 引入报错重试统计器
 from logger import stats
+from json_encoding import LargeJSONResponse
 from media_tasks import run_media_task
 from message_processing import (
     GIANT_CONTENT_THRESHOLD,
@@ -1150,12 +1151,13 @@ class SDKGeneration:
         response_obj_call = None
         _prepend_prefill(openai_response_content, self.prefill_text)
         # 巨帧（4K 生图）主动回收 SDK/pydantic 引用环（同假流式路径）。
-        # 注：曾评估过"预序列化再 encode"替代 JSONResponse（期望省一份
-        # 拷贝），实测 CPython json C 编码器的内部累积缓冲峰值本身就达
-        # content+输出+缓冲 ≈ 2.2×content，提前释放 dict 不改变峰值，
-        # 故保持 JSONResponse（scripts/measure_emission_memory.py 可复测）。
+        # Encode giant strings in bounded slices into the final byte buffer;
+        # unlike pre-serializing with dumps(), this also avoids its accumulator
+        # and the complete JSON-text -> UTF-8 copy.
         if _response_has_giant_content(openai_response_content):
             gc.collect()
+            print(f"✅ [Express] {self.request_obj.model} | 非流式响应完成")
+            return LargeJSONResponse(content=openai_response_content)
         print(f"✅ [Express] {self.request_obj.model} | 非流式响应完成")
         return JSONResponse(content=openai_response_content)
 

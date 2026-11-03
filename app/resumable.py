@@ -686,7 +686,10 @@ class ResumableStore:
         async with self._lock:
             if self._buffers.get(buf.id) is not buf or buf.done:
                 return False
-            task = self._pumps.pop(buf.id, None)
+            # Keep the task discoverable until its completion callback runs.
+            # An identical request arriving during cancellation must wait for
+            # the old upstream's cleanup before starting its replacement.
+            task = self._pumps.get(buf.id)
             await buf.fail(reason, 410, "superseded")
         if (task is not None and task is not asyncio.current_task()
                 and not task.done() and not task.cancelling()):

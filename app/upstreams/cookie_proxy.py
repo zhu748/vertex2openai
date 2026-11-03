@@ -27,6 +27,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from first_reply import timed_call
 from impersonate import open_upstream_client
 from logger import stats
+from json_encoding import LargeJSONResponse
 from message_processing import _create_safety_ratings_html
 from models import OpenAIRequest
 from prefill import PrefillDeduper, strip_prefill_overlap
@@ -1344,7 +1345,8 @@ class CookieGeneration:
                     ],
                     "usage": usage,
                 }
-                return JSONResponse(content=payload)
+                response_class = LargeJSONResponse if self.is_image else JSONResponse
+                return response_class(content=payload)
 
             except Exception as e:
                 err_msg = str(e)

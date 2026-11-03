@@ -62,6 +62,7 @@ from config import API_KEY
 from express_endpoint import resolve_express_model_path
 from generation_config import _function_tools, _system_instruction
 from logger import stats
+from json_encoding import LargeJSONResponse
 from media_tasks import run_media_task
 from message_processing import create_gemini_prompt
 from model_loader import get_express_models
@@ -74,7 +75,7 @@ from request_connection import BodyTooLargeError
 from request_ingress import IngressError
 from routes.chat_api import _call_upstream
 from runtime_state import app_state
-from streaming import sse_frames
+from streaming import ByteBoundedQueue, sse_frames
 from upstream_errors import extract_upstream_error
 from upstreams.express_sdk import _normalize_model_name
 
@@ -196,11 +197,10 @@ def _claude_stream_response(response: StreamingResponse, display_model: str, *,
                 yield chunk
 
     _END = object()  # 生产者结束哨兵
-    # 有界队列：慢客户端（网络拥塞）不会让上游读帧无限堆内存——
-    # 队满时生产者阻塞在 put 上，形成自然背压；正常生成速率远低于消费
-    # 速率，128 帧余量足够不产生延迟。客户端断开/异常时 producer.cancel()
-    # 会唤醒阻塞中的 put。
-    frame_queue: asyncio.Queue = asyncio.Queue(maxsize=128)
+    # Text retains the existing 128-frame read-ahead, while image slices have
+    # a 2 MiB byte budget (128 x 256 KiB would otherwise retain 32 MiB).
+    # Cancelling the producer also interrupts a blocked byte-budget wait.
+    frame_queue = ByteBoundedQueue(maxsize=128, max_bytes=2 * 1024 * 1024)
 
     async def _produce_frames():
         """后台任务：从上游读帧入队；异常/结束也入队，交给消费者统一处理。"""
@@ -386,6 +386,10 @@ async def claude_messages(fastapi_request: Request, api_key: str = Depends(get_c
             message = _openai_error_message(payload, f"上游请求失败（HTTP {status}）。")
             err_status = status if status >= 400 else 502
             return claude_error(err_status, anthropic_error_type(err_status), message)
+        # The parsed content owns the image now. Release the intermediate
+        # OpenAI JSON body before encoding its Anthropic representation.
+        body_size = len(getattr(response, "body", b""))
+        response = None
         try:
             anthropic_payload = openai_completion_to_anthropic(
                 payload or {}, display_model, new_message_id(), omit_thinking=omit_thinking)
@@ -398,7 +402,8 @@ async def claude_messages(fastapi_request: Request, api_key: str = Depends(get_c
             tokens = f" | 输入 {usage.get('input_tokens', 0)} / 输出 {usage.get('output_tokens', 0)} tokens"
         print(f"✅ [Claude] 模型 {display_model} | 非流式响应完成 | "
               f"耗时 {time.monotonic() - request_started:.1f}s{tokens}")
-        return JSONResponse(content=anthropic_payload)
+        response_class = LargeJSONResponse if body_size > 1024 * 1024 else JSONResponse
+        return response_class(content=anthropic_payload)
 
     # ---- 流式：OpenAI SSE 帧 → Anthropic SSE 事件 ----
     return _claude_stream_response(response, display_model, omit_thinking=omit_thinking,

@@ -62,6 +62,40 @@ HEARTBEAT_FRAME = ": keep-alive\n\n"
 _FRAME_SEP_RE = re.compile(rb"\r\n\r\n|\n\n|\r\r")
 
 
+class ByteBoundedQueue:
+    """Backpressure on both item count and retained frame bytes.
+
+    One oversized frame may pass into an otherwise empty byte budget, so a
+    legal upstream event never deadlocks. Control items carry no byte charge.
+    """
+    def __init__(self, maxsize=128, max_bytes=2 * 1024 * 1024):
+        self._queue = asyncio.Queue(maxsize=maxsize)
+        self._max_bytes = max_bytes
+        self._bytes = 0
+        self._changed = asyncio.Condition()
+
+    async def put(self, item):
+        size = len(item) if isinstance(item, (bytes, bytearray)) else 0
+        async with self._changed:
+            await self._changed.wait_for(
+                lambda: not size or not self._bytes or self._bytes + size <= self._max_bytes)
+            self._bytes += size
+        try:
+            await self._queue.put((item, size))
+        except BaseException:
+            async with self._changed:
+                self._bytes -= size
+                self._changed.notify_all()
+            raise
+
+    async def get(self):
+        item, size = await self._queue.get()
+        async with self._changed:
+            self._bytes -= size
+            self._changed.notify_all()
+        return item
+
+
 async def sse_frames(source, max_frame_bytes=64 * 1024 * 1024):
     """Frame raw SSE before inserting comments or assigning resume IDs.
 

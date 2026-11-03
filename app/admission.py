@@ -98,6 +98,10 @@ class LeasedIterator:
     def __init__(self, source, lease, *, sse=True, observe=True):
         self.source = source.__aiter__()
         self.lease = lease
+        # An auxiliary memory gate owns no trace counters, but its upstream
+        # iterator still runs in the request's diagnostic context. Capture it
+        # here so reading/closing from another task preserves that identity.
+        self.trace = lease.trace if lease.trace is not None else current_trace.get()
         # 双层租约（全局闸 + 生图闸）同流包装时只让最外层记账，
         # 否则 sent_frames/bytes 会被双计。
         self.observer = (
@@ -109,7 +113,7 @@ class LeasedIterator:
 
     async def __anext__(self):
         token = current_proxy_usage.set(self.lease.usage)
-        trace_token = current_trace.set(self.lease.trace)
+        trace_token = current_trace.set(self.trace)
         try:
             chunk = await anext(self.source)
             if self.observer:
@@ -128,7 +132,7 @@ class LeasedIterator:
             current_proxy_usage.reset(token)
 
     async def aclose(self):
-        token = current_trace.set(self.lease.trace)
+        token = current_trace.set(self.trace)
         try:
             close = getattr(self.source, "aclose", None)
             if close:
@@ -156,6 +160,29 @@ class ManagedStreamingResponse(StreamingResponse):
             await super().__call__(scope, receive, send)
         finally:
             await self.aclose()
+
+
+async def run_with_image_limit(model, operation):
+    """Share the image memory gate across all protocols and upstream channels."""
+    from model_capabilities import get_profile
+
+    if not get_profile(model)["is_image"]:
+        return await operation()
+    lease = image_limiter.reserve()
+    try:
+        response = await operation()
+    except BaseException as exc:
+        lease.release("cancelled" if isinstance(exc, (asyncio.CancelledError, GeneratorExit)) else "error", str(exc))
+        raise
+    if isinstance(response, StreamingResponse):
+        response.body_iterator = LeasedIterator(
+            response.body_iterator, lease,
+            sse="text/event-stream" in response.headers.get("content-type", ""),
+            observe=False,
+        )
+    else:
+        lease.release("succeeded" if response.status_code < 400 else "error")
+    return response
 
 
 def limit_generation(function):

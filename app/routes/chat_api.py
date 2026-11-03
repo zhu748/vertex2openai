@@ -23,11 +23,9 @@ from upstreams.cookie_proxy import CookieProxyUpstream
 from upstream_errors import extract_upstream_error, create_openai_error_response
 from logger import stats
 from streaming import keepalive_sse, close_setup_task
-from admission import LeasedIterator, image_limiter, limit_generation, ManagedStreamingResponse
+from admission import image_limiter as image_limiter, limit_generation, ManagedStreamingResponse, run_with_image_limit
 from response_validation import IncompleteResponseError
 from request_tracking import configure as track_configure
-
-import model_capabilities
 
 # 第二轮：弱网可靠传输 —— 服务端响应缓冲 + 序列号事件 + 断线重放 / 分片轮询。
 # 上游读取由后台泵驱动，与前端连接解绑；已收到的事件保存在有界缓冲。
@@ -326,47 +324,10 @@ async def _apply_json_fallback(
 
 @limit_generation
 async def _call_upstream(request_obj: OpenAIRequest, fastapi_request: Request):
-    """选择上游凭证并生成交付响应；生图请求叠加第二道并发闸。
-
-    生图并发闸（image_max_concurrency，默认 2，2026-11 第二轮）：4K
-    生图单次峰值 RSS +150~200MB，两路并发即可 OOMKill 512MB 容器
-    （Render 免费档），因此生图在全局闸之外单独计数，满时 503 快速
-    失败（文本流不受影响）。流式响应把生图名额挂到最内层
-    body_iterator（随流 EOF/断开/取消释放，与全局闸同生命周期语义）；
-    非流式与异常路径立即释放。
-    """
-    try:
-        image_slot_needed = bool(
-            model_capabilities.get_profile(request_obj.model)["is_image"]
-        )
-    except Exception:
-        image_slot_needed = False
-    image_lease = image_limiter.reserve() if image_slot_needed else None
-    try:
-        response = await _dispatch_upstream(request_obj, fastapi_request)
-    except BaseException as exc:
-        if image_lease is not None:
-            image_lease.release(
-                "cancelled"
-                if isinstance(exc, (asyncio.CancelledError, GeneratorExit))
-                else "error",
-                str(exc),
-            )
-        raise
-    if image_lease is None:
-        return response
-    if isinstance(response, StreamingResponse):
-        # 包装最内层 body_iterator：外层 limit_generation 的全局租约会再
-        # 包一层（两层 LeasedIterator 串行，各自释放各自名额；生图闸
-        # traced=False，不会双计 trace 里程碑/payload 观测）。
-        response.body_iterator = LeasedIterator(
-            response.body_iterator, image_lease, sse=True
-        )
-        return response
-    image_lease.release(
-        "succeeded" if getattr(response, "status_code", 200) < 400 else "error"
+    """选择上游；与 Gemini 原生接口共用生图内存并发闸。"""
+    return await run_with_image_limit(
+        request_obj.model, lambda: _dispatch_upstream(request_obj, fastapi_request)
     )
-    return response
 
 
 async def _dispatch_upstream(request_obj: OpenAIRequest, fastapi_request: Request):

@@ -1,5 +1,7 @@
 """Bound decoded HTTP bodies before buffering them in memory."""
 
+import io
+
 import anyio
 import httpx
 
@@ -14,12 +16,14 @@ async def read_limited_bytes(response, limit: int) -> bytes:
     """Read decoded bytes with a strict budget, even without Content-Length."""
     if declared_body_exceeds(response.headers.get("content-length", ""), limit):
         raise ValueError(f"HTTP 响应超过 {limit} 字节上限。")
-    data = bytearray()
-    async for chunk in response.aiter_bytes(chunk_size=min(64 * 1024, limit + 1)):
-        if len(data) + len(chunk) > limit:
-            raise ValueError(f"HTTP 响应超过 {limit} 字节上限。")
-        data.extend(chunk)
-    return bytes(data)
+    # BytesIO.getvalue() shares its finished immutable bytes buffer on CPython;
+    # bytearray -> bytes would keep two complete bodies alive during the copy.
+    with io.BytesIO() as data:
+        async for chunk in response.aiter_bytes(chunk_size=min(64 * 1024, limit + 1)):
+            if data.tell() + len(chunk) > limit:
+                raise ValueError(f"HTTP 响应超过 {limit} 字节上限。")
+            data.write(chunk)
+        return data.getvalue()
 
 
 async def read_upstream_bytes(response) -> bytes:

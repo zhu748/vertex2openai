@@ -58,7 +58,7 @@ from retry_policy import get_retry_settings, is_retryable_exception, is_retryabl
 from upstream_errors import extract_upstream_error, google_status_detail
 from usage import merge_usage_metadata
 from response_validation import IncompleteResponseError, has_finish_reason
-from admission import limit_generation, GenerationCapacityError
+from admission import limit_generation, GenerationCapacityError, run_with_image_limit
 from retry_policy import retry_delay as _retry_delay, wait_for_retry as _wait_for_retry
 from auth import constant_time_equal
 from config import API_KEY
@@ -389,6 +389,14 @@ async def _close_upstream(upstream: httpx.Response) -> None:
 @limit_generation
 async def _passthrough_request(fastapi_request: Request, model: str, action: str,
                                query: str, payload: bytes):
+    return await run_with_image_limit(
+        model if action in ("generateContent", "streamGenerateContent") else "",
+        lambda: _passthrough_request_impl(fastapi_request, model, action, query, payload),
+    )
+
+
+async def _passthrough_request_impl(fastapi_request: Request, model: str, action: str,
+                                   query: str, payload: bytes):
     """选 Key → 透传 → 429/5xx 换 Key 重试 → 钉定失败兜底。返回 Response。
 
     客户端生命周期：共享池化客户端（app/client_pool.py），同一代理形态下
