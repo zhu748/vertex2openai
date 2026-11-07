@@ -1000,7 +1000,19 @@ class SDKGeneration:
                         await close()
 
     async def collect_response(self):
-        track_configure(mode="json", upstream_model=self.model_to_call)
+        # 与流式路径（response()）及 Cookie 通道（cookie_proxy 两模式都上报
+        # thinking_level）对齐：非流式整取同样上报思考档位与输出上限。旧实现
+        # 只报 mode/upstream_model，请求监控对 json 模式永远显示「默认 / 默认」，
+        # 让人误以为控制台强制档位（native_thinking_mode=console）没生效——
+        # 实际 gen_config_dict 在 chat_completions 里就已带上 thinking_config，
+        # 流式与非流式共用同一份配置，仅监控字段缺失。
+        _thinking = self.gen_config_dict.get("thinking_config") or {}
+        track_configure(
+            mode="json",
+            upstream_model=self.model_to_call,
+            thinking_level=_thinking.get("thinking_level"),
+            max_output_tokens=self.gen_config_dict.get("max_output_tokens"),
+        )
         # 手动退避重试循环（替代 tenacity），以便在每次重试前检测客户端断开
         max_retries, backoff_sec, jitter_sec = get_retry_settings()
         response_obj_call = None

@@ -2,6 +2,12 @@
 
 基于原版 `vertex2openai-main`（2026-09-01），持续完善兼容性、可靠性和代码组织。
 
+## 2026-11-07（第八轮）：Express 非流式请求跟踪上报思考档位与输出上限
+
+- 背景：用户核实「3.5-flash-lite 开启全局最高思考强度并强制跟随上方档位（`native_thinking_mode=console`）后，非流式请求监控仍显示思考档位=默认，流式却正常显示 high」。属实——Express 通道的 `track_configure` 只在流式分支（`SDKGeneration.response()`）上报 `thinking_level` / `max_output_tokens`，非流式整取 `collect_response()` 仅上报 `mode` / `upstream_model`，请求监控对 json 模式永远显示「默认 / 默认」，让人误以为控制台强制档位没生效。实际上 `thinking_config` 在 `chat_completions` 阶段就已写入 `gen_config_dict`，流式与非流式共用同一份配置，档位照常下发（用户 trace 里非流式请求生成 2,645 字符思考即为佐证：`gemini-3.5-flash-lite` 家族默认档位是 minimal，强制 high 未生效不可能产出该量级思考）；Cookie 通道两种模式均上报，唯 Express json 模式漏报。
+- 修复：`collect_response` 入口对齐流式路径与 Cookie 通道口径，从 `gen_config_dict` 读取 `thinking_config.thinking_level` 与 `max_output_tokens` 一并上报；无思考配置（legacy 模型）时上报 None，监控侧维持「默认」显示。纯诊断字段补齐，上游请求与响应行为零变化。
+- 测试：`test_express_json_tracking` 新增 2 项契约（上报档位与上限 / 无配置时上报 None，用「客户端已断开」短路重试循环免去上游桩）；全量套件打补丁前后失败集合逐条一致（17 项既有跨文件隔离失败，原始 HEAD 同批次同样失败，零新增）。
+
 ## 2026-11-03（第七轮）：断开超窗后直接取消上游（不再后台空烧）
 
 - 背景：用户指出「断开连接之后，超过了断连续传的时间，已经连不上了，应该直接取消请求上游，而不是在后台浪费请求」。属实——旧实现里 `resume_expired()` 只在懒检查点生效（重连 410 / 同指纹新请求替换 / 面板 meta），断开超窗后无人再来时，后台泵任务会把上游跑到自然结束，最长吃满整轮 `request_timeout_seconds`（默认 1800 秒）：慢思考/长生成请求的配额就这样替一个永远不会回来的客户端烧掉（README 旧文甚至明说「窗口不是后台任务的自动取消定时器」）。非流式路径最典型：HTTP 处理器挂在 `buf.wait_for` 等整取结果，连接早已死亡，上游却照常跑完。
