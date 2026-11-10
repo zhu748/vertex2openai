@@ -1053,12 +1053,10 @@ Gemini 原生 `streamGenerateContent?alt=sse` 默认增加安全的事件间注�
 ## 本地开发与检查
 
 目录职责和扩展位置见 [代码结构与维护约定](docs/architecture.md)，
-最新图片防崩溃审查与内存基准见 [图片内存专项复核（2026-11-03）](docs/image-memory-audit-2026-11-03.md)，
-此前逐轮修复见 [深入审查与迭代优化（2026-11-03）](docs/review-2026-11-03-iterative.md)，
-此前的全面审查见 [全面审查与优化](docs/comprehensive-review.md)，
-此前记录见 [项目审查与优化记录](docs/optimization-review.md)。
-模块职责与维护入口见 [架构约定](docs/architecture.md)，
-本轮结构调整与复查结果见 [可维护性重构记录](docs/maintainability-2026-10-25.md)。
+代理协议的验证证据见 [代理协议与转换验证](docs/proxy-protocol-validation.md)。
+历史审查与优化快照（带日期的轮次记录、审计证据包）已统一移入
+[docs/archive/](docs/archive/)，仅作过程留档，不描述当前行为；
+各轮变更的权威叙述见 `CHANGES.md`。
 应用入口为 `app/main.py`，管理路由位于 `app/routes/`，页面位于 `app/templates/`；
 离线回归集中在 `tests/`，`scripts/` 保留检查入口与诊断工具。
 
