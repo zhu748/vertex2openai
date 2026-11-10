@@ -144,9 +144,37 @@ def sort_levels(levels) -> list:
     return known + extra
 
 
+# ---------------------------------------------------------------------------
+# 模型别名后缀域（2026-11 P3-2 自 anti_truncation 归位）：后缀表与别名拆分是
+# 纯字符串解析，supports_transport 需要 get_profile——三者本质都是模型能力
+# 档案的查询面，住在档案层后 anti_truncation 不再被本模块反向引用。
+# anti_truncation re-export 这三个名字以保持历史 import 路径与测试 seam。
+# ---------------------------------------------------------------------------
+SUFFIX_MODES = {
+    "-antitruncation-nonstream": "nonstream",
+    "-antitruncation-stream": "stream",
+    "-antitruncation": "stream",  # short alias accepted for manual clients
+}
+
+
+def split_model_alias(model: str) -> tuple[str, str | None]:
+    """Strip only our suffix; keep the upstream model's original spelling."""
+    name = model.strip()
+    for suffix, mode in SUFFIX_MODES.items():
+        if name.lower().endswith(suffix):
+            return name[:-len(suffix)], mode
+    return name, None
+
+
+def supports_transport(model: str) -> bool:
+    """该模型是否走文本传输（抗截断参数流只对纯文本生成模型有意义）。"""
+    name, _ = split_model_alias(model)
+    return (not get_profile(name)["is_image"]
+            and not re.search(r"audio|tts|live|embed|video|robotics", name, re.I))
+
+
 def _strip_known_suffixes(name: str) -> str:
     """去掉抗截断 / -search / 分辨率 / 思考档位别名，得到判断家族用的基础名。"""
-    from anti_truncation import split_model_alias
     n, _ = split_model_alias(name.lower())
     for suf in ("-search", "-1k", "-2k", "-4k", "-512"):
         if n.endswith(suf):
@@ -658,7 +686,6 @@ def capabilities_summary(model_name: str, settings: Optional[Dict[str, Any]] = N
     传入该模型生效的 settings 时，会把「采样参数处理」开关算进去，
     否则控制台显示的能力会和实际下发的参数对不上。
     """
-    from anti_truncation import supports_transport
     prof = get_profile(model_name)
     default_sampling_advice = prof.get("sampling_advice")
     if settings:

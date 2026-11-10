@@ -24,31 +24,13 @@ from response_validation import (
 )
 
 
-SUFFIX_MODES = {
-    "-antitruncation-nonstream": "nonstream",
-    "-antitruncation-stream": "stream",
-    "-antitruncation": "stream",  # short alias accepted for manual clients
-}
-
+# 后缀表与别名拆分自 2026-11 P3-2 起住在 model_capabilities（能力档案层，
+# 见其注释）；此处 re-export 保持 `from anti_truncation import SUFFIX_MODES /
+# split_model_alias` 的历史路径与 patch seam。
+from model_capabilities import SUFFIX_MODES, split_model_alias, supports_transport  # noqa: F401
 
 class TransportSelectionError(ValueError):
     code = 400
-
-
-def split_model_alias(model: str) -> tuple[str, str | None]:
-    """Strip only our suffix; keep the upstream model's original spelling."""
-    name = model.strip()
-    for suffix, mode in SUFFIX_MODES.items():
-        if name.lower().endswith(suffix):
-            return name[:-len(suffix)], mode
-    return name, None
-
-
-def supports_transport(model: str) -> bool:
-    from model_capabilities import get_profile
-    name, _ = split_model_alias(model)
-    return (not get_profile(name)["is_image"]
-            and not re.search(r"audio|tts|live|embed|video|robotics", name, re.I))
 
 
 def listed_suffixes(model: str, settings: dict) -> tuple[str, ...]:

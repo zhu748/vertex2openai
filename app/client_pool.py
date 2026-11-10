@@ -388,10 +388,19 @@ def get_pooled_express_client(api_key: str, key_proxy: Optional[str] = None) -> 
     return express_sdk_pool.get(api_key, key_proxy)
 
 
+# 额外池的关闭注册表（2026-11 P3-2 解 impersonate ↔ client_pool 环）：
+# impersonate 的上游客户端池在本模块注册关闭器，close_all_clients 遍历
+# 执行——依赖方向收拢为 impersonate → client_pool 单向。
+_extra_pool_closers: list = []
+
+
+def register_extra_pool_closer(closer) -> None:
+    """注册一个无参协程工厂；close_all_clients 收尾时统一调用。"""
+    _extra_pool_closers.append(closer)
+
+
 async def close_all_clients() -> None:
     """在事件循环结束前释放当前连接池与延迟回收队列。"""
-    from impersonate import _upstream_client_pool
-
     await asyncio.gather(express_sdk_pool.aclose(), passthrough_client_pool.aclose(),
-                         _upstream_client_pool.aclose())
+                         *(closer() for closer in _extra_pool_closers))
     await _closer.aclose()

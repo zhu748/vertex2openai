@@ -17,7 +17,7 @@ from http_io import BoundedAsyncClient, buffer_upstream_response
 from proxy_tls import build_httpx_proxy
 
 from runtime_state import app_state
-from client_pool import schedule_graceful_close, _closer
+from client_pool import register_extra_pool_closer, schedule_graceful_close, _closer
 
 # 控制台可选的伪装档案（curl_cffi 泛别名会跟随其内置的最新浏览器版本）
 SUPPORTED_PROFILES = ("off", "chrome", "edge", "safari", "firefox", "safari_ios")
@@ -434,3 +434,6 @@ def _make_upstream_closer(client: Any) -> Callable[[], Any]:
 
 
 _upstream_client_pool = _UpstreamClientPool()
+# 本池的关闭经注册表统一调度（2026-11 P3-2：client_pool.close_all_clients
+# 遍历注册的关闭器，不再反向 import 本模块）。
+register_extra_pool_closer(lambda: _upstream_client_pool.aclose())
