@@ -1,0 +1,25 @@
+# 覆盖率配置（2026-11 P3-5 引入）。
+#
+# 目的不是追求行数指标，而是为「tests/ 激进合并档（审查报告估 750-1,050
+# 行）」提供数据支撑：先看清哪些 app 模块在测试里零命中，再决定合并/删除
+# 哪些测试，避免无数据支撑的测试压缩。
+#
+# 运行：python -m coverage run -m pytest tests/ -q
+#      python -m coverage report --sort=cover | head -40   （低覆盖榜首）
+#      python -m coverage report --include="app/upstreams/*" --show-missing
+[run]
+source = app
+# 单进程运行（conftest 三层隔离已保证模块间互不污染，见 P2-8）。
+parallel = False
+# 生成的 .coverage 数据文件放仓库外层 build 目录，避免误提交。
+data_file = build/.coverage
+branch = False
+
+[report]
+# 控制台路径以仓库根为基准显示。
+skip_covered = False
+show_missing = False
+sort = cover
+# 测试探针脚本（scripts/probe_*）与生成物不参与统计。
+omit =
+    */__pycache__/*
