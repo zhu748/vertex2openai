@@ -213,12 +213,18 @@ func TestTURNRejectsWrongCredentialsAndUntrustedTLS(t *testing.T) {
 	}
 }
 
-func TestTURNCancellationStopsSilentServer(t *testing.T) {
+// startSilentServer accepts exactly one connection and discards whatever the
+// client sends until the peer goes away. The returned channel closes once the
+// accepted connection has fully torn down; tests use it to prove the caller
+// did not leak the control connection (shared by the authenticated and
+// anonymous cancellation tests).
+func startSilentServer(t *testing.T) (*net.TCPAddr, <-chan struct{}) {
+	t.Helper()
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	t.Cleanup(func() { ln.Close() })
 	closed := make(chan struct{})
 	go func() {
 		defer close(closed)
@@ -228,7 +234,12 @@ func TestTURNCancellationStopsSilentServer(t *testing.T) {
 			io.Copy(io.Discard, c)
 		}
 	}()
-	cfg := config{Server: "127.0.0.1", Port: ln.Addr().(*net.TCPAddr).Port, Username: "user", Password: "password"}
+	return ln.Addr().(*net.TCPAddr), closed
+}
+
+func TestTURNCancellationStopsSilentServer(t *testing.T) {
+	addr, closed := startSilentServer(t)
+	cfg := config{Server: "127.0.0.1", Port: addr.Port, Username: "user", Password: "password"}
 	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer cancel()
 	started := time.Now()

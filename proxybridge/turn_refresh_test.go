@@ -18,31 +18,37 @@ import (
 	"github.com/pion/stun/v4"
 )
 
-// scriptedTURN is an open TURN server whose Allocate and Refresh responses
-// carry configurable LIFETIME values, and which can inject one unsolicited
-// ConnectionAttempt indication ahead of the first Refresh response.
-type scriptedTURN struct {
-	ln           net.Listener
-	mu           sync.Mutex
-	refreshAt    []time.Time
-	cids         map[uint32]*net.TCPAddr
-	next         uint32
-	active       sync.WaitGroup
-	allocateLife atomic.Uint32 // seconds granted in the Allocate response
-	refreshLife  atomic.Uint32 // seconds granted in each Refresh response
-	injectOnce   atomic.Bool   // send a ConnectionAttempt before first Refresh reply
-	t            *testing.T
+// fakeTURN is the shared scriptable open TURN server for the anonymous-relay
+// and refresh-lifetime tests. Responses need no credentials; optional
+// behaviors are toggled via atomics:
+//   - allocateLife / refreshLife: seconds granted in Allocate / Refresh
+//     responses (default 600, the 0x00000288 the relay fake used to hardcode)
+//   - failRefresh: Refresh replies 437 allocation-quota-exceeded
+//   - injectConnectionAttempt: one unsolicited ConnectionAttempt indication
+//     ahead of the first Refresh response (RFC 6062 section 6.2.2)
+//   - refreshTimes(): timestamps of every observed Refresh transaction
+type fakeTURN struct {
+	ln                      net.Listener
+	mu                      sync.Mutex
+	refreshAt               []time.Time
+	cids                    map[uint32]*net.TCPAddr
+	next                    uint32
+	active                  sync.WaitGroup
+	allocateLife            atomic.Uint32 // seconds granted in the Allocate response
+	refreshLife             atomic.Uint32 // seconds granted in each Refresh response
+	failRefresh             atomic.Bool   // Refresh replies 437 instead of success
+	injectConnectionAttempt atomic.Bool   // send a ConnectionAttempt before first Refresh reply
 }
 
-func startScriptedTURN(t *testing.T) (*scriptedTURN, *net.TCPAddr) {
+func startFakeTURN(t *testing.T) (*fakeTURN, *net.TCPAddr) {
 	t.Helper()
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &scriptedTURN{ln: ln, cids: map[uint32]*net.TCPAddr{}, next: 0x2100, t: t}
-	s.allocateLife.Store(10)
-	s.refreshLife.Store(10)
+	s := &fakeTURN{ln: ln, cids: map[uint32]*net.TCPAddr{}, next: 0x2100}
+	s.allocateLife.Store(600)
+	s.refreshLife.Store(600)
 	go func() {
 		for {
 			conn, err := ln.Accept()
@@ -57,7 +63,7 @@ func startScriptedTURN(t *testing.T) (*scriptedTURN, *net.TCPAddr) {
 	return s, ln.Addr().(*net.TCPAddr)
 }
 
-func (s *scriptedTURN) serve(conn net.Conn) {
+func (s *fakeTURN) serve(conn net.Conn) {
 	msg, err := readSTUNRaw(conn)
 	if err != nil {
 		return
@@ -100,7 +106,7 @@ func (s *scriptedTURN) serve(conn net.Conn) {
 	}
 }
 
-func (s *scriptedTURN) relayControl(conn net.Conn) {
+func (s *fakeTURN) relayControl(conn net.Conn) {
 	for {
 		msg, err := readSTUNRaw(conn)
 		if err != nil {
@@ -133,7 +139,7 @@ func (s *scriptedTURN) relayControl(conn net.Conn) {
 			// server emit an unsolicited ConnectionAttempt indication on the
 			// control connection (RFC 6062 section 6.2.2). Public relays see
 			// these constantly from scanners.
-			if s.injectOnce.CompareAndSwap(true, false) {
+			if s.injectConnectionAttempt.CompareAndSwap(true, false) {
 				indication := stun.MustBuild(
 					stun.TransactionID,
 					stun.NewType(stun.MethodConnectionAttempt, stun.ClassIndication),
@@ -142,6 +148,10 @@ func (s *scriptedTURN) relayControl(conn net.Conn) {
 				if err := writeSTUNRaw(conn, indication); err != nil {
 					return
 				}
+			}
+			if s.failRefresh.Load() {
+				writeSTUNRaw(conn, errorReply(msg, 437))
+				return
 			}
 			s.mu.Lock()
 			s.refreshAt = append(s.refreshAt, time.Now())
@@ -158,14 +168,14 @@ func (s *scriptedTURN) relayControl(conn net.Conn) {
 	}
 }
 
-func (s *scriptedTURN) refreshTimes() []time.Time {
+func (s *fakeTURN) refreshTimes() []time.Time {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]time.Time(nil), s.refreshAt...)
 }
 
 // waitForRefreshes polls until at least n refreshes were observed.
-func waitForRefreshs(t *testing.T, s *scriptedTURN, n int, budget time.Duration) []time.Time {
+func waitForRefreshs(t *testing.T, s *fakeTURN, n int, budget time.Duration) []time.Time {
 	t.Helper()
 	deadline := time.Now().Add(budget)
 	for time.Now().Before(deadline) {
@@ -220,7 +230,7 @@ func echoRoundTrip(t *testing.T, conn net.Conn, payload []byte) {
 //     killed the allocation between refreshes.
 func TestAnonymousTURNRefreshHonorsGrantedLifetime(t *testing.T) {
 	peer := echoFixture(t)
-	server, addr := startScriptedTURN(t)
+	server, addr := startFakeTURN(t)
 	server.allocateLife.Store(4) // short initial grant
 	server.refreshLife.Store(2)  // even shorter re-grant
 	cfg := config{Scheme: "turn", Server: "127.0.0.1", Port: addr.Port}
@@ -248,10 +258,10 @@ func TestAnonymousTURNRefreshHonorsGrantedLifetime(t *testing.T) {
 // refresh, killing the allocation, and desynchronizing the stream.
 func TestAnonymousTURNIndicationDoesNotKillRefresh(t *testing.T) {
 	peer := echoFixture(t)
-	server, addr := startScriptedTURN(t)
+	server, addr := startFakeTURN(t)
 	server.allocateLife.Store(10)
 	server.refreshLife.Store(10)
-	server.injectOnce.Store(true)
+	server.injectConnectionAttempt.Store(true)
 	cfg := config{Scheme: "turn", Server: "127.0.0.1", Port: addr.Port}
 
 	conn := dialAnonymous(t, cfg, peer)

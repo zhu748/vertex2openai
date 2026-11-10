@@ -13,7 +13,6 @@ import (
         "io"
         "net"
         "sync"
-        "sync/atomic"
         "testing"
         "time"
 
@@ -51,130 +50,10 @@ func successReply(request *stun.Message, additional ...stun.Setter) *stun.Messag
         return msg
 }
 
-// fakeAnonymousTURN answers Allocate/Refresh with success (no credentials)
-// and relays bound data connections to the stored peer address.
-type fakeAnonymousTURN struct {
-        t           *testing.T
-        ln          net.Listener
-        mu          sync.Mutex
-        cids        map[uint32]*net.TCPAddr
-        next        uint32
-        active      sync.WaitGroup
-        failRefresh atomic.Bool
-        lifetime    [4]byte
-}
-
-func startFakeAnonymousTURN(t *testing.T, target *net.TCPAddr) (*fakeAnonymousTURN, *net.TCPAddr) {
-        t.Helper()
-        ln, err := net.Listen("tcp4", "127.0.0.1:0")
-        if err != nil {
-                t.Fatal(err)
-        }
-        fake := &fakeAnonymousTURN{t: t, ln: ln, cids: map[uint32]*net.TCPAddr{}, next: 0x1234,
-                lifetime: [4]byte{0, 0, 2, 88}}
-        go func() {
-                for {
-                        conn, err := ln.Accept()
-                        if err != nil {
-                                return
-                        }
-                        fake.active.Add(1)
-                        go func() { defer fake.active.Done(); defer conn.Close(); fake.serve(conn) }()
-                }
-        }()
-        t.Cleanup(func() { ln.Close(); fake.active.Wait() })
-        return fake, ln.Addr().(*net.TCPAddr)
-}
-
-func (f *fakeAnonymousTURN) serve(conn net.Conn) {
-        msg, err := readSTUNRaw(conn)
-        if err != nil {
-                return
-        }
-        switch msg.Type.Method {
-        case stun.MethodAllocate:
-                f.mu.Lock()
-                lifetime := f.lifetime
-                f.mu.Unlock()
-                if err := writeSTUNRaw(conn, successReply(msg, stun.RawAttribute{
-                        Type: stun.AttrLifetime, Value: lifetime[:]})); err != nil {
-                        return
-                }
-                f.relayControl(conn)
-        case stun.MethodConnectionBind:
-                value, err := msg.Get(stun.AttrConnectionID)
-                if err != nil {
-                        return
-                }
-                f.mu.Lock()
-                peer, matched := f.cids[binary.BigEndian.Uint32(value)]
-                f.mu.Unlock()
-                if !matched {
-                        writeSTUNRaw(conn, errorReply(msg, 400))
-                        return
-                }
-                if err := writeSTUNRaw(conn, successReply(msg)); err != nil {
-                        return
-                }
-                upstream, err := net.DialTimeout("tcp4", peer.String(), 5*time.Second)
-                if err != nil {
-                        return
-                }
-                defer upstream.Close()
-                done := make(chan struct{}, 2)
-                go func() { io.Copy(upstream, conn); done <- struct{}{} }()
-                go func() { io.Copy(conn, upstream); done <- struct{}{} }()
-                <-done
-        default:
-                writeSTUNRaw(conn, errorReply(msg, 400))
-        }
-}
-
-// relayControl answers Connect and Refresh transactions on the control
-// connection until it closes.
-func (f *fakeAnonymousTURN) relayControl(conn net.Conn) {
-        for {
-                msg, err := readSTUNRaw(conn)
-                if err != nil {
-                        return
-                }
-                switch msg.Type.Method {
-                case stun.MethodConnect:
-                        peerAddr := &stun.XORMappedAddress{}
-                        if err := peerAddr.GetFromAs(msg, stun.AttrXORPeerAddress); err != nil {
-                                writeSTUNRaw(conn, errorReply(msg, 400))
-                                return
-                        }
-                        f.mu.Lock()
-                        f.next++
-                        cid := f.next
-                        f.cids[cid] = &net.TCPAddr{IP: peerAddr.IP, Port: peerAddr.Port}
-                        f.mu.Unlock()
-                        value := make([]byte, 4)
-                        binary.BigEndian.PutUint32(value, cid)
-                        if err := writeSTUNRaw(conn, successReply(msg,
-                                stun.RawAttribute{Type: stun.AttrConnectionID, Value: value})); err != nil {
-                                return
-                        }
-                case stun.MethodCreatePermission:
-                        // Some servers require a permission before Connect; accept it.
-                        if err := writeSTUNRaw(conn, successReply(msg)); err != nil {
-                                return
-                        }
-                case stun.MethodRefresh:
-                        if f.failRefresh.Load() {
-                                writeSTUNRaw(conn, errorReply(msg, 437))
-                                return
-                        }
-                        if err := writeSTUNRaw(conn, successReply(msg, stun.RawAttribute{
-                                Type: stun.AttrLifetime, Value: []byte{0, 0, 2, 88}})); err != nil {
-                                return
-                        }
-                default:
-                        writeSTUNRaw(conn, errorReply(msg, 400))
-                }
-        }
-}
+// fakeAnonymousTURN / startFakeAnonymousTURN 已合并为 turn_refresh_test.go
+// 的 fakeTURN / startFakeTURN（2026-11 P2 测试去重）：两者本就是同一份
+// 「无鉴权 Allocate/ConnectionBind/Connect/Refresh + 拨号对端中继」骨架，
+// 仅 lifetime 配置方式与失败注入开关不同，现统一为原子开关。
 
 func errorReply(request *stun.Message, code stun.ErrorCode) *stun.Message {
         msg, err := stun.Build(
@@ -189,8 +68,7 @@ func errorReply(request *stun.Message, code stun.ErrorCode) *stun.Message {
 }
 
 func TestDetectTURNModeSelectsAnonymousAndPion(t *testing.T) {
-        peer := echoFixture(t)
-        _, openServer := startFakeAnonymousTURN(t, peer)
+        _, openServer := startFakeTURN(t)
         openCfg := config{Scheme: "turn", Server: "127.0.0.1", Port: openServer.Port}
         mode, err := detectTURNMode(t.Context(), openCfg, nil)
         if err != nil {
@@ -212,7 +90,7 @@ func TestDetectTURNModeSelectsAnonymousAndPion(t *testing.T) {
 
 func TestAnonymousTURNRelayRoundTrip(t *testing.T) {
         peer := echoFixture(t)
-        _, serverAddr := startFakeAnonymousTURN(t, peer)
+        _, serverAddr := startFakeTURN(t)
         cfg := config{Scheme: "turn", Server: "127.0.0.1", Port: serverAddr.Port,
                 Username: "", Password: ""}
         tlsConfig, err := cfg.tlsConfig()
@@ -254,21 +132,8 @@ func TestAnonymousTURNRelayRoundTrip(t *testing.T) {
 }
 
 func TestAnonymousTURNCancellationStopsSilentServer(t *testing.T) {
-        ln, err := net.Listen("tcp4", "127.0.0.1:0")
-        if err != nil {
-                t.Fatal(err)
-        }
-        defer ln.Close()
-        closed := make(chan struct{})
-        go func() {
-                defer close(closed)
-                c, err := ln.Accept()
-                if err == nil {
-                        defer c.Close()
-                        io.Copy(io.Discard, c)
-                }
-        }()
-        cfg := config{Scheme: "turn", Server: "127.0.0.1", Port: ln.Addr().(*net.TCPAddr).Port}
+        addr, closed := startSilentServer(t)
+        cfg := config{Scheme: "turn", Server: "127.0.0.1", Port: addr.Port}
         ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
         defer cancel()
         started := time.Now()
@@ -293,10 +158,8 @@ func TestAnonymousTURNCancellationStopsSilentServer(t *testing.T) {
 // erroring, the process survives, and repeated kills stay idempotent.
 func TestAnonymousTURNRefreshFailureFailsClosed(t *testing.T) {
         peer := echoFixture(t)
-        fake, serverAddr := startFakeAnonymousTURN(t, peer)
-        fake.mu.Lock()
-        fake.lifetime = [4]byte{0, 0, 0, 6} // 6s → first refresh after 5s
-        fake.mu.Unlock()
+        fake, serverAddr := startFakeTURN(t)
+        fake.allocateLife.Store(6) // 6s → first refresh after 5s
         fake.failRefresh.Store(true)
 
         cfg := config{Scheme: "turn", Server: "127.0.0.1", Port: serverAddr.Port}
