@@ -1,4 +1,8 @@
-/* Shared console helpers, channel configuration and Express credentials. */
+/* Shared console helpers, channel configuration and Express credentials.
+ * 2026-11 P2-6：并入 IIFE 命名空间体系（与 channel-config / console-models 的
+ * 隐式全局 + onclick 契约共存——外部引用面经 window 显式导出，可变状态用
+ * getter/setter 与闭包双向同步，行为与原全局版本一致）。 */
+(() => {
 const $ = (id) => document.getElementById(id);
 let keysRevision = null;
 let settingsLoaded = false,
@@ -654,3 +658,77 @@ async function saveExpressUa() {
     );
   });
 }
+
+
+  /* ---- 外部引用面（与历史隐式全局一致；2026-11 P2-6 并入 IIFE 体系）----
+   * $ / toast / esc / readJSON 等基座被其余控制台脚本与 HTML onclick 引用。
+   * 函数声明不会重绑，静态挂载即可；可变状态走 getter/setter 双向同步：
+   * console-forms 的 discard 会重绑 KEYS，guard 变量由 console-models
+   * 置位、channel-config / console-forms 读取，闭包内重绑也要让外部读到。 */
+  Object.assign(window, {
+  accountProxyFields,
+  addKeyRow,
+  collectKeys,
+  credentialCopy,
+  esc,
+  fmt,
+  keyProxyPill,
+  keySrcPill,
+  loadExpressKeys,
+  loadNotice,
+  loadRuntime,
+  logout,
+  mergeProbeResults,
+  navigateHash,
+  postSettings,
+  probeAllKeys,
+  probeOneKey,
+  projectFromInput,
+  proxyDraft,
+  readJSON,
+  removeKeyRow,
+  renderKeys,
+  renderMode,
+  responseError,
+  saveExpressKeys,
+  saveExpressUa,
+  saveFingerprint,
+  saveProxy,
+  switchTab,
+  testProxy,
+  toast,
+  updateExpressCustomVis,
+  updateExpressPill,
+  updateFpPill,
+  updateMode,
+  updateProxyDraft,
+  updateProxyPill
+  });
+  Object.defineProperty(window, '$', { get: () => $ });
+  Object.defineProperty(window, 'FP_LABELS', { get: () => FP_LABELS });
+  Object.defineProperty(window, 'FP2_LABELS', { get: () => FP2_LABELS });
+  Object.defineProperty(window, 'settingsLoaded', {
+    get: () => settingsLoaded,
+    set: (v) => { settingsLoaded = v; }
+  });
+  Object.defineProperty(window, 'keysLoaded', {
+    get: () => keysLoaded,
+    set: (v) => { keysLoaded = v; }
+  });
+  Object.defineProperty(window, 'capabilitiesLoaded', {
+    get: () => capabilitiesLoaded,
+    set: (v) => { capabilitiesLoaded = v; }
+  });
+  Object.defineProperty(window, 'runtimeLoaded', {
+    get: () => runtimeLoaded,
+    set: (v) => { runtimeLoaded = v; }
+  });
+  Object.defineProperty(window, 'KEYS', {
+    get: () => KEYS,
+    set: (v) => { KEYS = v; }
+  });
+  Object.defineProperty(window, 'SAVED_KEYS', {
+    get: () => SAVED_KEYS,
+    set: (v) => { SAVED_KEYS = v; }
+  });
+})();
