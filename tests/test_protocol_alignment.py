@@ -386,7 +386,7 @@ class ClaudeCompletionLogTests(unittest.IsolatedAsyncioTestCase):
     async def _run(self, body, upstream_response):
         with mock.patch.object(claude_api, "get_express_models",
                                mock.AsyncMock(return_value=list(AVAILABLE))), \
-             mock.patch.object(claude_api, "_call_upstream",
+             mock.patch.object(claude_api, "call_upstream",
                                mock.AsyncMock(return_value=upstream_response)):
             return await claude_api.claude_messages(self._request(body), "test-key")
 

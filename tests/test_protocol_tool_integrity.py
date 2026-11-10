@@ -273,7 +273,7 @@ class ClaudeRouteErrors(unittest.IsolatedAsyncioTestCase):
         body = {"model": MODEL, "max_tokens": 10, "messages": [{"role": "user", "content": "x"}]}
         response = JSONResponse({"choices": [{"message": {"tool_calls": [call('not-json')]}}]})
         with mock.patch.object(claude_api, "_available_models", mock.AsyncMock(return_value=[])), \
-                mock.patch.object(claude_api, "_call_upstream", mock.AsyncMock(return_value=response)):
+                mock.patch.object(claude_api, "call_upstream", mock.AsyncMock(return_value=response)):
             result = await claude_api.claude_messages(SimpleNamespace(json=mock.AsyncMock(return_value=body)), "offline")
         self.assertEqual(result.status_code, 502)
         self.assertEqual(json.loads(result.body)["error"]["type"], "api_error")

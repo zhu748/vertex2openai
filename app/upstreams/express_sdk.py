@@ -350,3 +350,7 @@ class ExpressSDKUpstream(BaseUpstream):
             text_transport=text_transport,
             credential_describer=_describe_current_credential,
         )
+
+
+# 公共别名（2026-11 P2-7）：claude_api 不再 import 下划线私有名。
+normalize_model_name = _normalize_model_name

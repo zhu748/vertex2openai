@@ -217,7 +217,7 @@ class ClaudeRouteContractTests(unittest.IsolatedAsyncioTestCase):
             request = SimpleNamespace(json=mock.AsyncMock(return_value=body))
             with self.subTest(invalid=invalid), \
                  mock.patch.object(claude_api, "_available_models", mock.AsyncMock(return_value=[])), \
-                 mock.patch.object(claude_api, "_call_upstream", mock.AsyncMock()) as call:
+                 mock.patch.object(claude_api, "call_upstream", mock.AsyncMock()) as call:
                 response = await claude_api.claude_messages(request, "unused")
                 self.assertEqual(response.status_code, 400)
                 self.assertEqual(json.loads(response.body)["error"]["type"], "invalid_request_error")

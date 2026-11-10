@@ -217,3 +217,10 @@ def create_generation_config(request: OpenAIRequest) -> dict[str, Any]:
     if tools:
         config["tools"] = tools
     return config
+
+
+# 公共别名（2026-11 P2-7）：claude_api 等兄弟模块不再 import 下划线私有名。
+# 与原函数同一对象；引擎内部调用与既有测试 patch seam（_system_instruction
+# 等原名）不受影响。
+system_instruction = _system_instruction
+function_tools = _function_tools

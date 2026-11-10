@@ -27,6 +27,7 @@ from express_key_manager import ExpressKeyManager
 from fastapi.responses import JSONResponse, StreamingResponse
 from models import OpenAIRequest
 from routes import chat_api
+import channel_dispatch
 from runtime_state import app_state
 from upstream_errors import create_openai_error_response
 
@@ -379,7 +380,7 @@ class StreamFallbackTests(unittest.TestCase):
             self.assertEqual(channel, "express")
             return alt_response
 
-        with mock.patch.object(chat_api, "_invoke_channel", fake_invoke):
+        with mock.patch.object(channel_dispatch, "_invoke_channel", fake_invoke):
             frames = self._run(primary)
         # 主通道错误帧与 [DONE] 被吞掉，客户端只看到备用通道输出
         joined = "".join(frames)
@@ -399,7 +400,7 @@ class StreamFallbackTests(unittest.TestCase):
             calls.append(args)
             return _stream_response(["data: [DONE]\n\n"])
 
-        with mock.patch.object(chat_api, "_invoke_channel", fake_invoke):
+        with mock.patch.object(channel_dispatch, "_invoke_channel", fake_invoke):
             frames = self._run(primary)
         joined = "".join(frames)
         # 已输出内容：错误如实下发，绝不二次调用（半截答案不能重发）
@@ -414,7 +415,7 @@ class StreamFallbackTests(unittest.TestCase):
         async def fake_invoke(*a, **k):  # pragma: no cover - 不应被调用
             raise AssertionError("400 不应触发兜底")
 
-        with mock.patch.object(chat_api, "_invoke_channel", fake_invoke):
+        with mock.patch.object(channel_dispatch, "_invoke_channel", fake_invoke):
             frames = self._run(primary)
         self.assertIn("参数非法", "".join(frames))
 
@@ -426,7 +427,7 @@ class StreamFallbackTests(unittest.TestCase):
         async def fake_invoke(*a, **k):  # pragma: no cover - 不应被调用
             raise AssertionError("正常流不应触发兜底")
 
-        with mock.patch.object(chat_api, "_invoke_channel", fake_invoke):
+        with mock.patch.object(channel_dispatch, "_invoke_channel", fake_invoke):
             frames = self._run(primary)
         self.assertIn("正常回复", "".join(frames))
 
@@ -437,7 +438,7 @@ class StreamFallbackTests(unittest.TestCase):
         async def failing_invoke(*a, **k):
             raise RuntimeError("备用通道崩溃")
 
-        with mock.patch.object(chat_api, "_invoke_channel", failing_invoke):
+        with mock.patch.object(channel_dispatch, "_invoke_channel", failing_invoke):
             frames = self._run(primary)
         joined = "".join(frames)
         # 备用启动失败 → 回放主通道错误帧 + [DONE]
@@ -465,7 +466,7 @@ class JsonFallbackTests(unittest.TestCase):
             self.assertEqual(channel, "express")
             return success
 
-        with mock.patch.object(chat_api, "_invoke_channel", fake_invoke):
+        with mock.patch.object(channel_dispatch, "_invoke_channel", fake_invoke):
             result = asyncio.run(chat_api._apply_json_fallback(
                 primary, self.request_obj, self.req_stub, "cookie", 30.0))
         self.assertIs(result, success)
@@ -476,7 +477,7 @@ class JsonFallbackTests(unittest.TestCase):
         async def failing_invoke(*a, **k):
             raise RuntimeError("备用崩溃")
 
-        with mock.patch.object(chat_api, "_invoke_channel", failing_invoke):
+        with mock.patch.object(channel_dispatch, "_invoke_channel", failing_invoke):
             result = asyncio.run(chat_api._apply_json_fallback(
                 primary, self.request_obj, self.req_stub, "cookie", 30.0))
         self.assertIs(result, primary)

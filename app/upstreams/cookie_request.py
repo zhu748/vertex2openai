@@ -772,3 +772,10 @@ def build_request_body(
         "operationName": STREAM_GENERATE_OPERATION_NAME,
         "variables": variables,
     }
+
+
+# 公共别名（2026-11 P2-7）：cookie_native 不再 import 下划线私有名；
+# 引擎内部调用与既有测试 patch seam（原名）不受影响。
+build_request_context = _build_request_context
+cookie_ui_schema = _cookie_ui_schema
+native_default_safety_settings = _native_default_safety_settings

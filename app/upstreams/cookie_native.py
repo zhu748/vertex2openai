@@ -66,9 +66,9 @@ from upstreams.cookie_transport import (
 from upstreams.cookie_request import (
     COOKIE_STRUCTURED_OUTPUT_DISABLED_MESSAGE,
     NATIVE_GENERATION_KEYS,
-    _build_request_context,
-    _cookie_ui_schema,
-    _native_default_safety_settings,
+    build_request_context,
+    cookie_ui_schema,
+    native_default_safety_settings,
 )
 
 # 生图 markdown（extract_events 的 image 事件载荷）→ inlineData 反解
@@ -244,7 +244,7 @@ def _native_tools_to_variables(tools: Any) -> tuple[list[dict], bool, list[str]]
                 parameters = sanitize_for_gemini(json_schema)
             elif parameters is not None and not isinstance(parameters, dict):
                 raise SchemaValidationError("函数 parameters 必须是 JSON 对象。")
-            converted["parameters"] = _cookie_ui_schema(
+            converted["parameters"] = cookie_ui_schema(
                 parameters if parameters is not None else {"type": "object"})
             declarations.append(converted)
     return declarations, use_search, [d["name"] for d in declarations]
@@ -325,7 +325,7 @@ def native_request_to_variables(parsed: dict, model_name: str, project_id: str,
             raise SchemaValidationError(COOKIE_STRUCTURED_OUTPUT_DISABLED_MESSAGE)
         schema = gen.get("responseSchema")
         if isinstance(schema, dict) and schema:
-            gen["responseSchema"] = _cookie_ui_schema(
+            gen["responseSchema"] = cookie_ui_schema(
                 {k: v for k, v in schema.items() if k != "$schema"})
     if profile["is_image"] and not gen.get("responseModalities"):
         gen["responseModalities"] = ["TEXT", "IMAGE"]
@@ -338,7 +338,7 @@ def native_request_to_variables(parsed: dict, model_name: str, project_id: str,
         "contents": parsed.get("contents") or [],
         "model": f"projects/{project_id}/locations/global/publishers/google/models/{model_name}",
         "generationConfig": gen,
-        "safetySettings": parsed.get("safetySettings") or _native_default_safety_settings(),
+        "safetySettings": parsed.get("safetySettings") or native_default_safety_settings(),
     }
 
     system = _normalize_system_instruction(parsed.get("systemInstruction"))
@@ -374,7 +374,7 @@ def build_native_body(parsed: dict, model_name: str, project_id: str,
                       *, requested_model: str = "") -> dict:
     """variables + GraphQL 信封（requestContext / querySignature 均为热改感知）。"""
     return {
-        "requestContext": _build_request_context(project_id),
+        "requestContext": build_request_context(project_id),
         "querySignature": get_stream_query_signature(),
         "operationName": STREAM_GENERATE_OPERATION_NAME,
         "variables": native_request_to_variables(parsed, model_name, project_id,

@@ -30,6 +30,7 @@ import streaming
 from logger import ProxyStats
 from models import OpenAIRequest
 from routes import chat_api
+import channel_dispatch
 from runtime_state import AppState, app_state
 from upstreams import cookie_transport, cookie_proxy, express_sdk, cookie_request
 
@@ -167,7 +168,7 @@ class QuietStreamTests(unittest.IsolatedAsyncioTestCase):
         request = SimpleNamespace(is_disconnected=mock.AsyncMock(return_value=False))
         with mock.patch.object(chat_api.app_state, "is_web_proxy_enabled", return_value=True), \
              mock.patch.object(chat_api.cookie_upstream, "chat_completions", return_value=response), \
-             mock.patch.object(chat_api, "stats", stats):
+             mock.patch.object(channel_dispatch, "stats", stats):
             result = await chat_api._call_upstream(req(stream=True), request)
             body = "".join([frame async for frame in result.body_iterator])
         self.assertTrue(closed.is_set())

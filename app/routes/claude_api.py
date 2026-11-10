@@ -60,7 +60,7 @@ from claude_protocol import (
 )
 from config import API_KEY
 from express_endpoint import resolve_express_model_path
-from generation_config import _function_tools, _system_instruction
+from generation_config import function_tools, system_instruction
 from logger import stats
 from json_encoding import LargeJSONResponse
 from media_tasks import run_media_task
@@ -73,11 +73,11 @@ from request_tracking import configure as track_configure
 from response_validation import IncompleteResponseError
 from request_connection import BodyTooLargeError
 from request_ingress import IngressError
-from routes.chat_api import _call_upstream
+from routes.chat_api import call_upstream
 from runtime_state import app_state
 from streaming import ByteBoundedQueue, SSE_NO_BUFFER_HEADERS, sse_frames
 from upstream_errors import extract_upstream_error
-from upstreams.express_sdk import _normalize_model_name
+from upstreams.express_sdk import normalize_model_name
 
 router = APIRouter()
 
@@ -335,7 +335,7 @@ def _claude_stream_response(response: StreamingResponse, display_model: str, *,
 async def claude_messages(fastapi_request: Request, api_key: str = Depends(get_claude_auth)):
     """Anthropic Messages 端点：Anthropic 请求 → 内部管线 → Anthropic 响应。
 
-    并发闸（limit_generation）内置于 _call_upstream，不在此重复装饰，
+    并发闸（limit_generation）内置于 call_upstream，不在此重复装饰，
     避免同一请求占用两份并发配额。
     上游错误（404 模型不可用 / 403 权限 / 429 拥堵等）如实透传状态码，
     仅把错误体改写为 Anthropic 形状；流式已开始后错误以 SSE error 事件表达。
@@ -368,7 +368,7 @@ async def claude_messages(fastapi_request: Request, api_key: str = Depends(get_c
           f"{'流式' if request_obj.stream else '非流式'} | max_tokens={request_obj.max_tokens}")
 
     try:
-        response = await _call_upstream(request_obj, fastapi_request)
+        response = await call_upstream(request_obj, fastapi_request)
     except GenerationCapacityError:
         return claude_error(529, "overloaded_error", "服务并发已达上限，请稍后重试。")
     except asyncio.CancelledError:
@@ -501,7 +501,7 @@ async def _count_exact_input_tokens(request_obj, fastapi_request: Request,
     if not isinstance(record, dict) or not record.get("key"):
         return None
 
-    base_model, _, model_error = _normalize_model_name(raw_internal_model)
+    base_model, _, model_error = normalize_model_name(raw_internal_model)
     if model_error or not base_model:
         return None
     try:
@@ -530,8 +530,8 @@ async def _count_exact_input_tokens(request_obj, fastapi_request: Request,
         if not callable(count_tokens_call):
             return None
         config = types.CountTokensConfig(
-            system_instruction=_system_instruction(request_obj) or None,
-            tools=_function_tools(request_obj) or None,
+            system_instruction=system_instruction(request_obj) or None,
+            tools=function_tools(request_obj) or None,
         )
         response = await count_tokens_call(model=model_path, contents=contents, config=config)
         total = getattr(response, "total_tokens", None)
