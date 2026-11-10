@@ -31,7 +31,10 @@ def is_builtin_search_tool(tool) -> bool:
 
 
 def has_search_suffix(model: str) -> bool:
-    return split_model_alias(model)[0].endswith("-search")
+    # -search 后缀判定统一大小写不敏感（2026-11 C-9）：原生端点与
+    # model_capabilities / anti_truncation 均按 lower() 判，仅此处敏感，
+    # 造成跨通道行为分叉（大写变体经原生端点可用、OpenAI 通道报 404）。
+    return split_model_alias(model)[0].lower().endswith("-search")
 
 
 def search_suffix_has_priority(request) -> bool:

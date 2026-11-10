@@ -201,13 +201,17 @@ def _final_usage(
     """上游真实计量优先；未回传且 usage_estimation 开启时给字符级粗估。
 
     粗估附带 "estimated": true；生图（正文为 base64 data URL）不适用，调用方不走本函数。
+    思考文本恰好计一次：流式路径把 thought 项并入 completion_text 传入，
+    非流式路径经 reasoning_text 传入——两口径必须给出相同结果（2026-11
+    对齐：reasoning 为空时不再追加换行，否则流式比非流式多计一个字符）。
     """
     usage = map_usage(usage_meta)
     if usage_meta is None and app_state.get_setting("usage_estimation", False):
         prompt = messages_prompt_text(getattr(request_obj, "messages", None) or [])
-        estimated = estimate_usage(
-            prompt, (completion_text or "") + "\n" + (reasoning_text or "")
-        )
+        combined = completion_text or ""
+        if reasoning_text:
+            combined = f"{combined}\n{reasoning_text}"
+        estimated = estimate_usage(prompt, combined)
         if estimated["total_tokens"]:
             return estimated
     return usage
@@ -230,8 +234,17 @@ async def _collect_full_response(
     *,
     prefill_active=False,
     force_search=False,
+    account_id: str | None = None,
+    record=None,
 ) -> dict:
-    """非流式地完整取回一次响应（供生图假流式复用）。返回 dict。"""
+    """非流式地完整取回一次响应（供生图假流式复用）。返回 dict。
+
+    account_id / record：凭据记账句柄（由 image_frames 传入）。鉴权失败
+    （HTTP 401/403 或 GraphQL 权限类错误）时向 credential_manager 记账，
+    触发坏账号冷却隔离（2026-11 P1 修复：旧实现两个鉴权失败出口都直接
+    return，生图流量下的失效账号会被反复选中烧满全部重试预算，完全
+    绕过健康隔离——与同通道流式/非流式路径行为分叉）。
+    """
     # 请求体只构建一次：构建内部含远程图片下载 + PIL 压缩，旧实现每次
     # 重试都重建一遍 = 反复下载同一批图片。重试发同一个 body 本就是重试语义。
     if await fastapi_request.is_disconnected():
@@ -249,10 +262,20 @@ async def _collect_full_response(
         if attempt:
             stats.add_retry()
         try:
-            # 兼容旧调用形态：本参数历史上是现成的 headers dict（测试桩直传
-            # {}），按旧口径原样放行；新形态传 cookie 字符串，按次重算认证头。
+            # 兼容旧调用形态的显式收紧（2026-11 C-14）：本参数历史上是现成
+            # 的 headers dict（测试桩直传 {}），空 dict 作为占位放行；非空
+            # dict 仅接受 {'cookie': ...} 形态——旧兜底 `or cookie_str` 会把
+            # 整个 dict（可能含 Cookie 明文键值）当请求头原样发出。
             if isinstance(cookie_str, dict):
-                req_headers = build_headers(cookie_str.get("cookie", "")) or cookie_str
+                if not cookie_str:
+                    req_headers = {}
+                else:
+                    req_headers = build_headers(cookie_str.get("cookie", ""))
+                    if not req_headers:
+                        raise TypeError(
+                            "cookie_str 为 dict 时必须携带可用的 'cookie' 键"
+                            "（旧调用形态已收紧，拒绝整包 headers 直传）"
+                        )
             else:
                 req_headers = build_headers(cookie_str)
                 if not req_headers:
@@ -279,6 +302,7 @@ async def _collect_full_response(
                     attempt,
                     jitter_sec,
                     error=f"HTTP {response.status_code}: {response.text[:200]}",
+                    identity_rotates=False,  # Cookie 通道重试复用同一身份，Retry-After 有约束力
                 )
                 print(
                     f"⚠️ [Studio] HTTP {response.status_code}（生图，尝试 {attempt + 1}）: {response.text[:300]} | {delay:.1f}s 后重试..."
@@ -287,6 +311,12 @@ async def _collect_full_response(
                     return {"kind": "error", "message": "客户端已断开连接。"}
                 continue
             if response.status_code != 200:
+                # 鉴权失败记账（2026-11 P1）：与流式/非流式路径同口径，
+                # 401/403 要进账号健康隔离，不能只返回错误字典。
+                if response.status_code in (401, 403) and account_id is not None:
+                    credential_manager.record_cookie_auth_failure(
+                        account_id, credential=record
+                    )
                 return {
                     "kind": "error",
                     "code": response.status_code,
@@ -366,7 +396,8 @@ async def _collect_full_response(
                 and attempt < retry_max
             ):
                 delay = retry_delay(
-                    None, backoff_sec, attempt, jitter_sec, error=api_error
+                    None, backoff_sec, attempt, jitter_sec, error=api_error,
+                    identity_rotates=False,  # 同上：同一 Cookie 身份的重试
                 )
                 print(
                     f"⚠️ [Studio] 生图 429/限流（尝试 {attempt + 1}）: {api_error[:300]} | {delay:.1f}s 后重试..."
@@ -375,6 +406,12 @@ async def _collect_full_response(
                     return {"kind": "error", "message": "客户端已断开连接。"}
                 continue
             if api_error:
+                # 鉴权失败记账：api_error_details 已含文本兜底（权限类文案
+                # → 403），无 code 字段的 GraphQL 错误块同样进健康隔离。
+                if api_error_status in (401, 403) and account_id is not None:
+                    credential_manager.record_cookie_auth_failure(
+                        account_id, credential=record
+                    )
                 return {"kind": "error", "code": api_error_status, "message": api_error}
 
             if not full_text.strip():
@@ -399,7 +436,8 @@ async def _collect_full_response(
         except Exception as e:
             em = str(e)
             if is_retryable_exception(e) and attempt < retry_max:
-                delay = retry_delay(None, backoff_sec, attempt, jitter_sec, error=em)
+                delay = retry_delay(None, backoff_sec, attempt, jitter_sec, error=em,
+                                    identity_rotates=False)
                 print(
                     f"⚠️ [Studio] 生图异常（尝试 {attempt + 1}）：{em[:300]} | {delay:.1f}s 后重试..."
                 )
@@ -485,6 +523,8 @@ class CookieGeneration:
                 self.fastapi_request,
                 prefill_active=self.prefill_active,
                 force_search=self.force_builtin_search,
+                account_id=self.account_id,
+                record=self.record,
             )
         )
         try:
@@ -606,6 +646,7 @@ class CookieGeneration:
                 got_text = False  # 是否收到过“正文”（text/image）
                 got_thought = False  # 是否收到过思考
                 got_tool_call = False
+                got_wire_signature = False  # 是否收到过 thoughtSignature 事件
                 tool_call_index = 0
                 stream_ordinary_metadata = []
                 stream_part_order = []
@@ -686,17 +727,18 @@ class CookieGeneration:
                             signature = apply_wire_signature(
                                 data, stream_ordinary_metadata, stream_part_order
                             )
+                            if signature:
+                                got_wire_signature = True
                             extra = thought_signature_extra(
                                 signature, data.get("part_kind")
                             )
                             if extra:
-                                google = extra.setdefault("google", {})
-                                if stream_ordinary_metadata:
-                                    google["ordinary_parts"] = list(
-                                        stream_ordinary_metadata
-                                    )
-                                if got_tool_call:
-                                    google["part_order"] = list(stream_part_order)
+                                # 签名事件只携带签名与 part 类型（2026-11 P2-2 修复）：
+                                # 旧实现每个签名事件都内嵌「至今全部普通 part
+                                # （含全部思考全文）」快照，P 个带签名 part 的响应
+                                # 线上传输 O(P²)（Express 通道已修复过同一问题，
+                                # 见 express_response.py 的终帧快照注释）；完整
+                                # 拓扑改由下方收尾帧一次性携带。
                                 if not has_yielded_to_client:
                                     yield make_openai_chunk(
                                         self.response_id,
@@ -871,6 +913,7 @@ class CookieGeneration:
                         attempt,
                         self.jitter_sec,
                         error=str(error_to_raise),
+                        identity_rotates=False,  # Cookie 通道重试复用同一身份，Retry-After 有约束力
                     )
                     print(
                         f"⚠️ [Studio] 遇到可重试拥堵/限流: {str(error_to_raise)[:300]} | {wait_sec}s 后进行第 {attempt + 2} 次退避重试"
@@ -926,7 +969,14 @@ class CookieGeneration:
                     credential_manager.record_cookie_success(
                         self.account_id, credential=self.record
                     )
-                    if got_tool_call and stream_ordinary_metadata:
+                    # 终帧一次性拓扑快照（2026-11 P2-2）：存在工具调用**或签名
+                    # 元数据**即携带完整 ordinary_parts + part_order——旧实现仅
+                    # 工具调用触发，纯文本/纯思考响应只能依赖每个签名事件的
+                    # 滚动快照（O(P²) 流量）；现在签名事件瘦身，拓扑统一由
+                    # 终帧交付，流量回到线性（与 Express 通道设计对齐）。
+                    if stream_ordinary_metadata and (
+                        got_tool_call or got_wire_signature
+                    ):
                         google = {
                             "ordinary_parts": list(stream_ordinary_metadata),
                             "part_order": list(stream_part_order),
@@ -962,6 +1012,14 @@ class CookieGeneration:
                         finish_raw, blocked_msg, got_thought, self.strip_thoughts
                     )
                     stats.add_error()
+                    # 收到过思考即证明 Cookie 有效（2026-11 C-2 修复）：无正文
+                    # 分支不记成功，但必须清零该账号的失败计数——否则上游正常
+                    # 返回、仅正文被剥离/安全拦截的账号会因历史失败累计被
+                    # 误冷却 600 秒，多 Cookie 池下可用账号被静默摘除。
+                    if got_thought:
+                        credential_manager.record_cookie_success(
+                            self.account_id, credential=self.record
+                        )
                     print(
                         f"❌ [Studio] {self.base_model_name} | 上游{desc}（{detail}）"
                     )
@@ -1094,6 +1152,7 @@ class CookieGeneration:
                             attempt,
                             self.jitter_sec,
                             error=f"HTTP {response.status_code}: {response.text[:200]}",
+                            identity_rotates=False,  # Cookie 通道重试复用同一身份，Retry-After 有约束力
                         )
                         print(
                             f"⚠️ [Studio] HTTP {response.status_code} (尝试 {attempt + 1}): {response.text[:300]} | {delay:.1f}s 后重试..."
@@ -1243,6 +1302,7 @@ class CookieGeneration:
                         attempt,
                         self.jitter_sec,
                         error=api_error,
+                        identity_rotates=False,  # 同上：同一 Cookie 身份的重试
                     )
                     print(
                         f"⚠️ [Studio] 429/限流 (尝试 {attempt + 1}): {api_error[:300]} | {wait_sec:.1f}s 后重试..."
@@ -1300,6 +1360,12 @@ class CookieGeneration:
                         self.strip_thoughts,
                     )
                     stats.add_error()
+                    # 与流式路径同口径（2026-11 C-2）：收到过思考即证明 Cookie
+                    # 有效，清零账号失败计数，避免历史累计触发误冷却。
+                    if reasoning_text:
+                        credential_manager.record_cookie_success(
+                            self.account_id, credential=self.record
+                        )
                     print(
                         f"❌ [Studio] {self.base_model_name} | 上游{desc}（{detail}）| {elapsed:.1f}s"
                     )
@@ -1354,7 +1420,8 @@ class CookieGeneration:
 
                 if is_retryable and attempt < self.retry_max:
                     wait_sec = retry_delay(
-                        None, self.backoff_sec, attempt, self.jitter_sec, error=err_msg
+                        None, self.backoff_sec, attempt, self.jitter_sec, error=err_msg,
+                        identity_rotates=False,  # 同上：同一 Cookie 身份的重试
                     )
                     print(
                         f"⚠️ [Studio] 异常 (尝试 {attempt + 1}): {err_msg[:300]} | {wait_sec:.1f}s 后重试..."

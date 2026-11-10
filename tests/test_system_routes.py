@@ -33,9 +33,11 @@ class SystemRoutesTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(fields["password"], "p@ss")
 
     async def test_health_head_preserves_representation_headers_without_a_body(self):
-        with mock.patch.object(system_api, "get_effective_proxy_url", return_value="direct"):
-            get_response = await system_api.healthz_get()
-            head_response = await system_api.healthz_head()
+        request = SimpleNamespace(cookies={})
+        with mock.patch.object(system_api, "get_effective_proxy_url", return_value="direct"), \
+             mock.patch.object(system_api, "is_authenticated", return_value=True):
+            get_response = await system_api.healthz_get(request)
+            head_response = await system_api.healthz_head(request)
         self.assertEqual(head_response.status_code, get_response.status_code)
         self.assertEqual(head_response.headers, get_response.headers)
         sent = []

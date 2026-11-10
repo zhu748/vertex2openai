@@ -296,6 +296,42 @@ class NativeAssemblerTests(unittest.TestCase):
         asm.feed("thought_signature", {"value": "c2ln", "part_kind": "text"})
         self.assertEqual(asm.parts[-1], {"text": "hi", "thoughtSignature": "c2ln"})
 
+    def test_stream_budget_is_cumulative_and_tracks_last_part(self):
+        # 2026-11 P2-3 回归：流式（retain_parts=False）预算改**累计**语义，
+        # 不再逐 part 重置——预算名副其实；分帧判定用 last_part_bytes，
+        # 不被累计值污染（小 part 保持单帧编码）。
+        asm = NativeAssembler("m", retain_parts=False, max_response_bytes=1000)
+        asm.feed("text", "a" * 100)
+        self.assertEqual(asm.response_bytes, 100 + len('{"text": ""}'))
+        asm.feed("text", "b")
+        self.assertGreater(asm.response_bytes, asm.last_part_bytes)
+        self.assertLess(asm.last_part_bytes, 1024 * 1024)  # 小 part 不触发分帧
+        # 累计超出预算：即使本 part 很小也要拒绝。
+        with self.assertRaises(NativeBridgeError):
+            asm.feed("text", "c" * 900)
+
+    def test_image_models_get_relaxed_bridge_budget(self):
+        # 2026-11 P2-3 回归：图像模型按 128MB 放宽预算（4K 高细节 PNG
+        # base64 可达 53-93MB），文本模型维持 64MB——同一张 4K 图不再
+        # 在 Gemini 原生端点被 502 误拒。
+        from upstreams import cookie_native
+        self.assertEqual(cookie_native._bridge_response_budget("gemini-3.1-flash-image"),
+                         cookie_native.IMAGE_RESPONSE_BYTES)
+        self.assertEqual(cookie_native._bridge_response_budget("gemini-3.6-flash"),
+                         cookie_native.MAX_RESPONSE_BYTES)
+        # 80MB 单 part：文本模型拒绝，图像模型放行。
+        big = {"inlineData": {"mimeType": "image/png",
+                              "data": "A" * (80 * 1024 * 1024)}}
+        text_asm = NativeAssembler("gemini-3.6-flash",
+                                   max_response_bytes=cookie_native.MAX_RESPONSE_BYTES)
+        with self.assertRaises(NativeBridgeError):
+            text_asm.feed("native_part", big)
+        image_asm = NativeAssembler(
+            "gemini-3.1-flash-image",
+            max_response_bytes=cookie_native.IMAGE_RESPONSE_BYTES)
+        image_asm.feed("native_part", big)
+        self.assertEqual(image_asm.part_count, 1)
+
 
 class GoogleErrorBodyTests(unittest.TestCase):
     def test_status_details(self):

@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -292,6 +293,50 @@ class NativeStatsRetryTests(unittest.TestCase):
         asyncio.run(run())
         self.assertTrue(upstream.is_closed)
         self.assert_stats(total=0, success=0, error=1)
+
+    def test_resumable_slow_setup_failure_is_counted_as_error(self):
+        # 2026-11 P2-8 回归：续传慢路径（setup 超过 50ms 窗口）以 200+SSE
+        # 错误帧交付，middleware 看不到状态码——done-callback 必须补记一次
+        # error，否则 total ≠ success + error 永久漂移（chat_api 同模式）。
+        self.settings["resumable_enabled"] = True
+
+        async def slow_passthrough(request, model, action, query, payload):
+            await asyncio.sleep(0.15)  # 异步延迟：超过 0.05s 快路径窗口
+            return gemini_native._native_error(500, "boom")
+
+        with mock.patch.object(gemini_native, "_passthrough_request", side_effect=slow_passthrough):
+            response = self.post("streamGenerateContent", params={"alt": "sse"},
+                                 headers={"x-goog-api-key": "client-key", "x-resumable": "1"})
+        self.assertEqual(response.status_code, 200)  # 慢路径：SSE 先行
+        self.assertIn("boom", response.text)
+        # done-callback 在事件循环内即刻调度；短暂轮询等统计落地。
+        for _ in range(50):
+            if self.stats.error_requests:
+                break
+            time.sleep(0.02)
+        self.assert_stats(total=1, success=0, error=1)
+
+    def test_resumable_slow_setup_success_is_counted_once(self):
+        # 对照组：慢 setup 但最终成功——内层 _relay 记一次 success，
+        # setup 的 done-callback 不得补 error（无双计）。
+        self.settings["resumable_enabled"] = True
+        upstream = httpx.Response(200, content=COMPLETE_SSE,
+                                  headers={"content-type": "text/event-stream"})
+
+        async def slow_passthrough(request, model, action, query, payload):
+            await asyncio.sleep(0.15)
+            return await gemini_native._relay_stream(upstream)
+
+        with mock.patch.object(gemini_native, "_passthrough_request", side_effect=slow_passthrough):
+            response = self.post("streamGenerateContent", params={"alt": "sse"},
+                                 headers={"x-goog-api-key": "client-key", "x-resumable": "1"})
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("ok", response.text)
+        for _ in range(50):
+            if self.stats.success_requests:
+                break
+            time.sleep(0.02)
+        self.assert_stats(total=1, success=1, error=0)
 
     def test_429_stream_response_is_closed_before_retry(self):
         closed = []

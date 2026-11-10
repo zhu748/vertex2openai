@@ -89,7 +89,7 @@ from upstreams.express_response import (
 from upstreams.express_response import (
     is_gemini_response_valid as is_gemini_response_valid,
 )
-from usage import make_usage_chunk, map_usage, merge_usage_metadata, wants_usage
+from usage import make_usage_chunk, map_usage, merge_usage_metadata, usage_snapshot_unchanged, wants_usage
 
 
 def _keepalive_frame(model_name: str) -> str:
@@ -338,11 +338,18 @@ async def gemini_fake_stream_generator(
                             f"⚠️ [自动重试] 假流式上游繁忙（{e_call.__class__.__name__}），"
                             f"第 {attempt + 1} 次退避重试，等待 {wait_time} 秒。"
                         )
-                        waited = 0.0
-                        while waited < wait_time:
-                            step = min(0.5, wait_time - waited)
-                            await asyncio.sleep(step)
-                            waited += step
+                        # 退避计时改单调时钟 deadline（2026-11 P2-6 修复）：旧
+                        # 写法按「名义步长」累加 waited，事件循环繁忙（生图 GC、
+                        # 巨帧序列化）时 asyncio.sleep 的实际耗时远超 0.5s，
+                        # 名义累加却不变——设定 5 秒的退避在负载下可能实际拖到
+                        # 10-20 秒。与同文件 stream_frames / collect_response
+                        # 及 retry_policy.wait_for_retry 的 deadline 口径对齐。
+                        deadline = time.monotonic() + wait_time
+                        while True:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                break
+                            await asyncio.sleep(min(0.5, remaining))
                             if await _request_disconnected(fastapi_request):
                                 print(
                                     "ℹ️ [客户端断开] 假流式退避期间客户端已断开，停止重试。"
@@ -681,16 +688,19 @@ class SDKGeneration:
                             f"📥 [首个上游分片] {self.request_obj.model}：第 {attempt + 1} 次尝试等待 {elapsed:.1f} 秒收到分片；分片可能仅含思考或用量。"
                         )
                     if getattr(chunk_item_call, "usage_metadata", None):
-                        usage_metadata = merge_usage_metadata(usage_metadata, chunk_item_call.usage_metadata)
-                        final_usage = map_usage(usage_metadata)
-                        record_usage(
-                            final_usage
-                        )  # 与旧 _extract_usage 一致：trace 用量口径
-                        final_p_tk, final_c_tk, final_t_tk = (
-                            final_usage["prompt_tokens"],
-                            final_usage["completion_tokens"],
-                            final_usage["total_tokens"],
-                        )
+                        # 计数器未变化的累计快照直接短路（2026-11 O-5）：
+                        # 逐帧 pydantic model_dump 是长流式的隐性热点。
+                        if not usage_snapshot_unchanged(usage_metadata, chunk_item_call.usage_metadata):
+                            usage_metadata = merge_usage_metadata(usage_metadata, chunk_item_call.usage_metadata)
+                            final_usage = map_usage(usage_metadata)
+                            record_usage(
+                                final_usage
+                            )  # 与旧 _extract_usage 一致：trace 用量口径
+                            final_p_tk, final_c_tk, final_t_tk = (
+                                final_usage["prompt_tokens"],
+                                final_usage["completion_tokens"],
+                                final_usage["total_tokens"],
+                            )
 
                     # 支持 n>1：按候选序号逐个输出
                     require_unblocked_response(chunk_item_call)

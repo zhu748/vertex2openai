@@ -6,6 +6,7 @@ import os
 import tempfile
 import threading
 import time
+from functools import lru_cache
 from typing import Optional
 
 import config as app_config
@@ -77,9 +78,15 @@ class AppState:
 
     # ---------- 持久化 ----------
 
-    def _load_from_disk(self) -> None:
+    def _load_from_disk(self):
+        """读盘并把成功加载的数据发布到 _state；返回读到的 dict。
+
+        文件缺失/损坏时**不改 _state**并返回 None：调用方（reload）需要
+        区分「读到了什么」与「内存里还有什么」，不能拿内存态充当磁盘真相
+        （2026-11 C-11）。
+        """
         if not os.path.exists(STATE_FILE):
-            return
+            return None
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -94,6 +101,7 @@ class AppState:
                 os.chmod(STATE_FILE, 0o600)
             except OSError:
                 pass
+            return data
         except Exception as e:
             # 损坏/不可读：先把原文件改名备份再降级为内存模式。不备份的话，
             # 用户在控制台改任何一项设置都会触发 _save() 用近空状态原子替换
@@ -240,8 +248,13 @@ class AppState:
         """显式从磁盘重载（外部改了文件时用）。"""
         with self._io_lock:
             with self._lock:
-                self._load_from_disk()
-                self._committed = copy.deepcopy(self._state)
+                loaded = self._load_from_disk()
+                # 提交基线取「刚读到的磁盘数据」而非内存态（2026-11 C-11）：
+                # 文件缺失/损坏时 _load_from_disk 不改 _state，旧写法会把含
+                # 未落盘变更的内存态发布为已提交基线——此后任一次保存失败
+                # 的回滚都会复活这些幽灵变更（从未真正落盘过）。读不到文件
+                # 时磁盘真相为空，基线同置空，与启动时的空态一致。
+                self._committed = copy.deepcopy(loaded if loaded is not None else {})
                 # 作废重载前已拍下、尚未落盘的快照，避免旧保存覆盖外部编辑。
                 self._save_seq += 1
                 self._persisted_seq = self._save_seq
@@ -498,7 +511,7 @@ class AppState:
             return {}
         record_id = str(item.get("id", "") or "").strip()
         if not record_id:
-            record_id = "cookie-" + hashlib.sha256(cookie.encode()).hexdigest()[:24]
+            record_id = _cookie_record_id(cookie)
         return {"id": record_id, "cookie": cookie,
                 "project_id": str(item.get("project_id", "") or "").strip(),
                 "note": str(item.get("note", "") or "").strip(),
@@ -782,10 +795,34 @@ class AppState:
 app_state = AppState()
 
 
+# Cookie 账号去 ID 的 sha256 结果缓存（2026-11 O-9）：无 id 记录每次
+# get_cookie_accounts（每请求路径）都做一次全长 sha256（50-200µs，账号
+# 多时线性叠加）；以 cookie 串为键做小 LRU，哈希一次终身复用。
+@lru_cache(maxsize=256)
+def _cookie_record_id(cookie: str) -> str:
+    return "cookie-" + hashlib.sha256(cookie.encode()).hexdigest()[:24]
+
+
 # ============================================================
 # 出站代理统一读取口（热改支持）。新调用使用账号候选列表 + ProxyChain；
 # 两个单值 getter 保留给客户端池构造和旧调用方读取第一条。
 # ============================================================
+# 全局代理解析缓存（2026-11 O-3）：parse_proxy_list 的正则分段在每请求
+# 路径上花 0.3~2ms 事件循环 CPU，而输入只在控制台保存设置时变化。按
+# 「输入原值」（存储值或环境值）为键做单槽缓存——值相同直接复用，保存
+# 动作或运行期改写 config.PROXY_URL/PROXY_URLS（测试口子）自然换键失效。
+# 返回副本防调用方改写。
+_PROXY_PARSE_CACHE: list = [None, ()]  # [输入键, 解析结果 tuple]；初始值即 parse(None)
+
+
+def _cached_parse_proxy_list(stored) -> list:
+    cache = _PROXY_PARSE_CACHE
+    if cache[0] != stored:
+        cache[0] = stored
+        cache[1] = tuple(parse_proxy_list(stored))
+    return list(cache[1])
+
+
 def get_effective_proxy_url() -> str:
     """Legacy first-entry view of the global list; saved empty means direct."""
     proxies = get_effective_proxy_urls()
@@ -799,7 +836,7 @@ def get_effective_proxy_urls() -> list[str]:
         stored = app_state.get_raw_stored_setting("proxy_url")
     if stored is None:
         stored = app_config.PROXY_URLS if app_config.PROXY_URLS is not None else app_config.PROXY_URL
-    return parse_proxy_list(stored)
+    return _cached_parse_proxy_list(stored)
 
 
 def get_effective_proxy_uris_for_account(record=None) -> list[str]:

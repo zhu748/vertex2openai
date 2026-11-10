@@ -400,6 +400,70 @@ class CookieRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["kind"], "error")
         self.assertEqual(result["code"], 429)
 
+    async def test_image_collection_records_auth_failure_on_http_401(self):
+        # 2026-11 P1-1 回归：生图整取路径的 HTTP 401/403 必须向
+        # credential_manager 记账（坏账号进冷却隔离），不能只返回错误。
+        obj = api_helpers.OpenAIRequest(model="gemini-3.1-flash-image", messages=[])
+        self.client.post = mock.AsyncMock(return_value=httpx.Response(401, text="unauthenticated"))
+        record = object()
+        with mock.patch.object(cookie_proxy.credential_manager, "record_cookie_auth_failure") as fail:
+            result = await cookie_proxy._collect_full_response(
+                "p", obj.model, obj, {}, {}, 0, 0, 0, self.request,
+                account_id="acct-1", record=record)
+        self.assertEqual(result["kind"], "error")
+        self.assertEqual(result["code"], 401)
+        fail.assert_called_once_with("acct-1", credential=record)
+
+    async def test_image_collection_records_auth_failure_on_graphql_permission_text(self):
+        # 2026-11 P2-1 回归：GraphQL 错误块无 code 字段、仅权限类文案时，
+        # api_error_details 文本兜底归类 403，生图整取路径同样记账。
+        obj = api_helpers.OpenAIRequest(model="gemini-3.1-flash-image", messages=[])
+        record = object()
+        with mock.patch.object(cookie_proxy, "extract_events",
+                               return_value=[("error", {"message": "Request failed: permission denied for project"})]), \
+             mock.patch.object(cookie_proxy.credential_manager, "record_cookie_auth_failure") as fail:
+            result = await cookie_proxy._collect_full_response(
+                "p", obj.model, obj, {}, {}, 0, 0, 0, self.request,
+                account_id="acct-2", record=record)
+        self.assertEqual(result["kind"], "error")
+        self.assertEqual(result["code"], 403)
+        fail.assert_called_once_with("acct-2", credential=record)
+
+    async def test_image_collection_without_account_id_skips_accounting(self):
+        # 未传记账句柄（如旧调用形态/测试桩）时不得触碰 credential_manager。
+        obj = api_helpers.OpenAIRequest(model="gemini-3.1-flash-image", messages=[])
+        self.client.post = mock.AsyncMock(return_value=httpx.Response(403, text="forbidden"))
+        with mock.patch.object(cookie_proxy.credential_manager, "record_cookie_auth_failure") as fail:
+            result = await cookie_proxy._collect_full_response("p", obj.model, obj, {}, {}, 0, 0, 0, self.request)
+        self.assertEqual(result["kind"], "error")
+        self.assertEqual(result["code"], 403)
+        fail.assert_not_called()
+
+    async def test_thought_only_response_clears_cookie_failure_count(self):
+        # 2026-11 C-2 回归：上游成功返回但仅有思考（无正文）时不记成功，
+        # 但必须清零账号失败计数——收到过思考即证明 Cookie 有效，否则
+        # 正文被剥离/安全拦截的账号会因历史失败累计被误冷却 600 秒。
+        obj = api_helpers.OpenAIRequest(model="gemini-3.6-flash", messages=[])
+        with mock.patch.object(cookie_proxy, "extract_events",
+                               return_value=[("thought", "let me think"), ("finish", "STOP")]), \
+             mock.patch.object(cookie_proxy.credential_manager, "record_cookie_success") as ok:
+            response = await cookie_proxy.CookieProxyUpstream().chat_completions(obj, self.request)
+        self.assertEqual(response.status_code, 200)  # 无正文 → 诊断提示正文
+        self.assertEqual(self.stats.error_requests, 1)  # 无正文仍计错误
+        ok.assert_called_once()
+
+    async def test_empty_response_does_not_clear_cookie_failures(self):
+        # 对照组：完全空响应（连思考都没有）不能清失败计数——Cookie 是否
+        # 有效无证据，维持既有失败累计。
+        obj = api_helpers.OpenAIRequest(model="gemini-3.6-flash", messages=[])
+        with mock.patch.object(cookie_proxy, "extract_events",
+                               return_value=[("finish", "STOP")]), \
+             mock.patch.object(cookie_proxy.credential_manager, "record_cookie_success") as ok:
+            response = await cookie_proxy.CookieProxyUpstream().chat_completions(obj, self.request)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.stats.error_requests, 1)
+        ok.assert_not_called()
+
     async def test_http_502_504_retry_and_honor_retry_after(self):
         # backoff=5（窗口 4.5~5.5s）：上游提示 2.5s 比窗口短，照常采纳
         self.settings["retry_backoff_seconds"] = 5

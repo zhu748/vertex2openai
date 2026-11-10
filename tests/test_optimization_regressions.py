@@ -383,5 +383,109 @@ class CleanupAndRedactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(redact(redact(message)), redact(message))
 
 
+class HotPathOptimizationTests(unittest.TestCase):
+    """2026-11 O 批次（审查报告性能优化项）的行为锁定回归。"""
+
+    def test_request_fingerprint_folds_long_strings_stably(self):
+        # O-4：超长字符串折叠为长度+摘要——同请求同指纹、异内容异指纹，
+        # 且不再出现 20MB 级的 json.dumps 全量物化。
+        from routes.chat_api import _request_fingerprint
+        from models import OpenAIRequest
+
+        def request_with(image_data):
+            return OpenAIRequest(model="gemini-3.1-flash-image", messages=[{
+                "role": "user", "content": [
+                    {"type": "text", "text": "画一只猫"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_data}"}},
+                ]}])
+
+        big = "QUJD" * 5000
+        fp_same_a = _request_fingerprint(request_with(big))
+        fp_same_b = _request_fingerprint(request_with(big))
+        fp_other = _request_fingerprint(request_with("WFla" * 5000))
+        self.assertEqual(fp_same_a, fp_same_b)
+        self.assertNotEqual(fp_same_a, fp_other)
+        # 折叠生效：指纹不含原始 base64，只含摘要。
+        self.assertNotIn(big, fp_same_a)
+        self.assertIn("folded:", fp_same_a)
+        # 短文本请求保持全量参与（不折叠）。
+        short = OpenAIRequest(model="gemini-3.6-flash",
+                              messages=[{"role": "user", "content": "你好"}])
+        self.assertIn("你好", _request_fingerprint(short))
+
+    def test_sse_frame_kind_fast_path_matches_parsed_semantics(self):
+        # O-7：子串快筛与完整解析口径一致——内容帧零解析直通，空串内容
+        # 帧（Express 真实存在）不得误判为内容（否则锁死跨通道兜底）。
+        from routes.chat_api import _sse_frame_kind
+        cases = [
+            ('data: {"choices":[{"delta":{"content":"hello"}}]}\n\n', "content"),
+            ('data: {"choices":[{"delta":{"content":""}}]}\n\n', "other"),
+            ('data: {"choices":[{"delta":{"reasoning_content":"think"}}]}\n\n', "content"),
+            ('data: {"choices":[{"delta":{"reasoning_content":""}}]}\n\n', "other"),
+            ('data: {"choices":[{"delta":{"tool_calls":[{"index":0}]}}]}\n\n', "content"),
+            ('data: {"choices":[{"delta":{"tool_calls":[]}}]}\n\n', "other"),
+            ('data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n', "other"),
+            ('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n', "finish"),
+            ('data: {"error":{"code":429,"message":"quota"}}\n\n', "error"),
+            ('data: [DONE]\n\n', "done"),
+            (': keep-alive\n\n', "keepalive"),
+            ('data: {"id":"chatcmpl-keepalive","choices":[]}\n\n', "keepalive"),
+            ('data: {"choices":[],"usage":{"total_tokens":1}}\n\n', "other"),
+        ]
+        for frame, expected in cases:
+            with self.subTest(frame=frame[:60]):
+                self.assertEqual(_sse_frame_kind(frame)[0], expected)
+                # bytes 帧归一化后同口径。
+                self.assertEqual(_sse_frame_kind(frame.encode())[0], expected)
+
+    def test_proxy_list_parse_cache_follows_value_changes(self):
+        # O-3：按输入值缓存，保存设置 / 运行期改写环境值都要立即生效。
+        import runtime_state as rs
+        with mock.patch.object(rs.app_state, "get_raw_stored_setting", return_value=None):
+            with mock.patch.object(config, "PROXY_URL", "socks5://cache-a:1080"), \
+                 mock.patch.object(config, "PROXY_URLS", None):
+                self.assertEqual(rs.get_effective_proxy_urls(), ["socks5://cache-a:1080"])
+            with mock.patch.object(config, "PROXY_URL", "socks5://cache-b:1080"), \
+                 mock.patch.object(config, "PROXY_URLS", None):
+                self.assertEqual(rs.get_effective_proxy_urls(), ["socks5://cache-b:1080"])
+            # 存储值优先于环境值，保存动作换键失效。
+            with mock.patch.object(rs.app_state, "get_raw_stored_setting", return_value="http://saved:8080"):
+                self.assertEqual(rs.get_effective_proxy_urls(), ["http://saved:8080"])
+            with mock.patch.object(rs.app_state, "get_raw_stored_setting", return_value=[]):
+                self.assertEqual(rs.get_effective_proxy_urls(), [])
+
+    def test_usage_snapshot_short_circuit_keeps_counter_merges(self):
+        # O-5：计数器未变的快照跳过 merge；变化（含新增计数器）时正常合并。
+        from usage import map_usage, merge_usage_metadata, usage_snapshot_unchanged
+        first = merge_usage_metadata(None, {"promptTokenCount": 10, "candidatesTokenCount": 5})
+        same = {"promptTokenCount": 10, "candidatesTokenCount": 5}
+        self.assertTrue(usage_snapshot_unchanged(first, same))
+        grown = {"promptTokenCount": 10, "candidatesTokenCount": 8}
+        self.assertFalse(usage_snapshot_unchanged(first, grown))
+        # previous 缺失的计数器出现 = 变化（merge 会补录）。
+        added = {"promptTokenCount": 10, "candidatesTokenCount": 5, "thoughtsTokenCount": 3}
+        self.assertFalse(usage_snapshot_unchanged(first, added))
+        second = merge_usage_metadata(first, grown)
+        self.assertEqual(map_usage(second)["completion_tokens"], 8)
+
+    def test_count_tokens_image_estimation_uses_counter_not_padding(self):
+        # O-10：图片估算走计数器（无 "x" 占位串物化），量级与旧口径一致。
+        import tracemalloc
+        from claude_protocol import estimate_request_tokens
+        body = {"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "hi"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                         "data": "QUJD" * (1024 * 1024)}},
+        ]}]}
+        tracemalloc.start()
+        tokens = estimate_request_tokens(body)
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        # 1MiB base64 → 折半字节的图片 ≈ 26 万 token 量级；瞬时峰值应远
+        # 小于旧实现的「等长占位串 + join」（>1MiB）。
+        self.assertGreater(tokens, 200_000)
+        self.assertLess(peak, 512 * 1024)
+
+
 if __name__ == "__main__":
     unittest.main()

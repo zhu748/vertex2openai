@@ -1,6 +1,21 @@
 Third-party software notices for vertex2openai-proxy-bridge.
 Versions and checksums are pinned in go.mod / go.sum.
 
+收录范围声明（2026-11 G-5）：本文件列出**当前 Linux 构建实际链接**的
+模块许可。go.mod 另有两处 replace 指向的 fork 模块，仅在特定平台构建时
+被链接、尚未收录于此：
+
+  - golang.zx2c4.com/wintun => github.com/yuhaiin/wintun
+    （上游 wintun 源码为 GPLv2；该 fork 仓库内**无 LICENSE 文件**，
+    需在发布 Windows 构建前向上游与 fork 作者确认再行收录。）
+  - tailscale.com => github.com/Asutorufa/tailscale
+    （tailscale/tailscale 的 BSD-3-Clause fork；发布对应平台构建前
+    应附上该仓库的完整 LICENSE 文本。）
+
+任何新增平台构建（Windows / 含 wireguard 的变体）发布前，必须先把上述
+模块的许可文本补入本文件——「版本以 go.mod 为准」的承诺以本声明为
+准绳，不再有静默漏发。
+
 
 ========================================================================
 codeberg.org/miekg/dns / LICENSE

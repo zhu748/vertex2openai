@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, patch
 
 _STATE = tempfile.TemporaryDirectory(prefix="v2o-optimization-")
 os.environ["STATE_DIR"] = _STATE.name
-os.environ["API_KEY"] = "optimization-test"
+os.environ["API_KEY"] = "test-key"
 os.environ["MODELS_CONFIG_URL"] = ""
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
@@ -68,7 +68,7 @@ class NativeLifecycleTests(unittest.IsolatedAsyncioTestCase):
         app_state.set_cookie_accounts([RECORD])
         app_state.update_settings({"upstream_max_concurrency": 1})
         self.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test",
-                                       headers={"x-goog-api-key": "optimization-test"})
+                                       headers={"x-goog-api-key": "test-key"})
         self.patches = [patch.object(native, "open_upstream_client", fake_upstream),
                         patch.object(native, "stream_events", fake_events)]
         for item in self.patches:
@@ -409,7 +409,7 @@ class ConsoleConflictTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unsupported_schema_returns_400_before_upstream(self):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test",
-                                    headers={"Authorization": "Bearer optimization-test"}) as client:
+                                    headers={"Authorization": "Bearer test-key"}) as client:
             response = await client.post("/v1/chat/completions", json={"model": MODEL,
                 "messages": [{"role": "user", "content": "hello"}],
                 "tools": [{"type": "function", "function": {"name": "f", "parameters": {"allOf": []}}}]})

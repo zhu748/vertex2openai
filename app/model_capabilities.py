@@ -67,7 +67,7 @@ _SIZE_AR_MAP = {
 #   LOW / HIGH 所有 3.x 都有。
 # 补充核对（vertex-master thinking.go，2026-10-22）：
 #   gemini-3-pro(-preview) 官方仅 LOW/HIGH 两档，MEDIUM 会 400 → 折叠到 HIGH；
-#   3.7/3.8 Flash 与 Gemini 4 Argon 仅 LOW/MEDIUM/HIGH；
+#   3.7/3.8 Flash 与 Gemini 4（Argon / Carbon）仅 LOW/MEDIUM/HIGH；
 #   3.1-flash-image(-lite) 仅 MINIMAL/HIGH。
 _LEVEL_ORDER = ["minimal", "low", "medium", "high"]
 
@@ -124,7 +124,7 @@ def _collapse_level(level: str, levels: set) -> str:
 
     等价于 vertex-master 四类模型的收敛表：
     - LevelsLowHigh（3-pro-preview）：NONE/MINIMAL/LOW→LOW，MEDIUM/HIGH→HIGH
-    - LevelsNoMinimal（3.1-pro / 3.7/3.8-flash / 4-argon）：NONE/MINIMAL→LOW
+    - LevelsNoMinimal（3.1-pro / 3.7/3.8-flash / 4-argon / 4-carbon）：NONE/MINIMAL→LOW
     - LevelsMinimalHigh（3.1-flash-image）：NONE/MINIMAL/LOW→MINIMAL，MEDIUM→HIGH
     - LevelsAll（3.6- Flash）：NONE→MINIMAL
     """

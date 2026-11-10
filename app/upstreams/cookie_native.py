@@ -72,8 +72,23 @@ from upstreams.cookie_request import (
 
 # 生图 markdown（extract_events 的 image 事件载荷）→ inlineData 反解
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+# 图像模型响应预算（2026-11 P2-3）：4K 高细节 PNG 的 base64 单对象可达
+# 53-93MB（实测记录见 cookie_response.CompleteTextObjectCursor 注释），
+# 64MB 会把同一张经 /v1/chat/completions 能成功交付的 4K 图在 Gemini
+# 原生端点（models/*:generateContent）误拒为 502。对齐 OpenAI 通道的
+# 放宽语义，图像模型按 128MB 预算（覆盖实测上限 + 余量）。
+IMAGE_RESPONSE_BYTES = 128 * 1024 * 1024
 
 _IMAGE_MD_RE = re.compile(r"^!\[.*?\]\(data:([^;,]+);base64,([A-Za-z0-9+/=]+)\)$", re.S)
+
+
+def _bridge_response_budget(model: str) -> int:
+    """原生桥响应预算：图像模型按放宽后的 128MB，其余维持 64MB。"""
+    try:
+        is_image = bool(mc.get_profile(model)["is_image"])
+    except Exception:
+        is_image = False
+    return IMAGE_RESPONSE_BYTES if is_image else MAX_RESPONSE_BYTES
 
 # 原生请求里上游 GraphQL 无法承载、需要静默丢弃的字段（丢弃时打一条日志）
 _DROPPED_NATIVE_KEYS = ("cachedContent", "labels")
@@ -410,12 +425,21 @@ class NativeAssembler:
     非流式：collect 同样喂事件，payload 一次性出整包。
     """
 
-    def __init__(self, model_version: str, *, retain_parts: bool = True):
+    def __init__(self, model_version: str, *, retain_parts: bool = True,
+                 max_response_bytes: int | None = None):
         self.model_version = model_version
         self.parts: list[dict] = []
         self.retain_parts = retain_parts
+        # None = 构造时取模块常量（保持运行期 patch 模块常量的测试口子）。
+        self.max_response_bytes = (
+            MAX_RESPONSE_BYTES if max_response_bytes is None else max_response_bytes
+        )
         self.part_count = 0
+        # 累计响应字节（预算口径）与最后一个 part 的字节（分帧口径）分开记：
+        # 2026-11 P2-3 —— 流式路径旧写法在 retain_parts=False 时逐 part 重置
+        # response_bytes，「响应预算」实际只约束单 part，与文档语义不符。
         self.response_bytes = 0
+        self.last_part_bytes = 0
         self.finish: Optional[str] = None
         self.usage: Optional[dict] = None
         self.safety: Any = None
@@ -457,8 +481,11 @@ class NativeAssembler:
             self.blocked = str(data).split("（")[0].split("(")[0].strip() or "BLOCKED"
         if part is not None:
             size = _part_json_size(part)
-            self.response_bytes = self.response_bytes + size if self.retain_parts else size
-            if self.response_bytes > MAX_RESPONSE_BYTES:
+            # 累计语义（2026-11 P2-3）：流式/非流式同口径，预算名副其实；
+            # 图像模型经 max_response_bytes 放宽（见 IMAGE_RESPONSE_BYTES）。
+            self.response_bytes += size
+            self.last_part_bytes = size
+            if self.response_bytes > self.max_response_bytes:
                 raise NativeBridgeError(502, "上游响应超过允许的大小。")
             if self.retain_parts:
                 self.parts.append(part)
@@ -576,9 +603,12 @@ async def _events_with_retry(fastapi_request: Request, record: dict, body: dict,
             if retry_now is None:
                 return
             # 退避等待期间吐心跳保活（SSE 消费方转成 : keep-alive）。
+            # identity_rotates=False：原生桥重试复用同一 Cookie 身份，
+            # 上游 Retry-After 有约束力（2026-11 P2-5）。
             async for _hb in retry_heartbeats(
                     retry_delay(getattr(retry_now, "retry_after", None),
-                                backoff_sec, attempt, jitter_sec, error=str(retry_now)),
+                                backoff_sec, attempt, jitter_sec, error=str(retry_now),
+                                identity_rotates=False),
                     request=fastapi_request):
                 if await fastapi_request.is_disconnected():
                     raise NativeBridgeError(499, "客户端已断开连接。")
@@ -663,7 +693,9 @@ async def _handle_native_request_impl(fastapi_request: Request, model: str, acti
 
     if is_stream:
         async def stream():
-            assembler = NativeAssembler(requested_model or model, retain_parts=False)
+            assembler = NativeAssembler(
+                requested_model or model, retain_parts=False,
+                max_response_bytes=_bridge_response_budget(model))
             first = True
 
             def encode(payload, *, fragmented=False):
@@ -693,7 +725,7 @@ async def _handle_native_request_impl(fastapi_request: Request, model: str, acti
                         part = assembler.stream_event(kind, data)
                         if part is not None:
                             for chunk in encode({"candidates": [{"content": {"role": "model", "parts": [part]}, "index": 0}]},
-                                                fragmented=assembler.response_bytes > 1024 * 1024):
+                                                fragmented=assembler.last_part_bytes > 1024 * 1024):
                                 yield chunk
                 for chunk in encode(assembler.terminal()):
                     yield chunk
@@ -723,7 +755,8 @@ async def _handle_native_request_impl(fastapi_request: Request, model: str, acti
         return StreamingResponse(stream(), media_type="text/event-stream" if use_sse else "application/json",
                                  headers={"Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no"})
 
-    assembler = NativeAssembler(requested_model or model)
+    assembler = NativeAssembler(
+        requested_model or model, max_response_bytes=_bridge_response_budget(model))
     try:
         async with aclosing(_timed_events(fastapi_request, record, body, model, deadline)) as events:
             async for kind, data in events:

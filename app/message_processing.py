@@ -1,6 +1,7 @@
 """OpenAI 与 Gemini 消息、内容和响应格式转换。"""
 
 import base64
+import html
 import json
 import re
 import time
@@ -868,8 +869,11 @@ def _create_safety_ratings_html(safety_ratings: list) -> str:
         ss_s = f"{ss:.8f}" if ss is not None else "None"
         return f"{cat}: {prob} (Score: {ps_s}, Severity: {ss_s})"
 
-    summary_line = _fmt(*highest)
-    all_ratings_str = "\n".join(_fmt(*t) for t in normalized)
+    # 输出必转义（2026-11 S-7）：cat/prob 是上游枚举名，值域当前受 Google
+    # 控制，但「全链路输出必转义」的可审计不变量不应有例外——换一个上
+    # 游/中转（反代注入、自定义网关）即变成注入面。
+    summary_line = html.escape(_fmt(*highest))
+    all_ratings_str = html.escape("\n".join(_fmt(*t) for t in normalized))
 
     css_style = "<style>.cb{border:1px solid #444;margin:10px;border-radius:4px;background:#111}.cb summary{padding:8px;cursor:pointer;background:#222}.cb pre{margin:0;padding:10px;border-top:1px solid #444;white-space:pre-wrap}</style>"
     html_output = (

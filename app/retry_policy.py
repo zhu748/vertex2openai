@@ -99,7 +99,10 @@ def get_retry_settings() -> tuple[int, float, float]:
 
 
 def is_retryable_status(code: int) -> bool:
-    return code == 429 or 500 <= code <= 599
+    # 白名单收敛（2026-11 C-4）：501 Not Implemented / 505 HTTP Version Not
+    # Supported 等确定性 5xx 重试必然得到相同结果，只会烧重试预算（默认
+    # 10 次 × 退避）；429 与「可能自愈」的 5xx（500/502/503/504）才值得重试。
+    return code in (429, 500, 502, 503, 504)
 
 
 def is_retryable_message(error_msg: str) -> bool:
@@ -160,7 +163,7 @@ def is_auth_or_billing_error(error: object) -> bool:
     return any(marker in low for marker in AUTH_OR_BILLING_MARKERS)
 
 
-def _retry_delay_value(retry_after: Optional[str], default: float, attempt: int = 0, jitter: float = 1.0) -> float:
+def _retry_delay_value(retry_after: Optional[str], default: float, attempt: int = 0, jitter: float = 1.0, *, identity_rotates: bool = True) -> float:
     """计算一次重试的等待秒数。
 
     - retry_backoff_mode == "fixed"（默认）：**固定间隔 + 小幅抖动**，不随重试次数
@@ -171,9 +174,14 @@ def _retry_delay_value(retry_after: Optional[str], default: float, attempt: int 
     - default：基础间隔秒数（控制台 retry_backoff_seconds，默认 5）；
     - jitter：抖动幅度秒数（控制台 retry_jitter_seconds，默认 1），实际等待在
       [base - jitter/2, base + jitter/2] 内均匀采样，且不低于 0；
-    - retry_after：上游 Retry-After（秒数或 HTTP 日期）仍被采纳，但钳位到
-      [0, base + jitter/2]：更短的服务器提示照常生效，更长的等待不再
-      拖住重试（上一身份的 429 对换到的新身份没有约束力）。
+    - retry_after：上游 Retry-After（秒数或 HTTP 日期）。
+    - identity_rotates（2026-11 P2-5）：本次重试是否**轮换身份**。
+      True（Express 通道，每次重试换 Key）：上一身份的 429 对新身份没有约束力，
+      仍钳位到 [0, base + jitter/2]——更短的服务器提示照常生效，更长的不再拖住重试。
+      False（Cookie 通道，重试循环复用同一 Cookie）：上游的 Retry-After 对同一
+      身份仍有约束力，上限放宽为 max(窗口上限, Retry-After)——旧实现无条件
+      钳位，单 Cookie 部署遇限流时以 5.5s 间隔硬撞限流窗口，10 次重试预算
+      白白烧完；保留 120 秒绝对上限防御天文数字。
     """
     base = max(0.0, default)
     try:
@@ -193,6 +201,11 @@ def _retry_delay_value(retry_after: Optional[str], default: float, attempt: int 
             return 0.0
         return random.uniform(max(0.0, base - half), cap)
 
+    def hint_cap(hint: float) -> float:
+        if identity_rotates:
+            return cap
+        return min(120.0, max(cap, hint))
+
     if not retry_after:
         return fallback()
     try:
@@ -202,19 +215,19 @@ def _retry_delay_value(retry_after: Optional[str], default: float, attempt: int 
             delay = parsedate_to_datetime(retry_after).timestamp() - time.time()
         except (TypeError, ValueError, OverflowError):
             return fallback()
-        return max(0.0, min(delay, cap))
-    return min(delay, cap) if math.isfinite(delay) and delay >= 0 else fallback()
+        return max(0.0, min(delay, hint_cap(max(0.0, delay))))
+    return min(delay, hint_cap(delay)) if math.isfinite(delay) and delay >= 0 else fallback()
 
 
-def retry_delay(retry_after: Optional[str], default: float, attempt: int = 0, jitter: float = 1.0, *, error=None) -> float:
-    delay = _retry_delay_value(retry_after, default, attempt, jitter)
+def retry_delay(retry_after: Optional[str], default: float, attempt: int = 0, jitter: float = 1.0, *, error=None, identity_rotates: bool = True) -> float:
+    delay = _retry_delay_value(retry_after, default, attempt, jitter, identity_rotates=identity_rotates)
     retry_wait(delay, error or "上游返回可重试错误或连接失败，详见关联日志。")
     return delay
 
 
-def exception_retry_delay(error: Exception, default: float, attempt: int = 0, jitter: float = 1.0) -> float:
+def exception_retry_delay(error: Exception, default: float, attempt: int = 0, jitter: float = 1.0, *, identity_rotates: bool = True) -> float:
     headers = getattr(getattr(error, "response", None), "headers", None)
-    return retry_delay(headers.get("retry-after") if headers is not None else None, default, attempt, jitter, error=error)
+    return retry_delay(headers.get("retry-after") if headers is not None else None, default, attempt, jitter, error=error, identity_rotates=identity_rotates)
 
 
 async def wait_for_retry(request, delay: float) -> bool:

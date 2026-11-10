@@ -11,7 +11,7 @@ from unittest import mock
 
 _STATE = tempfile.TemporaryDirectory(prefix="v2o-continued-review-")
 os.environ["STATE_DIR"] = _STATE.name
-os.environ["API_KEY"] = "review-test-key"
+os.environ["API_KEY"] = "test-key"
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from fastapi import Request
@@ -79,7 +79,7 @@ class RequestStateFallbackTests(unittest.TestCase):
                     alternate = mock.AsyncMock(return_value=JSONResponse({"content": "unexpected fallback"}))
                     with (mock.patch.object(chat_api.express_upstream, "chat_completions", primary if mode == "api_key" else alternate),
                           mock.patch.object(chat_api.cookie_upstream, "chat_completions", primary if mode == "web_proxy" else alternate)):
-                        response = self.client.post("/v1/chat/completions", headers={"Authorization": "Bearer review-test-key"},
+                        response = self.client.post("/v1/chat/completions", headers={"Authorization": "Bearer test-key"},
                                                     json={"model": "gemini-3.6-flash", "stream": stream,
                                                           "messages": [{"role": "user", "content": "hello"}]})
                     self.assertEqual(response.status_code, 200 if stream else 503)
@@ -95,7 +95,7 @@ class RequestStateFallbackTests(unittest.TestCase):
         success = JSONResponse({"choices": [{"message": {"content": "recovered"}}]})
         with (mock.patch.object(chat_api.cookie_upstream, "chat_completions", mock.AsyncMock(return_value=failure)),
               mock.patch.object(chat_api.express_upstream, "chat_completions", mock.AsyncMock(return_value=success)) as express):
-            response = self.client.post("/v1/chat/completions", headers={"Authorization": "Bearer review-test-key"},
+            response = self.client.post("/v1/chat/completions", headers={"Authorization": "Bearer test-key"},
                                    json={"model": "gemini-3.6-flash", "messages": [{"role": "user", "content": "hello"}]})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["choices"][0]["message"]["content"], "recovered")
@@ -114,7 +114,7 @@ class RequestStateFallbackTests(unittest.TestCase):
                 return_value=StreamingResponse(failed(), media_type="text/event-stream"))),
               mock.patch.object(chat_api.express_upstream, "chat_completions", mock.AsyncMock(
                 return_value=StreamingResponse(recovered(), media_type="text/event-stream"))) as express):
-            response = self.client.post("/v1/chat/completions", headers={"Authorization": "Bearer review-test-key"},
+            response = self.client.post("/v1/chat/completions", headers={"Authorization": "Bearer test-key"},
                                    json={"model": "gemini-3.6-flash", "stream": True,
                                          "messages": [{"role": "user", "content": "hello"}]})
         self.assertEqual(response.status_code, 200)

@@ -230,8 +230,12 @@ class SdkClientPool:
                 return _closer.track(entry[1])
 
         retired_key = ("sdk", id(self), api_key, sig)
-        client = _closer.reclaim(retired_key)
+        # ensure_capacity 必须先于 reclaim（2026-11 C-10）：reclaim 成功后
+        # 若 ensure_capacity 抛出（延迟回收队列满载 PoolCapacityError），
+        # 已回收的客户端既不在 retired 池也不在活跃池，被直接孤儿化。
+        # 先腾容量再回收，失败时客户端仍留在延迟关闭器里等待重试。
         _closer.ensure_capacity(int(entry is not None or len(self._clients) >= self._maxsize))
+        client = _closer.reclaim(retired_key)
         if client is None:
             client = genai.Client(
                 vertexai=True, api_key=api_key,
@@ -320,8 +324,9 @@ class HttpxClientPool:
                 self._entries[sig] = hit
                 return _closer.track(hit)
 
-        client = _closer.reclaim(("httpx", id(self), sig))
+        # ensure_capacity 先于 reclaim（同上 C-10：回收成功后腾容量抛错会孤儿化客户端）。
         _closer.ensure_capacity(int(len(self._entries) >= self._maxsize))
+        client = _closer.reclaim(("httpx", id(self), sig))
         if client is None:
             client = factory()
         stale: list = []

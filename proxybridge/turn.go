@@ -108,14 +108,20 @@ func (c config) dialTURN(ctx context.Context, peer *net.TCPAddr, tlsConfig *tls.
 	}
 	stopData := context.AfterFunc(ctx, func() { data.Close() })
 	defer stopData()
-	if deadline, ok := ctx.Deadline(); ok {
-		data.SetDeadline(deadline)
+	// 绑定期 deadline 下限（2026-11 G-3，对齐匿名路径）：ctx 无 Deadline 时，
+	// 静默服务器会让 DialTCPWithConn 无限挂起；给 10 秒下限。
+	bindDeadline := time.Now().Add(10 * time.Second)
+	if deadline, ok := ctx.Deadline(); ok && deadline.Before(bindDeadline) {
+		bindDeadline = deadline
 	}
+	data.SetDeadline(bindDeadline)
 	adapter := &turnDataConn{TCPConn: tcp, stream: data, binding: true}
 	bound, err := allocation.DialTCPWithConn(adapter, "tcp", peer)
 	if err != nil || ctx.Err() != nil {
 		data.Close()
-		return nil, errors.New("turn_connect_failed_check_peer_policy")
+		// 具体错误保留在受控格式里（2026-11 G-3）：诊断只打印 code 前缀，
+		// cause 经 Unwrap 供调用方排障，不再被统一错误码吞掉。
+		return nil, protocolError{"turn_connect_failed_check_peer_policy", err}
 	}
 	adapter.binding = false
 	data.SetDeadline(time.Time{})

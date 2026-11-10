@@ -56,6 +56,18 @@ def frame(delta=None, finish=None, usage=None):
 
 
 class FinishReasonTests(unittest.TestCase):
+    def test_safety_ratings_html_escapes_upstream_enums(self):
+        # 2026-11 S-7 回归：安全分类摘要拼进 HTML 时必须转义上游枚举名，
+        # 维持「输出必转义」的可审计不变量（换上游/中转即注入面）。
+        from message_processing import _create_safety_ratings_html
+        out = _create_safety_ratings_html([
+            {"category": "HARM_CATEGORY<script>", "probability": "NEVER<b>",
+             "probabilityScore": None, "severityScore": 0.1}])
+        self.assertNotIn("<script>", out)
+        self.assertNotIn("NEVER<b>", out)
+        self.assertIn("&lt;Script&gt;", out)  # 分类名经标题规范化
+        self.assertIn("NEVER&lt;b&gt;", out)
+
     def test_new_safety_reasons_remain_refusals_in_both_delivery_modes(self):
         for reason in ("MODEL_ARMOR", "IMAGE_PROHIBITED_CONTENT", "IMAGE_RECITATION"):
             with self.subTest(reason=reason):

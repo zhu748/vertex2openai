@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
-from console_auth import require_auth
+from console_auth import is_authenticated, require_auth
 import config
 from runtime_state import app_state, get_effective_proxy_url, get_effective_proxy_urls, mask_proxy_url
 from proxy_resolver import classify_proxy_uri, validate_proxy_uri
@@ -58,14 +58,19 @@ def _healthz_payload() -> dict:
 
 
 @router.get("/healthz")
-async def healthz_get():
+async def healthz_get(request: Request):
+    # 部署形态详情（通道模式/凭证数量/代理出口）不再未鉴权披露（2026-11
+    # S-4 加固）：默认只回 status 供监控探活，登录控制台后附带完整字段。
+    if not is_authenticated(request):
+        return JSONResponse(content={"status": "ok"})
     return JSONResponse(content=_healthz_payload())
 
 
 @router.head("/healthz")
-async def healthz_head():
-    # 保留 GET 的表示头部，但在 ASGI 层就省略正文。
-    response = JSONResponse(content=_healthz_payload())
+async def healthz_head(request: Request):
+    # 保留 GET 的表示头部，但在 ASGI 层就省略正文（鉴权口径与 GET 一致）。
+    payload = _healthz_payload() if is_authenticated(request) else {"status": "ok"}
+    response = JSONResponse(content=payload)
     return Response(headers=dict(response.headers))
 
 

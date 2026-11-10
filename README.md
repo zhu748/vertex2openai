@@ -55,9 +55,12 @@ Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风
     并继续重试，各请求独立使用完整重试预算，不需要额外 Key。同一请求已退回裸模型名后会保留
     该路径，避免每次 429 重试又重打已知失败的项目路径。仅在配置了其他启用 Key 时才附带轮换，
     并使用新 Key 自己的项目路径。400/401/403/404 等明确的永久错误
-    不会仅因消息含 quota 或模型名含 429 而反复重试。支持 `Retry-After` 秒数与 HTTP 日期：
-    比配置窗口更短的提示照常采纳，更长的提示钳位到窗口上限（间隔 + 抖动/2，换 Key 重试时
-    上一身份的等待要求对新身份无约束力）；等待中断连立即停止，仅实际执行的重试计入面板。
+    不会仅因消息含 quota 或模型名含 429 而反复重试。支持 `Retry-After` 秒数与 HTTP 日期，
+    且按通道区分（2026-11）：**Express（每次重试换 Key）**——比配置窗口更短的提示照常采纳，
+    更长的钳位到窗口上限（间隔 + 抖动/2；上一身份的等待要求对新身份无约束力）；
+    **Cookie（重试复用同一身份）**——上游提示仍具约束力，等待至多
+    `max(窗口上限, Retry-After)`，绝对上限 120 秒，不再以 5.5s 间隔硬撞限流窗口。
+    等待中断连立即停止，仅实际执行的重试计入面板。
     流式预填充和空的用量块不会提前阻断重试；收到正文、思考或工具调用后不再重发，
     后续异常会明确返回错误事件，避免将半截答案当成成功。
   - **跨通道兜底重试（Express ↔ Cookie 互备，默认关闭）**：手动开启后，主通道在**尚未向客户端输出任何内容**前
@@ -162,7 +165,9 @@ curl -fsS https://你的域名/healthz     # GET：返回 JSON 状态
 curl -fsSI https://你的域名/healthz    # HEAD：只看状态码，响应无 body，适合监控平台
 ```
 
-GET 返回（代理地址自动脱敏，凭据不外泄）：
+**鉴权分级（2026-11 加固）**：未登录默认只返回 `{"status": "ok"}`——部署形态
+（通道模式、Key/Cookie 数量、代理出口）不再向匿名访问者披露；**登录控制台后**
+（带会话 Cookie）GET 才附带完整字段，用于控制台自检：
 
 ```json
 {
@@ -212,12 +217,15 @@ curl -s https://你的域名/v1beta/models -H "x-goog-api-key: 你的API_KEY"
 
 - **鉴权三种写法任选**：`Authorization: Bearer <API_KEY>`、`x-goog-api-key: <API_KEY>`、`?key=<API_KEY>`
   （与 OpenAI 端点同一把 Key，常量时间比较校验）。
+  ⚠️ 安全提示：`?key=` 写法的 Key 会进入反向代理的访问日志与浏览器历史（本服务自身日志已脱敏）。
+  这是 Gemini 客户端兼容的固有暴露面；公网部署建议优先用 Header 写法，并在反代层屏蔽含 `?key=` 的访问日志。
 - **双前缀**：`/v1beta/...`（Generative Language 风格）与 `/v1/...`（Vertex 风格）都注册了 POST 透传；
   模型列表只在 `/v1beta/models`（`/v1/models` 保持 OpenAI 格式，供 OpenAI 生态使用）。
 - **上游选择与重试**：复用 Express Key 池（轮询/随机）与 location 钉定；429/5xx 与网络异常按
   控制台 `retry_max` / `retry_backoff_seconds` / `retry_jitter_seconds` 重试（总尝试次数 =
   `retry_max + 1`，设 0 仍请求一次），间隔为**固定值 + 抖动**（默认 5±0.5 秒，不随次数增长）；
-  上游 `Retry-After` 更短时采纳其提示，更长时钳位到窗口上限。每次重试按策略重新选 Key，
+  上游 `Retry-After` 按 通道区分采纳（Express 换 Key 重试钳位到窗口上限；Cookie 同身份重试
+  遵循提示、封顶 120 秒）。每次重试按策略重新选 Key，
   单 Key 或 Key 池轮转一遍后仍可继续重试，客户端断开即停止；上游错误状态码与 body 原样透传。
   Cookie 模式下，`generateContent` / `streamGenerateContent` 转换为私有 batchGraphql 请求；
   其它模式优先使用 Express，没有 Key 而有 Cookie 时可桥接生成接口。
@@ -803,13 +811,13 @@ Express 文本通道保留普通 `type: "function"` 声明的自定义函数语�
 
 ## 抗截断模型选项
 
-默认仅 **`gemini-3.8-flash` 和 `gemini-4-argon`（Gemini 4a / Argon）** 在 `/v1/models` 中显示流式与非流式抗截断后缀。其它模型默认仅提供普通名称和原有搜索别名，不添加抗截断后缀。
+默认仅 **`gemini-3.8-flash`、`gemini-4-argon`（Gemini 4a / Argon）和 `gemini-4-carbon`（Gemini 4 / Carbon）** 在 `/v1/models` 中显示流式与非流式抗截断后缀。其它模型默认仅提供普通名称和原有搜索别名，不添加抗截断后缀。
 
-**普通无后缀名称始终不启用抗截断，包括 3.8 Flash 和 4a。** 只有选择已开启的抗截断后缀才会使用该传输方式，无需额外运行 Node.js/Go 网关或配置客户端正则。
+**普通无后缀名称始终不启用抗截断，包括 3.8 Flash、4a 和 4 Carbon。** 只有选择已开启的抗截断后缀才会使用该传输方式，无需额外运行 Node.js/Go 网关或配置客户端正则。
 
 | 模型名称示例 | 行为 |
 |---|---|
-| `gemini-3.8-flash` / `gemini-4-argon` | 普通入口，不启用抗截断 |
+| `gemini-3.8-flash` / `gemini-4-argon` / `gemini-4-carbon` | 普通入口，不启用抗截断 |
 | `gemini-3.8-flash-antitruncation-nonstream` | 上游完整返回后还原正文；客户端开启 `stream` 时仍以 SSE 交付 |
 | `gemini-3.8-flash-antitruncation-stream` | 上游支持时增量还原正文；客户端关闭 `stream` 时返回普通 JSON |
 | `gemini-3.6-flash` | 普通入口，不启用抗截断；在设置中开启后才添加其抗截断别名 |

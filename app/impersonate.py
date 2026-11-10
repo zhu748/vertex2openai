@@ -327,6 +327,16 @@ def _create_upstream_client(client_kwargs: dict):
         "verify": client_kwargs.get("verify", True),
         "trust_env": False,
         "default_headers": True,
+        # 句柄池容量对齐上游并发闸门（2026-11 P2-4 修复）：curl_cffi 0.16.3
+        # 默认 max_clients=10，且句柄获取发生在设置请求超时**之前**——队列
+        # 空时 pop_curl 无限等待。闸门默认 32，流式请求占住句柄直到流结束，
+        # 第 11 个并发流开始无限排队，最终以「等待模型首回复超时」报错
+        # （模型根本没收到请求），并触发换 Key/换账号的重试放大。
+        # 取当前生效闸门值（控制台热调后新建的会话跟随新值；已池化会话
+        # 维持构造时容量，签名淘汰后自然更新）。
+        "max_clients": max(
+            10, int(app_state.get_setting("upstream_max_concurrency", 32))
+        ),
     }
     if proxy:
         session_kwargs["proxy"] = _curl_remote_dns_proxy(proxy)
@@ -379,8 +389,9 @@ class _UpstreamClientPool:
                 self._entries[sig] = hit
                 return _closer.track(hit, usage)
 
-        client = _closer.reclaim(("cookie", id(self), sig))
+        # ensure_capacity 先于 reclaim（同 C-10：避免回收成功后腾容量抛错孤儿化客户端）。
         _closer.ensure_capacity(int(len(self._entries) >= _UPSTREAM_POOL_MAX))
+        client = _closer.reclaim(("cookie", id(self), sig))
         if client is None:
             client = factory(client_kwargs)
         stale: list = []

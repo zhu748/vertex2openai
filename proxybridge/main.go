@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -56,9 +57,18 @@ var diagnostics atomic.Uint32
 
 // Diagnostic messages are controlled codes: peer-provided errors can contain
 // echoed credentials. Bound output even when an offline node is retried often.
-func diagnostic(code string) {
+// protocolError renders as "code: cause" where the cause may carry TURN reason
+// phrases — keep only the code token, and collapse anything else to a single
+// line defensively (newlines enable log forgery; 2026-11 G-4).
+func diagnostic(message string) {
+	if idx := strings.Index(message, ": "); idx > 0 {
+		message = message[:idx]
+	}
+	if idx := strings.IndexAny(message, "\r\n\x00"); idx >= 0 {
+		message = message[:idx]
+	}
 	if diagnostics.Add(1) <= 128 {
-		fmt.Fprintln(os.Stderr, code)
+		fmt.Fprintln(os.Stderr, message)
 	}
 }
 
@@ -182,11 +192,16 @@ func dialResolved(ctx context.Context, target string, ipv4Only bool, dial func(c
 		}
 	}
 	if len(ordered) == 0 {
-		// DNS succeeded but returned no usable A/AAAA record: report the
-		// resolution failure instead of the misleading family error.
-		return nil, errors.New("target_dns_failed")
+		if len(ips) == 0 {
+			// DNS succeeded but returned no usable A/AAAA record.
+			return nil, errors.New("target_dns_failed")
+		}
+		// DNS 本身成功，但 ipv4Only（SSTP IPCP 只承载 IPv4）把全部
+		// 地址过滤掉了（如仅有 AAAA 记录的目标）——这不是解析失败
+		// （2026-11 G-1：旧实现统一误报 target_dns_failed，误导排障）。
+		return nil, errors.New("target_address_family_unsupported")
 	}
-	err = errors.New("target_address_family_unsupported")
+	err = errors.New("target_dial_failed")
 	for i, ip := range ordered {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
@@ -374,7 +389,95 @@ func handleSOCKS(ctx context.Context, conn net.Conn, dial dialFunc) {
 	relay(conn, upstream)
 }
 
+// relay 空闲回收窗口（2026-11 P2-7，测试可缩短）：
+//
+// 双向拷贝此前只在第一个方向「带错误」返回时才关闭两侧连接。半关闭语义下
+// （对端正常 EOF、CloseWrite 成功、返回 nil），另一方向的 io.Copy 在静默
+// 目标上会无限阻塞——组件文档自己就警告过「部分开放 TURN 服务器连接建立
+// 后无响应」。每个挂死连接占住 1 个 goroutine、上游数据连接、控制连接以及
+// 匿名路径的持续续期任务，128 个槽位被逐个耗尽后新连接全部进入拒绝路径，
+// 进程无法自愈，表现为难以定位的「代理越来越慢直到不可用」。
+var (
+	// 半关闭后剩余方向的无流量回收窗口。
+	relayHalfCloseIdle = 5 * time.Minute
+	// 从未搬运过任何字节的连接回收窗口：真实客户端在 SOCKS 应答后立即
+	// 发送请求，长时间零字节即死连接。
+	relayFirstByteIdle = 10 * time.Minute
+	// 看门狗轮询间隔。
+	relayIdleCheck = 15 * time.Second
+)
+
+// countingConn 统计经手字节数：任一方向有真实流量即视为活跃。
+type countingConn struct {
+	net.Conn
+	counter *atomic.Int64
+}
+
+func (c countingConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.counter.Add(int64(n))
+	}
+	return n, err
+}
+
+func (c countingConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if n > 0 {
+		c.counter.Add(int64(n))
+	}
+	return n, err
+}
+
+// CloseWrite 必须转发到底层连接（若支持）：包装会遮蔽具体的
+// CloseWrite 方法，copyTo 的类型断言将改走整连接关闭分支，破坏
+// 「首个方向 EOF 后另一方向仍可传输」的半关闭语义。底层不支持时
+// 回退为整连接关闭，与 relay 原有的 else 分支行为一致。
+func (c countingConn) CloseWrite() error {
+	if closer, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return closer.CloseWrite()
+	}
+	c.Conn.Close()
+	return nil
+}
+
+// relayIdleWatchdog 只回收「确认静默」的连接：从未有过流量
+// （relayFirstByteIdle），或半关闭后长时间无新字节（relayHalfCloseIdle）。
+// 两侧都打开且有过流量的静默是合法场景——非流式 4K 生图在响应就绪前
+// 可静默 10 分钟以上——不做中途闲置回收，避免误杀慢生成。
+func relayIdleWatchdog(a, b net.Conn, activity *atomic.Int64, started time.Time, halfClosed bool, finished <-chan struct{}) {
+	ticker := time.NewTicker(relayIdleCheck)
+	defer ticker.Stop()
+	lastCount := activity.Load()
+	lastChange := started
+	for {
+		select {
+		case <-finished:
+			return
+		case now := <-ticker.C:
+			cur := activity.Load()
+			if cur != lastCount {
+				lastCount, lastChange = cur, now
+				continue
+			}
+			if cur == 0 && now.Sub(started) >= relayFirstByteIdle {
+				a.Close()
+				b.Close()
+				return
+			}
+			if halfClosed && now.Sub(lastChange) >= relayHalfCloseIdle {
+				a.Close()
+				b.Close()
+				return
+			}
+		}
+	}
+}
+
 func relay(a, b net.Conn) {
+	var activity atomic.Int64
+	ca := countingConn{Conn: a, counter: &activity}
+	cb := countingConn{Conn: b, counter: &activity}
 	done := make(chan error, 2)
 	copyTo := func(dst, src net.Conn) {
 		_, err := io.Copy(dst, src)
@@ -387,11 +490,15 @@ func relay(a, b net.Conn) {
 		}
 		done <- err
 	}
-	go copyTo(a, b)
-	go copyTo(b, a)
-	if err := <-done; err != nil {
+	go copyTo(ca, cb)
+	go copyTo(cb, ca)
+	first := <-done
+	if first != nil {
 		a.Close()
 		b.Close()
 	}
+	finished := make(chan struct{})
+	defer close(finished)
+	go relayIdleWatchdog(a, b, &activity, time.Now(), first == nil, finished)
 	<-done
 }

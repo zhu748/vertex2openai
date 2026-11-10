@@ -61,6 +61,48 @@ class GrpcStatusMappingTests(unittest.TestCase):
         code, _ = api_error_details({"message": "something odd"})
         self.assertEqual(code, 502)
 
+    def test_auth_permission_text_fallback_maps_to_403(self):
+        # 2026-11 P2-1 回归：无结构化 code 时，Cookie/项目权限类文案要
+        # 归类 403（触发续期提示与账号隔离），而不是落进 429/502 兜底。
+        from upstreams.cookie_transport import api_error_details
+        for message in ("Permission denied on resource",
+                        "Request had invalid credentials",
+                        "requires billing to be enabled",
+                        "project not found or access denied"):
+            with self.subTest(message=message):
+                code, _ = api_error_details({"message": message})
+                self.assertEqual(code, 403, message)
+        # 结构化信号仍优先于文本：显式 429 + 权限文案 → 429（不误隔离）。
+        code, _ = api_error_details({"code": 429, "message": "permission denied quota"})
+        self.assertEqual(code, 429)
+
+    def test_usage_estimation_counts_thought_exactly_once(self):
+        # 2026-11 C-1 核验回归：流式（元数据 join，含 thought 项）与非流式
+        # （full_text + reasoning_text）两条估算路径必须给出**相同**的
+        # completion 估算——思考文本恰好计一次。评审报告曾疑有双计，
+        # 实测两条路径口径一致；本测试锁定该不变量，防止未来分叉。
+        from upstreams.cookie_proxy import _final_usage
+        from thought_signatures import ordinary_part_metadata
+        request = SimpleNamespace(
+            messages=[{"role": "user", "content": "hello world"}])
+        meta = [
+            ordinary_part_metadata("text", "answer body text", None),
+            ordinary_part_metadata("thought", "thinking hard about the problem", None),
+        ]
+        with mock.patch.object(
+            __import__("runtime_state", fromlist=["app_state"]).app_state,
+            "get_setting", return_value=True):
+            streaming = _final_usage(
+                None, request,
+                "\n".join(p.get("text", "") for p in meta))
+            nonstream = _final_usage(
+                None, request, "answer body text",
+                "thinking hard about the problem")
+        self.assertEqual(streaming.get("completion_tokens"),
+                         nonstream.get("completion_tokens"))
+        self.assertGreater(streaming.get("completion_tokens", 0), 0)
+        self.assertTrue(streaming.get("estimated"))
+
 
 class CookieKeywordNarrowingTests(unittest.TestCase):
     def test_safety_denial_text_not_cookie_expired(self):

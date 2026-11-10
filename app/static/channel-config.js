@@ -1260,7 +1260,7 @@
     $('proxy-import-list').innerHTML = items
       .map(
         (row) => `<div class="proxy-import-row" data-import-id="${esc(row.id)}">
-    <input type="checkbox" aria-label="选择${esc(row.source)}" ${row.selected ? 'checked' : ''} ${!canImportProxy(row) || proxyEditor.job ? 'disabled' : ''} onchange="toggleProxyImport('${esc(row.id)}',this.checked)">
+    <input type="checkbox" aria-label="选择${esc(row.source)}" ${row.selected ? 'checked' : ''} ${!canImportProxy(row) || proxyEditor.job ? 'disabled' : ''}>
     <div><strong>${esc(row.name || row.label)}</strong><small>${esc(row.source)}${row.name ? ' · ' + esc(row.label) : ''}</small></div>
     <div class="proxy-row-result" data-state="${esc(row.state)}">${esc(row.result ? proxyResultText(row.result) : { ready: '未测试', queued: '等待测试', testing: '正在测试…', cancelled: '测试已停止' }[row.state] || row.message)}</div></div>`
       )
@@ -1399,6 +1399,17 @@
         proxyEditor.batch = null;
         renderProxyImport();
       });
+    // 事件委托替代内联 onchange（2026-11 S-6）：esc() 的实体编码在 HTML
+    // 属性解析后会被还原，单引号可闭合内联 JS 字符串——当前数据源虽为
+    // 纯数字，但「换数据源即 XSS」。行 id 从 data-import-id 读取，不再
+    // 进入任何 JS 字符串上下文。
+    $('proxy-import-list').addEventListener('change', (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLInputElement) || target.type !== 'checkbox') return;
+      const row = target.closest('.proxy-import-row');
+      const id = row ? row.getAttribute('data-import-id') : null;
+      if (id !== null) toggleProxyImport(id, target.checked);
+    });
     document.querySelector('.proxy-nav').addEventListener('keydown', (event) => {
       if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
       const names = ['list', 'form', 'import'];

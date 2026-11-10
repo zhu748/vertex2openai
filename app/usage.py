@@ -96,6 +96,40 @@ def map_usage(metadata: Any) -> dict[str, int]:
     return usage
 
 
+def usage_snapshot_unchanged(previous: dict | None, metadata: Any) -> bool:
+    """六个计数器与已合并快照完全一致 → 调用方可跳过 merge（2026-11 O-5）。
+
+    流式 chunk 常携带**不变的**累计 usage 快照，逐帧 merge 都要做一次
+    pydantic model_dump；属性直读短路后未变化帧零成本。native-only 附加
+    字段（模态明细等）不参与判定——漏检的代价只是少一次非计数字段更新。
+    """
+    if not previous:
+        return False
+    for snake, camel in (
+        ("prompt_token_count", "promptTokenCount"),
+        ("tool_use_prompt_token_count", "toolUsePromptTokenCount"),
+        ("candidates_token_count", "candidatesTokenCount"),
+        ("thoughts_token_count", "thoughtsTokenCount"),
+        ("cached_content_token_count", "cachedContentTokenCount"),
+        ("total_token_count", "totalTokenCount"),
+    ):
+        if isinstance(metadata, dict):
+            value = metadata.get(camel, metadata.get(snake))
+        else:
+            value = getattr(metadata, snake, None)
+            if value is None:
+                value = getattr(metadata, camel, None)
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            count = max(0, int(value))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if count != previous.get(camel, previous.get(snake)):
+            return False
+    return True
+
+
 def merge_usage_metadata(previous: dict | None, metadata: Any) -> dict:
     """Merge cumulative Gemini snapshots without treating omitted counters as zero."""
     if isinstance(metadata, dict):

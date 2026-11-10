@@ -443,7 +443,12 @@ class KeyPriorityTests(unittest.TestCase):
             # 清空保存 = 明确直连，不被环境变量抢回
             app_state.update_settings({"proxy_url": ""})
             self.assertEqual(get_effective_proxy_uri_for_key(None), "")
-        app_state._state.get("settings", {}).pop("proxy_url", None)   # 还原「从未保存」
+        # 还原「从未保存」：update_settings 对 proxy_url/proxy_urls 是**成对**
+        # 落键的，只弹一个会把「保存为空 = 明确直连」泄漏给后续用例
+        # （ConfigShapeTests 的全局兜底曾被读成直连，2026-11 修复）。
+        settings = app_state._state.get("settings", {})
+        settings.pop("proxy_url", None)
+        settings.pop("proxy_urls", None)
 
     def test_record_normalization_keeps_proxy(self):
         app_state.set_express_keys([{"key": "k1", "proxy": REAL_VLESS},

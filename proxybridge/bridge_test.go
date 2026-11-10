@@ -431,3 +431,91 @@ func TestSSTPPortCollisionDoesNotStartVPNHandshake(t *testing.T) {
 	default:
 	}
 }
+
+func TestRelayRecyclesSilentHalfClosedPeer(t *testing.T) {
+	// 2026-11 P2-7：一侧正常 EOF（半关闭返回 nil）后，静默目标的另一
+	// 方向必须被空闲看门狗回收——旧实现会无限阻塞，槽位被逐个耗尽。
+	oldIdle, oldCheck := relayHalfCloseIdle, relayIdleCheck
+	relayHalfCloseIdle, relayIdleCheck = 150*time.Millisecond, 25*time.Millisecond
+	defer func() { relayHalfCloseIdle, relayIdleCheck = oldIdle, oldCheck }()
+
+	left, leftPeer := net.Pipe()
+	right, rightPeer := net.Pipe()
+	defer leftPeer.Close()
+	defer rightPeer.Close()
+	done := make(chan struct{})
+	go func() {
+		relay(left, right)
+		close(done)
+	}()
+	// 上行方向正常 EOF；rightPeer 保持打开且静默 → 下行方向只能等看门狗。
+	leftPeer.Close()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("silent half-closed peer was never recycled")
+	}
+}
+
+func TestRelayRecyclesNeverStartedConnection(t *testing.T) {
+	// 2026-11 P2-7：两侧都打开但从未搬运过任何字节的死连接也要回收。
+	oldIdle, oldCheck := relayFirstByteIdle, relayIdleCheck
+	relayFirstByteIdle, relayIdleCheck = 150*time.Millisecond, 25*time.Millisecond
+	defer func() { relayFirstByteIdle, relayIdleCheck = oldIdle, oldCheck }()
+
+	left, leftPeer := net.Pipe()
+	right, rightPeer := net.Pipe()
+	defer leftPeer.Close()
+	defer rightPeer.Close()
+	done := make(chan struct{})
+	go func() {
+		relay(left, right)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("never-started connection was never recycled")
+	}
+}
+
+func TestRelayKeepsActiveSlowConnectionOpen(t *testing.T) {
+	// 对照组：有过流量的连接即使长时间静默也不得被看门狗误杀——
+	// 非流式 4K 生图在响应就绪前可静默 10 分钟以上（合法场景）。
+	oldIdle, oldCheck := relayHalfCloseIdle, relayIdleCheck
+	relayHalfCloseIdle, relayIdleCheck = 200*time.Millisecond, 25*time.Millisecond
+	defer func() { relayHalfCloseIdle, relayIdleCheck = oldIdle, oldCheck }()
+
+	left, leftPeer := net.Pipe()
+	right, rightPeer := net.Pipe()
+	defer leftPeer.Close()
+	defer rightPeer.Close()
+	done := make(chan struct{})
+	go func() {
+		relay(left, right)
+		close(done)
+	}()
+	// 先搬运一个字节（连接已「活跃」），随后两侧静默且不半关闭。
+	go func() {
+		leftPeer.Write([]byte("x"))
+	}()
+	buf := make([]byte, 1)
+	rightPeer.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := io.ReadFull(rightPeer, buf); err != nil {
+		t.Fatalf("byte was not relayed: %v", err)
+	}
+	rightPeer.SetReadDeadline(time.Time{})
+	select {
+	case <-done:
+		t.Fatal("active silent connection was recycled prematurely")
+	case <-time.After(600 * time.Millisecond):
+		// 看门狗窗口（200ms）已过多个周期仍未回收：符合预期。
+	}
+	leftPeer.Close()
+	rightPeer.Close()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("relay did not finish after both peers closed")
+	}
+}

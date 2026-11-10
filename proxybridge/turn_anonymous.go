@@ -364,6 +364,13 @@ func (c config) dialTURNAnonymous(ctx context.Context, peer *net.TCPAddr, tlsCon
 		data.Close()
 		return nil, fmt.Errorf("connection bind: %w", stunError(bindResponse))
 	}
+	// Transaction ID 校验（2026-11 G-2）：行为异常的服务器可用任意成功响应
+	// 让绑定「成功」；与同文件 rawSTUNTransaction 的语义对齐，ID 不匹配
+	// 即拒绝。（数据连接不做 indication 跳过循环：绑定期内不该有旁路流量。）
+	if bindResponse.TransactionID != bind.TransactionID {
+		data.Close()
+		return nil, errors.New("connection bind: transaction mismatch")
+	}
 	adapter.binding = false
 	data.SetDeadline(time.Time{})
 	complete = true

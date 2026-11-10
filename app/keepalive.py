@@ -17,6 +17,7 @@
 """
 
 import asyncio
+import ipaddress
 from typing import Optional
 
 import httpx
@@ -31,16 +32,51 @@ _MIN_INTERVAL_SECONDS = 5
 _MAX_REDIRECTS = 5
 
 
+# 已知的云元数据域名（静态可判）：域名型元数据端点无法用地址段判段。
+_METADATA_HOSTS = frozenset({"metadata.google.internal", "metadata.goog"})
+
+
+def _keepalive_host_allowed(host: str) -> bool:
+    """保活目标的地址段裁决（2026-11 S-3）。
+
+    云元数据 / 链路本地段（169.254.169.254、metadata.google.internal 等）
+    绝不是合法保活目标：会话被伪造后可借保活任务盲探元数据端点收割凭据。
+    环回与私网段**保留**：把 URL 填成自己的 http://127.0.0.1:port/healthz
+    是文档化的「自我保活」用法，操作者已通过控制台鉴权，目标是其自己的
+    实例/内网监控。
+    """
+    if host.lower() in _METADATA_HOSTS:
+        return False
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return True  # 普通域名无法静态判段；解析交给出站层
+    return not (addr.is_link_local or addr.is_multicast
+                or addr.is_reserved or addr.is_unspecified)
+
+
 def validate_keepalive_url(url: str) -> bool:
     if not url:
         return True
     try:
         parsed = httpx.URL(url)
-        return (parsed.scheme in ("http", "https") and bool(parsed.host)
-                and not any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in url)
-                and (parsed.port is None or 1 <= parsed.port <= 65535))
     except (httpx.InvalidURL, ValueError):
         return False
+    if not (parsed.scheme in ("http", "https") and bool(parsed.host)):
+        return False
+    if any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in url):
+        return False
+    if parsed.port is not None and not 1 <= parsed.port <= 65535:
+        return False
+    # 2026-11 S-3 加固：
+    # 1) 拒绝内嵌凭据（userinfo）的 URL：保活没有鉴权语义，凭据只会在
+    #    启动/运行日志里原样泄露（GET {url}）。
+    authority = url.split("://", 1)[-1].split("/", 1)[0]
+    if "@" in authority:
+        return False
+    # 2) 链路本地 / 云元数据地址段拒绝（见 _keepalive_host_allowed）。
+    #    重定向目标经本函数复检，同一口径。
+    return _keepalive_host_allowed(parsed.host)
 
 
 class KeepAliveService:

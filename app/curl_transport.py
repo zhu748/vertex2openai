@@ -28,6 +28,12 @@ class CancellationSafeSession(AsyncSession):
         curl = await super().pop_curl()
         lease = _request_lease.get()
         if lease is not None and lease.session is self:
+            if lease.curl is not None and lease.curl is not curl:
+                # 同一 lease 换新句柄（curl_cffi 内置重试时）：重置释放
+                # 标记（2026-11 C-12）。当前未启用内置重试不可达，但消除
+                # 对库配置的隐含依赖——否则旧句柄的 released 状态会让
+                # 新句柄的取消清理波洞（release_curl 直接放过）。
+                lease.released = asyncio.Event()
             lease.curl = curl
         return curl
 

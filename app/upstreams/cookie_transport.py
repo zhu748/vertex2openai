@@ -179,13 +179,27 @@ def grpc_status_code(data) -> int | None:
 
 
 def api_error_details(data) -> tuple[int, str]:
+    """GraphQL 错误块 → (HTTP 状态码, 消息) 的**唯一**分类入口。
+
+    优先级：显式 code 字段 > gRPC 状态码（extensions.status.code）>
+    鉴权/项目类文本关键词 > 限流文本 > 502。文本兜底从流式路径收敛到
+    这里（2026-11 修复）：此前只有流式判定 Cookie/项目失效（且文本可
+    覆盖结构化码），非流式与生图整取只认结构化码——同一错误在
+    GraphQL 块不带 code 字段时，流式触发续期提示与账号隔离、非流式
+    返回 502 且不记账。现在流式/非流式/生图/探测四处共用本函数，
+    行为一致；结构化信号仍优先于文本（与 COOKIE_EXPIRED_KEYWORDS
+    的注释口径对齐）。
+    """
     raw = data.get("message") if isinstance(data, dict) else data
     message = raw if isinstance(raw, str) and raw.strip() else str(data)
     code = data.get("code") if isinstance(data, dict) else None
     if not isinstance(code, int) or not 400 <= code <= 599:
-        # 结构化信号优先：gRPC 状态码（extensions.status.code）→ HTTP；
-        # 都没有再落到文本关键词（旧口径，兜底）。
+        # 结构化信号优先：gRPC 状态码（extensions.status.code）→ HTTP。
         code = _GRPC_TO_HTTP.get(grpc_status_code(data))
+    if not isinstance(code, int) or not 400 <= code <= 599:
+        # 文本兜底：Cookie/项目权限类文案 → 403，触发续期提示与账号隔离。
+        if is_cookie_expired_error(message) or is_project_error(message):
+            code = 403
     if not isinstance(code, int) or not 400 <= code <= 599:
         code = 429 if is_retryable_error(message) else 502
     return code, message
@@ -327,11 +341,11 @@ async def _execute_stream_request_generator_once(
                         if is_native_tool_error(err_msg) and not has_content:
                             yield "native_tool_unsupported", error
                             return
-                        if (
-                            code in (401, 403)
-                            or is_cookie_expired_error(err_msg)
-                            or is_project_error(err_msg)
-                        ) and not has_content:
+                        # 鉴权失效判定收敛进 api_error_details（2026-11）：
+                        # code 已含结构化 401/403 与文本兜底（Cookie/项目类
+                        # 文案 → 403），此处只看结果码；提示语仍按项目/
+                        # Cookie 区分。
+                        if code in (401, 403) and not has_content:
                             hint = (
                                 PROJECT_ERROR_HINT
                                 if is_project_error(err_msg)

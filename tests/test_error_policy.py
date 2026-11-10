@@ -36,6 +36,34 @@ class RetrySettingsTests(unittest.TestCase):
         with mock.patch.object(app_state, "get_setting", side_effect=legacy.get):
             self.assertEqual(retry_policy.get_retry_settings(), (50, 5.0, 1.0))
 
+    def test_retryable_status_whitelist_excludes_deterministic_5xx(self):
+        # 2026-11 C-4 回归：501/505 等确定性 5xx 重试必然得到相同结果，
+        # 不得进入重试白名单；429 与可自愈的 500/502/503/504 保留。
+        for code in (429, 500, 502, 503, 504):
+            self.assertTrue(retry_policy.is_retryable_status(code), code)
+        for code in (400, 401, 403, 404, 408, 501, 505, 507, 511):
+            self.assertFalse(retry_policy.is_retryable_status(code), code)
+
+    def test_retry_after_honored_for_same_identity_clamped_for_rotation(self):
+        # 2026-11 P2-5 回归：同一身份重试（Cookie 通道）时上游 Retry-After
+        # 有约束力（30s 提示 → 等 30s，不再压到 5.5s 窗口）；换身份重试
+        # （Express 通道）维持旧钳位语义；两种模式都保留 120s 绝对上限。
+        settings = {"retry_backoff_mode": "fixed"}
+        with mock.patch.object(app_state, "get_setting",
+                               side_effect=lambda key, default=None: settings.get(key, default)):
+            same = retry_policy._retry_delay_value("30", 5.0, 0, 1.0, identity_rotates=False)
+            rotate = retry_policy._retry_delay_value("30", 5.0, 0, 1.0, identity_rotates=True)
+            self.assertEqual(same, 30.0)
+            self.assertLessEqual(rotate, 5.5)
+            # 天文数字防御：两种模式都封顶 120 秒。
+            self.assertEqual(
+                retry_policy._retry_delay_value("9999", 5.0, 0, 1.0, identity_rotates=False),
+                120.0)
+            # 更短的服务器提示照常生效（不人为拉长）。
+            self.assertEqual(
+                retry_policy._retry_delay_value("2", 5.0, 0, 1.0, identity_rotates=False),
+                2.0)
+
     def test_sdk_thinking_configuration_is_valid_for_the_pinned_dependency(self):
         obj = OpenAIRequest(model="gemini-3.6-flash", messages=[], reasoning_effort="high")
         with mock.patch.object(

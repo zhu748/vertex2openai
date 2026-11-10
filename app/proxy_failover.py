@@ -4,6 +4,7 @@ Never invent a direct route. Model/auth/quota errors keep their existing retry
 policy. Once streaming data has been exposed, errors propagate without replay.
 """
 
+import threading
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
@@ -49,24 +50,32 @@ class ProxyChain:
         self.candidates = tuple(candidates if candidates is not None else
                                 get_effective_proxy_uris_for_account(record)) or ("",)
         self.index = 0
+        # index 的读-改-写加锁（2026-11 C-13）：事件循环与媒体下载 worker
+        # 线程会并发触碰同一链（to_thread 里的下载失败触发 advance），裸
+        # `+=` 非原子，最坏丢失一次自增导致故障切换跳档/回退。
+        self._index_lock = threading.Lock()
 
     @property
     def current(self):
-        return self.candidates[self.index]
+        with self._index_lock:
+            return self.candidates[self.index]
 
     def advance(self, error=None, *, status=None):
-        if self.index + 1 >= len(self.candidates):
-            return False
-        if status not in PROXY_FAILURE_STATUSES and not is_proxy_failure(error):
-            return False
-        previous = self.current
-        self.index += 1
+        with self._index_lock:
+            if self.index + 1 >= len(self.candidates):
+                return False
+            if status not in PROXY_FAILURE_STATUSES and not is_proxy_failure(error):
+                return False
+            previous = self.candidates[self.index]
+            self.index += 1
+            current = self.candidates[self.index]
+            position, total = self.index + 1, len(self.candidates)
         from logger import stats
         stats.add_retry()
         reason = f"HTTP {status}" if status is not None else type(error).__name__
         print(f"🔀 [代理切换] {mask_proxy_uri(previous) or '直连'} 失败（{reason}），"
-              f"按顺序尝试 {self.index + 1}/{len(self.candidates)}："
-              f"{mask_proxy_uri(self.current) or '直连'}")
+              f"按顺序尝试 {position}/{total}："
+              f"{mask_proxy_uri(current) or '直连'}")
         return True
 
     async def prepare(self, factory):

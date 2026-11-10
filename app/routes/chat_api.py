@@ -10,6 +10,7 @@ from channel_capabilities import cookie_feature_error
 import asyncio
 import hashlib
 import json
+import re
 import time
 import traceback
 from contextlib import suppress
@@ -119,19 +120,42 @@ async def _invoke_channel(request_obj: OpenAIRequest, fastapi_request: Request, 
     return await express_upstream.chat_completions(request_obj, fastapi_request)
 
 
+# 内容帧快筛（2026-11 O-7）：仅在值确为**非空**时命中——空串
+# （"content": ""，Express 流式真实存在）不匹配（前瞻要求引号后有字符），
+# 与解析后 has_payload 口径一致；JSON 转义会给内嵌同类子串加反斜杠，不误报。
+_CONTENT_FRAME_RE = re.compile(
+    r'"(?:content|reasoning_content)":\s*"(?=[^"])|"tool_calls":\s*\[\s*\{')
+
+
 def _sse_frame_kind(frame: str) -> tuple[str, Optional[int]]:
     """解析一帧 SSE：返回 (类型, 错误码)。
 
     类型 ∈ keepalive（注释帧/保活帧）/ done（[DONE]）/ error（错误负载）/
     content（真实内容：正文、思考或工具调用增量）/ finish（仅含结束标记、
     无任何内容增量的空收尾帧）/ other（role 声明等）。
+
+    分类顺序按热路径成本排布（2026-11 O-7）：兜底开启时长流的每帧都要
+    过本函数——内容帧（绝大多数）用廉价子串预筛直通、零 JSON 解析；
+    疑似错误/收尾/角色/用量帧再走完整反序列化。子串模式只在「值确为
+    非空」时命中（空串/空列表不匹配），与解析后 has_payload 口径一致；
+    JSON 转义会把内嵌的同类子串打上反斜杠，不会误报。bytes 帧归一化。
     """
+    if isinstance(frame, (bytes, bytearray)):
+        frame = frame.decode("utf-8", "replace")
     stripped = frame.strip()
     if not stripped.startswith("data:"):
         return ("keepalive", None)
     payload_text = stripped[len("data:"):].strip()
     if payload_text == "[DONE]":
         return ("done", None)
+    if _CONTENT_FRAME_RE.search(payload_text):
+        return ("content", None)
+    if '"chatcmpl-keepalive"' in payload_text:
+        return ("keepalive", None)
+    if '"error"' not in payload_text and '"choices"' not in payload_text:
+        # 无错误负载也无 choices 结构（如纯 usage 帧）：不可能是
+        # error/content/finish，直接归 other，省一次完整反序列化。
+        return ("other", None)
     try:
         payload = json.loads(payload_text)
     except ValueError:
@@ -181,7 +205,9 @@ async def _try_channel_fallback(
         raise
     except Exception as exc:
         code, msg = extract_upstream_error(exc)
-        stats.add_error()
+        # 不在此 add_error（2026-11 C-3 修复）：主通道失败已计过一次错误，
+        # 兜底通道自身的流式/非流式路径也会按各自口径计数，这里再计会使
+        # 同一请求在大盘上出现 2 个错误（success + error 之和超过 total）。
         print(f"❌ [跨通道兜底] 备用通道[{_channel_label(fallback_channel)}]启动失败："
               f"HTTP {code} | {str(msg)[:200]}")
         return None
@@ -256,6 +282,20 @@ async def _stream_with_fallback_frames(
     print(f"ℹ️ [跨通道兜底] 备用通道[{fallback_label}]未返回流式响应（HTTP {alt_code}），回放主通道错误。")
     yield pending_error_frame
     yield DONE_FRAME
+
+
+def _stream_fallback_candidate(result, fastapi_request, primary_channel, request_obj) -> bool:
+    """快路径结果是否需要**尝试**跨通道兜底（决定同步返回还是移入生成器）。
+
+    流式响应的兜底在流内懒触发（不阻塞）；无备用通道或不可兜底的错误
+    保持同步路径（快验证错误保留 HTTP 状态码语义）。只有「可兜底的快
+    错误」需要进入带心跳的生成器路径（2026-11 C-5）。
+    """
+    if isinstance(result, StreamingResponse):
+        return False
+    fallback_channel = _other_channel(fastapi_request, primary_channel, request_obj)
+    return fallback_channel is not None and _fallback_eligible_code(
+        getattr(result, "status_code", 502))
 
 
 async def _apply_stream_fallback(
@@ -379,8 +419,39 @@ async def _dispatch_upstream(request_obj: OpenAIRequest, fastapi_request: Reques
             await close_setup()
             raise
         if done:
-            response = await _apply_stream_fallback(
-                setup.result(), request_obj, fastapi_request, _primary_channel(), deadline)
+            primary = setup.result()
+            if not _stream_fallback_candidate(
+                    primary, fastapi_request, _primary_channel(), request_obj):
+                # 流式响应（兜底在流内懒触发）或不可兜底的快错误（保持
+                # HTTP 状态码）：同步路径，无额外等待。
+                response = await _apply_stream_fallback(
+                    primary, request_obj, fastapi_request, _primary_channel(), deadline)
+            else:
+                # 可兜底的快错误：兜底统一移入带心跳的生成器路径（2026-11
+                # C-5）。旧实现在此同步 await 备用通道（含最长 30 秒媒体
+                # 下载），客户端 SSE 尚未建立、零字节无心跳——同一失败落在
+                # 50ms 窗口前后体验完全不同；现在与慢路径一致：等待期间
+                # keepalive 心跳照发，错误以 SSE 错误帧交付（流式客户端本
+                # 就要处理该形态，慢路径一直是这么交付的）。
+                async def fast_prepared_frames():
+                    result = await _apply_stream_fallback(
+                        primary, request_obj, fastapi_request, _primary_channel(), deadline)
+                    if isinstance(result, StreamingResponse):
+                        async for frame in result.body_iterator:
+                            yield frame
+                    else:
+                        stats.add_error()
+                        try:
+                            payload = json.loads(result.body)
+                        except (ValueError, TypeError, AttributeError):
+                            payload = None
+                        if not isinstance(payload, dict) or not payload.get("error"):
+                            payload = create_openai_error_response(
+                                result.status_code if result.status_code >= 400 else 502,
+                                "上游未返回流式响应。", "upstream_error")
+                        yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                        yield DONE_FRAME
+                response = ManagedStreamingResponse(fast_prepared_frames(), media_type="text/event-stream", cleanup=close_setup)
         else:
             async def prepared_frames():
                 result = await setup
@@ -438,13 +509,39 @@ async def _dispatch_upstream(request_obj: OpenAIRequest, fastapi_request: Reques
     return response
 
 
+# 指纹折叠阈值（2026-11 O-4）：超过该长度的字符串（base64 图片等）折叠为
+# 「长度 + sha256 摘要」，同一请求指纹保持稳定（同图同摘要），生图请求
+# 免去一次 20MB 级的 json.dumps 全量序列化与转义扫描。
+_FP_LONG_STRING = 4096
+_FP_CHUNK = 1 << 20
+
+
+def _fp_fold(value):
+    if isinstance(value, str) and len(value) > _FP_LONG_STRING:
+        digest = hashlib.sha256()
+        for i in range(0, len(value), _FP_CHUNK):
+            # str 切片不会劈开码点，分块编码与整串编码逐字节一致。
+            digest.update(value[i:i + _FP_CHUNK].encode("utf-8"))
+        return f"\x00folded:{len(value)}:{digest.hexdigest()}"
+    if isinstance(value, dict):
+        return {k: _fp_fold(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_fp_fold(v) for v in value]
+    return value
+
+
 def _request_fingerprint(request_obj: OpenAIRequest) -> str:
-    """稳定请求指纹：同一请求原样重发即命中同一缓冲区（不再烧上游配额）。"""
+    """稳定请求指纹：同一请求原样重发即命中同一缓冲区（不再烧上游配额）。
+
+    超长字符串（内嵌图片等）折叠为长度+摘要参与指纹：既保持「同请求同
+    指纹、异请求异指纹」的语义，又免去全量序列化（O-4）。
+    """
     try:
-        return json.dumps(request_obj.model_dump(mode="json"), sort_keys=True,
-                          ensure_ascii=False, separators=(",", ":"))
+        dumped = request_obj.model_dump(mode="json")
     except Exception:
-        return json.dumps(request_obj.model_dump(), sort_keys=True, default=str)
+        dumped = request_obj.model_dump()
+    return json.dumps(_fp_fold(dumped), sort_keys=True,
+                      ensure_ascii=False, separators=(",", ":"))
 
 
 def _resume_headers(stream_id: str, replay: bool = False) -> dict:

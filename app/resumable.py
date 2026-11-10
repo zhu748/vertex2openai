@@ -81,12 +81,15 @@ async def resolve_buffer(store, request, api_key: str, fingerprint: str, *, mode
         buf = await (store.get_exact(generation) if generation else store.get(request_key))
         if buf is None or buf.kind != kind:
             raise ResumeRequestError(404, "续传缓冲不存在或已过期；重新生成请移除续传 ID 与游标。")
-        if buf.fingerprint_key and buf.fingerprint_key != fingerprint_key:
-            raise ResumeRequestError(409, "续传请求体与原请求不一致。")
+        # 归属校验必须先于指纹校验（2026-11 C-7）：持有他人 rid 的探测者
+        # 改一下请求体就能在指纹 409 与归属 404 之间区分出「rid 存在」；
+        # 归属 404 不泄露存在性，放在最前。
         if buf.owner_key_digest and owner_key_digest and buf.owner_key_digest != owner_key_digest:
             # 同一 rid 不可能属于另一把 Key（rid 混入 Key+指纹），不一致说明
-            # 调用者拿着别人的生成 ID 在试。404 不泄露存在性。
+            # 调用者拿着别人的生成 ID 在试。
             raise ResumeRequestError(404, "续传缓冲不存在或已过期；重新生成请移除续传 ID 与游标。")
+        if buf.fingerprint_key and buf.fingerprint_key != fingerprint_key:
+            raise ResumeRequestError(409, "续传请求体与原请求不一致。")
         if buf.resume_expired():
             await store.drop(buf.id, expected=buf, reason="客户端断开已超过续传窗口。", superseded=True)
             raise ResumeRequestError(410, "客户端断开已超过续传窗口；重新生成请移除旧续传 ID 与游标。")
@@ -242,6 +245,15 @@ def compute_stream_id(headers: Any, api_key: str, fingerprint: str) -> Tuple[str
     return f"req-{digest}", "请求体指纹"
 
 
+def _frame_size(frame: str) -> int:
+    """帧的 UTF-8 字节数：纯 ASCII 帧跳过全量 encode（2026-11 O-6）。
+
+    SSE 帧绝大多数是 ASCII；str.isascii() 是 O(1) 的内部位标志，
+    命中时 len(frame) 即字节数，非 ASCII 再做精确编码计数。
+    """
+    return len(frame) if frame.isascii() else len(frame.encode("utf-8"))
+
+
 class ResumableBuffer:
     """一次回复的服务端权威副本（有序、带序号、可多次读取）。"""
 
@@ -293,7 +305,7 @@ class ResumableBuffer:
             # 淘汰/完成后的副本必须保持不变；部分上游会在取消后仍交出最后一块。
             if self.done:
                 return None
-            size = len(frame.encode("utf-8"))
+            size = _frame_size(frame)
             if self.bytes_stored + size > self.max_buffer_bytes:
                 raise BufferCapacityError("单次响应超过续传缓冲字节上限。")
             if self._account_bytes and not self._account_bytes(size, False):
@@ -363,7 +375,7 @@ class ResumableBuffer:
                     frames.append(self.event_frame(DONE_FRAME))
                     self.events.append(frames[-1])
             self.payload = payload
-            size = sum(len(f.encode("utf-8")) for f in frames) + len(json.dumps(payload).encode())
+            size = sum(_frame_size(f) for f in frames) + _frame_size(json.dumps(payload))
             if self._account_bytes:
                 self._account_bytes(size, True)
             self.bytes_stored += size
@@ -711,8 +723,6 @@ class ResumableStore:
             task.cancel()
         buf = self._buffers.pop(stream_id, None)
         if buf is not None:
-            self._bytes_used = max(0, self._bytes_used - buf.bytes_stored)
-            buf._account_bytes = None
             buf._cancel_grace_timer()
             if self._requests.get(buf.request_key) == stream_id:
                 self._requests.pop(buf.request_key, None)
@@ -724,6 +734,13 @@ class ResumableStore:
                     buf.owner_trace.cancel(reason)
                 finally:
                     current_trace.reset(token)
+            # 预算回收放到 fail 之后、按**最终**字节数结算（2026-11 C-6）：
+            # 旧序「先按旧字节数回收 → 置 _account_bytes=None → 再 fail」会让
+            # fail 追加的终态帧完全绕过全局记账，每次淘汰预算永久少计一个
+            # 终态帧（虚高、超卖内存）。现在终态帧先经 force 记账短暂入账
+            # （正确反映其在读者侧仍占内存），随后连同全部字节一次性回收。
+            self._bytes_used = max(0, self._bytes_used - buf.bytes_stored)
+            buf._account_bytes = None
         return buf is not None
 
     async def list_meta(self) -> List[dict]:
@@ -881,6 +898,19 @@ async def pump_stream(buf: ResumableBuffer, body_iterator: AsyncIterator[Any]) -
                 continue
             last_data_at = time.monotonic()
             next_wait_log = last_data_at + 60
+            # 契约保护（2026-11 C-8）：本函数隐含「一个 chunk == 一个 SSE 事件」
+            # —— buf.event_frame(text) 把整个 chunk 作为一个带序号事件落缓冲，
+            # 前端凭 Last-Event-ID 续传时与这里的序号对齐。若未来某上游一帧
+            # 产出多个事件，按 chunk 计数会丢事件（序号跳变、续传漏帧）；
+            # 断言在此显式拦住，新增多事件生产者时必须先按事件拆分再 append。
+            if __debug__:
+                _frame_count = sum(
+                    1 for line in text.splitlines() if line.startswith("data:")
+                )
+                assert _frame_count <= 1, (
+                    f"pump_stream 收到含 {_frame_count} 个 data: 事件的 chunk："
+                    "续传序号契约要求一帧一事件，请在上游侧拆分。"
+                )
             # The upstream generators report failures as ordinary SSE error
             # frames followed by DONE. Completion of the iterator does not turn
             # such a reply into a successful poll/replay result.

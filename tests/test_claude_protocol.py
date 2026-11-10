@@ -810,6 +810,7 @@ class EffortChainTests(unittest.TestCase):
             "gemini-3.1-pro": {"low", "medium", "high"},
             "gemini-3.8-flash": {"low", "medium", "high"},
             "gemini-4-argon": {"low", "medium", "high"},
+            "gemini-4-carbon": {"low", "medium", "high"},
             "gemini-3.6-flash": {"minimal", "low", "medium", "high"},
             "gemini-3.1-flash-lite": {"minimal", "low", "medium", "high"},
             "gemini-3.1-flash-image": {"minimal", "high"},

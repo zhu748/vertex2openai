@@ -22,6 +22,45 @@ LOGIN_BODY_BYTES = 256 * 1024
 MANAGEMENT_BODY_BYTES = 8 * 1024 * 1024
 
 
+def _normalize_authority(value: str) -> str:
+    host = value.strip().lower()
+    for default in (":80", ":443"):
+        if host.endswith(default):
+            host = host[: -len(default)]
+    return host
+
+
+def _csrf_origin_denied(scope) -> bool:
+    """控制台写接口的 CSRF 防线（2026-11 S-2）。
+
+    控制台没有 CSRF token，唯一防线是会话 Cookie 的 SameSite=Lax——部署
+    在共享注册域的子域下（a.example.com 与 b.example.com）时 Lax 不拦截
+    跨站 POST，被伪造的表单可改写代理与凭证配置。口径：浏览器跨站请求
+    必带 Origin，要求 Origin 的主机与 Host（或可信反代传入的
+    X-Forwarded-Host）一致；非浏览器客户端（curl/SDK）不带 Origin，放行。
+    """
+    origin = host = forwarded = ""
+    for key, value in scope.get("headers", []):
+        if key == b"origin":
+            origin = value.decode("latin-1")
+        elif key == b"host":
+            host = value.decode("latin-1")
+        elif key == b"x-forwarded-host":
+            forwarded = value.decode("latin-1")
+    if not origin:
+        return False
+    from urllib.parse import urlsplit
+    origin_host = _normalize_authority(urlsplit(origin).netloc)
+    if not origin_host:
+        return False
+    allowed = {_normalize_authority(host)}
+    if forwarded:
+        # 反代会重写 Host（内网服务名）：以 X-Forwarded-Host 的第一段为准。
+        allowed.add(_normalize_authority(forwarded.split(",", 1)[0]))
+    allowed.discard("")
+    return bool(allowed) and origin_host not in allowed
+
+
 class StatsMiddleware:
     def __init__(self, app, stats):
         self.app = app
@@ -38,6 +77,13 @@ class StatsMiddleware:
                                 if key == b"content-length"), "")
         if (not tracked and scope["type"] == "http" and method in ("POST", "PUT", "PATCH", "DELETE")
                 and path.startswith("/api/")):
+            # CSRF 防线先于体积限制（2026-11 S-2）：跨站伪造请求在读体前拒绝。
+            if _csrf_origin_denied(scope):
+                from starlette.responses import JSONResponse
+                await JSONResponse(status_code=403, content={
+                    "error": "跨站请求被拒绝（Origin 与 Host 不一致）。"
+                })(scope, receive, send)
+                return
             limit = LOGIN_BODY_BYTES if path == "/api/login" else MANAGEMENT_BODY_BYTES
             if declared_body_exceeds(declared_length, limit):
                 await body_too_large_response(path, limit)(scope, receive, send)

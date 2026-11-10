@@ -80,17 +80,22 @@ def image_markdown(data, mime_type, *, encoded=False, label="Image"):
     name = secrets.token_hex(24) + extension
     path = directory / name
     temporary = path.with_suffix(path.suffix + ".tmp")
+    # 锁内只做目录级操作（2026-11 O-8）：mkdir + 配额回收（_prune 对他
+    # 写入者的新鲜 .tmp 会跳过、对 >600s 的孤儿残片会回收，天然兼容）。
+    # 写盘不再占全局锁——目标文件名是唯一随机 token，多写互不冲突；旧
+    # 实现把整张图的 base64 解码与写盘（4K 可达数十 MB）关在锁里，生图
+    # 并发被完全串行化，一张慢图队头阻塞全部下载。
     with _LOCK:
         directory.mkdir(parents=True, exist_ok=True)
         _prune(directory, size)
-        try:
-            with temporary.open("xb") as output:
-                for offset in range(0, len(data), CHUNK):
-                    piece = data[offset:offset + CHUNK]
-                    output.write(base64.b64decode(piece, validate=True) if encoded else piece)
-            temporary.replace(path)
-        finally:
-            temporary.unlink(missing_ok=True)
+    try:
+        with temporary.open("xb") as output:
+            for offset in range(0, len(data), CHUNK):
+                piece = data[offset:offset + CHUNK]
+                output.write(base64.b64decode(piece, validate=True) if encoded else piece)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
     return f"![{label}]({base}/v1/generated-images/{name})"
 
 

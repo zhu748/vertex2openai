@@ -1015,6 +1015,26 @@ async def _resumable_native(request, api_key, model, action, query, payload, par
             response = task.result()
             if not isinstance(response, StreamingResponse):
                 return response
+        else:
+            # 慢路径统计补记（2026-11 P2-8 修复）：HTTP 200 + SSE 已发出后，
+            # 后台 setup 稍后失败只会以错误帧进缓冲，middleware 按状态码
+            # 统计不到——total ≠ success + error 永久漂移。chat_api 的
+            # _resumable_stream 已用同一回调模式修复过完全相同的洞，此处
+            # 对齐：每个 setup_task 只补一次，取消（淘汰/停机）不计失败。
+            slow_path = True
+
+            def _count_slow_failure(done_task: asyncio.Task) -> None:
+                if not slow_path or done_task.cancelled():
+                    return  # 取消（淘汰/停机）不算失败
+                exc = None
+                try:
+                    exc = done_task.exception()
+                except asyncio.CancelledError:
+                    return
+                if exc is not None or not isinstance(done_task.result(), StreamingResponse):
+                    stats.add_error()
+
+            task.add_done_callback(_count_slow_failure)
     return StreamingResponse(
         sse_from_buffer(buf, start), media_type="text/event-stream",
         headers={"X-Resume-Id": buf.id, "Cache-Control": "no-store, no-transform",
@@ -1035,6 +1055,14 @@ def _passthrough_endpoint():
         model, action = _split_model_action(model_action)
         if not model:
             return _native_error(400, "模型名不能为空。")
+        # 路径归一化逃逸加固（2026-11 S-1）：本端点对模型段是全路径透传，
+        # httpx 会做路径归一化——模型名里的 ../ 或 ./ 分段会让持 Key 用户
+        # 把请求逃逸到 aiplatform.googleapis.com 的其他资源路径。显式拒绝
+        # 点分段；服务端自生成的 location 钉定路径不受影响。
+        if any(segment in ("", ".", "..") for segment in model.split("/")):
+            return _native_error(
+                400, "模型名不能包含点分段（./ 或 ../）或空路径段。"
+            )
         if action not in _SUPPORTED_ACTIONS:
             return _native_error(
                 404,

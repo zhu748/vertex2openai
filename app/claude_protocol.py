@@ -1164,10 +1164,12 @@ def estimate_request_tokens(body: dict) -> int:
     """按 Anthropic count_tokens 口径估算整个请求的输入 token 数。
 
     覆盖 system、消息文本、tool_use 入参、tool_result 文本与工具声明；
-    base64 图片按数据长度 / 4 粗算。客户端（如 Claude Code 的上下文管理）
-    只需要量级正确的值。
+    base64 图片按数据长度 / 4 粗算（2026-11 O-10：占位串改计数器直算，
+    多图请求估算的瞬时内存从数 MB 降到常数——旧写法为每张图物化一份
+    等长 "x" 占位串再整体 join；客户端只需量级正确的值）。
     """
     pieces: list[str] = []
+    image_chars = 0
 
     def add(value: Any):
         if isinstance(value, str) and value:
@@ -1213,7 +1215,8 @@ def estimate_request_tokens(body: dict) -> int:
                 source = block.get("source") or {}
                 data = source.get("data") if isinstance(source, dict) else None
                 if isinstance(data, str) and data:
-                    pieces.append("x" * (len(data) // 4))
+                    # 计数器直算，不再物化 "x" 占位串（O-10）。
+                    image_chars += len(data) // 4
 
     for tool in body.get("tools") or []:
         if not isinstance(tool, dict):
@@ -1225,7 +1228,12 @@ def estimate_request_tokens(body: dict) -> int:
         except (TypeError, ValueError):
             pass
 
-    return estimate_text_tokens("\n".join(pieces))
+    text_tokens = estimate_text_tokens("\n".join(pieces))
+    if image_chars:
+        # 图片占位与旧「"x"*n 进 join」口径等价（纯 ASCII：n/4），
+        # 合并后维持 max(1, ...) 的下限语义。
+        return max(1, text_tokens + round(image_chars / 4))
+    return text_tokens
 
 
 # ============================================================

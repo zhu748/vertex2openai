@@ -480,5 +480,99 @@ class CookieStreamTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result.status_code, 400)
 
 
+class SignatureTopologyTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.settings = dict(config.DEFAULT_SETTINGS, retry_max=0,
+                             retry_backoff_seconds=0, prefill_mode="off",
+                             fake_streaming=False, proxy_url="")
+        self.request = SimpleNamespace(is_disconnected=mock.AsyncMock(return_value=False))
+        self.stats = ProxyStats()
+        for patch in (
+            mock.patch.object(app_state, "get_setting", side_effect=lambda k, d=None: self.settings.get(k, d)),
+            mock.patch.object(app_state, "get_effective_settings", side_effect=lambda m, base=None: (self.settings.copy() if base is None else dict(base))),
+            mock.patch.object(cookie_proxy, "_get_cookie_string", return_value="SAPISID=test"),
+            mock.patch.object(cookie_proxy, "_get_project_id", return_value="project"),
+            mock.patch.object(cookie_proxy, "build_headers", return_value={"authorization": "test"}),
+            mock.patch.object(cookie_proxy, "stats", self.stats),
+            mock.patch.object(cookie_proxy, "credential_manager"),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.pool(SimpleNamespace(post=mock.AsyncMock()))
+
+    def pool(self, client):
+        @asynccontextmanager
+        async def open_client(kwargs):
+            yield client
+        patch = mock.patch.object(cookie_proxy, "open_upstream_client", open_client)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    async def _frames(self, events):
+        async def fake_events(*args, **kwargs):
+            for status, data in events:
+                yield status, data
+        with mock.patch.object(cookie_proxy, "build_request_body_async",
+                               mock.AsyncMock(return_value={"variables": {}})), \
+             mock.patch.object(cookie_proxy, "stream_events", fake_events):
+            obj = req(stream=True)
+            result = await cookie_proxy.CookieProxyUpstream().chat_completions(obj, self.request)
+            body = "".join([frame async for frame in result.body_iterator])
+        return [json.loads(line[5:]) for line in body.splitlines()
+                if line.startswith("data:") and line.strip() != "data: [DONE]"]
+
+    async def test_signature_events_stay_thin_and_final_frame_carries_topology(self):
+        # 2026-11 P2-2 回归：Cookie 流式的签名事件只携带签名与 part 类型，
+        # 不再内嵌「至今全部普通 part」的滚动快照（O(P²) 流量放大）；
+        # 完整 ordinary_parts/part_order 拓扑由收尾帧一次性携带（O(P)）。
+        events = [
+            ("text", "hello "),
+            ("thought_signature", {"value": "c2lnMQ==", "part_kind": "text"}),
+            ("text", "world"),
+            ("thought_signature", {"value": "c2lnMg==", "part_kind": "text"}),
+            ("finish", "STOP"),
+        ]
+        frames = await self._frames(events)
+        deltas = [p["choices"][0]["delta"] for p in frames
+                  if p.get("choices") and isinstance(p["choices"][0].get("delta"), dict)]
+        # 签名帧共 3 帧：两个瘦身中间帧 + 一个携带拓扑的收尾帧。
+        signature_frames = [d for d in deltas
+                            if "extra_content" in d and "thought_signature" in d["extra_content"].get("google", {})]
+        self.assertEqual(len(signature_frames), 3)
+        # 中间签名帧：只有签名本身，无滚动拓扑快照。
+        for delta in signature_frames:
+            google = delta["extra_content"]["google"]
+            if "ordinary_parts" in google:
+                continue  # 收尾帧，另一组断言覆盖
+            self.assertNotIn("ordinary_parts", google)
+            self.assertNotIn("part_order", google)
+        # 收尾：恰好一帧携带完整拓扑（两段正文 + 各自签名）。
+        topology_frames = [d for d in deltas
+                           if "extra_content" in d and "ordinary_parts" in d["extra_content"].get("google", {})]
+        self.assertEqual(len(topology_frames), 1)
+        google = topology_frames[0]["extra_content"]["google"]
+        self.assertEqual([item["kind"] for item in google["ordinary_parts"]], ["text", "text"])
+        self.assertEqual([item["text"] for item in google["ordinary_parts"]], ["hello ", "world"])
+        self.assertEqual(len(google["part_order"]), 2)
+        self.assertEqual(google["thought_signature"], "c2lnMg==")
+
+    async def test_tool_call_topology_still_on_final_frame(self):
+        # 对照组：工具调用响应的终帧拓扑快照保持不变（原有行为）。
+        events = [
+            ("text", "先查一下时间。"),
+            ("function_call", {"name": "get_time", "args": {}}),
+            ("finish", "STOP"),
+        ]
+        frames = await self._frames(events)
+        deltas = [p["choices"][0]["delta"] for p in frames
+                  if p.get("choices") and isinstance(p["choices"][0].get("delta"), dict)]
+        topology_frames = [d for d in deltas
+                           if "extra_content" in d and "ordinary_parts" in d["extra_content"].get("google", {})]
+        self.assertEqual(len(topology_frames), 1)
+        google = topology_frames[0]["extra_content"]["google"]
+        self.assertEqual(google["part_order"],
+                         [{"type": "ordinary", "index": 0}, {"type": "tool_call", "index": 0}])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

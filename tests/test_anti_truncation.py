@@ -78,10 +78,10 @@ class PrepareTests(unittest.TestCase):
         self.addCleanup(patch.stop)
         return state
 
-    def test_only_argon_and_38_flash_publish_aliases_and_plain_ids_never_enable(self):
+    def test_builtin_anti_truncation_models_publish_aliases_and_plain_ids_never_enable(self):
         state = self.isolated_state()
         models = json.loads((Path(__file__).resolve().parents[1] / "vertexModels.json").read_text())["models"]
-        enabled = {"gemini-4-argon", "gemini-3.8-flash"}
+        enabled = {"gemini-4-argon", "gemini-4-carbon", "gemini-3.8-flash"}
         self.assertTrue(enabled <= set(models))
         for model in models:
             req = request(stream=True).model_copy(update={"model": model})
