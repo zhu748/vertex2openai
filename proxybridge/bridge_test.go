@@ -435,9 +435,9 @@ func TestSSTPPortCollisionDoesNotStartVPNHandshake(t *testing.T) {
 func TestRelayRecyclesSilentHalfClosedPeer(t *testing.T) {
 	// 2026-11 P2-7：一侧正常 EOF（半关闭返回 nil）后，静默目标的另一
 	// 方向必须被空闲看门狗回收——旧实现会无限阻塞，槽位被逐个耗尽。
-	oldIdle, oldCheck := relayHalfCloseIdle, relayIdleCheck
-	relayHalfCloseIdle, relayIdleCheck = 150*time.Millisecond, 25*time.Millisecond
-	defer func() { relayHalfCloseIdle, relayIdleCheck = oldIdle, oldCheck }()
+	// 缩窗参数按值注入：改写包级变量会与遗留看门狗 goroutine 的读构成
+	// 数据竞争（CI -race 实锤）。
+	idle := relayIdleTimeouts{check: 25 * time.Millisecond, halfClose: 150 * time.Millisecond}
 
 	left, leftPeer := net.Pipe()
 	right, rightPeer := net.Pipe()
@@ -445,7 +445,7 @@ func TestRelayRecyclesSilentHalfClosedPeer(t *testing.T) {
 	defer rightPeer.Close()
 	done := make(chan struct{})
 	go func() {
-		relay(left, right)
+		relayWithIdleTimeouts(left, right, idle)
 		close(done)
 	}()
 	// 上行方向正常 EOF；rightPeer 保持打开且静默 → 下行方向只能等看门狗。
@@ -459,9 +459,7 @@ func TestRelayRecyclesSilentHalfClosedPeer(t *testing.T) {
 
 func TestRelayRecyclesNeverStartedConnection(t *testing.T) {
 	// 2026-11 P2-7：两侧都打开但从未搬运过任何字节的死连接也要回收。
-	oldIdle, oldCheck := relayFirstByteIdle, relayIdleCheck
-	relayFirstByteIdle, relayIdleCheck = 150*time.Millisecond, 25*time.Millisecond
-	defer func() { relayFirstByteIdle, relayIdleCheck = oldIdle, oldCheck }()
+	idle := relayIdleTimeouts{check: 25 * time.Millisecond, firstByte: 150 * time.Millisecond}
 
 	left, leftPeer := net.Pipe()
 	right, rightPeer := net.Pipe()
@@ -469,7 +467,7 @@ func TestRelayRecyclesNeverStartedConnection(t *testing.T) {
 	defer rightPeer.Close()
 	done := make(chan struct{})
 	go func() {
-		relay(left, right)
+		relayWithIdleTimeouts(left, right, idle)
 		close(done)
 	}()
 	select {
@@ -482,9 +480,7 @@ func TestRelayRecyclesNeverStartedConnection(t *testing.T) {
 func TestRelayKeepsActiveSlowConnectionOpen(t *testing.T) {
 	// 对照组：有过流量的连接即使长时间静默也不得被看门狗误杀——
 	// 非流式 4K 生图在响应就绪前可静默 10 分钟以上（合法场景）。
-	oldIdle, oldCheck := relayHalfCloseIdle, relayIdleCheck
-	relayHalfCloseIdle, relayIdleCheck = 200*time.Millisecond, 25*time.Millisecond
-	defer func() { relayHalfCloseIdle, relayIdleCheck = oldIdle, oldCheck }()
+	idle := relayIdleTimeouts{check: 25 * time.Millisecond, halfClose: 200 * time.Millisecond}
 
 	left, leftPeer := net.Pipe()
 	right, rightPeer := net.Pipe()
@@ -492,7 +488,7 @@ func TestRelayKeepsActiveSlowConnectionOpen(t *testing.T) {
 	defer rightPeer.Close()
 	done := make(chan struct{})
 	go func() {
-		relay(left, right)
+		relayWithIdleTimeouts(left, right, idle)
 		close(done)
 	}()
 	// 先搬运一个字节（连接已「活跃」），随后两侧静默且不半关闭。

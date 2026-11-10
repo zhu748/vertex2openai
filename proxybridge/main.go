@@ -407,6 +407,22 @@ var (
 	relayIdleCheck = 15 * time.Second
 )
 
+// relayIdleTimeouts 把看门狗的三个时间参数按值传递（2026-11 修复）：
+// 旧测试直接改写上面的包级变量来缩窗，而上一测试遗留的看门狗
+// goroutine 仍在读同一变量，`go test -race` 实锤数据竞争。
+// 参数只在本结构体里流转，测试注入缩窗值，包级变量回归纯只读。
+type relayIdleTimeouts struct {
+	check     time.Duration
+	firstByte time.Duration
+	halfClose time.Duration
+}
+
+var defaultRelayIdleTimeouts = relayIdleTimeouts{
+	check:     relayIdleCheck,
+	firstByte: relayFirstByteIdle,
+	halfClose: relayHalfCloseIdle,
+}
+
 // countingConn 统计经手字节数：任一方向有真实流量即视为活跃。
 type countingConn struct {
 	net.Conn
@@ -442,14 +458,17 @@ func (c countingConn) CloseWrite() error {
 }
 
 // relayIdleWatchdog 只回收「确认静默」的连接：从未有过流量
-// （relayFirstByteIdle），或半关闭后长时间无新字节（relayHalfCloseIdle）。
+// （idle.firstByte），或半关闭后长时间无新字节（idle.halfClose）。
 // 两侧都打开且有过流量的静默是合法场景——非流式 4K 生图在响应就绪前
 // 可静默 10 分钟以上——不做中途闲置回收，避免误杀慢生成。
-func relayIdleWatchdog(a, b net.Conn, activity *atomic.Int64, started time.Time, halfClosed bool, finished <-chan struct{}) {
-	ticker := time.NewTicker(relayIdleCheck)
+func relayIdleWatchdog(a, b net.Conn, activity *atomic.Int64, halfClosed *atomic.Bool,
+	started time.Time, finished <-chan struct{}, idle relayIdleTimeouts) {
+	ticker := time.NewTicker(idle.check)
 	defer ticker.Stop()
 	lastCount := activity.Load()
-	lastChange := started
+	// 半关闭静默窗口的起点：首次观察到 halfClosed 的那轮 tick。
+	// 新字节到达会清零重计——「半关闭后又活跃」的慢生成不受影响。
+	halfClosedSince := time.Time{}
 	for {
 		select {
 		case <-finished:
@@ -457,25 +476,37 @@ func relayIdleWatchdog(a, b net.Conn, activity *atomic.Int64, started time.Time,
 		case now := <-ticker.C:
 			cur := activity.Load()
 			if cur != lastCount {
-				lastCount, lastChange = cur, now
+				lastCount = cur
+				halfClosedSince = time.Time{}
 				continue
 			}
-			if cur == 0 && now.Sub(started) >= relayFirstByteIdle {
+			if cur == 0 && now.Sub(started) >= idle.firstByte {
 				a.Close()
 				b.Close()
 				return
 			}
-			if halfClosed && now.Sub(lastChange) >= relayHalfCloseIdle {
-				a.Close()
-				b.Close()
-				return
+			if halfClosed.Load() {
+				if halfClosedSince.IsZero() {
+					halfClosedSince = now
+					continue
+				}
+				if now.Sub(halfClosedSince) >= idle.halfClose {
+					a.Close()
+					b.Close()
+					return
+				}
 			}
 		}
 	}
 }
 
 func relay(a, b net.Conn) {
+	relayWithIdleTimeouts(a, b, defaultRelayIdleTimeouts)
+}
+
+func relayWithIdleTimeouts(a, b net.Conn, idle relayIdleTimeouts) {
 	var activity atomic.Int64
+	var halfClosed atomic.Bool
 	ca := countingConn{Conn: a, counter: &activity}
 	cb := countingConn{Conn: b, counter: &activity}
 	done := make(chan error, 2)
@@ -492,13 +523,18 @@ func relay(a, b net.Conn) {
 	}
 	go copyTo(ca, cb)
 	go copyTo(cb, ca)
+	finished := make(chan struct{})
+	defer close(finished)
+	// 看门狗必须在首次 done 之前启动：两侧都打开但从未有流量的死连接
+	// 正是 done 永远不来的场景——旧实现先等 first 再启动看门狗，恰好
+	// 回收不了它存在的唯一理由（never-started 死连接）。
+	go relayIdleWatchdog(a, b, &activity, &halfClosed, time.Now(), finished, idle)
 	first := <-done
-	if first != nil {
+	if first == nil {
+		halfClosed.Store(true)
+	} else {
 		a.Close()
 		b.Close()
 	}
-	finished := make(chan struct{})
-	defer close(finished)
-	go relayIdleWatchdog(a, b, &activity, time.Now(), first == nil, finished)
 	<-done
 }

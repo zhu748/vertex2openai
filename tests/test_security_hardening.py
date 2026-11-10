@@ -13,13 +13,16 @@ import unittest
 
 _STATE = tempfile.TemporaryDirectory(prefix="v2o-security-hardening-")
 os.environ["STATE_DIR"] = _STATE.name
+# 单进程模式（python scripts/check_project.py）没有 conftest 注入：与
+# 其他测试文件一致，导入 main 前钉死鉴权口令与离线模型清单。
+os.environ["API_KEY"] = "test-key"
+os.environ["MODELS_CONFIG_URL"] = ""
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from fastapi.testclient import TestClient
 
 import main
 from keepalive import validate_keepalive_url
-from routes import system_api
 
 
 class KeepaliveUrlHardeningTests(unittest.TestCase):

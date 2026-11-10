@@ -160,3 +160,6 @@ bin/vertex-proxy-bridge*
 
 # Optional frontend development dependencies
 node_modules/
+
+# Go 桥本地构建产物（CI 由 Docker 构建，不入库）
+proxybridge/proxybridge
