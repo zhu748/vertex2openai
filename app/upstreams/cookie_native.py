@@ -51,7 +51,7 @@ from logger import stats
 from proxy_failover import ProxyChain
 from response_validation import IncompleteResponseError
 from resumable import request_timeout_seconds
-from retry_policy import get_retry_settings, retry_delay
+from retry_policy import get_retry_settings
 from runtime_state import app_state
 from schema_validation import SchemaValidationError, sanitize_for_gemini, validate_json_schema
 from streaming import HEARTBEAT, HEARTBEAT_FRAME, SSE_NO_BUFFER_HEADERS, with_heartbeats
@@ -60,8 +60,8 @@ from usage import merge_usage_metadata
 from upstream_errors import google_status_detail
 from upstreams.cookie_response import RawSampler
 from upstreams.cookie_transport import (
+    cookie_retry_backoff_heartbeats,
     stream_events,
-    retry_heartbeats,
 )
 from upstreams.cookie_request import (
     COOKIE_STRUCTURED_OUTPUT_DISABLED_MESSAGE,
@@ -604,17 +604,18 @@ async def _events_with_retry(fastapi_request: Request, record: dict, body: dict,
 
             if retry_now is None:
                 return
-            # 退避等待期间吐心跳保活（SSE 消费方转成 : keep-alive）。
-            # identity_rotates=False：原生桥重试复用同一 Cookie 身份，
-            # 上游 Retry-After 有约束力（2026-11 P2-5）。
-            async for _hb in retry_heartbeats(
-                    retry_delay(getattr(retry_now, "retry_after", None),
-                                backoff_sec, attempt, jitter_sec, error=str(retry_now),
-                                identity_rotates=False),
-                    request=fastapi_request):
-                if await fastapi_request.is_disconnected():
-                    raise NativeBridgeError(499, "客户端已断开连接。")
+            # 退避等待期间吐心跳保活（SSE 消费方转成 : keep-alive）；
+            # 同一 Cookie 身份重试，Retry-After 有约束力（口径见
+            # cookie_transport._cookie_backoff_delay）。
+            async for _hb in cookie_retry_backoff_heartbeats(
+                fastapi_request,
+                retry_after=getattr(retry_now, "retry_after", None),
+                backoff_sec=backoff_sec, attempt=attempt, jitter_sec=jitter_sec,
+                error=str(retry_now), label="限流/拥堵", log_tag="[Cookie 原生桥]",
+            ):
                 yield "heartbeat", None
+            if await fastapi_request.is_disconnected():
+                raise NativeBridgeError(499, "客户端已断开连接。")
     raise NativeBridgeError(429, "上游持续限流，重试多次仍失败。")
 
 

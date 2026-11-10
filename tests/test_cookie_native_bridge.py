@@ -19,7 +19,7 @@ os.environ["STATE_DIR"] = _TEST_STATE_DIR.name
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 os.chdir(Path(__file__).resolve().parents[1] / "app")
 
-from upstreams import cookie_native  # noqa: E402
+from upstreams import cookie_native, cookie_transport  # noqa: E402
 from upstreams.cookie_native import (  # noqa: E402
     NativeAssembler,
     NativeBridgeError,
@@ -364,7 +364,7 @@ class RetryPumpTests(unittest.TestCase):
         with mock.patch.object(cookie_native, "build_headers", return_value={"authorization": "x"}), \
              mock.patch.object(cookie_native, "open_upstream_client", new=_fake_client_ctx), \
              mock.patch.object(cookie_native, "stream_events", fake_events), \
-             mock.patch.object(cookie_native, "retry_heartbeats", new=_no_wait_heartbeat), \
+             mock.patch.object(cookie_transport, "retry_heartbeats", new=_no_wait_heartbeat), \
              mock.patch.object(cookie_native, "ProxyChain", return_value=SimpleNamespace(
                  current="", bind_to_generation=lambda self=None: None)), \
              mock.patch.object(cookie_native, "get_retry_settings", return_value=(3, 0.0, 0.0)):

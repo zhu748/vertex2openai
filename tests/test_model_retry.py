@@ -469,7 +469,7 @@ class CookieRetryTests(unittest.IsolatedAsyncioTestCase):
         self.settings["retry_backoff_seconds"] = 5
         obj = api_helpers.OpenAIRequest(model="gemini-3.6-flash", messages=[])
         self.client.post.side_effect = [httpx.Response(502, headers={"retry-after": "2.5"}), httpx.Response(504), httpx.Response(200, json={})]
-        with mock.patch.object(cookie_proxy, "wait_for_retry", return_value=True) as wait, \
+        with mock.patch.object(cookie_transport, "wait_for_retry", return_value=True) as wait, \
              mock.patch.object(cookie_proxy, "extract_events", return_value=[("text", "answer"), ("finish", "STOP")]):
             response = await cookie_proxy.CookieProxyUpstream().chat_completions(obj, self.request)
         self.assertEqual(response.status_code, 200)
@@ -480,7 +480,7 @@ class CookieRetryTests(unittest.IsolatedAsyncioTestCase):
     async def test_disconnect_during_backoff_does_not_count_unsent_retry(self):
         obj = api_helpers.OpenAIRequest(model="gemini-3.6-flash", messages=[])
         self.client.post.return_value = httpx.Response(429)
-        with mock.patch.object(cookie_proxy, "wait_for_retry", return_value=False):
+        with mock.patch.object(cookie_transport, "wait_for_retry", return_value=False):
             response = await cookie_proxy.CookieProxyUpstream().chat_completions(obj, self.request)
         self.assertEqual(response.status_code, 499)
         self.assertEqual(self.client.post.await_count, 1)

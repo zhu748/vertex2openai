@@ -22,6 +22,7 @@ from retry_policy import (
     is_retryable_exception,
     is_retryable_message,
     is_retryable_status,
+    retry_delay,
     wait_for_retry,
 )
 from streaming import HEARTBEAT_FRAME
@@ -214,6 +215,53 @@ async def retry_heartbeats(total_sec: float, hb_interval: float = 3.0, request=N
             return
         waited += step
         yield HEARTBEAT_FRAME
+
+
+# Cookie 通道重试退避的统一入口（2026-11 P2 重试执行器收敛）：此前同一
+# 份「计算延迟 + 打日志 + 等待/吐心跳」骨架在 cookie_proxy 与
+# cookie_native 里平行存在 8 份，日志格式、attempt 口径与退避注释各自
+# 漂移（生图/流式/非流式/原生桥四种措辞、中文/半角冒号混用）。收敛后
+# 8 个调用点只保留各自不同的部分：错误来源、断连终态与交付形态。
+def _cookie_backoff_delay(*, retry_after, backoff_sec, attempt, jitter_sec, error, label, log_tag) -> float:
+    """计算 Cookie 通道退避延迟并打统一格式的重试日志。
+
+    Cookie 重试循环**复用同一 Cookie 身份**，上游的 Retry-After 对该身份
+    仍有约束力，因此 identity_rotates=False——上限放宽为
+    max(窗口上限, Retry-After)（保留 120 秒绝对上限），口径详见
+    retry_policy._retry_delay_value 的参数说明。
+    """
+    delay = retry_delay(retry_after, backoff_sec, attempt, jitter_sec,
+                        error=error, identity_rotates=False)
+    print(f"⚠️ {log_tag} {label}（尝试 {attempt + 1}）: {str(error)[:300]} | {delay:.1f}s 后重试...")
+    return delay
+
+
+async def cookie_retry_backoff(request, *, retry_after, backoff_sec, attempt, jitter_sec,
+                               error, label, log_tag="[Studio]") -> bool:
+    """Cookie 通道退避窗口（静默等待版，非流式/生图整取路径用）。
+
+    返回 False 表示客户端已断开，调用方按各自交付形态收尾
+    （499 JSONResponse / 错误字典 / 直接 return）并放弃重试。
+    """
+    delay = _cookie_backoff_delay(retry_after=retry_after, backoff_sec=backoff_sec,
+                                  attempt=attempt, jitter_sec=jitter_sec,
+                                  error=error, label=label, log_tag=log_tag)
+    return await wait_for_retry(request, delay)
+
+
+async def cookie_retry_backoff_heartbeats(request, *, retry_after, backoff_sec, attempt,
+                                           jitter_sec, error, label, log_tag="[Studio]"):
+    """Cookie 通道退避窗口（流式心跳版，流式/原生桥路径用）。
+
+    等待期间持续吐 SSE 心跳帧保活，前端不会在 429 长等待期间超时断开。
+    retry_heartbeats 在客户端断开时自行停止；调用方在 for 循环结束后
+    复查 is_disconnected() 决定终态（return / raise），再 continue。
+    """
+    delay = _cookie_backoff_delay(retry_after=retry_after, backoff_sec=backoff_sec,
+                                  attempt=attempt, jitter_sec=jitter_sec,
+                                  error=error, label=label, log_tag=log_tag)
+    async for frame in retry_heartbeats(delay, request=request):
+        yield frame
 
 
 class StreamRequestError(str):

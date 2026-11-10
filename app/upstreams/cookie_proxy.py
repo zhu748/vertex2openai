@@ -52,8 +52,6 @@ from retry_policy import (
     get_retry_settings,
     is_retryable_exception,
     is_retryable_status,
-    retry_delay,
-    wait_for_retry,
 )
 from runtime_state import app_state
 from schema_validation import SchemaValidationError
@@ -82,8 +80,9 @@ from upstreams.cookie_response import (
 )
 from upstreams.cookie_transport import (
     api_error_details,
+    cookie_retry_backoff,
+    cookie_retry_backoff_heartbeats,
     is_native_tool_error_response,
-    retry_heartbeats,
     stream_events,
 )
 from upstreams.request_preparation import prepare_messages
@@ -293,18 +292,13 @@ async def _collect_full_response(
                 )
 
             if is_retryable_status(response.status_code) and attempt < retry_max:
-                delay = retry_delay(
-                    getattr(response, "headers", {}).get("retry-after"),
-                    backoff_sec,
-                    attempt,
-                    jitter_sec,
+                if not await cookie_retry_backoff(
+                    fastapi_request,
+                    retry_after=getattr(response, "headers", {}).get("retry-after"),
+                    backoff_sec=backoff_sec, attempt=attempt, jitter_sec=jitter_sec,
                     error=f"HTTP {response.status_code}: {response.text[:200]}",
-                    identity_rotates=False,  # Cookie 通道重试复用同一身份，Retry-After 有约束力
-                )
-                print(
-                    f"⚠️ [Studio] HTTP {response.status_code}（生图，尝试 {attempt + 1}）: {response.text[:300]} | {delay:.1f}s 后重试..."
-                )
-                if not await wait_for_retry(fastapi_request, delay):
+                    label=f"HTTP {response.status_code}（生图）",
+                ):
                     return {"kind": "error", "message": "客户端已断开连接。"}
                 continue
             if response.status_code != 200:
@@ -392,14 +386,11 @@ async def _collect_full_response(
                 and is_retryable_status(api_error_status)
                 and attempt < retry_max
             ):
-                delay = retry_delay(
-                    None, backoff_sec, attempt, jitter_sec, error=api_error,
-                    identity_rotates=False,  # 同上：同一 Cookie 身份的重试
-                )
-                print(
-                    f"⚠️ [Studio] 生图 429/限流（尝试 {attempt + 1}）: {api_error[:300]} | {delay:.1f}s 后重试..."
-                )
-                if not await wait_for_retry(fastapi_request, delay):
+                if not await cookie_retry_backoff(
+                    fastapi_request, retry_after=None,
+                    backoff_sec=backoff_sec, attempt=attempt, jitter_sec=jitter_sec,
+                    error=api_error, label="生图 429/限流",
+                ):
                     return {"kind": "error", "message": "客户端已断开连接。"}
                 continue
             if api_error:
@@ -433,12 +424,11 @@ async def _collect_full_response(
         except Exception as e:
             em = str(e)
             if is_retryable_exception(e) and attempt < retry_max:
-                delay = retry_delay(None, backoff_sec, attempt, jitter_sec, error=em,
-                                    identity_rotates=False)
-                print(
-                    f"⚠️ [Studio] 生图异常（尝试 {attempt + 1}）：{em[:300]} | {delay:.1f}s 后重试..."
-                )
-                if not await wait_for_retry(fastapi_request, delay):
+                if not await cookie_retry_backoff(
+                    fastapi_request, retry_after=None,
+                    backoff_sec=backoff_sec, attempt=attempt, jitter_sec=jitter_sec,
+                    error=em, label="生图异常",
+                ):
                     return {"kind": "error", "message": "客户端已断开连接。"}
                 continue
             code, _ = extract_upstream_error(e)
@@ -904,25 +894,18 @@ class CookieGeneration:
                     if await self.fastapi_request.is_disconnected():
                         print("ℹ️ [Studio] 客户端已断开连接，取消后续重试。")
                         return
-                    wait_sec = retry_delay(
-                        getattr(error_to_raise, "retry_after", None),
-                        self.backoff_sec,
-                        attempt,
-                        self.jitter_sec,
-                        error=str(error_to_raise),
-                        identity_rotates=False,  # Cookie 通道重试复用同一身份，Retry-After 有约束力
-                    )
-                    print(
-                        f"⚠️ [Studio] 遇到可重试拥堵/限流: {str(error_to_raise)[:300]} | {wait_sec}s 后进行第 {attempt + 2} 次退避重试"
-                    )
                     # 退避等待期间持续吐心跳，保活前端连接（issue4：3.1-pro 频繁 429 长等待易被前端断开）
-                    async for _hb in retry_heartbeats(
-                        wait_sec, request=self.fastapi_request
+                    async for hb in cookie_retry_backoff_heartbeats(
+                        self.fastapi_request,
+                        retry_after=getattr(error_to_raise, "retry_after", None),
+                        backoff_sec=self.backoff_sec, attempt=attempt,
+                        jitter_sec=self.jitter_sec,
+                        error=str(error_to_raise), label="可重试拥堵/限流",
                     ):
-                        if await self.fastapi_request.is_disconnected():
-                            print("ℹ️ [Studio] 客户端已断开连接，取消后续重试。")
-                            return
-                        yield _hb
+                        yield hb
+                    if await self.fastapi_request.is_disconnected():
+                        print("ℹ️ [Studio] 客户端已断开连接，取消后续重试。")
+                        return
                     self.start_time = time.time()
                     continue
 
@@ -1143,18 +1126,14 @@ class CookieGeneration:
 
                 if is_retryable_status(response.status_code):
                     if attempt < self.retry_max:
-                        delay = retry_delay(
-                            getattr(response, "headers", {}).get("retry-after"),
-                            self.backoff_sec,
-                            attempt,
-                            self.jitter_sec,
+                        if not await cookie_retry_backoff(
+                            self.fastapi_request,
+                            retry_after=getattr(response, "headers", {}).get("retry-after"),
+                            backoff_sec=self.backoff_sec, attempt=attempt,
+                            jitter_sec=self.jitter_sec,
                             error=f"HTTP {response.status_code}: {response.text[:200]}",
-                            identity_rotates=False,  # Cookie 通道重试复用同一身份，Retry-After 有约束力
-                        )
-                        print(
-                            f"⚠️ [Studio] HTTP {response.status_code} (尝试 {attempt + 1}): {response.text[:300]} | {delay:.1f}s 后重试..."
-                        )
-                        if not await wait_for_retry(self.fastapi_request, delay):
+                            label=f"HTTP {response.status_code}",
+                        ):
                             return _client_gone()
                         continue
 
@@ -1288,18 +1267,12 @@ class CookieGeneration:
                     and is_retryable_status(api_error_status)
                     and attempt < self.retry_max
                 ):
-                    wait_sec = retry_delay(
-                        None,
-                        self.backoff_sec,
-                        attempt,
-                        self.jitter_sec,
-                        error=api_error,
-                        identity_rotates=False,  # 同上：同一 Cookie 身份的重试
-                    )
-                    print(
-                        f"⚠️ [Studio] 429/限流 (尝试 {attempt + 1}): {api_error[:300]} | {wait_sec:.1f}s 后重试..."
-                    )
-                    if not await wait_for_retry(self.fastapi_request, wait_sec):
+                    if not await cookie_retry_backoff(
+                        self.fastapi_request, retry_after=None,
+                        backoff_sec=self.backoff_sec, attempt=attempt,
+                        jitter_sec=self.jitter_sec,
+                        error=api_error, label="429/限流",
+                    ):
                         return _client_gone()
                     continue
                 if api_error:
@@ -1406,14 +1379,12 @@ class CookieGeneration:
                 is_retryable = is_retryable_exception(e)
 
                 if is_retryable and attempt < self.retry_max:
-                    wait_sec = retry_delay(
-                        None, self.backoff_sec, attempt, self.jitter_sec, error=err_msg,
-                        identity_rotates=False,  # 同上：同一 Cookie 身份的重试
-                    )
-                    print(
-                        f"⚠️ [Studio] 异常 (尝试 {attempt + 1}): {err_msg[:300]} | {wait_sec:.1f}s 后重试..."
-                    )
-                    if not await wait_for_retry(self.fastapi_request, wait_sec):
+                    if not await cookie_retry_backoff(
+                        self.fastapi_request, retry_after=None,
+                        backoff_sec=self.backoff_sec, attempt=attempt,
+                        jitter_sec=self.jitter_sec,
+                        error=err_msg, label="异常",
+                    ):
                         return _client_gone()
                     continue
 
