@@ -59,11 +59,11 @@ HEARTBEAT_FRAME = ": keep-alive\n\n"
 # 逐字重复同一 dict，改一处漏一处）。
 SSE_NO_BUFFER_HEADERS = {"Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no"}
 # SSE 终止帧（客户端按字面 "data: [DONE]" 识别；2026-11 审查收敛：原先
-# 只在 resumable 定义、api_helpers 用裸字面量比对，改由 streaming 统一
+# 只在 resumable 定义、express_pipeline 用裸字面量比对，改由 streaming 统一
 # 导出，resumable 向后兼容再导出）。
 DONE_FRAME = "data: [DONE]\n\n"
 # 错误消息进入 SSE / 续传缓冲时的截断上限：上游异常文本可能携带巨量堆栈
-# 或响应体，统一 1024 字符（此前 api_helpers 假流式路径用 512、其余 1024，
+# 或响应体，统一 1024 字符（此前 express_pipeline 假流式路径用 512、其余 1024，
 # 两套口径无业务差异，纯漂移；2026-11 审查收敛）。
 MAX_ERROR_MESSAGE_CHARS = 1024
 
@@ -153,7 +153,7 @@ async def sse_frames(source, max_frame_bytes=64 * 1024 * 1024):
 async def disconnected(request):
     """客户端是否已断开（request 为 None 或读取异常时按未断开处理）。
 
-    api_helpers 的重试循环与 with_heartbeats 共用这一个实现，
+    express_pipeline 的重试循环与 with_heartbeats 共用这一个实现，
     替代原先三份逐字相同的内嵌 _client_gone/_disconnected。"""
     if request is None:
         return False

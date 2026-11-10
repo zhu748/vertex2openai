@@ -170,13 +170,13 @@ class RetryFactoryErrorPropagationTests(unittest.TestCase):
 
         err = _api_error(401)
         chat_api  # noqa: B018 - 确认模块可导入
-        from api_helpers import _call_retry_factory
+        from upstreams.express_pipeline import _call_retry_factory
         _call_retry_factory(factory, err)
         self.assertIs(seen["error"], err)
 
     def test_legacy_no_arg_factory_still_works(self):
         # 测试桩常用的无参工厂不能因为新参数而 TypeError
-        from api_helpers import _call_retry_factory
+        from upstreams.express_pipeline import _call_retry_factory
         self.assertIsNone(_call_retry_factory(lambda: None, _api_error(401)))
         self.assertEqual(_call_retry_factory(lambda: "x", _api_error(401)), "x")
 
@@ -186,7 +186,7 @@ class RetryFactoryErrorPropagationTests(unittest.TestCase):
         def factory(**kwargs):
             seen.update(kwargs)
 
-        from api_helpers import _call_retry_factory
+        from upstreams.express_pipeline import _call_retry_factory
         err = _api_error(403)
         _call_retry_factory(factory, err)
         self.assertIs(seen.get("error"), err)
@@ -198,7 +198,7 @@ class RetryFactoryErrorPropagationTests(unittest.TestCase):
             seen.append(error)
             return "ok"
 
-        from api_helpers import _call_retry_factory
+        from upstreams.express_pipeline import _call_retry_factory
         self.assertEqual(_call_retry_factory(factory, None), "ok")
         self.assertEqual(seen, [None])
 
@@ -499,7 +499,7 @@ class BadCredentialWarningTests(unittest.TestCase):
     """_warn_bad_credential：命中告警一次、去重、未命中不打扰。"""
 
     def test_warning_printed_once_per_credential(self):
-        from api_helpers import _warn_bad_credential
+        from upstreams.express_pipeline import _warn_bad_credential
         warned = set()
         err = _api_error(401, "API_KEY_INVALID")
         with mock.patch("builtins.print") as fake_print:
@@ -509,13 +509,13 @@ class BadCredentialWarningTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)  # 同一把 Key 只告警一次
 
     def test_non_credential_error_returns_false(self):
-        from api_helpers import _warn_bad_credential
+        from upstreams.express_pipeline import _warn_bad_credential
         warned = set()
         self.assertFalse(_warn_bad_credential(lambda: "label", _api_error(429), warned))
         self.assertFalse(_warn_bad_credential(lambda: "label", ValueError("x"), warned))
 
     def test_none_describer_still_classifies(self):
-        from api_helpers import _warn_bad_credential
+        from upstreams.express_pipeline import _warn_bad_credential
         warned = set()
         self.assertTrue(_warn_bad_credential(None, _api_error(403), warned))
 

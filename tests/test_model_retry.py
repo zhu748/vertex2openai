@@ -19,7 +19,7 @@ from curl_cffi.requests.exceptions import Timeout as CurlTimeout
 from google.genai import types
 from google import genai
 
-import api_helpers
+import upstreams.express_pipeline as api_helpers
 import express_endpoint
 import retry_policy
 import upstream_errors

@@ -27,7 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "app"))
 
 from models import OpenAIRequest  # noqa: E402
-import api_helpers  # noqa: E402
+import upstreams.express_pipeline as api_helpers  # noqa: E402
 from proxies.protocols import ProxyResolveError, _qs, parse_share_uri_to_outbound  # noqa: E402
 import upstreams.cookie_proxy as cookie_proxy  # noqa: E402
 import upstreams.cookie_request as cookie_request  # noqa: E402

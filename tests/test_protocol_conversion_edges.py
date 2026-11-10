@@ -22,7 +22,7 @@ from google.genai import types
 from PIL import Image
 
 import claude_protocol as cp
-import api_helpers
+import upstreams.express_pipeline as api_helpers
 import config
 from logger import ProxyStats
 from message_processing import create_gemini_prompt, process_gemini_response_to_openai_dict

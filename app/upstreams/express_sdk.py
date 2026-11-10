@@ -12,7 +12,7 @@ from upstream_errors import create_openai_error_response
 from anti_truncation import prepare_transport, split_model_alias
 from upstreams.base import BaseUpstream
 from upstreams.request_preparation import prepare_messages
-from api_helpers import execute_gemini_call
+from upstreams.express_pipeline import execute_gemini_call
 from message_processing import create_gemini_prompt
 from client_pool import get_pooled_express_client
 import model_capabilities as mc

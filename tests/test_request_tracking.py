@@ -17,7 +17,7 @@ import httpx
 from fastapi.responses import StreamingResponse
 from google.genai import types
 
-import api_helpers
+import upstreams.express_pipeline as api_helpers
 import config
 import console_auth
 import main

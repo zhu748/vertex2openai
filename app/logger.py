@@ -237,7 +237,7 @@ def custom_print(*args, **kwargs):
 
     说明（P1-5 第一步）：仍保留对 builtins.print 的接管以兼容现有 6000 行代码里的
     print 调用，但已经**移除了用正则从日志文本反解 token 数**的逻辑——
-    那与中文文案强耦合，改一个字就静默失效。现在由 api_helpers._record_usage()
+    那与中文文案强耦合，改一个字就静默失效。现在由 express_pipeline._record_usage()
     直接调用 stats.add_tokens()。后续可分批把 print 迁移到 logging。
     """
     if getattr(_in_hook, "active", False):

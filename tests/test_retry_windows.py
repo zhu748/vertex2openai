@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 import httpx
 from google.genai import types
 
-import api_helpers
+import upstreams.express_pipeline as api_helpers
 import config
 import first_reply
 import main

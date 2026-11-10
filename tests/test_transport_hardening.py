@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 from google import genai
 from google.genai import types
 
-import api_helpers
+import upstreams.express_pipeline as api_helpers
 import client_pool
 import config
 import cookie_auth

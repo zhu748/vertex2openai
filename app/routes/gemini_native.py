@@ -413,7 +413,7 @@ async def _passthrough_request_impl(fastapi_request: Request, model: str, action
       次数放大），更短的上游 retry-after 会被采纳；
     - 钉定失败兜底（403/404 且报错像项目/区域问题，见 _looks_like_pin_failure）：
       不换 Key、不占上面的预算，仅把模型路径退回裸模型名再试一次——
-      与 SDK 通道（api_helpers.execute_gemini_call 的 fallback_model）对齐，
+      与 SDK 通道（express_pipeline.execute_gemini_call 的 fallback_model）对齐，
       避免「OpenAI 接口能自动兜底、原生透传却把 404 原样抛给客户端」。
     """
     started_at = time.monotonic()

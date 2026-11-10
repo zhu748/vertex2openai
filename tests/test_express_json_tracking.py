@@ -19,7 +19,7 @@ _STATE = tempfile.TemporaryDirectory(prefix="v2o-express-json-tracking-")
 os.environ["STATE_DIR"] = _STATE.name
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
-import api_helpers
+import upstreams.express_pipeline as api_helpers
 
 
 def _generation(thinking_config=None, max_output_tokens=None):

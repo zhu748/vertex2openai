@@ -18,7 +18,7 @@ import httpx
 from google import genai
 from google.genai import errors, types
 
-import api_helpers
+import upstreams.express_pipeline as api_helpers
 import first_reply
 import tool_stream
 from logger import ProxyStats

@@ -8,6 +8,7 @@ APP = Path(__file__).resolve().parents[1] / "app"
 ADAPTERS = (
     "routes",
     "api_helpers",
+    "upstreams.express_pipeline",
     "upstreams.cookie_proxy",
     "upstreams.cookie_native",
     "upstreams.express_sdk",

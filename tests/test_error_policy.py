@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from google.genai import types
 
-import api_helpers
+import upstreams.express_pipeline as api_helpers
 import config
 import retry_policy
 from logger import ProxyStats

@@ -163,7 +163,7 @@ class LogprobsTests(unittest.TestCase):
         self.assertIsNone(logprobs_payload_from_candidate(blank))
 
     def test_streaming_chunk_carries_logprobs_on_choice_level(self):
-        from api_helpers import _build_chunk_payload
+        from upstreams.express_pipeline import _build_chunk_payload
         chunk = genai_types.GenerateContentResponse(
             candidates=[genai_types.Candidate(
                 content=genai_types.Content(parts=[genai_types.Part(text="hi")]),
