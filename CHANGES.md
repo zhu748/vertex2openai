@@ -2,6 +2,16 @@
 
 基于原版 `vertex2openai-main`（2026-09-01），持续完善兼容性、可靠性和代码组织。
 
+## 2026-11-11（第十一轮）：按审查路线图完成 P2/P3 结构优化（两批十六提交）
+
+- 背景：代码审查报告（P0→P3 路线图）指出的结构性债务在本轮全部处置完毕：上一批（835936c..ebc50d7）落地 P0 缺陷修复、P1 机械合并（常量收敛、helper 化、死代码清除、冒烟脚本与历史文档归档、重试退避窗口 8 处合一、Go 假 TURN 服务器合并、轮次命名测试改名）；本批完成 P2 全部八项与 P3 两项，每步 `check_project.py` 全绿验收。
+- 模块归位（P2-2/P2-3/P2-5/P2-7）：`api_helpers.py` 的 Express 本体迁入 `upstreams/express_pipeline.py`（与 cookie 家族对称，原文件留兼容 re-export 层）；`cookie_proxy.py` 从 1,691 行拆出四条交付路径（真流式/非流式/生图假流式/缓冲假流式）到 `upstreams/cookie_delivery.py`，原文件只剩每请求上下文类、凭证装配与分发（357 行）；`chat_api.py` 的跨通道兜底引擎下沉 `channel_dispatch.py`（479 行），claude_api 改走公共 `call_upstream` 门面；Go `proxybridge/main.go`（555 行）拆为 main/socks/relay 三文件并补齐 `refuseOverloaded` 与 `diagnostic()` 的零覆盖测试。审查点名的三处跨模块私有 import 契约（claude_api→chat_api._call_upstream、claude_api→generation_config 下划线函数、cookie_native→cookie_request 私有函数）全部以公共别名收口。
+- 重复收敛（P2-4/P2-6）：message_processing 三份同构的「分段 content 遍历骨架」合一（`_iter_content_segments`，含 text:null 兜底、实例归一、image_url 三形态统一，附三管线契约特征测试）；前端六对 Key/Cookie CRUD 平行函数参数化为 `credential-list.js` 共享编排，七处 `/api/settings` POST 样板收敛进 `postSettings()`（代理编辑器因 throw 契约例外保留）；`dashboard.js` 全局基座并入 IIFE 命名空间体系（函数静态挂载 + 可变状态 getter/setter 双向同步）。
+- 测试基建（P2-8）：`check_project.py` 从「75 组逐文件子进程」改为 pytest 单进程运行（conftest 三层隔离生效），68 个测试文件头部的 STATE_DIR + sys.path 样板（434 行）删除，全套 1,274 项测试 16 秒跑完。
+- 循环依赖（P3-2）：后缀表/`split_model_alias`/`supports_transport` 归位 model_capabilities（anti_truncation 单向 re-export）；impersonate 的上游池关闭改为向 client_pool 注册关闭器，`close_all_clients` 遍历注册表，client_pool 不再反向引用 impersonate。
+- 覆盖率（P3-5）：引入 `.coveragerc` + coverage 依赖，全套基线 88%（15,790 语句 / 1,867 未命中），为后续测试合并决策提供逐模块数据。
+- 遗留（后续评估）：`_stream_events` 的 status 链 handler 表化（446 行、控制流重排需独立特征测试护航）；gemini_native 透传引擎下沉（~30 处 patch seam 分布在 14 个测试文件）；runtime_state 五合一拆解（36 个依赖方）；SSTP 依赖树削减（产品决策）。
+
 ## 2026-11-07（第八轮）：Express 非流式请求跟踪上报思考档位与输出上限
 
 - 背景：用户核实「3.5-flash-lite 开启全局最高思考强度并强制跟随上方档位（`native_thinking_mode=console`）后，非流式请求监控仍显示思考档位=默认，流式却正常显示 high」。属实——Express 通道的 `track_configure` 只在流式分支（`SDKGeneration.response()`）上报 `thinking_level` / `max_output_tokens`，非流式整取 `collect_response()` 仅上报 `mode` / `upstream_model`，请求监控对 json 模式永远显示「默认 / 默认」，让人误以为控制台强制档位没生效。实际上 `thinking_config` 在 `chat_completions` 阶段就已写入 `gen_config_dict`，流式与非流式共用同一份配置，档位照常下发（用户 trace 里非流式请求生成 2,645 字符思考即为佐证：`gemini-3.5-flash-lite` 家族默认档位是 minimal，强制 high 未生效不可能产出该量级思考）；Cookie 通道两种模式均上报，唯 Express json 模式漏报。
