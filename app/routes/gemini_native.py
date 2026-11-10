@@ -42,6 +42,7 @@ Key 霸占）；Cookie 桥接不支持的操作在有 Key 时回退 Key 透传�
 
 import json
 import asyncio
+from functools import partial
 import codecs
 import hashlib
 import time
@@ -58,7 +59,8 @@ from retry_policy import get_retry_settings, is_retryable_exception, is_retryabl
 from upstream_errors import extract_upstream_error, google_status_detail
 from usage import merge_usage_metadata
 from response_validation import IncompleteResponseError, has_finish_reason
-from admission import limit_generation, GenerationCapacityError, run_with_image_limit
+from admission import (count_slow_setup_failure, limit_generation, GenerationCapacityError,
+                       run_with_image_limit, SETUP_FAST_WINDOW_SECONDS)
 from retry_policy import retry_delay as _retry_delay, wait_for_retry as _wait_for_retry
 from auth import constant_time_equal
 from config import API_KEY
@@ -81,7 +83,7 @@ from client_pool import passthrough_client_pool
 from proxy_resolver import ProxyResolveError, resolve_proxy_uri
 from proxy_failover import ProxyChain
 from proxy_tls import build_httpx_proxy
-from streaming import sse_frames, with_heartbeats, HEARTBEAT, HEARTBEAT_FRAME
+from streaming import SSE_NO_BUFFER_HEADERS, sse_frames, with_heartbeats, HEARTBEAT, HEARTBEAT_FRAME
 from resumable import (resumable_store, resolve_buffer, ResumeRequestError, BufferCapacityError,
                        DetachedRequest, sse_from_buffer, within_request_deadline, image_bypass_enabled,
                        request_timeout_seconds, is_enabled as resumable_enabled)
@@ -495,8 +497,7 @@ async def _passthrough_request_impl(fastapi_request: Request, model: str, action
                 # 与 Express SDK 通道同款出站可观测性：本次请求的实际首选出口
                 # （Key 级优先、全局兑底）；直连（无候选）静默。
                 if proxy_chain.current:
-                    from proxy_resolver import mask_proxy_uri
-                    print(f"🌐 [出站代理] 当前出口：{mask_proxy_uri(proxy_chain.current)}")
+                    proxy_chain.log_current()
             except ProxyResolveError as e:
                 print(f"❌ [Gemini 透传] 出站代理不可用：{e}")
                 if key_attempts >= retry_max:
@@ -926,7 +927,7 @@ async def _relay_stream(upstream: httpx.Response, *, keepalive=False, deadline=N
     passthrough = {k: v for k, v in upstream.headers.items()
                    if k.lower() == "retry-after"}
     if keepalive:
-        passthrough.update({"Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no"})
+        passthrough.update(SSE_NO_BUFFER_HEADERS)
     return NativeStreamingResponse(_relay(), status_code=upstream.status_code,
                                    media_type=media_type, headers=passthrough or None)
 
@@ -1010,35 +1011,19 @@ async def _resumable_native(request, api_key, model, action, query, payload, par
                 raise
         task = hold_ingress(asyncio.create_task(within_request_deadline(buf, setup)))
         resumable_store.register_pump(buf.id, task, buffer=buf)
-        done, _ = await asyncio.wait({task}, timeout=0.05)
+        done, _ = await asyncio.wait({task}, timeout=SETUP_FAST_WINDOW_SECONDS)
         if done:
             response = task.result()
             if not isinstance(response, StreamingResponse):
                 return response
         else:
-            # 慢路径统计补记（2026-11 P2-8 修复）：HTTP 200 + SSE 已发出后，
-            # 后台 setup 稍后失败只会以错误帧进缓冲，middleware 按状态码
-            # 统计不到——total ≠ success + error 永久漂移。chat_api 的
-            # _resumable_stream 已用同一回调模式修复过完全相同的洞，此处
-            # 对齐：每个 setup_task 只补一次，取消（淘汰/停机）不计失败。
-            slow_path = True
-
-            def _count_slow_failure(done_task: asyncio.Task) -> None:
-                if not slow_path or done_task.cancelled():
-                    return  # 取消（淘汰/停机）不算失败
-                exc = None
-                try:
-                    exc = done_task.exception()
-                except asyncio.CancelledError:
-                    return
-                if exc is not None or not isinstance(done_task.result(), StreamingResponse):
-                    stats.add_error()
-
-            task.add_done_callback(_count_slow_failure)
+            # 慢路径统计补记（2026-11 P2-8 修复；单一实现见
+            # admission.count_slow_setup_failure，与 chat_api 共用）。
+            task.add_done_callback(partial(count_slow_setup_failure, on_error=stats.add_error))
     return StreamingResponse(
         sse_from_buffer(buf, start), media_type="text/event-stream",
-        headers={"X-Resume-Id": buf.id, "Cache-Control": "no-store, no-transform",
-                 "X-Accel-Buffering": "no", **({"X-Resumable-Replay": "1"} if not new else {})})
+        headers={"X-Resume-Id": buf.id, **SSE_NO_BUFFER_HEADERS,
+                 **({"X-Resumable-Replay": "1"} if not new else {})})
 
 
 def _passthrough_endpoint():

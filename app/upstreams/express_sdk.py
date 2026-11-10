@@ -17,7 +17,7 @@ from message_processing import create_gemini_prompt
 from client_pool import get_pooled_express_client
 import model_capabilities as mc
 from runtime_state import app_state
-from proxy_resolver import ProxyResolveError, mask_proxy_uri
+from proxy_resolver import ProxyResolveError
 from proxy_failover import FailoverSDKClient, ProxyChain
 from schema_validation import SchemaValidationError
 from request_validation import validate_openai_request
@@ -30,14 +30,9 @@ LEGACY_PAY_PREFIX = "[PAY]"
 OPENAI_DIRECT_SUFFIX = "-openai"
 OPENAI_SEARCH_SUFFIX = "-openaisearch"
 
-
-def _mask_key(key: str) -> str:
-    """日志用 Key 掩码：只保留首尾少量字符，避免完整密钥泄漏到控制台日志。"""
-    if not key:
-        return "(空)"
-    if len(key) <= 10:
-        return key[:2] + "…" + key[-2:]
-    return key[:6] + "…" + key[-4:]
+# 日志掩码统一用 express_key_probe.mask_key（2026-11 审查收敛：原先两处
+# 平行实现，短 Key 的掩码口径还不一致——空值 "(空)" vs "****"）。
+from express_key_probe import mask_key  # noqa: E402
 
 
 def _normalize_model_name(model_name: str) -> tuple[str, bool, str | None]:
@@ -217,7 +212,7 @@ class ExpressSDKUpstream(BaseUpstream):
                 content=create_openai_error_response(502, f"出站代理不可用：{e}", "proxy_error"),
             )
         if client_to_use.chain.current:
-            print(f"🌐 [出站代理] 当前出口：{mask_proxy_uri(client_to_use.chain.current)}")
+            client_to_use.chain.log_current()
         _log_resolved_endpoint(client_to_use)
         print(f"🌐 [上游端点] 使用官方 Gemini Express Mode SDK 调用模型 {base_model_name}。")
         if model_to_call != base_model_name:
@@ -336,7 +331,7 @@ class ExpressSDKUpstream(BaseUpstream):
                     idx = None
             pos = f"第 {idx + 1} 个" if idx is not None else "当前"
             pid = (key_record or {}).get("project_id") or "未绑定"
-            return f"{pos} Express API Key（{_mask_key(express_api_key)} | 项目={pid}）"
+            return f"{pos} Express API Key（{mask_key(express_api_key)} | 项目={pid}）"
 
         return await execute_gemini_call(
             client_to_use,

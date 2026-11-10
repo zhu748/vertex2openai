@@ -108,7 +108,7 @@ class JsonFramingTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(cookie_proxy, "_get_cookie_string", return_value="SAPISID=test"),
             mock.patch.object(app_state, "get_setting", side_effect=lambda key, default=None: default),
         ):
-            result = await cookie_proxy._collect_full_response("p", obj.model, obj, {}, {}, 0, 0, 0, request)
+            result = await cookie_proxy._collect_full_response("p", obj.model, obj, "SAPISID=test", {}, 0, 0, 0, request)
         self.assertEqual(result["kind"], "error")
         self.assertEqual(result["code"], 502)
         self.assertEqual(stats.success_requests, 0)

@@ -21,8 +21,8 @@ _SETTING_ENUMS = {
 # 数值键的允许范围（与读取侧的钳位逻辑一致，如 get_retry_settings 0-50/0-120）
 _SETTING_NUMERIC_RANGE = {
     "retry_max": (0, 50),
-    "first_reply_timeout_seconds": (0.0, 7200.0),
-    "resumable_disconnect_grace_seconds": (0.0, 7200.0),
+    "first_reply_timeout_seconds": (0.0, config.MAX_TIMEOUT_SECONDS),
+    "resumable_disconnect_grace_seconds": (0.0, config.MAX_TIMEOUT_SECONDS),
     "retry_backoff_seconds": (0.0, 120.0),
     "retry_jitter_seconds": (0.0, 60.0),
     "fake_streaming_interval": (0.0, 30.0),
@@ -33,7 +33,7 @@ _SETTING_NUMERIC_RANGE = {
     "resumable_max_streams": (1, 10000),
     "resumable_max_buffer_mb": (1, 1024),
     "resumable_max_total_mb": (1, 8192),
-    "request_timeout_seconds": (30, 7200),
+    "request_timeout_seconds": (30, config.MAX_TIMEOUT_SECONDS),
     "upstream_max_concurrency": (1, 1000),
     # 生图并发闸门：4K 生图单次峰值 RSS 可达 150-200MB，512MB 容器
     # 并发叠加即 OOMKill；默认 2，内存充裕的部署可调大

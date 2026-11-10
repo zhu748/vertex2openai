@@ -33,8 +33,8 @@ from message_processing import (  # noqa: E402
     slice_giant_content,
 )
 from upstreams.cookie_response import (  # noqa: E402
+    iter_openai_content_chunks,
     make_openai_chunk,
-    make_openai_content_chunks,
 )
 from upstreams.express_response import (  # noqa: E402
     _chunk_openai_response_dict_for_sse,
@@ -142,9 +142,9 @@ class ExpressFakeStreamFramingTests(unittest.TestCase):
 class CookieContentChunkTests(unittest.TestCase):
     def test_giant_content_multi_frame_byte_identical(self):
         content = _image_markdown(2 * 1024 * 1024)
-        frames = make_openai_content_chunks(
+        frames = list(iter_openai_content_chunks(
             "chatcmpl-ck", "nano-banana", content, role="assistant"
-        )
+        ))
         self.assertGreater(len(frames), 1)
         deltas = [_parse_sse(f)["choices"][0]["delta"]["content"] for f in frames]
         self.assertEqual("".join(deltas), content)
@@ -157,7 +157,7 @@ class CookieContentChunkTests(unittest.TestCase):
     def test_no_role_kept_absent(self):
         # 调用点自带独立 role 帧：不传 role 时不得擅自注入
         content = "![Image](data:image/png;base64," + "A" * (2 << 20) + ")"
-        frames = make_openai_content_chunks("chatcmpl-ck", "nano-banana", content)
+        frames = list(iter_openai_content_chunks("chatcmpl-ck", "nano-banana", content))
         for f in frames:
             self.assertNotIn(
                 "role", _parse_sse(f)["choices"][0]["delta"]
@@ -165,7 +165,7 @@ class CookieContentChunkTests(unittest.TestCase):
 
     def test_small_content_single_frame_matches_legacy_shape(self):
         content = "![Image](data:image/png;base64,AAA)"
-        frames = make_openai_content_chunks("chatcmpl-ck", "nano-banana", content)
+        frames = list(iter_openai_content_chunks("chatcmpl-ck", "nano-banana", content))
         self.assertEqual(
             frames,
             [make_openai_chunk("chatcmpl-ck", "nano-banana", content=content)],

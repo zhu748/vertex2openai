@@ -23,6 +23,7 @@ from console_auth import (
     require_auth,
 )
 from console_assets import versioned_assets
+from streaming import SSE_NO_BUFFER_HEADERS
 from logger import rt_logger, stats
 from request_tracking import request_registry
 
@@ -172,5 +173,5 @@ async def stream_logs_endpoint(request: Request, _auth: bool = Depends(require_a
         media_type="text/event-stream",
         # 与聊天/原生 SSE 端点同口径：默认开启响应缓冲的反代（nginx 等）
         # 会攒住日志与心跳，控制台「运行日志」长时间不更新（2026-10 修复）。
-        headers={"Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no"},
+        headers=SSE_NO_BUFFER_HEADERS,
     )

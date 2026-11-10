@@ -7,8 +7,12 @@ from typing import Any
 
 from models import normalize_content_part
 
-# CJK 统一表意文字与全角标点：粗估 1 字 ≈ 1 token；其余按 4 字符 ≈ 1 token。
-_CJK_RE = re.compile(r"[\u2e80-\u9fff\uf900-\ufaff\uff00-\uffef]")
+# CJK 字符集（公开导出）：粗估 1 字 ≈ 1 token；其余按 4 字符 ≈ 1 token。
+# 取 claude_protocol 与本模块旧定义的并集（部首/注音 + 假名 + 汉字 + 谚文 +
+# 兼容表意 + 全角标点），消除两处口径分叉（2026-11 审查收敛：此前
+# claude_protocol 的平行正则不含部首、本表不含谚文，同一文本估算不同）。
+CJK_CHAR_RE = re.compile(r"[\u2e80-\u9fff\uac00-\ud7af\uf900-\ufaff\uff00-\uffef]")
+_CJK_RE = CJK_CHAR_RE
 
 
 def estimate_token_count(text: str) -> int:

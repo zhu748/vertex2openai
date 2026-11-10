@@ -52,14 +52,14 @@ class BufferLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_deadline_is_fixed_for_admitted_generation(self):
         with mock.patch.object(resumable, "request_timeout_seconds", return_value=10):
-            buf = await self.store.create("deadline")
+            buf, _ = await self.store.create_if_absent("deadline")
         with mock.patch.object(resumable, "request_timeout_seconds", return_value=0.001):
             await resumable.within_request_deadline(buf, lambda: asyncio.sleep(0.01))
             await self.store.sweep()
         self.assertFalse(buf.done)
 
     async def test_unexpected_background_failure_wakes_readers_with_error(self):
-        buf = await self.store.create("exception")
+        buf, _ = await self.store.create_if_absent("exception")
         async def fail():
             raise RuntimeError("background operation failed")
         with self.assertRaises(RuntimeError):
@@ -69,7 +69,7 @@ class BufferLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("background operation failed", "".join(buf.events))
 
     async def test_shutdown_awaits_cleanup_of_already_discarded_pump(self):
-        buf = await self.store.create("discarded")
+        buf, _ = await self.store.create_if_absent("discarded")
         started, closed = asyncio.Event(), asyncio.Event()
         async def pump():
             try:

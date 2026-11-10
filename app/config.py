@@ -6,6 +6,12 @@ from proxy_config import parse_proxy_list
 # 出厂默认口令：定义成常量供启动告警比对（lifecycle.py）。
 DEFAULT_API_KEY = "123456"
 
+# 秒级超时类设置的全局硬上限（first_reply_timeout_seconds /
+# resumable_disconnect_grace_seconds / request_timeout_seconds 共用）。
+# settings_validation 的保存校验、first_reply / resumable 的运行时钳位
+# 均引用本常量（2026-11 审查收敛：此前三处平行写 7200）。
+MAX_TIMEOUT_SECONDS = 7200.0
+
 
 class AppSettings(BaseSettings):
     # 默认口令仅限本机体验；生产/公网部署必须用环境变量覆盖（启动时若
@@ -171,9 +177,6 @@ DEFAULT_SETTINGS = {
     # usage 恒为 0。开启后在上游未回传时按字符粗估（ASCII 4 字符≈1 token、CJK 1 字≈1
     # token），并在 usage 里附带 "estimated": true 供客户端区分。
     "usage_estimation": False,
-    # 思考签名内嵌开关（默认关）：
-    #   关 = 生成短 tool_call_id，签名存进进程内旁路缓存（推荐，避免被前端截断）
-    #   开 = 退回旧的 `{id}__thought__{base64}` 内嵌格式，供多进程/多副本部署使用
     # 生图请求是否下发 system_instruction（默认关，保持既有行为）。
     # 官方未禁止生图模型使用系统指令，但旧代码一直剥离；打开前请先真机验证目标模型。
     "image_system_instruction": False,

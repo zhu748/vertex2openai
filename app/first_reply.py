@@ -5,6 +5,7 @@ import time
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 
+import config as app_config
 from runtime_state import app_state
 from request_tracking import current_trace
 from response_validation import IncompleteResponseError
@@ -84,7 +85,7 @@ class FirstReplyTimeout(TimeoutError):
 def timeout_seconds(model):
     try:
         value = float(app_state.get_effective_settings(model).get("first_reply_timeout_seconds", 15))
-        return max(0.0, min(7200.0, value)) if math.isfinite(value) else 15.0
+        return max(0.0, min(app_config.MAX_TIMEOUT_SECONDS, value)) if math.isfinite(value) else 15.0
     except (TypeError, ValueError, OverflowError):
         return 15.0
 

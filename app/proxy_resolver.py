@@ -855,16 +855,32 @@ class ProxyBridgeManager(ProxyProcessManager):
                     )
                 # Never forward arbitrary child-process output: custom helpers or
                 # malformed peers could echo credentials in an error message.
+                #
+                # ⚠️ 跨进程契约（与 Go 侧同步维护）：这里的错误码本必须覆盖
+                # proxybridge 启动期（ready 文件写出前）可达的全部受控码。
+                # 新增/修改 Go 侧启动路径错误码时，必须同步更新本字典：
+                #   - proxybridge/main.go      （run() 的配置/监听/协议分发错误）
+                #   - proxybridge/turn.go      （tlsConfig / dialServer 探测错误）
+                #   - proxybridge/sstp.go      （startSSTP 握手与栈初始化错误）
+                #   - proxybridge/turn_anonymous.go （仅探测阶段经 detectTURNMode
+                #     间接可达；拨号期的 turn_* 码不会出现在启动日志里）
+                # 遗漏不会报错，只会退化为下方的笼统文案（2026-11 审查修复：
+                # 曾遗漏 sstp_packet_bridge_failed 等启动期可达码）。
                 known = {
                     "ca_read_failed": "无法读取 CA 证书文件",
                     "ca_invalid_pem": "CA 文件不是有效的 PEM 证书",
+                    "config_read_failed": "无法读取转换器配置文件",
+                    "server_connect_failed": "无法连接代理服务器（TCP 层）",
+                    "server_tls_failed_check_ca_sni": "代理服务器 TLS 握手失败（检查 CA 证书与 SNI）",
                     "sstp_custom_ca_requires_linux": "SSTP 自定义 CA 当前需要 Linux",
                     "sstp_auth_failed_requires_mschapv2": "SSTP 认证失败，需正确的 MS-CHAPv2 账号密码",
                     "sstp_handshake_failed_check_tls_credentials_and_mschapv2": "SSTP TLS / PPP 握手失败",
                     "sstp_handshake_timeout": "SSTP 握手超时（包含 TCP / TLS / PPP 的 30 秒总预算）",
                     "sstp_ipv4_address_missing": "SSTP 服务器未分配可用的 IPv4 地址",
                     "sstp_network_stack_failed": "SSTP 用户态网络栈初始化失败",
+                    "sstp_packet_bridge_failed": "SSTP 虚拟网卡桥接初始化失败（内核不支持或资源不足）",
                     "turn_probe_failed_check_server": "TURN 服务器探测失败：连接或分配请求无响应",
+                    "unsupported_protocol": "不支持的代理协议（仅 TURN / TURNS / SSTP）",
                     "listen_failed": "本地端口绑定失败",
                     "ready_write_failed": "无法写入转换器就绪标记",
                     "invalid_config": "转换器配置无效",

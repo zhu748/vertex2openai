@@ -305,10 +305,13 @@ class BufferLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(buf.finished_at, finished_at)
 
     async def test_replacing_buffer_closes_old_generation_and_wakes_readers(self):
-        old = await self.store.create("replace")
+        old, _ = await self.store.create_if_absent("replace")
         task = asyncio.create_task(asyncio.Event().wait())
         self.store.register_pump(old.id, task, buffer=old)
-        new = await self.store.create(old.id)
+        # create 的「无条件覆盖」语义经 drop() 显式表达：先丢弃旧代
+        # （取消其泵、置 503 终态），再占位建新代。
+        await self.store.drop(old.id)
+        new, _ = await self.store.create_if_absent(old.id)
         await asyncio.gather(task, return_exceptions=True)
         self.assertTrue(task.cancelled())
         self.assertTrue(old.done)

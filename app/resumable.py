@@ -28,11 +28,12 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 import config as app_config
 from runtime_state import app_state
 from streaming import with_heartbeats, HEARTBEAT, HEARTBEAT_FRAME
+from streaming import DONE_FRAME, MAX_ERROR_MESSAGE_CHARS
 from request_tracking import current_trace
 from upstream_errors import google_status_detail
 
 # 终止帧：与 OpenAI 流一致，客户端见到它即可判定「本轮完整结束」
-DONE_FRAME = "data: [DONE]\n\n"
+# DONE_FRAME 由 streaming 统一导出（上方 import），此处不再重复定义。
 
 
 class BufferCapacityError(RuntimeError):
@@ -150,7 +151,7 @@ def request_timeout_seconds() -> float:
 def disconnect_grace_seconds() -> float:
     try:
         value = float(_setting("resumable_disconnect_grace_seconds"))
-        return max(0.0, min(7200.0, value)) if math.isfinite(value) else 10.0
+        return max(0.0, min(app_config.MAX_TIMEOUT_SECONDS, value)) if math.isfinite(value) else 10.0
     except (ValueError, TypeError, OverflowError):
         return 10.0
 
@@ -362,9 +363,9 @@ class ResumableBuffer:
                         self.owner_trace.fail(message, code)
                 finally:
                     current_trace.reset(token)
-            payload = {"error": {"message": message[:1024], "type": error_type, "code": code}}
+            payload = {"error": {"message": message[:MAX_ERROR_MESSAGE_CHARS], "type": error_type, "code": code}}
             if self.kind == "native":
-                payload = {"error": {"message": message[:1024],
+                payload = {"error": {"message": message[:MAX_ERROR_MESSAGE_CHARS],
                                      "status": google_status_detail(code), "code": code}}
             frames = ([self.event_frame(f"data: {json.dumps(payload, ensure_ascii=False)}\n\n")]
                       if self.kind != "json" else [])
@@ -379,7 +380,7 @@ class ResumableBuffer:
             if self._account_bytes:
                 self._account_bytes(size, True)
             self.bytes_stored += size
-            self.status, self.error, self.status_code = "error", message[:1024], code
+            self.status, self.error, self.status_code = "error", message[:MAX_ERROR_MESSAGE_CHARS], code
             self.finished_at = time.time()
             self._cancel_grace_timer()
             self._cond.notify_all()
@@ -648,15 +649,6 @@ class ResumableStore:
                 buf.last_access = time.time()
             return buf
 
-    async def create(self, stream_id: str, model: str = "", kind: str = "stream") -> ResumableBuffer:
-        async with self._lock:
-            await self._discard_locked(stream_id, "已开始新一轮生成。")
-            buf = ResumableBuffer(stream_id, model=model, kind=kind)
-            self._attach(buf)
-            self._buffers[stream_id] = buf
-            await self._evict_locked(allow_running=True)
-            return buf
-
     async def create_if_absent(self, stream_id: str, model: str = "",
                                kind: str = "stream", *,
                                replace_delivered: bool = False) -> Tuple[ResumableBuffer, bool]:
@@ -665,6 +657,11 @@ class ResumableStore:
         `get` → 调上游 → `create` 三步之间有竞态窗口：并发的同一请求会各打一次上游，
         后建的缓冲还会把先建的覆盖掉（孤儿泵任务停机时也取消不到）。这里把「查 + 建」
         放进同一把锁：只有拿到 is_new=True 的那个请求去调上游，其余请求直接跟读同一份缓冲。
+
+        注：生产路径走 get_or_create_request（request_key → rid-* 映射 + 指纹/容量
+        治理）；本方法是测试可见的最小建缓冲入口，供单元测试直接驱动 eviction /
+        pump 生命周期等存储机制（2026-11 审查收敛：原并存的 ResumableStore.create
+        仅被测试使用，已并入本方法——新建场景两者行为等价）。
         """
         async with self._lock:
             buf = self._buffers.get(stream_id)
@@ -925,7 +922,7 @@ async def pump_stream(buf: ResumableBuffer, body_iterator: AsyncIterator[Any]) -
                     error = payload.get("error") if isinstance(payload, dict) else None
                     if error:
                         stream_error = str(error.get("message", "上游返回错误。")
-                                           if isinstance(error, dict) else error)[:1024]
+                                           if isinstance(error, dict) else error)[:MAX_ERROR_MESSAGE_CHARS]
                         code = error.get("code") if isinstance(error, dict) else None
                         stream_error_code = code if isinstance(code, int) and 400 <= code <= 599 else 502
             if await buf.append(buf.event_frame(text)) is None:

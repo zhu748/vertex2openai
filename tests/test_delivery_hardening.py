@@ -232,7 +232,7 @@ class BudgetTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(await self.store.get_exact(original.id), original)
 
     async def test_oversized_stream_fails_with_bounded_terminal_error(self):
-        buf = await self.store.create("large")
+        buf, _ = await self.store.create_if_absent("large")
         async def frames():
             yield 'data: {"text":"small"}\n\n'
             yield 'data: ' + 'x' * 20_000 + '\n\n'
@@ -245,8 +245,8 @@ class BudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(buf.events[-1].endswith(resumable.DONE_FRAME))
 
     async def test_global_byte_budget_and_accounting_release(self):
-        one = await self.store.create("one")
-        two = await self.store.create("two")
+        one, _ = await self.store.create_if_absent("one")
+        two, _ = await self.store.create_if_absent("two")
         with mock.patch.object(resumable, "_byte_limit", side_effect=lambda key, default: 100 if "total" in key else 1000):
             await one.append("x" * 80)
             with self.assertRaises(resumable.BufferCapacityError):
@@ -256,7 +256,7 @@ class BudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store._bytes_used, 30)
 
     async def test_oversized_json_does_not_enter_cache(self):
-        buf = await self.store.create("json", kind="json")
+        buf, _ = await self.store.create_if_absent("json", kind="json")
         with mock.patch.object(resumable, "_byte_limit", return_value=100):
             await buf.finish(payload={"answer": "x" * 10_000})
         self.assertEqual(buf.status_code, 503)
@@ -264,7 +264,7 @@ class BudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(buf.bytes_stored, 2048)
 
     async def test_deadline_stops_generation_even_with_connected_reader(self):
-        buf = await self.store.create("hung")
+        buf, _ = await self.store.create_if_absent("hung")
         buf.readers = 1
         stopped = asyncio.Event()
         async def operation():
@@ -281,14 +281,14 @@ class BudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(buf.done)
 
     async def test_sweeper_also_expires_connected_zombies(self):
-        buf = await self.store.create("hung-reader")
+        buf, _ = await self.store.create_if_absent("hung-reader")
         buf.deadline_monotonic -= 100000
         buf.readers = 1
         self.assertEqual(await self.store.sweep(), 1)
         self.assertTrue(buf.done)
 
     async def test_stream_pump_deadline_emits_504_and_terminal_frame(self):
-        buf = await self.store.create("stream-timeout")
+        buf, _ = await self.store.create_if_absent("stream-timeout")
         closed = asyncio.Event()
         async def source():
             try:
@@ -307,7 +307,7 @@ class BudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(buf.events[-1].endswith(resumable.DONE_FRAME))
 
     async def test_stream_error_code_is_preserved_in_poll_metadata(self):
-        buf = await self.store.create("error")
+        buf, _ = await self.store.create_if_absent("error")
         async def frames():
             yield 'data: {"error":{"code":429,"message":"quota"}}\n\n'
             yield resumable.DONE_FRAME

@@ -25,7 +25,9 @@ SUPPORTED_PROFILES = ("off", "chrome", "edge", "safari", "firefox", "safari_ios"
 # 超时总上限：curl 的 timeout 是“整个请求”的硬超时（不像 httpx 的 read 是
 # “两块数据之间的间隔”），长思考流可能持续数分钟，这里放宽到 30 分钟。
 _CURL_TOTAL_TIMEOUT_SECONDS = 1800.0
-_CURL_BUFFER_LIMIT_BYTES = 64 * 1024 * 1024
+# 有界读取上限与 http_io.MAX_UPSTREAM_RESPONSE_BYTES 同源（curl/httpx 两条
+# 传输线共用同一响应体预算；2026-11 审查收敛：此前两常量平行定义）。
+from http_io import MAX_UPSTREAM_RESPONSE_BYTES as _CURL_BUFFER_LIMIT_BYTES  # noqa: E402
 # 流式响应的自缓冲上限：aiter_text 为 aread 幂等语义自留一份副本，
 # 但 200 响应实际只会被 aiter 消费（非 200 才先 aread）——旧实现把整个
 # 流式响应（生图可达数十 MB base64 × 并发数）全额驻留内存，且超过

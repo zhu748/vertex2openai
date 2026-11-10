@@ -396,7 +396,7 @@ class CookieRetryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_image_collection_reports_exhausted_api_error(self):
         obj = api_helpers.OpenAIRequest(model="gemini-3.1-flash-image", messages=[])
-        result = await cookie_proxy._collect_full_response("p", obj.model, obj, {}, {}, 0, 0, 0, self.request)
+        result = await cookie_proxy._collect_full_response("p", obj.model, obj, "SAPISID=test", {}, 0, 0, 0, self.request)
         self.assertEqual(result["kind"], "error")
         self.assertEqual(result["code"], 429)
 
@@ -408,7 +408,7 @@ class CookieRetryTests(unittest.IsolatedAsyncioTestCase):
         record = object()
         with mock.patch.object(cookie_proxy.credential_manager, "record_cookie_auth_failure") as fail:
             result = await cookie_proxy._collect_full_response(
-                "p", obj.model, obj, {}, {}, 0, 0, 0, self.request,
+                "p", obj.model, obj, "SAPISID=test", {}, 0, 0, 0, self.request,
                 account_id="acct-1", record=record)
         self.assertEqual(result["kind"], "error")
         self.assertEqual(result["code"], 401)
@@ -423,7 +423,7 @@ class CookieRetryTests(unittest.IsolatedAsyncioTestCase):
                                return_value=[("error", {"message": "Request failed: permission denied for project"})]), \
              mock.patch.object(cookie_proxy.credential_manager, "record_cookie_auth_failure") as fail:
             result = await cookie_proxy._collect_full_response(
-                "p", obj.model, obj, {}, {}, 0, 0, 0, self.request,
+                "p", obj.model, obj, "SAPISID=test", {}, 0, 0, 0, self.request,
                 account_id="acct-2", record=record)
         self.assertEqual(result["kind"], "error")
         self.assertEqual(result["code"], 403)
@@ -434,7 +434,7 @@ class CookieRetryTests(unittest.IsolatedAsyncioTestCase):
         obj = api_helpers.OpenAIRequest(model="gemini-3.1-flash-image", messages=[])
         self.client.post = mock.AsyncMock(return_value=httpx.Response(403, text="forbidden"))
         with mock.patch.object(cookie_proxy.credential_manager, "record_cookie_auth_failure") as fail:
-            result = await cookie_proxy._collect_full_response("p", obj.model, obj, {}, {}, 0, 0, 0, self.request)
+            result = await cookie_proxy._collect_full_response("p", obj.model, obj, "SAPISID=test", {}, 0, 0, 0, self.request)
         self.assertEqual(result["kind"], "error")
         self.assertEqual(result["code"], 403)
         fail.assert_not_called()

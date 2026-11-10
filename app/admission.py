@@ -9,6 +9,33 @@ from runtime_state import app_state
 from proxy_resolver import ProxyUsage, current_proxy_usage
 from request_tracking import PayloadObserver, current_trace
 
+# setup 任务的「快窗口」：窗口内完成的异常/错误响应保留真实 HTTP 状态码
+# （middleware 能看到），窗口后才建立 SSE 连接（chat_api._resumable_stream
+# 与 gemini_native 透传续传共用同一预算；2026-11 审查收敛：此前三处硬编码）。
+SETUP_FAST_WINDOW_SECONDS = 0.05
+
+
+def count_slow_setup_failure(task: asyncio.Task, *, on_error) -> None:
+    """慢路径 setup 失败补记一次 on_error()（通常传 stats.add_error）。
+
+    HTTP 200 + SSE 已发出后，后台 setup 稍后失败只会以错误帧进续传缓冲，
+    middleware 按状态码统计不到——大盘上 total ≠ success + error 永久漂移。
+    快路径（窗口内完成）由 result() re-raise / 真实状态码走 middleware 计数，
+    本回调只补慢路径且每个 setup 任务只挂一次；取消（淘汰/停机）不计失败。
+    （2026-11 审查收敛：chat_api 与 gemini_native 曾各自复制同一闭包，
+    注释互指对方为「同一回调模式」，现为单一实现。on_error 在挂载时绑定，
+    保证测试对 stats 的 mock 替换对回调同样生效。）
+    """
+    if task.cancelled():
+        return  # 取消（淘汰/停机）不算失败
+    exc = None
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        return
+    if exc is not None or not isinstance(task.result(), StreamingResponse):
+        on_error()
+
 
 class GenerationCapacityError(RuntimeError):
     code = 503

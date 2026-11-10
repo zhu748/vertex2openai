@@ -254,21 +254,19 @@ async function loadRuntime() {
 let KEYS = [],
   SAVED_KEYS = [];
 function keySrcPill(rec) {
-  if (rec.project_source === 'auto')
-    return '<span class="pill" style="text-transform:none">来源 auto</span>';
-  if (rec.project_source === 'manual')
-    return '<span class="pill" style="text-transform:none">来源 manual</span>';
-  return '<span class="pill" style="text-transform:none;color:#b45309">未探测</span>';
+  if (rec.project_source === 'auto') return '<span class="pill">来源 auto</span>';
+  if (rec.project_source === 'manual') return '<span class="pill">来源 manual</span>';
+  return '<span class="pill" style="color:#b45309">未探测</span>';
 }
 function keyProxyPill(rec) {
   const proxies = proxyDraft(rec.proxies ?? rec.proxy),
     v = (proxies[0] || '').trim().toLowerCase();
   if (!v) return '';
   if (v === 'direct' || v === 'none' || v === '直连')
-    return '<span class="pill" style="text-transform:none;background:#f5f5f5;color:#737373">强制直连</span>';
+    return '<span class="pill" style="background:#f5f5f5;color:#737373">强制直连</span>';
   const proto = (proxies[0] || '').split(':')[0] || 'proxy';
   const native = ['http', 'https', 'socks5', 'socks5h'].includes(proto) ? '#047857' : '#1d4ed8';
-  return `<span class="pill" style="text-transform:none;color:${native}">专属代理 ${proxies.length} 条</span>`;
+  return `<span class="pill" style="color:${native}">专属代理 ${proxies.length} 条</span>`;
 }
 function renderKeys() {
   const box = $('keys-list');

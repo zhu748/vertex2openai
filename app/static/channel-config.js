@@ -55,9 +55,9 @@
     const health = rec.health;
     if (!health) return '';
     if (Number(health.cooldown_remaining) > 0)
-      return `<span class="pill" style="text-transform:none;color:#b45309" title="鉴权失败累计，调度已临时隔离该账号">冷却中 ${Math.ceil(Number(health.cooldown_remaining))}s</span>`;
+      return `<span class="pill" style="color:#b45309" title="鉴权失败累计，调度已临时隔离该账号">冷却中 ${Math.ceil(Number(health.cooldown_remaining))}s</span>`;
     if (Number(health.failures) > 0)
-      return `<span class="pill" style="text-transform:none;color:#b45309" title="近期鉴权失败 ${health.failures} 次，再失败可能进入冷却">失败 ${health.failures} 次</span>`;
+      return `<span class="pill" style="color:#b45309" title="近期鉴权失败 ${health.failures} 次，再失败可能进入冷却">失败 ${health.failures} 次</span>`;
     return '';
   }
   function cookieSecretControls(row, record, index) {
@@ -1444,13 +1444,16 @@
     open: openProxyEditor,
     sync: updateProxyEditorControls
   };
+  // 注意：refreshCookies 不在此处导出到 window——console-bootstrap.js 的
+  // 同名全局包装器（含 ensureChannelConfig 懒加载与错误 toast）后加载并
+  // 恒定遮蔽本导出；实际入口统一走包装器，命名空间内保留实现供其调用
+  // （2026-11 审查收敛：此前三个出口指向两种行为，排障时误导）。
   Object.assign(window, {
     updateCredentialStrategy,
     loadCookieAccounts,
     addCookieAccount,
     removeCookieAccount,
     saveCookieAccounts,
-    refreshCookies,
     testCookieAccount,
     closeProxyEditor,
     moveProxy,

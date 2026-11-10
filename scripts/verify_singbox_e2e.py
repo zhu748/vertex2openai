@@ -6,11 +6,15 @@
 
 验证链路：分享 URI → proxy_resolver 解析 → sing-box 子进程（本地 socks5 入站）
 → httpx 经本地 socks5 请求目标 URL（默认 aiplatform.googleapis.com）。
-同时验证：同 URI 端口稳定复用、sing-box 缺失时的明确报错（子进程隔离验证）。
+同时验证：同 URI 端口稳定复用、sing-box 缺失时的明确报错（子进程隔离验证）、
+进程被杀且原端口被占时自动换新端口复活（原 scripts/verify_round17.py 的
+独有场景，2026-11 审查收敛并入本脚本）。
 退出码 0 = 全部通过；非 0 = 失败（原因见输出）。
 """
+import asyncio
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import tempfile
@@ -72,6 +76,44 @@ def main() -> int:
         return 1
     finally:
         pr.singbox_manager.shutdown_all()
+
+    # ---------- 4.5 进程被杀 + 原端口被占 → 换新端口复活 ----------
+    # （原 verify_round17.py 场景 3；sing-box 转换型 URI 才适用）
+    async def revival_scenario() -> int:
+        inst = pr.singbox_manager._instances.get(uri)
+        if inst is None or not inst.alive():
+            print("ℹ️ 跳过复活场景：实例不在运行（非 sing-box 转换型 URI）。")
+            return 0
+        old_port = inst.port
+        inst.process.kill()
+        inst.process.wait(timeout=5)
+        # 用一个哑监听占住原端口，模拟「端口被其他进程抢走」
+        squatter = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        squatter.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        squatter.bind(("127.0.0.1", old_port))
+        squatter.listen(1)
+        try:
+            t0 = time.time()
+            revived = await pr.resolve_proxy_uri_async(uri)
+            new_port = int(revived.rsplit(":", 1)[1])
+            if new_port == old_port:
+                print(f"❌ 复活仍用被占端口 {old_port}")
+                return 1
+            print(f"✅ 崩溃复活：端口 {old_port}（被占）→ {new_port}（{time.time() - t0:.2f}s）")
+            import httpx
+            async with httpx.AsyncClient(proxy=revived, timeout=httpx.Timeout(15.0)) as client:
+                resp = await client.get(target)
+            print(f"✅ 复活后经代理请求 → HTTP {resp.status_code}")
+            return 0
+        except ProxyResolveError as e:
+            print(f"❌ 崩溃复活失败：{e}")
+            return 1
+        finally:
+            squatter.close()
+
+    revival = asyncio.run(revival_scenario())
+    if revival:
+        return revival
 
     # ---------- 5. sing-box 缺失时明确报错（子进程验证，不污染本进程缓存） ----------
     child_code = "\n".join([

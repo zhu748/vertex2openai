@@ -264,5 +264,52 @@ class RetryBackoffModeTests(unittest.TestCase):
             self.assertAlmostEqual(_retry_delay_value(None, 5.0, 30, 0.0), 120.0)  # 封顶
 
 
+class SapisidHashTests(unittest.TestCase):
+    """三段式 SAPISIDHASH 认证头契约（自 scripts/smoke_final.py 移植并加固）。
+
+    浏览器实现要求三段（SAPISIDHASH / SAPISID1PHASH / SAPISID3PHASH）
+    共用同一秒的时间戳；hash = SHA1("<ts> <value> <origin>")。
+    """
+
+    def test_three_segments_share_one_timestamp(self):
+        from cookie_auth import build_authorization_header
+        cookie = "SAPISID=aaa; __Secure-1PAPISID=bbb; __Secure-3PAPISID=ccc; SID=ddd"
+        auth = build_authorization_header(cookie)
+        self.assertIsNotNone(auth)
+        stamps = {seg.split("_", 1)[0] for seg in auth.split(" ") if "_" in seg}
+        self.assertEqual(len(stamps), 1, f"三段必须共用同一时间戳，实际 {stamps}")
+
+    def test_hash_matches_documented_formula(self):
+        import hashlib
+        from cookie_auth import SAPISIDHASH_ORIGIN, build_authorization_header
+        cookie = "SAPISID=alpha; __Secure-1PAPISID=beta; __Secure-3PAPISID=gamma; SID=ddd"
+        auth = build_authorization_header(cookie)
+        tokens = auth.split(" ")
+        main, one_p, three_p = tokens[1], tokens[3], tokens[5]
+        ts = main.split("_", 1)[0]
+
+        def expected(value):
+            digest = hashlib.sha1(f"{ts} {value} {SAPISIDHASH_ORIGIN}".encode()).hexdigest()
+            return f"{ts}_{digest}"
+
+        self.assertEqual(main, expected("alpha"))
+        self.assertEqual(one_p, expected("beta"))
+        self.assertEqual(three_p, expected("gamma"))
+
+    def test_missing_segments_fall_back_to_primary(self):
+        from cookie_auth import build_authorization_header
+        # 只有 SAPISID：三段都回退到 primary 值，仍能生成完整三段
+        auth = build_authorization_header("SAPISID=solo; SID=ddd")
+        self.assertIsNotNone(auth)
+        tokens = auth.split(" ")
+        self.assertEqual(tokens[1], tokens[3])
+        self.assertEqual(tokens[1], tokens[5])
+
+    def test_no_sapisid_family_returns_none(self):
+        from cookie_auth import build_authorization_header
+        self.assertIsNone(build_authorization_header("SID=ddd; HSID=eee"))
+        self.assertIsNone(build_authorization_header(""))
+
+
 if __name__ == "__main__":
     unittest.main()

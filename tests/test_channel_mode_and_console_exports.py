@@ -286,13 +286,26 @@ class ConsoleInlineHandlerExportTests(unittest.TestCase):
         )
 
     def test_test_cookie_account_is_exported(self):
-        """用户此前「找不到测试 Cookie 功能」的直接根因：按钮存在但函数未导出。"""
+        """用户此前「找不到测试 Cookie 功能」的直接根因：按钮存在但函数未导出。
+
+        refreshCookies 的全局出口在 console-bootstrap.js 的同名包装器
+        （含 ensureChannelConfig 懒加载与错误 toast），channel-config.js
+        内的实现在 consoleChannels 命名空间暴露供包装器调用——2026-11
+        审查收敛为单一出口，不再从 channel-config 重复导出到 window。
+        """
         channel = (self.APP / "static" / "channel-config.js").read_text(
             encoding="utf-8"
         )
         export_block = self._window_exports(channel)
         self.assertIn("testCookieAccount", export_block)
-        self.assertIn("refreshCookies", export_block)
+        bootstrap = (self.APP / "static" / "console-bootstrap.js").read_text(
+            encoding="utf-8"
+        )
+        self.assertRegex(
+            bootstrap,
+            r"(?m)^async function refreshCookies\(",
+            "console-bootstrap.js 必须提供全局 refreshCookies 包装器（顶层声明即 window 属性）",
+        )
 
 
 if __name__ == "__main__":

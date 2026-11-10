@@ -25,7 +25,7 @@ MAX_TOOL_STREAM_BYTES = 32 * 1024 * 1024
 MAX_TOOL_CALLS = 1024
 MAX_ARGUMENT_FIELDS = 65536
 _PATH_TOKEN = re.compile(r'''\.([^.[\]]+)|\[(0|[1-9][0-9]*)\]|\[("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')\]''')
-_SURROGATES = re.compile("[\ud800-\udfff]")
+from request_tracking import SURROGATE_RE as _SURROGATES
 
 
 def _fail(message):

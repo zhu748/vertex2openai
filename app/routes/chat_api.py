@@ -8,6 +8,7 @@ from auth import get_api_key, get_api_key_flexible
 from channel_capabilities import cookie_feature_error
 
 import asyncio
+from functools import partial
 import hashlib
 import json
 import re
@@ -23,8 +24,11 @@ from upstreams.express_sdk import ExpressSDKUpstream
 from upstreams.cookie_proxy import CookieProxyUpstream
 from upstream_errors import extract_upstream_error, create_openai_error_response
 from logger import stats
+from streaming import SSE_NO_BUFFER_HEADERS
 from streaming import keepalive_sse, close_setup_task
-from admission import image_limiter as image_limiter, limit_generation, ManagedStreamingResponse, run_with_image_limit
+from admission import (count_slow_setup_failure, image_limiter as image_limiter,
+                       limit_generation, ManagedStreamingResponse, run_with_image_limit,
+                       SETUP_FAST_WINDOW_SECONDS)
 from response_validation import IncompleteResponseError
 from request_tracking import configure as track_configure
 
@@ -414,7 +418,7 @@ async def _dispatch_upstream(request_obj: OpenAIRequest, fastapi_request: Reques
             await close_setup_task(setup)
 
         try:
-            done, _ = await asyncio.wait({setup}, timeout=0.05)
+            done, _ = await asyncio.wait({setup}, timeout=SETUP_FAST_WINDOW_SECONDS)
         except BaseException:
             await close_setup()
             raise
@@ -502,7 +506,7 @@ async def _dispatch_upstream(request_obj: OpenAIRequest, fastapi_request: Reques
                 await stream.aclose()
         headers = dict(response.headers)
         headers.pop("content-length", None)
-        headers.update({"Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no"})
+        headers.update(SSE_NO_BUFFER_HEADERS)
         return ManagedStreamingResponse(
             relay(), status_code=response.status_code, headers=headers, background=response.background,
             cleanup=getattr(response, "aclose", original.aclose))
@@ -545,7 +549,7 @@ def _request_fingerprint(request_obj: OpenAIRequest) -> str:
 
 
 def _resume_headers(stream_id: str, replay: bool = False) -> dict:
-    headers = {"X-Resume-Id": stream_id, "Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no"}
+    headers = {"X-Resume-Id": stream_id, **SSE_NO_BUFFER_HEADERS}
     if replay:
         headers["X-Resumable-Replay"] = "1"
     return headers
@@ -627,7 +631,7 @@ async def _resumable_stream(fastapi_request: Request, request_obj: OpenAIRequest
     resumable_store.register_pump(stream_id, setup_task, buffer=buf)
     # Fast setup errors keep their HTTP status. Slow preparation gets an SSE
     # reader immediately, so image downloads/proxy setup cannot leave it idle.
-    done, _ = await asyncio.wait({setup_task}, timeout=0.05)
+    done, _ = await asyncio.wait({setup_task}, timeout=SETUP_FAST_WINDOW_SECONDS)
     if done:
         resp = setup_task.result()
         if not isinstance(resp, StreamingResponse):
@@ -636,22 +640,9 @@ async def _resumable_stream(fastapi_request: Request, request_obj: OpenAIRequest
         # 慢路径：HTTP 200 + SSE 已经发给本次客户端，后台 setup 稍后失败时
         # 异常/错误响应只会进缓冲（错误帧），middleware 永远看不到——大盘
         # 上既非 success 也非 error（total ≠ success + error 永久漂移）。
-        # 快路径（0.05s 内完成）由 result() re-raise / 真实状态码走 middleware
-        # 计数，这里只补慢路径且每 setup_task 一次，无双计（2026-10 修复）。
-        slow_path = True
-
-        def _count_slow_failure(task: asyncio.Task) -> None:
-            if not slow_path or task.cancelled():
-                return  # 取消（淘汰/停机）不算失败
-            exc = None
-            try:
-                exc = task.exception()
-            except asyncio.CancelledError:
-                return
-            if exc is not None or not isinstance(task.result(), StreamingResponse):
-                stats.add_error()
-
-        setup_task.add_done_callback(_count_slow_failure)
+        # 快路径（窗口内完成）由 result() re-raise / 真实状态码走 middleware
+        # 计数；慢路径补记（2026-10 修复，单一实现见 admission）。
+        setup_task.add_done_callback(partial(count_slow_setup_failure, on_error=stats.add_error))
 
     return StreamingResponse(
         sse_from_buffer(buf, 0),

@@ -38,7 +38,6 @@ import resumable  # noqa: E402
 from routes import chat_api  # noqa: E402
 from upstreams.cookie_response import (  # noqa: E402
     iter_openai_content_chunks,
-    make_openai_content_chunks,
 )
 from upstreams.express_response import (  # noqa: E402
     split_giant_chunk_payload,
@@ -75,7 +74,7 @@ class CookieLazyChunkTests(unittest.TestCase):
         lazy = list(
             iter_openai_content_chunks("chatcmpl-x", "nano-banana", content, role="assistant")
         )
-        listed = make_openai_content_chunks("chatcmpl-x", "nano-banana", content, role="assistant")
+        listed = list(iter_openai_content_chunks("chatcmpl-x", "nano-banana", content, role="assistant"))
         self.assertGreater(len(lazy), 1)
         self.assertEqual(lazy, listed)
 

@@ -460,13 +460,14 @@ def iter_openai_content_chunks(
     content: str,
     role: "str | None" = None,
 ) -> Iterator[str]:
-    """惰性版 make_openai_content_chunks：按需产出 SSE 帧，不物化整张帧表。
+    """超大 content（4K 生图 base64）→ 按需产出的多帧 SSE 生成器。
 
-    list 版会先把全部切片序列化成完整帧列表——原文/切片表/序列化帧
-    三份全量拷贝同时在内存里（4K 生图 base64 单张 13-40MB，512MB 容器
-    上叠加解析链直接 OOMKill）。生成器版每帧只在 yield 瞬间存在一个
-    256KiB 切片 + 一条序列化帧；切片与单帧输出逐字节一致（客户端按
-    delta 拼接语义无感）。role 只注入首帧（对齐官方帧序）。
+    物化版（先建完整帧列表）会让原文/切片表/序列化帧三份全量拷贝同时
+    在内存里（4K 生图 base64 单张 13-40MB，512MB 容器上叠加解析链直接
+    OOMKill）。生成器版每帧只在 yield 瞬间存在一个 256KiB 切片 + 一条
+    序列化帧；切片与单帧输出逐字节一致（客户端按 delta 拼接语义无感）。
+    role 只注入首帧（对齐官方帧序）。需要列表形态的调用方包一层
+    list(iter_openai_content_chunks(...)) 即可。
     """
     if not content:
         return
@@ -479,18 +480,3 @@ def iter_openai_content_chunks(
             role=role if first else None,
         )
         first = False
-
-
-def make_openai_content_chunks(
-    response_id: str,
-    model: str,
-    content: str,
-    role: "str | None" = None,
-) -> list[str]:
-    """超大 content（4K 生图 base64）→ 多帧 SSE 列表。
-
-    语义与 iter_openai_content_chunks 完全一致（见其 docstring）；保留
-    list 形态供需要 len()/索引的调用方与既有测试使用。热路径（两处
-    cookie 发射循环）已改用惰性版。
-    """
-    return list(iter_openai_content_chunks(response_id, model, content, role=role))

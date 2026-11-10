@@ -75,7 +75,7 @@ from request_connection import BodyTooLargeError
 from request_ingress import IngressError
 from routes.chat_api import _call_upstream
 from runtime_state import app_state
-from streaming import ByteBoundedQueue, sse_frames
+from streaming import ByteBoundedQueue, SSE_NO_BUFFER_HEADERS, sse_frames
 from upstream_errors import extract_upstream_error
 from upstreams.express_sdk import _normalize_model_name
 
@@ -322,7 +322,7 @@ def _claude_stream_response(response: StreamingResponse, display_model: str, *,
     return ManagedStreamingResponse(
         event_stream(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no"},
+        headers=SSE_NO_BUFFER_HEADERS,
         cleanup=cleanup,
     )
 

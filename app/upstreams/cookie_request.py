@@ -46,16 +46,13 @@ def _get_experiment_flags() -> str:
 
 # batchGraphql generationConfig 已验证可接受的字段族（超出者由调用方决定
 # 是否透传/告警；真机验证记录见 CHANGES.md 各条“出站参数调试”）。
-_NATIVE_GENERATION_KEYS = frozenset({
+# 公开导出：Cookie 原生桥（cookie_native）直接用它做未知字段告警
+# （2026-11 审查收敛：原先只包一层同名函数，徒增一次跳转）。
+NATIVE_GENERATION_KEYS = frozenset({
     "temperature", "topP", "topK", "maxOutputTokens", "candidateCount",
     "stopSequences", "seed", "responseMimeType", "responseSchema",
     "responseModalities", "imageConfig", "mediaResolution", "thinkingConfig",
 })
-
-
-def _native_supported_generation_keys() -> frozenset:
-    """供 Cookie 原生桥（cookie_native）做未知字段告警的已知键集合。"""
-    return _NATIVE_GENERATION_KEYS
 
 
 def _native_default_safety_settings() -> list:

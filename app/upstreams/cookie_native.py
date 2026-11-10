@@ -54,9 +54,10 @@ from resumable import request_timeout_seconds
 from retry_policy import get_retry_settings, retry_delay
 from runtime_state import app_state
 from schema_validation import SchemaValidationError, sanitize_for_gemini, validate_json_schema
-from streaming import HEARTBEAT, HEARTBEAT_FRAME, with_heartbeats
+from streaming import HEARTBEAT, HEARTBEAT_FRAME, SSE_NO_BUFFER_HEADERS, with_heartbeats
 from tool_policy import has_search_suffix
 from usage import merge_usage_metadata
+from upstream_errors import google_status_detail
 from upstreams.cookie_response import RawSampler
 from upstreams.cookie_transport import (
     stream_events,
@@ -64,10 +65,10 @@ from upstreams.cookie_transport import (
 )
 from upstreams.cookie_request import (
     COOKIE_STRUCTURED_OUTPUT_DISABLED_MESSAGE,
+    NATIVE_GENERATION_KEYS,
     _build_request_context,
     _cookie_ui_schema,
     _native_default_safety_settings,
-    _native_supported_generation_keys,
 )
 
 # 生图 markdown（extract_events 的 image 事件载荷）→ inlineData 反解
@@ -174,13 +175,15 @@ def _normalize_thinking_config(gen: dict, profile: dict) -> None:
 
 
 def _google_error_body(code: int, message: str, status_detail: Optional[str] = None) -> dict:
-    """Google 风格错误体（原生 SDK 按 error.message 展示）。"""
-    detail = status_detail or {
-        400: "INVALID_ARGUMENT", 401: "UNAUTHENTICATED", 403: "PERMISSION_DENIED",
-        404: "NOT_FOUND", 413: "OUT_OF_RANGE", 429: "RESOURCE_EXHAUSTED",
-        503: "UNAVAILABLE", 504: "DEADLINE_EXCEEDED",
-    }.get(code, "INTERNAL" if code >= 500 else "FAILED_PRECONDITION")
-    return {"error": {"code": code, "message": message, "status": detail}}
+    """Google 风格错误体（原生 SDK 按 error.message 展示）。
+
+    状态映射统一走 upstream_errors.google_status_detail——与 gemini_native
+    的 _native_error、resumable 的 native 错误帧共用同一份映射，保证同一
+    状态码在所有路径给出一致的 detail（2026-11 审查修复：此前此处内联的
+    平行映射与共享版在 413/502/默认值上互相矛盾）。
+    """
+    return {"error": {"code": code, "message": message,
+                     "status": status_detail or google_status_detail(code)}}
 
 
 def _native_error(code: int, message: str, status_detail: Optional[str] = None) -> JSONResponse:
@@ -305,7 +308,7 @@ def native_request_to_variables(parsed: dict, model_name: str, project_id: str,
         raise SchemaValidationError("Cookie 通道暂不支持 candidateCount != 1。")
     if gen.get("responseLogprobs") or "logprobs" in gen:
         raise SchemaValidationError("Cookie 通道暂不支持 responseLogprobs / logprobs。")
-    unknown_gen = [k for k in gen if k not in _native_supported_generation_keys()]
+    unknown_gen = [k for k in gen if k not in NATIVE_GENERATION_KEYS]
     if unknown_gen:
         print(f"⚠️ [Cookie 原生桥] generationConfig 未经验证的字段将原样透传：{unknown_gen}")
     # 采样参数与 thinkingConfig 按模型档案规范化（不注入默认值，只剥离/换算
@@ -561,8 +564,7 @@ async def _events_with_retry(fastapi_request: Request, record: dict, body: dict,
     proxy_chain = ProxyChain(record)
     # 与 Express 通道同款出站可观测性（直连静默）。
     if proxy_chain.current:
-        from proxy_resolver import mask_proxy_uri
-        print(f"🌐 [出站代理] 当前出口：{mask_proxy_uri(proxy_chain.current)}")
+        proxy_chain.log_current()
     client_kwargs["_proxy_chain"] = proxy_chain.bind_to_generation()
 
     retry_max, backoff_sec, jitter_sec = get_retry_settings()
@@ -753,7 +755,7 @@ async def _handle_native_request_impl(fastapi_request: Request, model: str, acti
                 yield "]"
 
         return StreamingResponse(stream(), media_type="text/event-stream" if use_sse else "application/json",
-                                 headers={"Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no"})
+                                 headers=SSE_NO_BUFFER_HEADERS)
 
     assembler = NativeAssembler(
         requested_model or model, max_response_bytes=_bridge_response_budget(model))

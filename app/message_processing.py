@@ -133,6 +133,12 @@ def logprobs_payload_from_candidate(candidate: Any) -> Optional[Dict[str, Any]]:
     return {"content": content}
 
 
+# 裸 data: URL（非 markdown 包裹）的统一解析正则：RFC 2045 允许 base64 折行，
+# 必须 DOTALL；模式尾部是贪婪 (.+)，match 与 fullmatch 等价（2026-11 审查
+# 收敛：此前三处各写一份同构 pattern）。
+_DATA_URL_RE = re.compile(r"data:([^;]+);base64,(.+)", re.DOTALL)
+
+
 def _extract_markdown_images_to_parts(text: str) -> Tuple[List[types.Part], str]:
     parts = []
     remaining_text = text
@@ -254,7 +260,7 @@ def tool_response_with_media(content: Any, model_name: str = "", *, error_conten
                 raise SchemaValidationError("工具图片缺少有效地址。")
             try:
                 if url.startswith("data:"):
-                    match = re.fullmatch(r"data:([^;]+);base64,(.+)", url, re.DOTALL)
+                    match = _DATA_URL_RE.fullmatch(url)
                     if not match:
                         raise ValueError("无效的图片 data URL。")
                     mime, encoded = match.groups()
@@ -422,15 +428,8 @@ def _assistant_tool_parts(
                 if part_item.get("type") == "text":
                     text_pieces.append(part_item.get("text") or "")
                 elif part_item.get("type") == "image_url":
-                    img_url_data = part_item.get("image_url") or {}
-                    if isinstance(img_url_data, str):
-                        image_url = img_url_data
-                    elif isinstance(img_url_data, dict):
-                        image_url = img_url_data.get("url", "")
-                    else:
-                        image_url = getattr(img_url_data, "url", "") or ""
                     _ingest_image_part(
-                        image_url,
+                        _image_part_url(part_item),
                         lambda raw, mime: _append_sdk_image_part(
                             image_parts_collected, raw, mime
                         ),
@@ -448,38 +447,7 @@ def _assistant_tool_parts(
 
         message_sig, signature_kind = signature_from_extra(message)
         if message_sig:
-            target = None
-            if signature_kind == "thought":
-                target = next(
-                    (
-                        p
-                        for p in reversed(ordinary_parts)
-                        if getattr(p, "thought", None)
-                    ),
-                    None,
-                )
-            elif signature_kind == "text":
-                target = next(
-                    (
-                        p
-                        for p in reversed(ordinary_parts)
-                        if getattr(p, "text", None) is not None
-                        and not getattr(p, "thought", None)
-                    ),
-                    None,
-                )
-            if target is None and signature_kind != "signature_only":
-                target = ordinary_parts[-1] if ordinary_parts else None
-            if target is not None:
-                # list.index 按 == 匹配：等值重复 part 时会命中第一个，而
-                # target 是从后往前选出的那个——签名必须落在被选中的对象上。
-                ordinary_parts[_rindex_by_identity(ordinary_parts, target)] = (
-                    target.model_copy(update={"thought_signature": message_sig})
-                )
-            else:
-                ordinary_parts.append(
-                    types.Part(text="", thought_signature=message_sig)
-                )
+            _attach_message_signature(ordinary_parts, message_sig, signature_kind)
 
     google_extra = google_metadata(message)
     part_order = google_extra.get("part_order")
@@ -572,44 +540,13 @@ def _ordinary_message_parts(message: OpenAIMessage) -> tuple[str, list[types.Par
                 parts.extend(image_parts)
 
             elif part_item.get("type") == "image_url":
-                img_url_data = part_item.get("image_url") or {}
-                if isinstance(img_url_data, str):
-                    image_url = img_url_data
-                elif isinstance(img_url_data, dict):
-                    image_url = img_url_data.get("url", "")
-                else:
-                    image_url = getattr(img_url_data, "url", "") or ""
-
                 _ingest_image_part(
-                    image_url,
+                    _image_part_url(part_item),
                     lambda raw, mime: _append_sdk_image_part(parts, raw, mime),
                 )
 
     if message_sig and exact_ordinary_parts is None:
-        target = None
-        if signature_kind == "thought":
-            target = next(
-                (p for p in reversed(parts) if getattr(p, "thought", None)), None
-            )
-        elif signature_kind == "text":
-            target = next(
-                (
-                    p
-                    for p in reversed(parts)
-                    if getattr(p, "text", None) is not None
-                    and not getattr(p, "thought", None)
-                ),
-                None,
-            )
-        if target is None and signature_kind != "signature_only":
-            target = parts[-1] if parts else None
-        if target is None:
-            parts.append(types.Part(text="", thought_signature=message_sig))
-        else:
-            # 同上：按对象身份从后往前定位，避免等值重复 part 挂错签名。
-            parts[_rindex_by_identity(parts, target)] = target.model_copy(
-                update={"thought_signature": message_sig}
-            )
+        _attach_message_signature(parts, message_sig, signature_kind)
     return current_gemini_role, parts
 
 
@@ -704,6 +641,54 @@ def _rindex_by_identity(seq: list, item: Any) -> int:
     raise ValueError("签名目标 part 不在列表中（不应发生）")
 
 
+def _attach_message_signature(parts: list, message_sig, signature_kind) -> None:
+    """把消息级思考签名挂到目标 part（带工具调用与普通两条恢复路径共用）。
+
+    目标选择（与浏览器端语义对齐）：thought 签名挂最后一个思考 part；
+    text 签名挂最后一个非思考文本 part；都找不到时退回最后一个 part；
+    仅当 signature_only 才不退回（无 part 可挂时补一个空签名 part）。
+    挂载位置按对象身份反查（见 _rindex_by_identity 注释）。
+    （2026-11 审查收敛：此前 _assistant_tool_parts 与 _ordinary_message_parts
+    各持一份同构实现，注释互指“同上”。）
+    """
+    target = None
+    if signature_kind == "thought":
+        target = next(
+            (p for p in reversed(parts) if getattr(p, "thought", None)), None
+        )
+    elif signature_kind == "text":
+        target = next(
+            (
+                p
+                for p in reversed(parts)
+                if getattr(p, "text", None) is not None
+                and not getattr(p, "thought", None)
+            ),
+            None,
+        )
+    if target is None and signature_kind != "signature_only":
+        target = parts[-1] if parts else None
+    if target is None:
+        parts.append(types.Part(text="", thought_signature=message_sig))
+        return
+    parts[_rindex_by_identity(parts, target)] = target.model_copy(
+        update={"thought_signature": message_sig}
+    )
+
+
+def _image_part_url(part_item: dict) -> str:
+    """从归一后的 image_url 分段里取 URL（三种历史形态：字符串 / dict / 实例）。
+
+    （2026-11 审查收敛：两条消息恢复管线各自复制同一三分支。）
+    """
+    img_url_data = part_item.get("image_url") or {}
+    if isinstance(img_url_data, str):
+        return img_url_data
+    if isinstance(img_url_data, dict):
+        return img_url_data.get("url", "")
+    return getattr(img_url_data, "url", "") or ""
+
+
 def _ingest_image_part(image_url: str, append_part) -> None:
     """摄取一张 image_url（data: 或 http(s):）并交给 append_part 构造通道专属 part。
 
@@ -716,7 +701,7 @@ def _ingest_image_part(image_url: str, append_part) -> None:
     其抛出的 ValueError 按「远程图片超出处理限制」处理。
     """
     if image_url.startswith("data:"):
-        mime_match = re.match(r"data:([^;]+);base64,(.+)", image_url, re.DOTALL)
+        mime_match = _DATA_URL_RE.fullmatch(image_url)
         if not mime_match:
             return
         mime_type, b64_data = mime_match.groups()

@@ -60,6 +60,12 @@ class ProxyChain:
         with self._index_lock:
             return self.candidates[self.index]
 
+    def log_current(self) -> None:
+        """打印当前出口代理（掩码）——四条通道调用点共用同一日志形态
+        （2026-11 审查收敛：此前 4 处逐字重复同一 print）。"""
+        from proxy_resolver import mask_proxy_uri
+        print(f"🌐 [出站代理] 当前出口：{mask_proxy_uri(self.current)}")
+
     def advance(self, error=None, *, status=None):
         with self._index_lock:
             if self.index + 1 >= len(self.candidates):

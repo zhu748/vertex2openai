@@ -55,11 +55,25 @@ async def close_setup_task(setup):
 HEARTBEAT = object()
 HEARTBEAT_INTERVAL = 10.0
 HEARTBEAT_FRAME = ": keep-alive\n\n"
+# SSE 端点统一关闭反代缓冲的响应头（2026-11 审查收敛：此前 8 处调用点
+# 逐字重复同一 dict，改一处漏一处）。
+SSE_NO_BUFFER_HEADERS = {"Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no"}
+# SSE 终止帧（客户端按字面 "data: [DONE]" 识别；2026-11 审查收敛：原先
+# 只在 resumable 定义、api_helpers 用裸字面量比对，改由 streaming 统一
+# 导出，resumable 向后兼容再导出）。
+DONE_FRAME = "data: [DONE]\n\n"
+# 错误消息进入 SSE / 续传缓冲时的截断上限：上游异常文本可能携带巨量堆栈
+# 或响应体，统一 1024 字符（此前 api_helpers 假流式路径用 512、其余 1024，
+# 两套口径无业务差异，纯漂移；2026-11 审查收敛）。
+MAX_ERROR_MESSAGE_CHARS = 1024
 
 # 事件分隔符预编译（re.search 的模块级缓存对直接传 pattern 串也有，但这里
 # 主要收益是配合 Pattern.search(buffer, pos) 免去 buffer[scan:] 的切片拷贝：
 # 单个网络块含大量小事件时，旧实现每匹配一次就复制一次剩余字节）。
-_FRAME_SEP_RE = re.compile(rb"\r\n\r\n|\n\n|\r\r")
+# 公开导出：request_tracking.PayloadObserver 的渐进扫描共用同一份定义
+# （两套实现已用注释互指，2026-11 审查收敛为单一常量）。
+FRAME_SEP_RE = re.compile(rb"\r\n\r\n|\n\n|\r\r")
+_FRAME_SEP_RE = FRAME_SEP_RE
 
 
 class ByteBoundedQueue:
@@ -270,5 +284,5 @@ async def prepare_sse(operation, request, error_body, on_error):
             yield b"data: " + error_body(exc) + b"\n\n"
 
     return ManagedStreamingResponse(keepalive_sse(frames(), request), media_type="text/event-stream",
-                                    headers={"Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no"},
+                                    headers=SSE_NO_BUFFER_HEADERS,
                                     cleanup=cleanup)

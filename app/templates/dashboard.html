@@ -286,7 +286,7 @@
          <div class="text-xs text-neutral-500 mt-0.5">多个 Key 可同时启用，每个 Key 可设置自己的项目、代理列表与回退策略</div>
         </div>
         <div class="toolbar-actions">
-         <span class="pill" id="keys-count" style="text-transform:none">加载中…</span>
+         <span class="pill" id="keys-count">加载中…</span>
          <button class="px-3 py-1.5 text-sm rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="runAction(this,()=&gt;probeAllKeys())">探测已保存 Key</button>
          <button class="px-3 py-1.5 text-sm rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="addKeyRow()">＋ 添加 Key</button>
          <button class="btn px-4 py-1.5 text-sm" onclick="runAction(this,()=&gt;saveExpressKeys())">保存 Key 列表</button>
@@ -389,7 +389,7 @@
          <div class="text-xs text-neutral-500 mt-0.5">curl_cffi 为 TLS 与浏览器身份头使用配套档案。仅作用于 Cookie 通道，不保证私有接口可用。</div>
         </div>
         <div class="toolbar-actions">
-         <span class="pill" id="fp-status" style="text-transform:none">—</span>
+         <span class="pill" id="fp-status">—</span>
          <button class="btn px-4 py-1.5 text-sm" onclick="runAction(this,()=&gt;saveFingerprint())">保存伪装设置</button>
         </div>
        </div>
@@ -450,7 +450,7 @@
          <div class="text-xs text-neutral-500 mt-0.5">设置 SDK 与 REST 的客户端标签；仅调整请求头，TLS 栈保持不变。</div>
         </div>
         <div class="toolbar-actions">
-         <span class="pill" id="fp2-status" style="text-transform:none">—</span>
+         <span class="pill" id="fp2-status">—</span>
          <button class="btn px-4 py-1.5 text-sm" onclick="runAction(this,()=&gt;saveExpressUa())">保存指纹设置</button>
         </div>
        </div>
@@ -519,7 +519,7 @@
         <div class="scope-picker">
          <label class="lbl mb-1" for="model-sel">
           选择模型
-          <span class="pill pill-accent hidden" id="ov-badge" style="text-transform:none">已有专属参数</span>
+          <span class="pill pill-accent hidden" id="ov-badge">已有专属参数</span>
           <span class="pill draft-badge hidden" id="scope-draft-state" role="status">未保存</span>
          </label>
          <select aria-label="当前编辑的模型或全局默认" class="inp" id="model-sel" onchange="renderCaps()" style="">

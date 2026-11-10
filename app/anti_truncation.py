@@ -11,7 +11,7 @@ import secrets
 import time
 
 # 代理项快速筛查（_unicode 的热路径短路用）。
-_SURROGATE_RE = re.compile("[\ud800-\udfff]")
+from request_tracking import SURROGATE_RE as _SURROGATE_RE
 
 from fastapi.responses import StreamingResponse
 from google.genai import types

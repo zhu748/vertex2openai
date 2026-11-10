@@ -874,8 +874,10 @@ def error_event(err_type: str, message: str) -> str:
     return _sse_event("error", {"type": "error", "error": {"type": err_type, "message": message}})
 
 
-MAX_TOOL_STREAM_BYTES = 32 * 1024 * 1024
-MAX_STREAM_TOOL_CALLS = 1024
+# 工具参数流的上限与 tool_stream（Express 通道重组器）共用同一份定义
+#（2026-11 审查收敛：此前双常量同值异名，改一处漏一处）。
+from tool_stream import MAX_TOOL_CALLS, MAX_TOOL_STREAM_BYTES  # noqa: E402
+MAX_STREAM_TOOL_CALLS = MAX_TOOL_CALLS
 
 
 class ClaudeStreamState:
@@ -1148,8 +1150,9 @@ class ClaudeStreamState:
 # CJK 字符区间（半角假名补充 / 假名 / 扩展 A / 基本汉字 / 谚文 / 兼容 / 全角形态）。
 # 预编译正则一次性匹配全部区间：逐字符 any(lo<=code<=hi) 循环在 40 万字符
 # 的大上下文上要 300ms+（Claude Code 每轮都调 count_tokens），正则只需 ~10ms。
-_CJK_RE = re.compile(
-    "[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff\uff00-\uffef]")
+# CJK 正则与 usage.estimate_token_count 共用同一份并集口径定义
+# （2026-11 审查收敛：此前两处平行正则区间不同，同一文本 token 估算分叉）。
+from usage import CJK_CHAR_RE as _CJK_RE  # noqa: E402
 
 
 def estimate_text_tokens(text: str) -> int:

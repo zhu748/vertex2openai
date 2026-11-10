@@ -191,6 +191,15 @@ def _safety_html_if_enabled(ratings: Any) -> str:
     return _create_safety_ratings_html(ratings)
 
 
+def _client_gone(message: str = "客户端已断开连接。") -> JSONResponse:
+    """499 断连响应（非流式/流式/生图/缓冲交付路径共用同一形态；
+    2026-11 审查收敛：此前四处逐字重复同一 JSONResponse 块）。"""
+    return JSONResponse(
+        status_code=499,
+        content=create_openai_error_response(499, message, "client_closed_request"),
+    )
+
+
 def _get_cookie_string() -> str:
     return app_state.get_google_cookie() or ""
 
@@ -262,28 +271,16 @@ async def _collect_full_response(
         if attempt:
             stats.add_retry()
         try:
-            # 兼容旧调用形态的显式收紧（2026-11 C-14）：本参数历史上是现成
-            # 的 headers dict（测试桩直传 {}），空 dict 作为占位放行；非空
-            # dict 仅接受 {'cookie': ...} 形态——旧兜底 `or cookie_str` 会把
-            # 整个 dict（可能含 Cookie 明文键值）当请求头原样发出。
-            if isinstance(cookie_str, dict):
-                if not cookie_str:
-                    req_headers = {}
-                else:
-                    req_headers = build_headers(cookie_str.get("cookie", ""))
-                    if not req_headers:
-                        raise TypeError(
-                            "cookie_str 为 dict 时必须携带可用的 'cookie' 键"
-                            "（旧调用形态已收紧，拒绝整包 headers 直传）"
-                        )
-            else:
-                req_headers = build_headers(cookie_str)
-                if not req_headers:
-                    return {
-                        "kind": "error",
-                        "code": 401,
-                        "message": "Cookie 中未找到 SAPISID，无法计算认证头。",
-                    }
+            # cookie_str 一律是完整 Cookie 字符串（2026-11 审查收敛：曾保留
+            # 兼容旧测试桩直传 headers dict 的分支，测试桩已改为传字符串，
+            # 拒绝整包 headers 直传的防御逻辑随之并入下方统一的 None 判定）。
+            req_headers = build_headers(cookie_str)
+            if not req_headers:
+                return {
+                    "kind": "error",
+                    "code": 401,
+                    "message": "Cookie 中未找到 SAPISID，无法计算认证头。",
+                }
             async with open_upstream_client(client_kwargs) as client:
                 upstream_attempt()
                 # 整取响应（生图假流式路径）：不参与首回复计时（2026-11
@@ -1158,12 +1155,7 @@ class CookieGeneration:
                             f"⚠️ [Studio] HTTP {response.status_code} (尝试 {attempt + 1}): {response.text[:300]} | {delay:.1f}s 后重试..."
                         )
                         if not await wait_for_retry(self.fastapi_request, delay):
-                            return JSONResponse(
-                                status_code=499,
-                                content=create_openai_error_response(
-                                    499, "客户端已断开连接。", "client_closed_request"
-                                ),
-                            )
+                            return _client_gone()
                         continue
 
                 if response.status_code != 200:
@@ -1308,12 +1300,7 @@ class CookieGeneration:
                         f"⚠️ [Studio] 429/限流 (尝试 {attempt + 1}): {api_error[:300]} | {wait_sec:.1f}s 后重试..."
                     )
                     if not await wait_for_retry(self.fastapi_request, wait_sec):
-                        return JSONResponse(
-                            status_code=499,
-                            content=create_openai_error_response(
-                                499, "客户端已断开连接。", "client_closed_request"
-                            ),
-                        )
+                        return _client_gone()
                     continue
                 if api_error:
                     if api_error_status in (401, 403):
@@ -1427,12 +1414,7 @@ class CookieGeneration:
                         f"⚠️ [Studio] 异常 (尝试 {attempt + 1}): {err_msg[:300]} | {wait_sec:.1f}s 后重试..."
                     )
                     if not await wait_for_retry(self.fastapi_request, wait_sec):
-                        return JSONResponse(
-                            status_code=499,
-                            content=create_openai_error_response(
-                                499, "客户端已断开连接。", "client_closed_request"
-                            ),
-                        )
+                        return _client_gone()
                     continue
 
                 elapsed = time.time() - self.start_time
@@ -1642,9 +1624,7 @@ def _prepare_cookie_generation(
     # 与 Express 通道同款出站可观测性：本次请求的实际首选出口（账号级优先、
     # 全局兑底）；直连（无候选）静默，与 express_sdk 的行为一致。
     if proxy_chain.current:
-        from proxy_resolver import mask_proxy_uri
-
-        print(f"🌐 [出站代理] 当前出口：{mask_proxy_uri(proxy_chain.current)}")
+        proxy_chain.log_current()
     client_kwargs["_proxy_chain"] = proxy_chain.bind_to_generation()
 
     # 重试配置（控制台可调）；语义与 Express 通道统一：总尝试次数 = retry_max + 1

@@ -19,14 +19,19 @@ _attempt_started = ContextVar("attempt_started", default=None)
 MAX_INSPECTION_BYTES = 2 * 1024 * 1024
 
 # SSE 帧分隔符：PayloadObserver 每个网络块都会扫描，必须预编译。
-_FRAME_SEP_RE = re.compile(rb"\r\n\r\n|\n\n|\r\r")
+# SSE 帧分隔符与 streaming.sse_frames 共用同一份定义（2026-11 审查收敛：
+# 此前两处平行定义，注释互相指认）。
+from streaming import FRAME_SEP_RE as _FRAME_SEP_RE
 
 # redact 在每条日志/每个 SSE 块上都会执行，必须用预编译 pattern。
 _RE_URL_CREDS = re.compile(r"(?i)(?<![a-z0-9+.-])([a-z][a-z0-9+.-]{0,31})://[^/\s@]+@")
 _RE_QUERY_KEY = re.compile(r"(?i)([?&](?:key|api_key|access_token)=)[^&\s'\"]+")
 _RE_BEARER = re.compile(r"(?i)(bearer[ \t]+)[^\s'\",;]+")
 _RE_GOOGLE_KEY = re.compile(r"AIza[\w\-]{20,}")
-_RE_SURROGATES = re.compile(r"[\ud800-\udfff]")
+# 孤立代理字符清洗正则（公开导出）：tool_stream / anti_truncation 的文本
+# 净化共用同一份定义（2026-11 审查收敛：此前三处平行定义）。
+SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+_RE_SURROGATES = SURROGATE_RE
 
 
 def numeric_usage(usage):

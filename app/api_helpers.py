@@ -59,35 +59,26 @@ from retry_policy import (
 )
 from runtime_state import app_state
 from tool_stream import ToolStreamAssembler
+from streaming import DONE_FRAME, MAX_ERROR_MESSAGE_CHARS
 from streaming import disconnected as _request_disconnected
 from upstream_errors import (
     create_openai_error_response,
     error_status,
     extract_upstream_error,
 )
-from upstreams.express_response import (
-    ToolCallIndexer as ToolCallIndexer,
-)
-from upstreams.express_response import (
-    _build_chunk_payload as _build_chunk_payload,
-)
-from upstreams.express_response import (
-    _chunk_openai_response_dict_for_sse as _chunk_openai_response_dict_for_sse,
-)
-from upstreams.express_response import (
-    _dedup_chunk_payload as _dedup_chunk_payload,
-)
-from upstreams.express_response import (
-    split_giant_chunk_payload as split_giant_chunk_payload,
-)
-from upstreams.express_response import (
-    _prepend_prefill as _prepend_prefill,
-)
-from upstreams.express_response import (
-    convert_chunk_to_openai as convert_chunk_to_openai,
-)
-from upstreams.express_response import (
-    is_gemini_response_valid as is_gemini_response_valid,
+# express_response 的转换件在此合并导入：convert_chunk_to_openai /
+# ToolCallIndexer / _chunk_openai_response_dict_for_sse 同时是既有测试经
+# api_helpers 访问的再导出面（tests/test_model_retry.py 等），其余为本
+# 文件自用。2026-11 审查收敛：原 8 条独立的 `import X as X` 语句合一。
+from upstreams.express_response import (  # noqa: F401
+    ToolCallIndexer,
+    _build_chunk_payload,
+    _chunk_openai_response_dict_for_sse,
+    _dedup_chunk_payload,
+    _prepend_prefill,
+    convert_chunk_to_openai,
+    is_gemini_response_valid,
+    split_giant_chunk_payload,
 )
 from usage import make_usage_chunk, map_usage, merge_usage_metadata, usage_snapshot_unchanged, wants_usage
 
@@ -396,7 +387,7 @@ async def gemini_fake_stream_generator(
         async for chunk_sse in _chunk_openai_response_dict_for_sse(
             openai_response_dict=openai_response_dict
         ):
-            if chunk_sse.strip() == "data: [DONE]" and wants_usage(request_obj):
+            if chunk_sse.strip() == DONE_FRAME.strip() and wants_usage(request_obj):
                 yield make_usage_chunk(
                     openai_response_dict["id"],
                     request_obj.model,
@@ -431,8 +422,8 @@ async def gemini_fake_stream_generator(
             f"❌ [API 错误响应] 假流发生器运行崩溃 (Model: {request_obj.model})。错误详情: {err_msg_detail}"
         )
         sse_err_msg_display = str(e_outer_gemini)
-        if len(sse_err_msg_display) > 512:
-            sse_err_msg_display = sse_err_msg_display[:512] + "..."
+        if len(sse_err_msg_display) > MAX_ERROR_MESSAGE_CHARS:
+            sse_err_msg_display = sse_err_msg_display[:MAX_ERROR_MESSAGE_CHARS] + "..."
         code, _ = extract_upstream_error(e_outer_gemini)
         err_resp_sse = create_openai_error_response(
             code, sse_err_msg_display, "server_error"
@@ -991,7 +982,8 @@ class SDKGeneration:
                     f"❌ [API 错误响应] 流式连接异常中断 (Model: {self.model_to_call})。错误详情: {err_msg_detail_stream}"
                 )
                 s_err = str(e_stream_call)
-                s_err = s_err[:1024] + "..." if len(s_err) > 1024 else s_err
+                s_err = (s_err[:MAX_ERROR_MESSAGE_CHARS] + "..."
+                         if len(s_err) > MAX_ERROR_MESSAGE_CHARS else s_err)
                 if self.is_auto_attempt:
                     raise e_stream_call
                 # 流式响应已是 200，中间件按状态码计不到这次失败，
