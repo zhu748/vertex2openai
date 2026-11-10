@@ -77,6 +77,34 @@ async function responseError(response, fallback = '保存失败', result = null)
     : fallback + '（HTTP ' + response.status + '）';
 }
 
+/* /api/settings POST 样板（2026-11 P2-6 收敛：七个调用点同构的 30s 超时 +
+ * JSON 头 + 错误归一）。成功时调用 onSaved(保存后响应) 并返回 true；守卫
+ * 未过或请求失败时统一 toast 并返回 false。channel-config 的代理编辑器
+ * 保存不复用此入口：那里需要 throw 给外层状态机，错误 UI 语义不同。 */
+async function postSettings(payload, onSaved) {
+  if (!settingsLoaded) {
+    toast('设置尚未加载，请先在模型参数页重新加载配置');
+    return false;
+  }
+  try {
+    const r = await fetch('/api/settings', {
+      signal: AbortSignal.timeout(30000),
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (r.ok) {
+      const saved = await r.json().catch(() => null);
+      if (onSaved) onSaved(saved);
+      return true;
+    }
+    toast('❌ ' + (await responseError(r)));
+  } catch (e) {
+    toast('❌ 网络请求失败');
+  }
+  return false;
+}
+
 function switchTab(t, updateHash = true) {
   if (!['overview', 'channel', 'params', 'runtime', 'requests', 'logs'].includes(t)) return;
   const previous = document.querySelector('.tab.active')?.dataset.tab;
@@ -317,13 +345,42 @@ function collectKeys() {
   });
   return KEYS.filter((r) => r.key);
 }
-function addKeyRow() {
-  if (!keysLoaded) {
-    toast('凭证列表尚未加载，请先重新加载配置');
-    return;
-  }
-  collectKeys();
-  KEYS.push({
+/* Express Key 列表：load/save/add/remove 编排由 credential-list.js 的共享
+ * 骨架持有（2026-11 P2-6），此处只描述 Key 侧差异。 */
+const keyList = credentialList.create({
+  endpoint: '/api/express-keys',
+  itemsKey: 'keys',
+  noticeLabel: '凭证列表',
+  loadRetryHint: '重新加载成功后再保存 Key。',
+  notLoadedToast: '凭证尚未加载，请先重新加载配置',
+  toastNoun: 'Key',
+  formsGroup: 'keys',
+  accountGroup: 'key',
+  // 空列表保存是破坏性操作（环境变量导入不会再发生），必须确认。
+  emptyConfirm: () =>
+    confirm(
+      '将保存为“空 Key 列表”。\n保存后即使环境变量 VERTEX_EXPRESS_API_KEY 有值，重启也不会再导入。\n确定吗？'
+    ),
+  responseItems: (d) => d.keys || [],
+  getItems: () => KEYS,
+  setItems: (v) => {
+    KEYS = v;
+  },
+  getSaved: () => SAVED_KEYS,
+  setSaved: (v) => {
+    SAVED_KEYS = v;
+  },
+  getRevision: () => keysRevision,
+  setRevision: (v) => {
+    keysRevision = v;
+  },
+  isLoaded: () => keysLoaded,
+  markLoaded: () => {
+    keysLoaded = true;
+  },
+  render: renderKeys,
+  collect: collectKeys,
+  blankRecord: () => ({
     key: '',
     project_id: '',
     project_source: '',
@@ -331,68 +388,21 @@ function addKeyRow() {
     proxies: [],
     proxy_fallback: true,
     enabled: true
-  });
-  renderKeys();
-  window.consoleForms?.openAccount('key', KEYS.length - 1);
-  $('key-' + (KEYS.length - 1)).focus();
-}
-function removeKeyRow(i) {
-  collectKeys();
-  KEYS.splice(i, 1);
-  renderKeys();
-  window.consoleForms?.refresh();
-}
+  }),
+  focusNew: (n) => $('key-' + n).focus(),
+  afterRemove: () => window.consoleForms?.refresh()
+});
 async function loadExpressKeys() {
-  try {
-    const d = await readJSON('/api/express-keys');
-    KEYS = (d.keys || []).map(credentialCopy);
-    SAVED_KEYS = KEYS.map(credentialCopy);
-    keysRevision = d.revision ?? null;
-    keysLoaded = true;
-    renderKeys();
-    window.consoleForms?.saved('keys');
-  } catch (e) {
-    loadNotice('channel', '凭证列表' + e.message + '。重新加载成功后再保存 Key。');
-  }
+  await keyList.load();
 }
 async function saveExpressKeys() {
-  if (!keysLoaded) {
-    toast('凭证尚未加载，请先重新加载配置');
-    return;
-  }
-  const payload = collectKeys();
-  if (
-    payload.length === 0 &&
-    !confirm(
-      '将保存为“空 Key 列表”。\n保存后即使环境变量 VERTEX_EXPRESS_API_KEY 有值，重启也不会再导入。\n确定吗？'
-    )
-  ) {
-    renderKeys();
-    return;
-  }
-  try {
-    const r = await fetch('/api/express-keys', {
-      signal: AbortSignal.timeout(30000),
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ keys: payload, revision: keysRevision })
-    });
-    const d = await r.json();
-    if (r.ok) {
-      keysRevision = d.revision ?? null;
-      KEYS = (d.keys || []).map(credentialCopy);
-      SAVED_KEYS = KEYS.map(credentialCopy);
-      renderKeys();
-      window.consoleForms?.saved('keys');
-      toast('已保存 ' + KEYS.length + ' 个 Key（已热生效）');
-    } else {
-      const message = await responseError(r, '保存失败', d);
-      if (r.status === 409) loadNotice('channel', message);
-      toast('❌ ' + message);
-    }
-  } catch (e) {
-    toast('❌ 网络请求失败');
-  }
+  await keyList.save();
+}
+function addKeyRow() {
+  keyList.add();
+}
+function removeKeyRow(i) {
+  keyList.remove(i);
 }
 async function probeOneKey(i) {
   collectKeys();
@@ -531,35 +541,20 @@ function updateProxyDraft() {
   $('proxy-test-result').classList.add('hidden');
 }
 async function saveProxy() {
-  if (!settingsLoaded) {
-    toast('设置尚未加载，请先在模型参数页重新加载配置');
-    return;
-  }
   const proxies = proxyDraft($('proxy-input').value);
-  try {
-    const r = await fetch('/api/settings', {
-      signal: AbortSignal.timeout(30000),
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ proxy_urls: proxies })
-    });
-    if (r.ok) {
-      const saved = await r.json();
-      GLOBAL_SETTINGS.proxy_urls = saved.proxy_urls;
-      GLOBAL_SETTINGS.proxy_url = saved.proxy_url;
-      $('proxy-input').value = saved.proxy_urls.join('\n');
-      updateProxyPill(saved.proxy_urls.length);
-      updateProxyDraft();
-      window.consoleForms?.saved('proxy');
-      toast(
-        proxies.length
-          ? '✅ 已保存 ' + saved.proxy_urls.length + ' 条代理（按顺序故障切换）'
-          : '已清空代理，恢复直连'
-      );
-    } else toast('❌ ' + (await responseError(r)));
-  } catch (e) {
-    toast('❌ 网络请求失败');
-  }
+  await postSettings({ proxy_urls: proxies }, (saved) => {
+    GLOBAL_SETTINGS.proxy_urls = saved.proxy_urls;
+    GLOBAL_SETTINGS.proxy_url = saved.proxy_url;
+    $('proxy-input').value = saved.proxy_urls.join('\n');
+    updateProxyPill(saved.proxy_urls.length);
+    updateProxyDraft();
+    window.consoleForms?.saved('proxy');
+    toast(
+      proxies.length
+        ? '✅ 已保存 ' + saved.proxy_urls.length + ' 条代理（按顺序故障切换）'
+        : '已清空代理，恢复直连'
+    );
+  });
 }
 async function testProxy() {
   const v = proxyDraft($('proxy-input').value)[0] || 'direct';
@@ -609,38 +604,17 @@ function updateFpPill(v) {
   p.style.color = on ? '#047857' : '#737373';
 }
 async function saveFingerprint() {
-  if (!settingsLoaded) {
-    toast('设置尚未加载，请先在模型参数页重新加载配置');
-    return;
-  }
   const v = $('cookie-impersonate').value;
-  try {
-    const r = await fetch('/api/settings', {
-      signal: AbortSignal.timeout(30000),
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ cookie_impersonate: v })
-    });
-    if (r.ok) {
-      GLOBAL_SETTINGS.cookie_impersonate = v;
-      updateFpPill(v);
-      window.consoleForms?.saved('fingerprint');
-      toast(
-        v === 'off'
-          ? '✅ 已关闭伪装（下一个请求生效）'
-          : '✅ 伪装已保存并热生效：' + (FP_LABELS[v] || v)
-      );
-    } else {
-      let msg = '保存失败';
-      try {
-        const d = await r.json();
-        if (d && d.error) msg = d.error;
-      } catch (_) {}
-      toast('❌ ' + msg);
-    }
-  } catch (e) {
-    toast('❌ 网络请求失败');
-  }
+  await postSettings({ cookie_impersonate: v }, () => {
+    GLOBAL_SETTINGS.cookie_impersonate = v;
+    updateFpPill(v);
+    window.consoleForms?.saved('fingerprint');
+    toast(
+      v === 'off'
+        ? '✅ 已关闭伪装（下一个请求生效）'
+        : '✅ 伪装已保存并热生效：' + (FP_LABELS[v] || v)
+    );
+  });
 }
 
 /* ---------- Express 通道请求头指纹 ---------- */
@@ -665,39 +639,18 @@ function updateExpressCustomVis() {
   if (sel && inp) inp.style.display = sel.value === 'custom' ? '' : 'none';
 }
 async function saveExpressUa() {
-  if (!settingsLoaded) {
-    toast('设置尚未加载，请先在模型参数页重新加载配置');
-    return;
-  }
   const v = $('express-ua-profile').value;
   const c = $('express-ua-custom').value.trim();
-  try {
-    const r = await fetch('/api/settings', {
-      signal: AbortSignal.timeout(30000),
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ express_ua_profile: v, express_ua_custom: c })
-    });
-    if (r.ok) {
-      GLOBAL_SETTINGS.express_ua_profile = v;
-      GLOBAL_SETTINGS.express_ua_custom = c;
-      updateExpressPill(v, c);
-      updateExpressCustomVis();
-      window.consoleForms?.saved('express-fingerprint');
-      toast(
-        v === 'sdk' || (v === 'custom' && !c)
-          ? '✅ 已恢复官方 SDK 原生形态（下一个请求生效）'
-          : '✅ 请求头指纹已保存并热生效：' + (FP2_LABELS[v] || v)
-      );
-    } else {
-      let msg = '保存失败';
-      try {
-        const d = await r.json();
-        if (d && d.error) msg = d.error;
-      } catch (_) {}
-      toast('❌ ' + msg);
-    }
-  } catch (e) {
-    toast('❌ 网络请求失败');
-  }
+  await postSettings({ express_ua_profile: v, express_ua_custom: c }, () => {
+    GLOBAL_SETTINGS.express_ua_profile = v;
+    GLOBAL_SETTINGS.express_ua_custom = c;
+    updateExpressPill(v, c);
+    updateExpressCustomVis();
+    window.consoleForms?.saved('express-fingerprint');
+    toast(
+      v === 'sdk' || (v === 'custom' && !c)
+        ? '✅ 已恢复官方 SDK 原生形态（下一个请求生效）'
+        : '✅ 请求头指纹已保存并热生效：' + (FP2_LABELS[v] || v)
+    );
+  });
 }

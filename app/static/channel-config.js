@@ -20,23 +20,15 @@
     }
     const previous = GLOBAL_SETTINGS.roundrobin;
     select.disabled = true;
-    try {
-      const roundrobin = select.value === 'roundrobin';
-      const response = await fetch('/api/settings', {
-        method: 'POST',
-        signal: AbortSignal.timeout(30000),
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ roundrobin })
-      });
-      if (!response.ok) throw new Error(await responseError(response));
+    const roundrobin = select.value === 'roundrobin';
+    const ok = await postSettings({ roundrobin });
+    if (ok) {
       GLOBAL_SETTINGS.roundrobin = roundrobin;
       toast('账号调度已切换为' + (roundrobin ? '按顺序轮询' : '随机使用'));
-    } catch (error) {
+    } else {
       select.value = previous ? 'roundrobin' : 'random';
-      toast(error.message);
-    } finally {
-      select.disabled = false;
     }
+    select.disabled = false;
   }
 
   /* Cookie 会话探测结果文案：与后端 cookie_probe 的三种状态一一对应。 */
@@ -211,80 +203,66 @@
     });
     return COOKIE_ACCOUNTS;
   }
-  async function loadCookieAccounts() {
-    try {
-      const data = await readJSON('/api/cookie-accounts');
-      COOKIE_ACCOUNTS = (data.accounts || []).map(credentialCopy);
-      cookiesRevision = data.revision ?? null;
+  /* Cookie 账号列表：load/save/add/remove 编排由 credential-list.js 的
+   * 共享骨架持有（2026-11 P2-6），此处只描述 Cookie 侧差异。 */
+  const cookieList = credentialList.create({
+    endpoint: '/api/cookie-accounts',
+    itemsKey: 'accounts',
+    noticeLabel: 'Cookie 账号',
+    loadRetryHint: '请重新加载配置。',
+    notLoadedToast: 'Cookie 账号尚未加载，请先重新加载配置',
+    toastNoun: 'Cookie 账号',
+    formsGroup: 'cookies',
+    accountGroup: 'cookie',
+    responseItems: (d) => {
+      if (!Array.isArray(d.accounts)) {
+        const error = new Error('保存响应缺少账号列表，请刷新面板后重试');
+        error.ui = true;
+        throw error;
+      }
+      return d.accounts;
+    },
+    getItems: () => COOKIE_ACCOUNTS,
+    setItems: (v) => {
+      COOKIE_ACCOUNTS = v;
+    },
+    getSaved: () => SAVED_COOKIES,
+    setSaved: (v) => {
+      SAVED_COOKIES = v;
+    },
+    getRevision: () => cookiesRevision,
+    setRevision: (v) => {
+      cookiesRevision = v;
+    },
+    isLoaded: () => cookiesLoaded,
+    markLoaded: () => {
       cookiesLoaded = true;
-      SAVED_COOKIES = COOKIE_ACCOUNTS.map(credentialCopy);
-      renderCookieAccounts();
-      window.consoleForms?.saved('cookies');
-    } catch (error) {
-      loadNotice('channel', 'Cookie 账号' + error.message + '。请重新加载配置。');
-    }
-  }
-  function addCookieAccount() {
-    if (!cookiesLoaded) {
-      toast('Cookie 账号尚未加载，请先重新加载配置');
-      return;
-    }
-    collectCookieAccounts();
+    },
+    render: renderCookieAccounts,
+    collect: collectCookieAccounts,
     // The server assigns an account ID on save, including on ordinary HTTP sites
     // where crypto.randomUUID() is unavailable.
-    COOKIE_ACCOUNTS.push({
+    blankRecord: () => ({
       cookie: '',
       project_id: '',
       note: '',
       enabled: true,
       proxies: [],
       proxy_fallback: true
-    });
-    renderCookieAccounts();
-    window.consoleForms?.openAccount('cookie', COOKIE_ACCOUNTS.length - 1);
-    $('cookie-' + (COOKIE_ACCOUNTS.length - 1)).focus();
+    }),
+    focusNew: (n) => $('cookie-' + n).focus()
+  });
+  async function loadCookieAccounts() {
+    await cookieList.load();
+  }
+  function addCookieAccount() {
+    cookieList.add();
   }
   function removeCookieAccount(index) {
-    collectCookieAccounts();
-    COOKIE_ACCOUNTS.splice(index, 1);
-    renderCookieAccounts();
+    cookieList.remove(index);
   }
   async function saveCookieAccounts() {
-    if (!cookiesLoaded) {
-      toast('Cookie 账号尚未加载，请先重新加载配置');
-      return;
-    }
-    let accounts;
-    try {
-      accounts = collectCookieAccounts();
-    } catch (error) {
-      toast('❌ 收集账号信息失败：' + error.message);
-      return;
-    }
-    try {
-      const response = await fetch('/api/cookie-accounts', {
-        method: 'POST',
-        signal: AbortSignal.timeout(30000),
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ accounts, revision: cookiesRevision })
-      });
-      const result = await response.json();
-      if (!response.ok) {
-        const message = await responseError(response, '保存失败', result);
-        if (response.status === 409) loadNotice('channel', message);
-        throw new Error(message);
-      }
-      if (!Array.isArray(result.accounts))
-        throw new Error('保存响应缺少账号列表，请刷新面板后重试');
-      cookiesRevision = result.revision ?? null;
-      COOKIE_ACCOUNTS = result.accounts.map(credentialCopy);
-      SAVED_COOKIES = COOKIE_ACCOUNTS.map(credentialCopy);
-      renderCookieAccounts();
-      window.consoleForms?.saved('cookies');
-      toast('已保存 ' + COOKIE_ACCOUNTS.length + ' 个 Cookie 账号（已热生效）');
-    } catch (error) {
-      toast('❌ ' + error.message);
-    }
+    await cookieList.save();
   }
 
   async function refreshCookies(index = null) {

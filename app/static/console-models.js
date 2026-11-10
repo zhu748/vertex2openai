@@ -368,22 +368,12 @@ async function saveModelOverride() {
       return;
     }
     // 全局默认作用域：写进全局设置，而不是任何模型的专属值
-    try {
-      const r = await fetch('/api/settings', {
-        signal: AbortSignal.timeout(30000),
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(settingsBody(patch))
-      });
-      if (r.ok) {
-        Object.assign(GLOBAL_SETTINGS, patch);
-        MODEL_DRAFTS.delete(m);
-        renderCaps(false);
-        toast('已保存为全局默认');
-      } else toast(await responseError(r));
-    } catch (e) {
-      toast('保存失败');
-    }
+    await postSettings(settingsBody(patch), () => {
+      Object.assign(GLOBAL_SETTINGS, patch);
+      MODEL_DRAFTS.delete(m);
+      renderCaps(false);
+      toast('已保存为全局默认');
+    });
     return;
   }
   patch = Object.fromEntries(Object.entries(patch).filter(([key]) => modelEdits.has(key)));
@@ -655,22 +645,11 @@ async function saveSettings() {
   }
   const m = $('model-sel').value;
   const overriding = !!(OVERRIDES[m] && Object.keys(OVERRIDES[m]).length > 0);
-  try {
-    const r = await fetch('/api/settings', {
-      signal: AbortSignal.timeout(30000),
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(settingsBody(patch))
-    });
-    if (r.ok) {
-      const saved = await r.json();
-      // Another section may have saved model defaults while this response was in flight.
-      // Only merge the fields owned by this form, never an older full-state snapshot.
-      Object.keys(patch).forEach((key) => (GLOBAL_SETTINGS[key] = saved[key]));
-      window.consoleForms?.saved('runtime');
-      toast(overriding ? '全局运行设置已保存；模型专属参数保持不变' : '全局运行设置已保存');
-    } else toast(await responseError(r));
-  } catch (e) {
-    toast('❌ 网络请求失败');
-  }
+  await postSettings(settingsBody(patch), (saved) => {
+    // Another section may have saved model defaults while this response was in flight.
+    // Only merge the fields owned by this form, never an older full-state snapshot.
+    Object.keys(patch).forEach((key) => (GLOBAL_SETTINGS[key] = saved[key]));
+    window.consoleForms?.saved('runtime');
+    toast(overriding ? '全局运行设置已保存；模型专属参数保持不变' : '全局运行设置已保存');
+  });
 }
