@@ -4,14 +4,10 @@ import os
 import re
 from html.parser import HTMLParser
 from pathlib import Path
-import sys
 import tempfile
 import unittest
 from unittest import mock
 
-_STATE = tempfile.TemporaryDirectory(prefix="v2o-console-test-")
-os.environ["STATE_DIR"] = _STATE.name
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from fastapi.testclient import TestClient
 
@@ -86,7 +82,7 @@ class ConsoleRoutesTests(unittest.TestCase):
         previous = Path.cwd()
         console._load_template.cache_clear()
         try:
-            os.chdir(_STATE.name)
+            os.chdir(os.environ["STATE_DIR"])
             self.assertEqual(self.client.get("/").status_code, 200)
             self.login()
             response = self.client.get("/")

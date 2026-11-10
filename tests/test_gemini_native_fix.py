@@ -19,16 +19,9 @@
 """
 import asyncio
 import json
-import os
-import sys
-import tempfile
 import types
-from pathlib import Path
 
 # 必须在 import 项目模块之前设置（runtime_state 模块级读取）
-_TEST_STATE_DIR = tempfile.TemporaryDirectory(prefix="v2o-native-test-")
-os.environ["STATE_DIR"] = _TEST_STATE_DIR.name
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 import httpx
 import unittest.mock as mock

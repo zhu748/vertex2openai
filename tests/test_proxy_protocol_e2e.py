@@ -12,14 +12,9 @@ import json
 import os
 from pathlib import Path
 import socket
-import sys
-import tempfile
 import unittest
 from unittest import mock
 
-_STATE = tempfile.TemporaryDirectory(prefix="v2o-proxy-e2e-")
-os.environ["STATE_DIR"] = _STATE.name
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 import httpx
 from cryptography import x509
@@ -47,7 +42,7 @@ def encode(value):
 @unittest.skipUnless(os.environ.get("PROXY_E2E_SINGBOX_BIN"), "set PROXY_E2E_SINGBOX_BIN for real protocol relays")
 class RealProxyProtocolTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.root = Path(_STATE.name)
+        self.root = Path(os.environ["STATE_DIR"])
         self.binary = str(Path(os.environ["PROXY_E2E_SINGBOX_BIN"]).resolve())
         self.check_only = os.environ.get("PROXY_E2E_CHECK_ONLY") == "1"
         if not self.check_only:

@@ -1,16 +1,9 @@
 """Saved credential preservation must be resolved at commit time."""
 
 import asyncio
-import os
-from pathlib import Path
-import sys
-import tempfile
 import unittest
 from unittest import mock
 
-_STATE = tempfile.TemporaryDirectory(prefix="v2o-concurrent-console-")
-os.environ["STATE_DIR"] = _STATE.name
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from fastapi.testclient import TestClient
 

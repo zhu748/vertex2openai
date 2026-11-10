@@ -14,15 +14,9 @@
 """
 
 import os
-import sys
-import tempfile
 import unittest
-from pathlib import Path
 from unittest import mock
 
-_STATE = tempfile.TemporaryDirectory(prefix="v2o-imglife-test-")
-os.environ.setdefault("STATE_DIR", _STATE.name)
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from fastapi.responses import JSONResponse, StreamingResponse  # noqa: E402
 

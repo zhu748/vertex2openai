@@ -3,16 +3,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
-import sys
-import tempfile
 import threading
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-_STATE = tempfile.TemporaryDirectory(prefix="v2o-transport-hardening-")
-os.environ["STATE_DIR"] = _STATE.name
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 import httpx
 from fastapi.testclient import TestClient
@@ -338,7 +333,7 @@ class PersistenceTests(unittest.TestCase):
         self.assertEqual(state.get_setting("retry_max"), 3)
         disk = json.loads(Path(runtime_state.STATE_FILE).read_text())
         self.assertEqual(disk["settings"]["retry_max"], 3)
-        self.assertFalse(list(Path(_STATE.name).glob(".web_state-*.tmp")))
+        self.assertFalse(list(Path(os.environ["STATE_DIR"]).glob(".web_state-*.tmp")))
 
     def test_cookie_and_project_save_is_atomic(self):
         state = runtime_state.AppState()

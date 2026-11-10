@@ -1,16 +1,9 @@
 """生成参数重构后的请求优先级、结构化输出和消息隔离回归。"""
 
 import copy
-import os
-from pathlib import Path
-import sys
-import tempfile
 import unittest
 from unittest import mock
 
-_STATE = tempfile.TemporaryDirectory(prefix="v2o-config-test-")
-os.environ["STATE_DIR"] = _STATE.name
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 import config
 import generation_config

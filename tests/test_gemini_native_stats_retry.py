@@ -3,18 +3,11 @@
 通过实际 FastAPI 路由和统计中间件发请求，上游完全使用 MockTransport。
 """
 import asyncio
-import os
-from pathlib import Path
-import sys
-import tempfile
 import time
 import types
 import unittest
 from unittest import mock
 
-_STATE_DIR = tempfile.TemporaryDirectory(prefix="v2o-native-stats-")
-os.environ["STATE_DIR"] = _STATE_DIR.name
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 import httpx
 import anyio

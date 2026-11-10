@@ -1,17 +1,10 @@
 """共享错误处理、异常重试配置和 SDK 拦截响应的离线回归。"""
 
 import json
-import os
-from pathlib import Path
-import sys
-import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-_STATE = tempfile.TemporaryDirectory(prefix="v2o-error-policy-")
-os.environ["STATE_DIR"] = _STATE.name
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from google.genai import types
 

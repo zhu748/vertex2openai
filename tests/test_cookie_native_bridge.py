@@ -7,16 +7,11 @@ finishReason 缺失报错）、toolConfig 收窄、SSE 错误帧格式。
 """
 import asyncio
 import os
-import sys
-import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-_TEST_STATE_DIR = tempfile.TemporaryDirectory(prefix="v2o-native-bridge-")
-os.environ["STATE_DIR"] = _TEST_STATE_DIR.name
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 os.chdir(Path(__file__).resolve().parents[1] / "app")
 
 from upstreams import cookie_native, cookie_transport  # noqa: E402

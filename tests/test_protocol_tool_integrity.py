@@ -1,16 +1,9 @@
 """Tool declaration identity, history replay and Claude stream integrity."""
 import json
-import os
-from pathlib import Path
-import sys
-import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-_STATE = tempfile.TemporaryDirectory(prefix="v2o-tool-integrity-")
-os.environ["STATE_DIR"] = _STATE.name
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from fastapi.responses import JSONResponse, StreamingResponse
 from google.genai import types

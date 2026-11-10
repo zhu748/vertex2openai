@@ -8,16 +8,12 @@
 
 import asyncio
 import json
-import os
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-_TEMP = tempfile.TemporaryDirectory(prefix="v2o-upstream-align-")
-os.environ["STATE_DIR"] = _TEMP.name
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "app"))
 

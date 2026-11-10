@@ -4,17 +4,10 @@ import asyncio
 from contextlib import asynccontextmanager, redirect_stdout
 import io
 import json
-import os
-from pathlib import Path
-import sys
-import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-_TEMP = tempfile.TemporaryDirectory(prefix="v2o-failover-")
-os.environ["STATE_DIR"] = _TEMP.name
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 import httpx
 from google import genai

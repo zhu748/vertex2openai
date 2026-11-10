@@ -7,17 +7,10 @@ Fragment assembly remains a Key/Express capability tested elsewhere.
 import asyncio
 from contextlib import asynccontextmanager
 import json
-import os
-from pathlib import Path
-import sys
-import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-_STATE = tempfile.TemporaryDirectory(prefix="v2o-cookie-tool-stream-")
-os.environ["STATE_DIR"] = _STATE.name
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 import httpx
 

@@ -1,17 +1,10 @@
 """运行态、连接、续传和 SDK 边界回归；不使用真实凭据或外网。"""
 import asyncio
 import json
-import os
-from pathlib import Path
-import sys
-import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-_STATE_DIR = tempfile.TemporaryDirectory(prefix="v2o-runtime-test-")
-os.environ["STATE_DIR"] = _STATE_DIR.name
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 import httpx
 from fastapi.testclient import TestClient

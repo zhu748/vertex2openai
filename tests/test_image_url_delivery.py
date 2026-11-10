@@ -2,8 +2,6 @@
 import asyncio
 import base64
 import os
-from pathlib import Path
-import sys
 import tempfile
 import time
 import unittest
@@ -11,7 +9,6 @@ from unittest import mock
 
 _STATE = tempfile.TemporaryDirectory()
 os.environ.setdefault("STATE_DIR", _STATE.name)
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse

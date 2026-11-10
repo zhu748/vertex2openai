@@ -20,18 +20,12 @@ Bug B（控制台 Cookie 列表按钮静默失效）：
 """
 
 import asyncio
-import os
 import re
-import sys
-import tempfile
 import types
 import unittest
 import unittest.mock as mock
 from pathlib import Path
 
-_TEST_STATE_DIR = tempfile.TemporaryDirectory(prefix="v2o-mode-test-")
-os.environ["STATE_DIR"] = _TEST_STATE_DIR.name
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 import httpx
 

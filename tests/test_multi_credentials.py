@@ -12,8 +12,6 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-_TEMP = tempfile.TemporaryDirectory(prefix="v2o-multi-credentials-")
-os.environ["STATE_DIR"] = _TEMP.name
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "app"))
 
@@ -36,7 +34,7 @@ from upstreams import cookie_delivery, cookie_proxy
 
 class StateFixture:
     def setUp(self):
-        self.directory = tempfile.TemporaryDirectory(dir=_TEMP.name)
+        self.directory = tempfile.TemporaryDirectory(dir=os.environ["STATE_DIR"])
         self.addCleanup(self.directory.cleanup)
         # 快照并回滚全局单例：本文件大量用 set_channel_mode("mixed") /
         # set_express_keys([]) 改写 app_state；只重置不回滚会把 mixed 模式
@@ -162,7 +160,7 @@ class EnvironmentTests(StateFixture, unittest.TestCase):
         self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"settings": {"fresh": True}})
         self.assertIn("SAPISID=precious", backups[0].read_text(encoding="utf-8"))
         # 顶层非 JSON 对象同样按损坏备份处理。
-        state2_dir = tempfile.TemporaryDirectory(dir=_TEMP.name)
+        state2_dir = tempfile.TemporaryDirectory(dir=os.environ["STATE_DIR"])
         self.addCleanup(state2_dir.cleanup)
         with mock.patch.object(runtime_state, "STATE_FILE",
                                str(Path(state2_dir.name) / "web_state.json")):

@@ -4,19 +4,12 @@ import asyncio
 import base64
 from concurrent.futures import ThreadPoolExecutor
 import json
-import os
-from pathlib import Path
-import sys
-import tempfile
 import threading
 import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-_STATE = tempfile.TemporaryDirectory(prefix="v2o-protocol-audit-")
-os.environ["STATE_DIR"] = _STATE.name
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from proxy_config import (ProxyFormatError, build_proxy_uri, normalize_proxy_uri,
                           parse_bridge_proxy_uri, parse_proxy_list, proxy_fields)

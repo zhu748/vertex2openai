@@ -2,17 +2,10 @@
 import asyncio
 from contextlib import asynccontextmanager
 import json
-import os
-from pathlib import Path
-import sys
-import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-_STATE_DIR = tempfile.TemporaryDirectory(prefix="v2o-model-retry-")
-os.environ["STATE_DIR"] = _STATE_DIR.name
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 import httpx
 from curl_cffi.requests.exceptions import Timeout as CurlTimeout

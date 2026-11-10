@@ -4,18 +4,13 @@ import asyncio
 from contextlib import asynccontextmanager
 import json
 import io
-import os
 from pathlib import Path
-import sys
 import tempfile
 import threading
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-_STATE = tempfile.TemporaryDirectory(prefix="v2o-audit-")
-os.environ["STATE_DIR"] = _STATE.name
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 import httpx
 

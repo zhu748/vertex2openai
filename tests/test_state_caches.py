@@ -1,15 +1,8 @@
 """签名缓存过期顺序、图片旧配置与生成参数快照回归。"""
 
-import os
-from pathlib import Path
-import sys
-import tempfile
 import unittest
 from unittest import mock
 
-_STATE = tempfile.TemporaryDirectory(prefix="v2o-state-caches-")
-os.environ["STATE_DIR"] = _STATE.name
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 import config
 import image_processing

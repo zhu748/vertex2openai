@@ -18,15 +18,11 @@
 import asyncio
 import hashlib
 import json
-import os
 import sys
-import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-_STATE = tempfile.TemporaryDirectory(prefix="v2o-review2-")
-os.environ["STATE_DIR"] = _STATE.name
 sys.path.insert(0, str(Path := __import__("pathlib").Path(__file__).resolve().parents[1] / "app"))
 
 import httpx

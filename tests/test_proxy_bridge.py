@@ -4,15 +4,10 @@ import json
 import os
 from pathlib import Path
 import stat
-import sys
-import tempfile
 import time
 import unittest
 from unittest import mock
 
-_STATE = tempfile.TemporaryDirectory(prefix="v2o-proxy-bridge-")
-os.environ["STATE_DIR"] = _STATE.name
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from proxy_config import (ProxyFormatError, build_proxy_uri, parse_bridge_proxy_uri,
                           parse_proxy_list, proxy_fields)

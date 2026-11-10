@@ -17,14 +17,8 @@ import asyncio
 import base64
 import json
 import os
-import sys
-import tempfile
 import unittest
-from pathlib import Path
 
-_STATE = tempfile.TemporaryDirectory(prefix="v2o-imgmem-test-")
-os.environ.setdefault("STATE_DIR", _STATE.name)
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from message_processing import (  # noqa: E402
     GIANT_CONTENT_SLICE,

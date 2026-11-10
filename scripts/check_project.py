@@ -1,6 +1,9 @@
 """统一离线检查入口：python scripts/check_project.py。
 
-先安装 requirements-dev.txt；每个测试脚本独立运行，避免模块级状态相互污染。
+先安装 requirements-dev.txt。测试自 2026-11 P2-8 起改走 pytest 单进程：
+conftest.py 的三层隔离（规范环境抢先导入 / 收集后复位 / 模块切换前恢复
+单例出厂快照）取代了旧的「逐文件独立子进程」模式，68 个测试文件头部的
+STATE_DIR + sys.path 样板随之删除。静态与架构检查仍各自独立运行。
 """
 from pathlib import Path
 import subprocess
@@ -15,9 +18,8 @@ def main() -> int:
         ("静态检查", ["-m", "ruff", "check", "app", "tests", "scripts", "--select", "E9,F63,F7,F82,B012,F401,F811,F841"]),
         ("工作流", [".github/scripts/check_workflows.py"]),
         ("模块边界", ["scripts/check_architecture.py"]),
+        ("单元测试", ["-m", "pytest", "tests/", "-q"]),
     ]
-    checks.extend((path.name, [str(path.relative_to(ROOT))])
-                  for path in sorted((ROOT / "tests").glob("test_*.py")))
     checks.append(("SDK 档案兼容", ["scripts/probe_sdk_channel_profiles.py"]))
     failures = []
     for name, args in checks:

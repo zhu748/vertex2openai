@@ -2,17 +2,11 @@
 
 import json
 import os
-from pathlib import Path
-import sys
-import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-_STATE = tempfile.TemporaryDirectory(prefix="v2o-continued-review-")
-os.environ["STATE_DIR"] = _STATE.name
 os.environ["API_KEY"] = "test-key"
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse

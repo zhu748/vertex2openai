@@ -8,16 +8,9 @@ gen_config_dict 在 chat_completions 阶段就已带上 thinking_config，
 流式与非流式共用同一份配置——缺失的只是监控字段。
 """
 import asyncio
-import os
-from pathlib import Path
-import sys
-import tempfile
 import unittest
 from unittest import mock
 
-_STATE = tempfile.TemporaryDirectory(prefix="v2o-express-json-tracking-")
-os.environ["STATE_DIR"] = _STATE.name
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 import upstreams.express_pipeline as api_helpers
 

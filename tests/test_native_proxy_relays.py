@@ -1,21 +1,16 @@
 """Actual HTTP/HTTPS/SOCKS5 relays through both application HTTP backends."""
 
 import asyncio
+import os
 import base64
 from datetime import datetime, timedelta, timezone
 import ipaddress
 import json
-import os
 from pathlib import Path
 import ssl
-import sys
-import tempfile
 import unittest
 from unittest import mock
 
-_STATE = tempfile.TemporaryDirectory(prefix="v2o-native-relays-")
-os.environ["STATE_DIR"] = _STATE.name
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 import httpx
 from google import genai
@@ -43,7 +38,7 @@ class NativeRelayTests(unittest.IsolatedAsyncioTestCase):
                 .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost"),
                     x509.DNSName("target.invalid"),
                     x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]), False).sign(key, hashes.SHA256()))
-        self.ca, key_file = Path(_STATE.name)/"ca.pem", Path(_STATE.name)/"key.pem"
+        self.ca, key_file = Path(os.environ["STATE_DIR"])/"ca.pem", Path(os.environ["STATE_DIR"])/"key.pem"
         self.ca.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
         key_file.write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
                                                serialization.NoEncryption()))

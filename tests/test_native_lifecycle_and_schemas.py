@@ -3,21 +3,15 @@ import asyncio
 import copy
 import json
 import os
-import sys
-import tempfile
 import threading
 import time
 import unittest
 from contextlib import asynccontextmanager
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-_STATE = tempfile.TemporaryDirectory(prefix="v2o-optimization-")
-os.environ["STATE_DIR"] = _STATE.name
 os.environ["API_KEY"] = "test-key"
 os.environ["MODELS_CONFIG_URL"] = ""
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 import httpx
 from fastapi.responses import StreamingResponse

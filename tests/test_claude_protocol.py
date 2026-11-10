@@ -6,17 +6,10 @@
 import asyncio
 import contextlib
 import json
-import os
-from pathlib import Path
-import sys
-import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-_STATE = tempfile.TemporaryDirectory(prefix="v2o-claude-proto-")
-os.environ["STATE_DIR"] = _STATE.name
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 import claude_protocol as cp
 import model_capabilities as mc

@@ -11,18 +11,14 @@
 
 import asyncio
 import json
-import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-_STATE = tempfile.TemporaryDirectory(prefix="v2o-review-fixes-")
-os.environ.setdefault("STATE_DIR", _STATE.name)
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "app"))
 

@@ -2,16 +2,9 @@
 
 import base64
 import json
-import os
-from pathlib import Path
-import sys
-import tempfile
 import unittest
 from urllib.parse import quote
 
-_STATE = tempfile.TemporaryDirectory(prefix="v2o-proxy-integrity-")
-os.environ["STATE_DIR"] = _STATE.name
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from proxy_resolver import ProxyResolveError, parse_share_uri_to_outbound, validate_proxy_uri
 from proxy_config import normalize_proxy_uri, proxy_fields

@@ -2,17 +2,10 @@
 
 import copy
 import json
-import os
-import sys
-import tempfile
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-_STATE = tempfile.TemporaryDirectory(prefix="v2o-tool-roundtrip-")
-os.environ["STATE_DIR"] = _STATE.name
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 import claude_protocol as cp
 from google.genai import types

@@ -1,18 +1,11 @@
 """batchGraphql 分块、转义、截断和响应体上限回归。"""
 
 import json
-import os
-from pathlib import Path
-import sys
-import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 from contextlib import asynccontextmanager
 
-_STATE = tempfile.TemporaryDirectory(prefix="v2o-cookie-response-")
-os.environ["STATE_DIR"] = _STATE.name
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from models import OpenAIRequest
 from logger import ProxyStats

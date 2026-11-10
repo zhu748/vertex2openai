@@ -3,19 +3,12 @@ import asyncio
 import base64
 import io
 import json
-import os
-from pathlib import Path
-import sys
-import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-_STATE = tempfile.TemporaryDirectory(prefix="v2o-optimization-")
-os.environ["STATE_DIR"] = _STATE.name
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from fastapi.testclient import TestClient
 from google.genai import types

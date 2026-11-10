@@ -1,15 +1,8 @@
 """Console inheritance and bounded operational summaries: offline integration tests."""
-import os
-from pathlib import Path
-import sys
-import tempfile
 import time
 import unittest
 from unittest import mock
 
-_STATE = tempfile.TemporaryDirectory(prefix="console-usability-")
-os.environ["STATE_DIR"] = _STATE.name
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from fastapi.testclient import TestClient
 import config

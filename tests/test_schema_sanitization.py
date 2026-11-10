@@ -7,15 +7,8 @@ items）原样透传给 Gemini 时，要么被服务端以 400 INVALID_ARGUMENT
 
 import copy
 import json
-import os
-import sys
-import tempfile
 import unittest
-from pathlib import Path
 
-_STATE = tempfile.TemporaryDirectory(prefix="v2o-sanitize-test-")
-os.environ.setdefault("STATE_DIR", _STATE.name)
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from models import OpenAIRequest
 from schema_validation import sanitize_for_gemini, validate_json_schema

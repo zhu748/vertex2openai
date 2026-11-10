@@ -8,15 +8,9 @@ import base64
 import json
 import os
 import time
-from pathlib import Path
-import sys
-import tempfile
 import unittest
 from unittest import mock
 
-_STATE_DIR = tempfile.TemporaryDirectory(prefix="v2o-proxy-resolver-")
-os.environ["STATE_DIR"] = _STATE_DIR.name
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 import proxy_resolver as pr
 from proxy_resolver import (

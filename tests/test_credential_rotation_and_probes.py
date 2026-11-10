@@ -6,19 +6,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
 import os
-from pathlib import Path
 import queue
-import sys
-import tempfile
 import threading
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-_STATE = tempfile.TemporaryDirectory(prefix="v2o-comprehensive-")
-os.environ["STATE_DIR"] = _STATE.name
 os.environ["API_KEY"] = "test-key"
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 import httpx
 

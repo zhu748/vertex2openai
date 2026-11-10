@@ -10,15 +10,8 @@
 - 文本模型不进入生图分支。
 """
 
-import os
-import sys
-import tempfile
 import unittest
-from pathlib import Path
 
-_STATE = tempfile.TemporaryDirectory(prefix="v2o-mediares-test-")
-os.environ.setdefault("STATE_DIR", _STATE.name)
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from models import OpenAIRequest  # noqa: E402
 from upstreams.cookie_request import build_request_body  # noqa: E402

@@ -2,18 +2,11 @@
 
 import asyncio
 from contextlib import asynccontextmanager
-import os
-from pathlib import Path
-import sys
-import tempfile
 import unittest
 from unittest import mock
 
 import httpx
 
-_STATE = tempfile.TemporaryDirectory(prefix="v2o-cookie-refresh-")
-os.environ["STATE_DIR"] = _STATE.name
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 import config  # noqa: F401  (确保 DEFAULT_SETTINGS 先加载)
 import settings_validation

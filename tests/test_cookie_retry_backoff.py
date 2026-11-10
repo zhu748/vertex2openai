@@ -12,14 +12,9 @@ import io
 import os
 from contextlib import redirect_stdout
 from pathlib import Path
-import sys
-import tempfile
 import unittest
 from unittest import mock
 
-_STATE = tempfile.TemporaryDirectory(prefix="v2o-cookie-retry-backoff-")
-os.environ["STATE_DIR"] = _STATE.name
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 os.chdir(Path(__file__).resolve().parents[1] / "app")
 
 from upstreams import cookie_transport  # noqa: E402

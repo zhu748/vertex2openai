@@ -10,18 +10,11 @@
 import asyncio
 import io
 import json
-import os
-from pathlib import Path
-import sys
-import tempfile
 import types
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-_STATE_DIR = tempfile.TemporaryDirectory(prefix="v2o-proto-align-")
-os.environ["STATE_DIR"] = _STATE_DIR.name
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 import httpx
 from fastapi.responses import StreamingResponse

@@ -1,17 +1,10 @@
 """Request diagnostics across real ASGI delivery, detached streams and retries."""
 import asyncio
 import json
-import os
-from pathlib import Path
-import sys
-import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-_STATE = tempfile.TemporaryDirectory(prefix="v2o-request-tracking-")
-os.environ["STATE_DIR"] = _STATE.name
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 import httpx
 from fastapi.responses import StreamingResponse

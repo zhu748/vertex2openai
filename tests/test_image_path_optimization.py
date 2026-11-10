@@ -33,17 +33,11 @@
 import asyncio
 import io
 import json
-import os
 import sys
-import tempfile
 import time
 import unittest
-from pathlib import Path
 from unittest import mock
 
-_STATE = tempfile.TemporaryDirectory(prefix="v2o-imgopt-test-")
-os.environ.setdefault("STATE_DIR", _STATE.name)
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from PIL import Image  # noqa: E402
 
