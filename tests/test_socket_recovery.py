@@ -25,7 +25,7 @@ import resumable
 import streaming
 from runtime_state import app_state
 from routes import chat_api, gemini_native
-from upstreams import express_sdk, cookie_proxy
+from upstreams import cookie_delivery, express_sdk, cookie_proxy
 
 
 async def first_event(response):
@@ -111,7 +111,7 @@ class SocketRecoveryTests(unittest.IsolatedAsyncioTestCase):
                         aio=SimpleNamespace(models=SimpleNamespace(generate_content=generate)))),
                     mock.patch.object(cookie_proxy, "_get_cookie_string", return_value="SAPISID=test"),
                     mock.patch.object(cookie_proxy, "_get_project_id", return_value="project"),
-                    mock.patch.object(cookie_proxy, "open_upstream_client", open_client),
+                    mock.patch.object(cookie_delivery, "open_upstream_client", open_client),
                 ]
                 for patch in patches:
                     patch.start()

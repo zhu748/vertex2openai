@@ -28,7 +28,7 @@ from express_key_manager import ExpressKeyManager
 from logger import ProxyStats
 from retry_policy import retry_delay
 from upstreams import express_sdk
-from upstreams import cookie_transport, cookie_proxy
+from upstreams import cookie_transport, cookie_delivery, cookie_proxy
 from http_options import get_http_options
 
 
@@ -362,14 +362,15 @@ class CookieRetryTests(unittest.IsolatedAsyncioTestCase):
                 return self._objs.pop(0) if self._objs else None
 
         for patch in (
-            mock.patch.object(cookie_proxy, "stats", self.stats),
+            mock.patch.object(cookie_delivery, "stats", self.stats),
             mock.patch.object(cookie_proxy, "_get_cookie_string", return_value="test-cookie"),
             mock.patch.object(cookie_proxy, "_get_project_id", return_value="test-project"),
             mock.patch.object(cookie_proxy, "build_headers", return_value={"authorization": "test-auth"}),
-            mock.patch.object(cookie_proxy, "open_upstream_client", side_effect=open_client),
-            mock.patch.object(cookie_proxy, "build_request_body_async", return_value={"variables": {}}),
-            mock.patch.object(cookie_proxy, "CompleteTextObjectCursor", FakeTextCursor),
-            mock.patch.object(cookie_proxy, "extract_events", return_value=[("error", {"code": 429, "message": "quota exhausted"})]),
+            mock.patch.object(cookie_delivery, "build_headers", return_value={"authorization": "test-auth"}),
+            mock.patch.object(cookie_delivery, "open_upstream_client", side_effect=open_client),
+            mock.patch.object(cookie_delivery, "build_request_body_async", return_value={"variables": {}}),
+            mock.patch.object(cookie_delivery, "CompleteTextObjectCursor", FakeTextCursor),
+            mock.patch.object(cookie_delivery, "extract_events", return_value=[("error", {"code": 429, "message": "quota exhausted"})]),
             mock.patch.object(cookie_proxy.app_state, "get_setting",
                               side_effect=lambda key, default=None: self.settings.get(key, default)),
             mock.patch.object(cookie_proxy.app_state, "get_effective_settings",
@@ -388,7 +389,7 @@ class CookieRetryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_permanent_api_error_with_quota_word_is_not_retried(self):
         obj = api_helpers.OpenAIRequest(model="gemini-3.6-flash", messages=[])
-        with mock.patch.object(cookie_proxy, "extract_events", return_value=[("error", {"code": 403, "message": "quota denied"})]):
+        with mock.patch.object(cookie_delivery, "extract_events", return_value=[("error", {"code": 403, "message": "quota denied"})]):
             response = await cookie_proxy.CookieProxyUpstream().chat_completions(obj, self.request)
         self.assertEqual(response.status_code, 403)
         self.assertEqual(self.client.post.await_count, 1)
@@ -419,7 +420,7 @@ class CookieRetryTests(unittest.IsolatedAsyncioTestCase):
         # api_error_details 文本兜底归类 403，生图整取路径同样记账。
         obj = api_helpers.OpenAIRequest(model="gemini-3.1-flash-image", messages=[])
         record = object()
-        with mock.patch.object(cookie_proxy, "extract_events",
+        with mock.patch.object(cookie_delivery, "extract_events",
                                return_value=[("error", {"message": "Request failed: permission denied for project"})]), \
              mock.patch.object(cookie_proxy.credential_manager, "record_cookie_auth_failure") as fail:
             result = await cookie_proxy._collect_full_response(
@@ -444,7 +445,7 @@ class CookieRetryTests(unittest.IsolatedAsyncioTestCase):
         # 但必须清零账号失败计数——收到过思考即证明 Cookie 有效，否则
         # 正文被剥离/安全拦截的账号会因历史失败累计被误冷却 600 秒。
         obj = api_helpers.OpenAIRequest(model="gemini-3.6-flash", messages=[])
-        with mock.patch.object(cookie_proxy, "extract_events",
+        with mock.patch.object(cookie_delivery, "extract_events",
                                return_value=[("thought", "let me think"), ("finish", "STOP")]), \
              mock.patch.object(cookie_proxy.credential_manager, "record_cookie_success") as ok:
             response = await cookie_proxy.CookieProxyUpstream().chat_completions(obj, self.request)
@@ -456,7 +457,7 @@ class CookieRetryTests(unittest.IsolatedAsyncioTestCase):
         # 对照组：完全空响应（连思考都没有）不能清失败计数——Cookie 是否
         # 有效无证据，维持既有失败累计。
         obj = api_helpers.OpenAIRequest(model="gemini-3.6-flash", messages=[])
-        with mock.patch.object(cookie_proxy, "extract_events",
+        with mock.patch.object(cookie_delivery, "extract_events",
                                return_value=[("finish", "STOP")]), \
              mock.patch.object(cookie_proxy.credential_manager, "record_cookie_success") as ok:
             response = await cookie_proxy.CookieProxyUpstream().chat_completions(obj, self.request)
@@ -470,7 +471,7 @@ class CookieRetryTests(unittest.IsolatedAsyncioTestCase):
         obj = api_helpers.OpenAIRequest(model="gemini-3.6-flash", messages=[])
         self.client.post.side_effect = [httpx.Response(502, headers={"retry-after": "2.5"}), httpx.Response(504), httpx.Response(200, json={})]
         with mock.patch.object(cookie_transport, "wait_for_retry", return_value=True) as wait, \
-             mock.patch.object(cookie_proxy, "extract_events", return_value=[("text", "answer"), ("finish", "STOP")]):
+             mock.patch.object(cookie_delivery, "extract_events", return_value=[("text", "answer"), ("finish", "STOP")]):
             response = await cookie_proxy.CookieProxyUpstream().chat_completions(obj, self.request)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.client.post.await_count, 3)
@@ -501,7 +502,7 @@ class CookieRetryTests(unittest.IsolatedAsyncioTestCase):
             yield "api_error_text", "connection interrupted"
 
         obj = api_helpers.OpenAIRequest(model="gemini-3.6-flash", messages=[], stream=True)
-        with mock.patch.object(cookie_proxy, "stream_events", side_effect=events):
+        with mock.patch.object(cookie_delivery, "stream_events", side_effect=events):
             response = await cookie_proxy.CookieProxyUpstream().chat_completions(obj, self.request)
             body = "".join([chunk async for chunk in response.body_iterator])
         self.assertIn('"error"', body)

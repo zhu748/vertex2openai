@@ -30,7 +30,7 @@ from models import OpenAIMessage, OpenAIRequest
 from pydantic import ValidationError
 from response_validation import IncompleteResponseError
 from routes import console, gemini_native
-from upstreams import cookie_proxy, cookie_request, express_sdk
+from upstreams import cookie_delivery, cookie_proxy, cookie_request, express_sdk
 from PIL import Image
 
 
@@ -300,7 +300,7 @@ class CookieImageTests(unittest.IsolatedAsyncioTestCase):
         request = SimpleNamespace(is_disconnected=mock.AsyncMock(return_value=False))
         with mock.patch.object(runtime_state.app_state, "get_settings", return_value=settings), \
              mock.patch.object(runtime_state.app_state, "get_setting", side_effect=lambda k, d=None: settings.get(k, d)), \
-             mock.patch.object(cookie_proxy, "open_upstream_client", client):
+             mock.patch.object(cookie_delivery, "open_upstream_client", client):
             response = await cookie_proxy.CookieProxyUpstream().chat_completions(obj, request,
                 credential_record={"cookie": "SAPISID=offline; SID=offline", "project_id": "project"})
             frames = "".join([frame async for frame in response.body_iterator])

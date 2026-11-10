@@ -26,7 +26,8 @@ from models import OpenAIRequest  # noqa: E402
 from runtime_state import app_state  # noqa: E402
 from schema_validation import SchemaValidationError  # noqa: E402
 import upstreams.cookie_request as cookie_request  # noqa: E402
-import upstreams.cookie_proxy as cookie_proxy  # noqa: E402
+import upstreams.cookie_proxy as cookie_proxy
+import upstreams.cookie_delivery as cookie_delivery  # noqa: E402
 
 
 JSON_PATCH_SCHEMA = {
@@ -167,7 +168,7 @@ class TestEnabledWiring(unittest.TestCase):
 class TestProxyFastFailGate(unittest.IsolatedAsyncioTestCase):
     async def test_disabled_rejects_before_network(self):
         obj = _request({"type": "json_object"})
-        with mock.patch.object(cookie_proxy, "open_upstream_client") as network:
+        with mock.patch.object(cookie_delivery, "open_upstream_client") as network:
             response = await cookie_proxy.CookieProxyUpstream().chat_completions(
                 obj, SimpleNamespace())
         self.assertEqual(response.status_code, 400)
@@ -187,7 +188,7 @@ class TestProxyFastFailGate(unittest.IsolatedAsyncioTestCase):
                 mock.patch.object(cookie_proxy, "prepare_messages", side_effect=fake_prepare_messages), \
                 mock.patch.object(cookie_proxy, "prepare_transport",
                                   side_effect=lambda req, *a, **k: (req, None)), \
-                mock.patch.object(cookie_proxy, "open_upstream_client") as network:
+                mock.patch.object(cookie_delivery, "open_upstream_client") as network:
             response = await cookie_proxy.CookieProxyUpstream().chat_completions(
                 obj, SimpleNamespace())
         gate_passed = True  # 未在门控处 400 即通过

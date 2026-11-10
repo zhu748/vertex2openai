@@ -32,7 +32,7 @@ import resumable
 from models import OpenAIRequest
 from routes import models_api
 from runtime_state import AppState, app_state
-from upstreams import cookie_proxy, express_sdk
+from upstreams import cookie_delivery, cookie_proxy, express_sdk
 
 
 MODEL = "gemini-3.6-flash"
@@ -457,7 +457,7 @@ class ChannelTests(unittest.IsolatedAsyncioTestCase):
             yield SimpleNamespace(post=post)
         with mock.patch.object(cookie_proxy, "_get_cookie_string", return_value="SAPISID=test"), \
              mock.patch.object(cookie_proxy, "_get_project_id", return_value="test-project"), \
-             mock.patch.object(cookie_proxy, "open_upstream_client", open_client):
+             mock.patch.object(cookie_delivery, "open_upstream_client", open_client):
             for model in (MODEL, "gemini-3.8-flash", "gemini-4-argon"):
                 for legacy in (None, "stream", "nonstream"):
                     req = request(anti_truncation_mode=legacy).model_copy(update={"model": model})
@@ -622,8 +622,8 @@ class ChannelTests(unittest.IsolatedAsyncioTestCase):
                 yield "finish", "STOP"
         with mock.patch.object(cookie_proxy, "_get_cookie_string", return_value="SAPISID=test"), \
              mock.patch.object(cookie_proxy, "_get_project_id", return_value="test-project"), \
-             mock.patch.object(cookie_proxy, "open_upstream_client", open_client), \
-             mock.patch.object(cookie_proxy, "stream_events", events):
+             mock.patch.object(cookie_delivery, "open_upstream_client", open_client), \
+             mock.patch.object(cookie_delivery, "stream_events", events):
             result = await cookie_proxy.CookieProxyUpstream().chat_completions(req, self.http_request)
             body = await self.body(result) if hasattr(result, "body_iterator") else result.body.decode()
         self.assertNotIn("antitruncation", seen[-1]["variables"]["model"])

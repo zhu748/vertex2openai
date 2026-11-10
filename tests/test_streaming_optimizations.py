@@ -32,7 +32,7 @@ from models import OpenAIRequest
 from routes import chat_api
 import channel_dispatch
 from runtime_state import AppState, app_state
-from upstreams import cookie_transport, cookie_proxy, express_sdk, cookie_request
+from upstreams import cookie_transport, cookie_delivery, cookie_proxy, express_sdk, cookie_request
 
 
 MODEL = "gemini-3.6-flash"
@@ -271,8 +271,9 @@ class CookieStreamTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(app_state, "get_effective_settings", side_effect=lambda m, base=None: (self.settings.copy() if base is None else dict(base))),
             mock.patch.object(cookie_proxy, "_get_cookie_string", return_value="SAPISID=test"),
             mock.patch.object(cookie_proxy, "_get_project_id", return_value="project"),
-            mock.patch.object(cookie_proxy, "build_headers", return_value={"authorization": "test"}),
-            mock.patch.object(cookie_proxy, "stats", self.stats),
+            mock.patch.object(cookie_proxy, "build_headers"),
+            mock.patch.object(cookie_delivery, "build_headers", return_value={"authorization": "test"}),
+            mock.patch.object(cookie_delivery, "stats", self.stats),
         ):
             patch.start()
             self.addCleanup(patch.stop)
@@ -281,7 +282,7 @@ class CookieStreamTests(unittest.IsolatedAsyncioTestCase):
         @asynccontextmanager
         async def open_client(kwargs):
             yield client
-        patch = mock.patch.object(cookie_proxy, "open_upstream_client", open_client)
+        patch = mock.patch.object(cookie_delivery, "open_upstream_client", open_client)
         patch.start()
         self.addCleanup(patch.stop)
 
@@ -439,7 +440,7 @@ class CookieStreamTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 closed.set()
         self.pool(SimpleNamespace())
-        with mock.patch.object(cookie_proxy, "stream_events", side_effect=events):
+        with mock.patch.object(cookie_delivery, "stream_events", side_effect=events):
             response = await cookie_proxy.CookieProxyUpstream().chat_completions(req(stream=True), self.request)
             body = "".join([frame async for frame in response.body_iterator])
         self.assertIn('"code": 502', body)
@@ -493,8 +494,9 @@ class SignatureTopologyTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(app_state, "get_effective_settings", side_effect=lambda m, base=None: (self.settings.copy() if base is None else dict(base))),
             mock.patch.object(cookie_proxy, "_get_cookie_string", return_value="SAPISID=test"),
             mock.patch.object(cookie_proxy, "_get_project_id", return_value="project"),
-            mock.patch.object(cookie_proxy, "build_headers", return_value={"authorization": "test"}),
-            mock.patch.object(cookie_proxy, "stats", self.stats),
+            mock.patch.object(cookie_proxy, "build_headers"),
+            mock.patch.object(cookie_delivery, "build_headers", return_value={"authorization": "test"}),
+            mock.patch.object(cookie_delivery, "stats", self.stats),
             mock.patch.object(cookie_proxy, "credential_manager"),
         ):
             patch.start()
@@ -505,7 +507,7 @@ class SignatureTopologyTests(unittest.IsolatedAsyncioTestCase):
         @asynccontextmanager
         async def open_client(kwargs):
             yield client
-        patch = mock.patch.object(cookie_proxy, "open_upstream_client", open_client)
+        patch = mock.patch.object(cookie_delivery, "open_upstream_client", open_client)
         patch.start()
         self.addCleanup(patch.stop)
 
@@ -513,9 +515,9 @@ class SignatureTopologyTests(unittest.IsolatedAsyncioTestCase):
         async def fake_events(*args, **kwargs):
             for status, data in events:
                 yield status, data
-        with mock.patch.object(cookie_proxy, "build_request_body_async",
+        with mock.patch.object(cookie_delivery, "build_request_body_async",
                                mock.AsyncMock(return_value={"variables": {}})), \
-             mock.patch.object(cookie_proxy, "stream_events", fake_events):
+             mock.patch.object(cookie_delivery, "stream_events", fake_events):
             obj = req(stream=True)
             result = await cookie_proxy.CookieProxyUpstream().chat_completions(obj, self.request)
             body = "".join([frame async for frame in result.body_iterator])

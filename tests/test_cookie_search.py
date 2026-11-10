@@ -20,7 +20,7 @@ import httpx
 import config
 from models import OpenAIRequest
 from runtime_state import app_state
-from upstreams import cookie_proxy, cookie_request
+from upstreams import cookie_delivery, cookie_proxy, cookie_request
 
 
 MODEL = "gemini-3.5-flash-lite"
@@ -88,8 +88,8 @@ class CookieSearchTests(unittest.IsolatedAsyncioTestCase):
             yield "text", "answer"
             yield "finish", "STOP"
 
-        with mock.patch.object(cookie_proxy, "open_upstream_client", open_client), \
-             mock.patch.object(cookie_proxy, "stream_events", events):
+        with mock.patch.object(cookie_delivery, "open_upstream_client", open_client), \
+             mock.patch.object(cookie_delivery, "stream_events", events):
             for suffix, tools in product(
                 ("-search", "-search ", "-search-antitruncation-stream", "-search-antitruncation-nonstream"),
                 (None, [CUSTOM]),
@@ -134,8 +134,8 @@ class CookieSearchTests(unittest.IsolatedAsyncioTestCase):
             yield "function_call", call
             yield "finish", reason
 
-        with mock.patch.object(cookie_proxy, "open_upstream_client", open_client), \
-             mock.patch.object(cookie_proxy, "stream_events", events):
+        with mock.patch.object(cookie_delivery, "open_upstream_client", open_client), \
+             mock.patch.object(cookie_delivery, "stream_events", events):
             for reason, expected in (("STOP", "tool_calls"), ("MAX_TOKENS", "length"), ("SAFETY", "content_filter")):
                 for stream, buffered in ((False, False), (True, False), (True, True)):
                     with self.subTest(reason=reason, stream=stream, buffered=buffered):

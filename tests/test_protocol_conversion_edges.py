@@ -31,6 +31,7 @@ from response_validation import IncompleteResponseError, map_finish_reason_to_op
 from routes import claude_api
 from runtime_state import app_state
 from upstreams import cookie_proxy
+import upstreams.cookie_delivery as cookie_delivery
 from upstreams.cookie_native import NativeAssembler
 from upstreams.cookie_request import _convert_messages_to_contents
 from upstreams.cookie_response import extract_events
@@ -273,8 +274,8 @@ class CookieImageSignatureTests(unittest.IsolatedAsyncioTestCase):
                 text=json.dumps(first) + "\n" + json.dumps(last))))
         request = OpenAIRequest(model="gemini-3.5-flash-lite", messages=[{"role": "user", "content": "hello"}])
         settings = dict(config.DEFAULT_SETTINGS, proxy_url="", retry_max=0)
-        with mock.patch.object(cookie_proxy, "open_upstream_client", opened), \
-             mock.patch.object(cookie_proxy, "stats", ProxyStats()), \
+        with mock.patch.object(cookie_delivery, "open_upstream_client", opened), \
+             mock.patch.object(cookie_delivery, "stats", ProxyStats()), \
              mock.patch.object(cookie_proxy.credential_manager, "record_cookie_success"), \
              mock.patch.object(app_state, "get_effective_settings", return_value=settings), \
              mock.patch.object(app_state, "get_setting", side_effect=lambda k, d=None: settings.get(k, d)):
@@ -322,8 +323,8 @@ class CookieImageSignatureTests(unittest.IsolatedAsyncioTestCase):
             yield SimpleNamespace(post=mock.AsyncMock(return_value=httpx.Response(200, json=source)))
         request = OpenAIRequest(model="gemini-3.5-flash-lite", messages=[{"role": "user", "content": "hello"}])
         settings = dict(config.DEFAULT_SETTINGS, proxy_url="", retry_max=0)
-        with mock.patch.object(cookie_proxy, "open_upstream_client", opened), \
-             mock.patch.object(cookie_proxy, "stats", ProxyStats()), \
+        with mock.patch.object(cookie_delivery, "open_upstream_client", opened), \
+             mock.patch.object(cookie_delivery, "stats", ProxyStats()), \
              mock.patch.object(cookie_proxy.credential_manager, "record_cookie_success"), \
              mock.patch.object(app_state, "get_effective_settings", return_value=settings), \
              mock.patch.object(app_state, "get_setting", side_effect=lambda k, d=None: settings.get(k, d)):

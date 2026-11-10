@@ -18,7 +18,9 @@ from models import OpenAIRequest
 from logger import ProxyStats
 from response_validation import IncompleteResponseError
 from runtime_state import app_state
-from upstreams import cookie_proxy, cookie_response
+from upstreams import cookie_proxy
+import upstreams.cookie_delivery as cookie_delivery
+from upstreams import cookie_response
 
 
 class Chunks:
@@ -103,8 +105,8 @@ class JsonFramingTests(unittest.IsolatedAsyncioTestCase):
         request = SimpleNamespace(is_disconnected=mock.AsyncMock(return_value=False))
         obj = OpenAIRequest(model="gemini-3.6-flash", messages=[])
         with (
-            mock.patch.object(cookie_proxy, "open_upstream_client", open_client),
-            mock.patch.object(cookie_proxy, "stats", stats),
+            mock.patch.object(cookie_delivery, "open_upstream_client", open_client),
+            mock.patch.object(cookie_delivery, "stats", stats),
             mock.patch.object(cookie_proxy, "_get_cookie_string", return_value="SAPISID=test"),
             mock.patch.object(app_state, "get_setting", side_effect=lambda key, default=None: default),
         ):

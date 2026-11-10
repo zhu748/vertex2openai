@@ -81,7 +81,7 @@ class GrpcStatusMappingTests(unittest.TestCase):
         # （full_text + reasoning_text）两条估算路径必须给出**相同**的
         # completion 估算——思考文本恰好计一次。评审报告曾疑有双计，
         # 实测两条路径口径一致；本测试锁定该不变量，防止未来分叉。
-        from upstreams.cookie_proxy import _final_usage
+        from upstreams.cookie_delivery import _final_usage
         from thought_signatures import ordinary_part_metadata
         request = SimpleNamespace(
             messages=[{"role": "user", "content": "hello world"}])
@@ -228,7 +228,7 @@ class UsageEstimationTests(unittest.TestCase):
         self.assertEqual(est["total_tokens"], 5)
 
     def test_final_usage_respects_switch(self):
-        from upstreams.cookie_proxy import _final_usage
+        from upstreams.cookie_delivery import _final_usage
         request = SimpleNamespace(messages=[SimpleNamespace(content="你好", role="user")])
         with mock.patch("upstreams.cookie_proxy.app_state.get_setting", return_value=False):
             usage = _final_usage(None, request, "回复")
@@ -239,7 +239,7 @@ class UsageEstimationTests(unittest.TestCase):
         self.assertGreater(usage["total_tokens"], 0)
 
     def test_real_metadata_never_estimated(self):
-        from upstreams.cookie_proxy import _final_usage
+        from upstreams.cookie_delivery import _final_usage
         meta = {"promptTokenCount": 10, "candidatesTokenCount": 5, "totalTokenCount": 15}
         request = SimpleNamespace(messages=[])
         with mock.patch("upstreams.cookie_proxy.app_state.get_setting", return_value=True):

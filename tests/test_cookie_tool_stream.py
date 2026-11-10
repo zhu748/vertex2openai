@@ -27,7 +27,7 @@ from models import OpenAIRequest
 from proxy_failover import ProxyChain, is_proxy_failure
 from response_validation import IncompleteResponseError, ToolStreamError
 from runtime_state import app_state
-from upstreams import cookie_native, cookie_proxy, cookie_request, cookie_response, cookie_transport
+from upstreams import cookie_delivery, cookie_native, cookie_proxy, cookie_request, cookie_response, cookie_transport
 
 MODEL = "gemini-4-argon"
 RECORD = {"id": "offline", "cookie": "SAPISID=offline", "project_id": "offline"}
@@ -118,9 +118,10 @@ class CookieStreamTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(app_state, "get_effective_settings", side_effect=lambda *a, **k: dict(self.settings)),
             mock.patch.object(app_state, "get_setting", side_effect=lambda k, d=None: self.settings.get(k, d)),
             mock.patch.object(cookie_transport, "timeout_seconds", return_value=.04),
-            mock.patch.object(cookie_proxy, "stats", self.stats),
+            mock.patch.object(cookie_delivery, "stats", self.stats),
             mock.patch.object(cookie_native, "stats", self.stats),
-            mock.patch.object(cookie_proxy, "build_headers", return_value={"authorization": "offline"}),
+            mock.patch.object(cookie_proxy, "build_headers"),
+            mock.patch.object(cookie_delivery, "build_headers", return_value={"authorization": "offline"}),
             mock.patch.object(cookie_native, "build_headers", return_value={"authorization": "offline"}),
             mock.patch.object(cookie_proxy.credential_manager, "record_cookie_success"),
             mock.patch.object(cookie_native.credential_manager, "get_cookie_record", return_value=RECORD),
@@ -137,7 +138,7 @@ class CookieStreamTests(unittest.IsolatedAsyncioTestCase):
         @asynccontextmanager
         async def opened(*args, **kwargs):
             yield client
-        for module in (cookie_proxy, cookie_native):
+        for module in (cookie_delivery, cookie_proxy, cookie_native):
             patch = mock.patch.object(module, "open_upstream_client", opened)
             patch.start()
             self.addCleanup(patch.stop)

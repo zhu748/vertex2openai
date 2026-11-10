@@ -34,7 +34,7 @@ import retry_policy
 import runtime_state
 from http_options import get_http_options
 from models import OpenAIRequest
-from upstreams import express_sdk, cookie_proxy
+from upstreams import cookie_delivery, express_sdk, cookie_proxy
 
 
 class StreamSizeTests(unittest.TestCase):
@@ -375,7 +375,7 @@ class RetryAndContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_cookie_rejects_unverified_structured_output_before_network_call(self):
         for response_format in ({"type": "json_object"}, {"type": "json_schema", "json_schema": {"schema": {"type": "object"}}}):
             obj = OpenAIRequest(model="gemini-3.6-flash", messages=[], response_format=response_format)
-            with mock.patch.object(cookie_proxy, "open_upstream_client") as network:
+            with mock.patch.object(cookie_delivery, "open_upstream_client") as network:
                 response = await cookie_proxy.CookieProxyUpstream().chat_completions(obj, SimpleNamespace())
             self.assertEqual(response.status_code, 400)
             network.assert_not_called()

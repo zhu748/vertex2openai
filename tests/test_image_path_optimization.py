@@ -338,10 +338,11 @@ class CookieCollectReleaseTests(unittest.TestCase):
 
     def test_response_buffer_released_before_parsing(self):
         import upstreams.cookie_proxy as cp
+        import upstreams.cookie_delivery as cd
 
         seen_refcounts = []
 
-        class SpyingCursor(cp.CompleteTextObjectCursor):
+        class SpyingCursor(cd.CompleteTextObjectCursor):
             # 解析入口（游标构造）时记录 fake_response 的引用计数。
             def __init__(cursor_self, text, limit=None):
                 seen_refcounts.append(sys.getrefcount(self._fake_response))
@@ -365,7 +366,7 @@ class CookieCollectReleaseTests(unittest.TestCase):
 
         class FakeResponse:
             status_code = 200
-            text = cp.json.dumps(body)
+            text = cd.json.dumps(body)
             headers = {}
 
             async def _unused(self):
@@ -404,13 +405,13 @@ class CookieCollectReleaseTests(unittest.TestCase):
         async def fake_timed_call(model, operation, *, whole_call=False, seconds=None):
             return await operation
 
-        with mock.patch.object(cp, "open_upstream_client", return_value=FakeCM()), \
-             mock.patch.object(cp, "timed_call", side_effect=fake_timed_call), \
-             mock.patch.object(cp, "build_headers", return_value={"auth": "1"}), \
-             mock.patch.object(cp, "build_request_body_async",
+        with mock.patch.object(cd, "open_upstream_client", return_value=FakeCM()), \
+             mock.patch.object(cd, "timed_call", side_effect=fake_timed_call), \
+             mock.patch.object(cd, "build_headers", return_value={"auth": "1"}), \
+             mock.patch.object(cd, "build_request_body_async",
                                mock.AsyncMock(return_value={"contents": []})), \
-             mock.patch.object(cp, "stats"), \
-             mock.patch.object(cp, "CompleteTextObjectCursor", SpyingCursor):
+             mock.patch.object(cd, "stats"), \
+             mock.patch.object(cd, "CompleteTextObjectCursor", SpyingCursor):
             result = asyncio.run(run())
 
         expected_md = f"![Generated Image](data:image/png;base64,{image_b64})"
@@ -590,6 +591,7 @@ def _cookie_collect_harness(body_builder, patches_extra=()):
 
     body_builder 返回 dict（单对象响应）或 list（多对象响应，逐个 dumps 拼接）。"""
     import upstreams.cookie_proxy as cp
+    import upstreams.cookie_delivery as cd
 
     body = body_builder()
     if isinstance(body, list):
@@ -628,12 +630,12 @@ def _cookie_collect_harness(body_builder, patches_extra=()):
         return await operation
 
     base_patches = [
-        mock.patch.object(cp, "open_upstream_client", return_value=FakeCM()),
-        mock.patch.object(cp, "timed_call", side_effect=fake_timed_call),
-        mock.patch.object(cp, "build_headers", return_value={"auth": "1"}),
-        mock.patch.object(cp, "build_request_body_async",
+        mock.patch.object(cd, "open_upstream_client", return_value=FakeCM()),
+        mock.patch.object(cd, "timed_call", side_effect=fake_timed_call),
+        mock.patch.object(cd, "build_headers", return_value={"auth": "1"}),
+        mock.patch.object(cd, "build_request_body_async",
                           mock.AsyncMock(return_value={"contents": []})),
-        mock.patch.object(cp, "stats"),
+        mock.patch.object(cd, "stats"),
     ]
     return run, base_patches + list(patches_extra), fake_response
 
@@ -647,10 +649,10 @@ class CookieCollectMemoryContractTests(unittest.TestCase):
         # 测试捕获 + getrefcount 临时项）。生成器形态的旧实现会由
         # async-for 变量 + 两层生成器帧局部 + 采样器留存多钉住至少 3 份，
         # 此测试会 FAIL。（dict 实例不支持 weakref，故用 refcount 计量。）
-        import upstreams.cookie_proxy as cp
+        import upstreams.cookie_delivery as cd
 
         captured = []
-        real_extract = cp.extract_events
+        real_extract = cd.extract_events
 
         def spying_extract(obj):
             captured.append(obj)
@@ -664,7 +666,7 @@ class CookieCollectMemoryContractTests(unittest.TestCase):
                 [sys.getrefcount(captured[i]) for i in range(len(captured))])
             real_chunk()
 
-        real_chunk = cp.upstream_chunk
+        real_chunk = cd.upstream_chunk
 
         run, patches, _ = _cookie_collect_harness(lambda: {
             "results": [{"data": {"candidates": [{
@@ -674,8 +676,8 @@ class CookieCollectMemoryContractTests(unittest.TestCase):
                 "finishReason": "STOP",
             }]}}]
         }, [
-            mock.patch.object(cp, "extract_events", spying_extract),
-            mock.patch.object(cp, "upstream_chunk", spying_chunk),
+            mock.patch.object(cd, "extract_events", spying_extract),
+            mock.patch.object(cd, "upstream_chunk", spying_chunk),
         ])
         for p in patches:
             p.start()
@@ -690,11 +692,11 @@ class CookieCollectMemoryContractTests(unittest.TestCase):
                         f"解析对象在事件消费前未释放: {chunk_checks}")
 
     def test_sampler_stops_retaining_on_body_but_keeps_count(self):
-        import upstreams.cookie_proxy as cp
+        import upstreams.cookie_delivery as cd
 
         created = []
 
-        class SpySampler(cp.RawSampler):
+        class SpySampler(cd.RawSampler):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
                 created.append(self)
@@ -707,7 +709,7 @@ class CookieCollectMemoryContractTests(unittest.TestCase):
                 "finishReason": "STOP",
             }]}}]},
             {"results": [{"data": {"candidates": [{"finishReason": "STOP"}]}}]},
-        ], [mock.patch.object(cp, "RawSampler", SpySampler)])
+        ], [mock.patch.object(cd, "RawSampler", SpySampler)])
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
@@ -723,11 +725,11 @@ class CookieCollectMemoryContractTests(unittest.TestCase):
 
     def test_sampler_retains_samples_when_no_body(self):
         # 无正文（只有思考）路径的 dump 诊断不受停止留存影响：样本照常保留。
-        import upstreams.cookie_proxy as cp
+        import upstreams.cookie_delivery as cd
 
         created = []
 
-        class SpySampler(cp.RawSampler):
+        class SpySampler(cd.RawSampler):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
                 created.append(self)
@@ -737,7 +739,7 @@ class CookieCollectMemoryContractTests(unittest.TestCase):
                 "content": {"parts": [{"text": "内心独白", "thought": True}]},
                 "finishReason": "STOP",
             }]}}]
-        }, [mock.patch.object(cp, "RawSampler", SpySampler)])
+        }, [mock.patch.object(cd, "RawSampler", SpySampler)])
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
@@ -755,6 +757,7 @@ class CookieCollectResponsePathTests(unittest.TestCase):
 
     def test_collect_response_releases_buffer_and_joins_image_events(self):
         import upstreams.cookie_proxy as cp
+        import upstreams.cookie_delivery as cd
 
         image_b64 = "QkFTRTY0" * 32
         body = {
@@ -776,7 +779,7 @@ class CookieCollectResponsePathTests(unittest.TestCase):
         fake_response = FakeResponse()
         seen_refcounts = []
 
-        class SpyingCursor(cp.CompleteTextObjectCursor):
+        class SpyingCursor(cd.CompleteTextObjectCursor):
             def __init__(cursor_self, text, limit=None):
                 seen_refcounts.append(sys.getrefcount(fake_response))
                 super().__init__(text)
@@ -811,14 +814,14 @@ class CookieCollectResponsePathTests(unittest.TestCase):
             return await operation
 
         async def run():
-            with mock.patch.object(cp, "open_upstream_client",
+            with mock.patch.object(cd, "open_upstream_client",
                                    return_value=FakeCM()), \
-                 mock.patch.object(cp, "timed_call", side_effect=fake_timed_call), \
+                 mock.patch.object(cd, "timed_call", side_effect=fake_timed_call), \
                  mock.patch.object(cp, "credential_manager"), \
-                 mock.patch.object(cp, "build_request_body_async",
+                 mock.patch.object(cd, "build_request_body_async",
                                    mock.AsyncMock(return_value={"variables": {}})), \
-                 mock.patch.object(cp, "CompleteTextObjectCursor", SpyingCursor):
-                return await gen.collect_response()
+                 mock.patch.object(cd, "CompleteTextObjectCursor", SpyingCursor):
+                return await cd.deliver_collect_response(gen)
 
         response = asyncio.run(run())
         payload = json.loads(response.body)

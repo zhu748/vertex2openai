@@ -31,7 +31,7 @@ from models import OpenAIRequest
 from routes import chat_api, gemini_native, models_api
 import runtime_state
 from runtime_state import AppState, app_state, get_effective_proxy_uris_for_account
-from upstreams import cookie_proxy
+from upstreams import cookie_delivery, cookie_proxy
 
 
 class StateFixture:
@@ -336,7 +336,7 @@ class RoutingTests(StateFixture, unittest.IsolatedAsyncioTestCase):
                 return httpx.Response(200, json={"results": [{"data": {"candidates": [{"content": {"parts": [{"text": "answer"}]}, "finishReason": "STOP"}]}}]})
             yield SimpleNamespace(post=post)
         request = SimpleNamespace(is_disconnected=mock.AsyncMock(return_value=False))
-        with mock.patch.object(cookie_proxy, "open_upstream_client", open_client):
+        with mock.patch.object(cookie_delivery, "open_upstream_client", open_client):
             results = await asyncio.gather(*(cookie_proxy.CookieProxyUpstream().chat_completions(
                 OpenAIRequest(model="gemini-3.6-flash", messages=[]), request) for _ in range(2)))
         self.assertTrue(all(r.status_code == 200 for r in results))
