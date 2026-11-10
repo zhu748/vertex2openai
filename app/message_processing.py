@@ -415,25 +415,22 @@ def _assistant_tool_parts(
         # 回合里图片无声消失，模型"看不到图"且无日志可查。与无
         # tool_calls 分支对齐：文本仍按 "".join 归一（语义不变），
         # image_url 分段逐个摄取（2026-10 修复）。
+        # 分段遍历骨架与普通消息路径、wire 路径共用（见
+        # _iter_content_segments）；本路径的差异只在于文本先聚合、
+        # markdown 图片在聚合文本上一次性抽取（图片后置）。
         if isinstance(message.content, list):
             text_pieces: list = []
             image_parts_collected: list = []
-            for part_item in message.content:
-                part_item = normalize_content_part(part_item)
-                if not isinstance(part_item, dict):
-                    text_attr = getattr(part_item, "text", None)
-                    if isinstance(text_attr, str):
-                        text_pieces.append(text_attr)
-                    continue
-                if part_item.get("type") == "text":
-                    text_pieces.append(part_item.get("text") or "")
-                elif part_item.get("type") == "image_url":
-                    _ingest_image_part(
-                        _image_part_url(part_item),
-                        lambda raw, mime: _append_sdk_image_part(
-                            image_parts_collected, raw, mime
-                        ),
-                    )
+            _iter_content_segments(
+                message.content,
+                text_pieces.append,
+                lambda url: _ingest_image_part(
+                    url,
+                    lambda raw, mime: _append_sdk_image_part(
+                        image_parts_collected, raw, mime
+                    ),
+                ),
+            )
             content_text = "".join(text_pieces)
         else:
             content_text = message.content
@@ -516,34 +513,24 @@ def _ordinary_message_parts(message: OpenAIMessage) -> tuple[str, list[types.Par
         parts.extend(image_parts)
 
     elif exact_ordinary_parts is None and isinstance(message.content, list):
-        for part_item in message.content:
+        def _emit_text(text_content: str):
             # F-1：pydantic 会把标准 part 解析成 ContentPartText / ContentPartImage 实例，
             # 归一成 dict 后只保留一条处理路径（原先 dict 与实例两套分支已出现行为分歧：
             # 实例分支直接 from_text，跳过了 markdown 内联图片抽取）。
-            part_item = normalize_content_part(part_item)
-            if not isinstance(part_item, dict):
-                text_attr = getattr(part_item, "text", None)
-                if isinstance(text_attr, str):
-                    parts.append(types.Part.from_text(text=text_attr))
-                continue
+            image_parts, clean_text = _extract_markdown_images_to_parts(
+                text_content
+            )
+            if clean_text:
+                parts.append(types.Part.from_text(text=clean_text))
+            parts.extend(image_parts)
 
-            if part_item.get("type") == "text":
-                # or 兑底：{"type":"text","text":null} 会以原始 dict 留在
-                # union 里，get("text", "\n") 此时返回 None，下游 re.finditer
-                # 直接 TypeError（2026-10 修复，与 message_text 同口径）。
-                text_content = part_item.get("text") or ""
-                image_parts, clean_text = _extract_markdown_images_to_parts(
-                    text_content
-                )
-                if clean_text:
-                    parts.append(types.Part.from_text(text=clean_text))
-                parts.extend(image_parts)
-
-            elif part_item.get("type") == "image_url":
-                _ingest_image_part(
-                    _image_part_url(part_item),
-                    lambda raw, mime: _append_sdk_image_part(parts, raw, mime),
-                )
+        _iter_content_segments(
+            message.content,
+            _emit_text,
+            lambda url: _ingest_image_part(
+                url, lambda raw, mime: _append_sdk_image_part(parts, raw, mime)
+            ),
+        )
 
     if message_sig and exact_ordinary_parts is None:
         _attach_message_signature(parts, message_sig, signature_kind)
@@ -676,6 +663,36 @@ def _attach_message_signature(parts: list, message_sig, signature_kind) -> None:
     )
 
 
+def _iter_content_segments(content_list, on_text, on_image_url) -> None:
+    """遍历 OpenAI 分段 content，把 text / image_url 分段派发给回调。
+
+    三条转换管线（工具回合恢复 / 普通消息 / Cookie wire）共用的遍历骨架
+    （2026-11 审查收敛：此前三处各持一份同构实现，文本空值兑底、实例形态
+    归一这些口径靠注释互相指认保持同步，漏改即分叉）。
+      - 裸字符串分段按文本处理（仅 wire 路径的历史输入会出现，另两条
+        管线的 content 经 pydantic 校验不会产生裸 str）；
+      - 归一后非 dict 的段落取 text 属性；
+      - 文本分段统一 or "" 兑底（{"type":"text","text":null} 不把
+        None 传给下游 markdown 抽取）；
+      - image_url 分段经 _image_part_url 归一（三种历史形态）。
+    on_text(text) / on_image_url(url) 自行决定聚合时机与目标形态。
+    """
+    for part_item in content_list:
+        if isinstance(part_item, str):
+            on_text(part_item)
+            continue
+        part_item = normalize_content_part(part_item)
+        if not isinstance(part_item, dict):
+            text_attr = getattr(part_item, "text", None)
+            if isinstance(text_attr, str):
+                on_text(text_attr)
+            continue
+        if part_item.get("type") == "text":
+            on_text(part_item.get("text") or "")
+        elif part_item.get("type") == "image_url":
+            on_image_url(_image_part_url(part_item))
+
+
 def _image_part_url(part_item: dict) -> str:
     """从归一后的 image_url 分段里取 URL（三种历史形态：字符串 / dict / 实例）。
 
@@ -700,6 +717,12 @@ def _ingest_image_part(image_url: str, append_part) -> None:
     append_part(raw_bytes, mime_type) 负责压缩与目标形态构造，
     其抛出的 ValueError 按「远程图片超出处理限制」处理。
     """
+    if not isinstance(image_url, str) or not image_url:
+        # wire 路径的输入未经 pydantic 校验：image_url.url 为 None / 非字符串
+        # 时按“无法识别的地址”静默跳过（与该函数“失败只跳过不炸请求”的
+        # 契约一致；此前 wire 侧靠调用点各自防御，SDK 侧则可能抛
+        # AttributeError，2026-11 收敛到跳过口径）。
+        return
     if image_url.startswith("data:"):
         mime_match = _DATA_URL_RE.fullmatch(image_url)
         if not mime_match:
@@ -773,30 +796,13 @@ def openai_content_to_wire_parts(content: Any) -> List[Dict[str, Any]]:
         return parts
 
     if isinstance(content, list):
-        for item in content:
-            if hasattr(item, "model_dump"):
-                item = item.model_dump()
-            if isinstance(item, str):
-                _add_text_with_inline_images(item)
-                continue
-            if not isinstance(item, dict):
-                text_attr = getattr(item, "text", None)
-                if isinstance(text_attr, str):
-                    _add_text_with_inline_images(text_attr)
-                continue
-
-            item_type = item.get("type", "")
-            if item_type == "text":
-                _add_text_with_inline_images(item.get("text", ""))
-            elif item_type == "image_url":
-                url = item.get("image_url", {})
-                if isinstance(url, dict):
-                    url = url.get("url", "")
-                if not isinstance(url, str) or not url:
-                    continue
-                _ingest_image_part(
-                    url, lambda raw, mime: parts.append(_wire_image_part(raw, mime))
-                )
+        _iter_content_segments(
+            content,
+            _add_text_with_inline_images,
+            lambda url: _ingest_image_part(
+                url, lambda raw, mime: parts.append(_wire_image_part(raw, mime))
+            ),
+        )
     return parts
 
 

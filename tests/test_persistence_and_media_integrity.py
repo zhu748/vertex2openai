@@ -190,6 +190,43 @@ class MediaIntegrityTests(unittest.TestCase):
         self.assertEqual([part.inline_data.data for part in parts], [b"\x01", b"\x02"])
         self.assertEqual(clean, "  before\n    indented\ttext\n  \n")
 
+    def test_all_three_pipelines_share_one_segment_traversal_contract(self):
+        """三条转换管线（工具回合 / 普通消息 / Cookie wire）的遍历口径锁定。
+
+        2026-11 收敛 _iter_content_segments 后的特征测试：文本空值兜底、
+        裸字符串分段、实例形态归一、image_url.url=None 静默跳过。
+        """
+        raw = self.png(1, 1)
+        encoded = base64.b64encode(raw).decode()
+        with mock.patch.object(message_processing, "optimize_image_bytes",
+                               side_effect=lambda b, m: (b, m)):
+            # 裸字符串分段（wire 路径历史形态）按文本处理。
+            wire = message_processing.openai_content_to_wire_parts(["plain string", {"type": "text", "text": " + more"}])
+            self.assertEqual(wire, [{"text": "plain string"}, {"text": " + more"}])
+
+            # text: null 兜底为空串，不产出 None part、不抛 TypeError。
+            sdk = message_processing.create_gemini_prompt(
+                [OpenAIMessage(role="user", content=[{"type": "text", "text": None}, {"type": "text", "text": "kept"}])])
+            self.assertEqual([p.text for p in sdk[0].parts], ["kept"])
+
+            # 实例形态分段（pydantic ContentPartText）与 dict 等价。
+            from models import ContentPartText
+            sdk = message_processing.create_gemini_prompt(
+                [OpenAIMessage(role="user", content=[ContentPartText(type="text", text="instance text")])])
+            self.assertEqual(sdk[0].parts[0].text, "instance text")
+
+            # image_url 三种历史形态统一摄取；url=None 静默跳过不炸。
+            for url, expect_image in ((f"data:image/png;base64,{encoded}", True),
+                                      ({"url": f"data:image/png;base64,{encoded}"}, True),
+                                      ({"url": None}, False), ("", False)):
+                with self.subTest(url=repr(url)[:24]):
+                    wire = message_processing.openai_content_to_wire_parts(
+                        [{"type": "image_url", "image_url": url}])
+                    if expect_image:
+                        self.assertEqual(wire[0]["inlineData"]["mimeType"], "image/png")
+                    else:
+                        self.assertEqual(wire, [])
+
 
 class CookieCompatibilityTests(unittest.TestCase):
     def test_null_tool_text_keeps_the_other_parts_in_compatibility_mode(self):
