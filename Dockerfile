@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM --platform=$BUILDPLATFORM golang:1.27.3-bookworm AS proxy-bridge-build
+FROM --platform=$BUILDPLATFORM golang:1.27.4-bookworm AS proxy-bridge-build
 WORKDIR /src
 COPY proxybridge/go.mod proxybridge/go.sum ./
 RUN go mod download

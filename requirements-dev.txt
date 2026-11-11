@@ -2,3 +2,7 @@
 PyYAML==6.0.3
 ruff==0.17.1
 coverage==7.13.1
+# check_project.py 的「单元测试」组以 `python -m pytest` 运行（2026-11 P2-8
+# 起单进程模式）：pytest 是离线检查链的硬依赖，缺失时 CI 干净环境直接
+# 「No module named pytest」红构建（本地沙箱常驻 pytest 曾掩盖该缺口）。
+pytest==9.0.2

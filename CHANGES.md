@@ -2,6 +2,13 @@
 
 基于原版 `vertex2openai-main`（2026-09-01），持续完善兼容性、可靠性和代码组织。
 
+## 2026-11-11（第十九轮）：首推 GitHub 后 CI 红构建修复（pytest 缺失 + Go 1.27.4）
+
+- 背景：第十八轮收尾推送 GitHub 后 "Build & Publish Docker Image" 首跑双红。test 矩阵挂在 check_project「单元测试」组：`No module named pytest`——P2-8 把单测切到 `python -m pytest` 单进程模式时 pytest 未进 requirements-dev.txt，本地沙箱常驻 pytest 掩盖了缺口，CI 干净环境当场暴露（pip-audit 与其余 8 组检查均通过，publish 因 test / proxy-bridge 未过而跳过，amd64 / arm64 双架构镜像构建本身成功）。proxy-bridge 挂在 govulncheck：GO-2026-6859（net/http MaxBytesReader 头部竞态导致 HTTP/1 server crash），go1.27.3 受影响、1.27.4 修复，SSTP 侧 `init → http.HandleFunc` 等三条符号路径实测可达。同批 Dependabot 自动开的 5 个 PR（actions 升级 ×4 + pion）基于修复前 main，同因红，待本轮合入后重定基。
+- CI 依赖补齐：requirements-dev.txt 补 `pytest==9.0.2`（与十八轮验证版本一致；conftest 三层隔离只用 pytest 核心，无 asyncio 插件依赖，pytest.ini 维持最小配置）。
+- Go 工具链升级：go.mod `go 1.27.3`→`1.27.4`（setup-go 按 go-version-file 跟随）、Dockerfile 构建段 `golang:1.27.3-bookworm`→`1.27.4-bookworm`（镜像内编译产物同步换修复版标准库）、docs/proxy-turn-sstp.md 非 Docker 最低版本同步；proxy-protocol-validation.md 的 1.27.3 为历史验证记录，保留。
+- 验收：干净 venv（Python 3.12.16，与 CI 3.12 矩阵同版本）仅装 requirements-dev.txt 后 `scripts/check_project.py` **9/9 组**全绿、全程 20s（单测组 16.7s，远低于该组 120s 子进程超时）——1,427 项测试 + 1,083 子测试 + 2 跳过，与第十八轮基线一致；Go 侧本地无工具链，gofmt / vet / `-race` / govulncheck 由 CI 在 1.27.4 下验证。
+
 ## 2026-11-11（第十八轮・收尾轮）：QUA/ENG 域清零，审查 85 项全部处置完毕
 
 - 背景：第十七轮清完安全域后，本轮处置审查报告最后剩余的 QUA 域 7 项与 ENG 域 7 项，含一项按审查预案**实测否决**（ENG-P3-5，net.Pipe 复现实验证明与看门狗契约冲突）。至此 2026-11 全面审查的 85 项发现全部闭环：83 项落地、2 项实测否决并留档（PRF-P3-2 join 峰值翻倍、ENG-P3-5 计数契约冲突）。验收：1,427 项 Python 测试（+14 契约）+ 1,083 子测试、check_project **9/9 组**全绿（新增 print 基线闸）、Go 侧 gofmt/vet 零告警 + `go test -race` 全绿（+6 SSTP 状态机离线单测）。

@@ -109,7 +109,7 @@ PROXY_URLS='["turns://user:pass@turn.example.com:5349","sstp://user:pass@vpn.exa
 
 Dockerfile 通过独立 Go 构建阶段编译转换器并复制到镜像，运行阶段不需要 Go。需要使用包含此次代码的新构建；旧镜像不会因填写新链接自动获得该组件。
 
-非 Docker 部署需安装 Go 1.27.3 或更新的兼容版本，然后在仓库根目录运行：
+非 Docker 部署需安装 Go 1.27.4 或更新的兼容版本（GO-2026-6859：net/http MaxBytesReader 头部竞态崩溃，1.27.3 受影响、1.27.4 修复），然后在仓库根目录运行：
 
 ```bash
 mkdir -p bin

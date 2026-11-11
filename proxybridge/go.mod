@@ -1,6 +1,6 @@
 module github.com/zhu748/vertex2openai/proxybridge
 
-go 1.27.3
+go 1.27.4
 
 replace (
 	golang.zx2c4.com/wintun => github.com/yuhaiin/wintun v0.0.0-20240224105357-b28a4c71608e
