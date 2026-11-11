@@ -25,6 +25,7 @@ import request_tracking
 from request_tracking import attempt_started_at, upstream_attempt
 from express_key_manager import ExpressKeyManager
 from routes import gemini_native
+from upstreams import native_catalog
 from upstreams import cookie_transport, cookie_proxy
 
 
@@ -543,7 +544,7 @@ class LoopbackTests(unittest.IsolatedAsyncioTestCase):
         app_state.update_settings({"retry_max": 0, "express_location": ""})
         request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(express_key_manager=ExpressKeyManager())),
                                   is_disconnected=mock.AsyncMock(return_value=False))
-        with mock.patch.object(gemini_native, "EXPRESS_BASE", "http://unused.invalid"):
+        with mock.patch.object(native_catalog, "EXPRESS_BASE", "http://unused.invalid"):
             response = await gemini_native._passthrough_request(request, "gemini-test", "generateContent", "", b"{}")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(json.loads(response.body)["candidates"][0]["content"]["parts"][0]["text"], "answer")
@@ -571,7 +572,7 @@ class LoopbackTests(unittest.IsolatedAsyncioTestCase):
         app_state.update_settings({"retry_max": 0, "express_location": ""})
         request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(express_key_manager=ExpressKeyManager())),
                                   is_disconnected=mock.AsyncMock(return_value=False))
-        with mock.patch.object(gemini_native, "EXPRESS_BASE", "http://unused.invalid"):
+        with mock.patch.object(native_catalog, "EXPRESS_BASE", "http://unused.invalid"):
             response = await gemini_native._passthrough_request(request, "gemini-test", "streamGenerateContent", "alt=sse", b"{}")
             body = b"".join([chunk async for chunk in response.body_iterator])
         self.assertIn(b"answer", body)

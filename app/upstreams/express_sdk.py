@@ -3,7 +3,7 @@ from functools import partial
 from typing import Any
 
 from fastapi import Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from models import OpenAIRequest
 from generation_config import create_generation_config
@@ -147,7 +147,7 @@ class ExpressSDKUpstream(BaseUpstream):
     封装了原有的多密钥切匙、代理挂载以及 SDK 运行时调用
     """
 
-    async def chat_completions(self, request_obj: OpenAIRequest, fastapi_request: Request, *, credential_record=None):
+    async def chat_completions(self, request_obj: OpenAIRequest, fastapi_request: Request, *, credential_record: dict=None) -> Response:
         track_configure(channel="express")
         try:
             validate_openai_request(request_obj)
@@ -196,7 +196,7 @@ class ExpressSDKUpstream(BaseUpstream):
         )
         # The request owns the ordered route, while the pool owns reusable
         # clients for each selected outlet. No per-call client is closed here.
-        async def client_for(record):
+        async def client_for(record: dict):
             return await FailoverSDKClient(
                 ProxyChain(record).bind_to_generation(),
                 lambda raw, resolved: get_pooled_express_client(record["key"], raw),
@@ -289,7 +289,7 @@ class ExpressSDKUpstream(BaseUpstream):
         # 本轮请求内已被隔离的坏凭证（鉴权失败/欠费）
         dead_keys: set = set()
 
-        async def retry_target_factory(error=None):
+        async def retry_target_factory(error: Exception=None):
             # A newly selected proxy must be warmed asynchronously as well.
             nonlocal express_api_key, key_record, client_to_use
             # 坏凭证（鉴权失败/欠费）当轮硬隔离：同一把 Key 重试只会得到

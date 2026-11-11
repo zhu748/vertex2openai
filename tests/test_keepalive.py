@@ -91,8 +91,11 @@ class KeepAliveServiceTests(unittest.IsolatedAsyncioTestCase):
         server = await asyncio.start_server(handler, "127.0.0.1", 0)
         self.addCleanup(server.close)
         port = server.sockets[0].getsockname()[1]
+        # SEC-P2-6：环回目标需 keepalive_allow_private 显式确认（本地回路的
+        # 自我保活正是该开关的文档化用途）。
         service = self._make_service({"keepalive_url": f"http://127.0.0.1:{port}/healthz",
-                                      "keepalive_interval": 3600})
+                                      "keepalive_interval": 3600,
+                                      "keepalive_allow_private": True})
         try:
             await service.start()
             self.assertTrue(service.is_running)
@@ -125,9 +128,18 @@ class KeepAliveSettingsValidationTests(unittest.TestCase):
         for bad in ("example.com/healthz", "ftp://example.com", 123):
             error = validate_global_settings_patch({"keepalive_url": bad})
             self.assertIsNotNone(error, bad)
-        for good in ("", "  ", "https://example.com/healthz", "http://127.0.0.1:8050/healthz"):
+        for good in ("", "  ", "https://example.com/healthz"):
             error = validate_global_settings_patch({"keepalive_url": good})
             self.assertIsNone(error, good)
+        # SEC-P2-6：私网/环回目标默认拒绝，需 keepalive_allow_private 显式放行。
+        error = validate_global_settings_patch({"keepalive_url": "http://127.0.0.1:8050/healthz"})
+        self.assertIsNotNone(error)
+        self.assertIn("keepalive_allow_private", error["error"])
+        import settings_validation
+        with mock.patch.object(settings_validation, "keepalive_private_targets_allowed",
+                               lambda override=None: True):
+            self.assertIsNone(
+                validate_global_settings_patch({"keepalive_url": "http://127.0.0.1:8050/healthz"}))
 
 
 class KeepAliveEnvSeedTests(unittest.TestCase):

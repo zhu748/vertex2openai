@@ -3,7 +3,11 @@ services:
     image: ghcr.io/zhu748/vertex2openai:latest
     container_name: vertex2openai
     ports:
-      - "8050:7860"
+      # SEC-P1-1：默认只绑回环地址——直接照抄示例也不会把控制台（可导出
+      # 完整 Google Cookie）暴露到公网。需要外部访问时，请在前面架反代并
+      # 配置 TLS（示例见 README「生产部署」），不要改成 0.0.0.0 裸暴露：
+      # 登录口令、粘贴的 Cookie、reveal 回传值都会明文过网。
+      - "127.0.0.1:8050:7860"
     volumes:
       # S-3：不挂卷的话，docker compose up --force-recreate 或升级镜像后
       # web_state.json 会丢失，Cookie 与全部控制台设置都要重配。
@@ -12,8 +16,12 @@ services:
       # 状态文件目录（web_state.json 落在这里）
       - STATE_DIR=/app/data
       # Protect this adapter's OpenAI-compatible API.
-      # ⚠️ 必须改成强口令：它既是本代理的 API Key，也是控制台登录密码
+      # ⚠️ 必须改成强口令：留默认值/公开占位值时服务会拒绝启动（ALLOW_DEFAULT_KEY=true 可显式放行，仅限本地调试）。
+      # 未设置 ADMIN_PASSWORD 时它同时也是控制台登录口令；要分享 API 给朋友，
+      # 请另设 ADMIN_PASSWORD 把控制台口令与 API Key 分开。
       - API_KEY=change-me-please
+      # 可选：控制台管理口令（推荐设置；留空 = 沿用上面的 API_KEY 登录控制台）
+      # - ADMIN_PASSWORD=your-strong-console-password
       # Required: one or more Gemini Express Mode API keys, separated by commas.
       - VERTEX_EXPRESS_API_KEY=your_vertex_express_api_key
       # Optional: Key + Cookie simultaneous use. With both configured on first boot,
@@ -48,4 +56,11 @@ services:
     # init: true 用 tini 兜底收尸：桥接子进程（vertex-proxy-bridge/sing-box）
     # 异常退出后不留僵尸进程，Python 侧的回收器只做兜底。
     init: true
+    # SEC-P3-7：容器加固——本项目不需要任何 Linux capabilities（桥接器用
+    # 非特权 TURN/SSTP 出站连接），全部丢弃；no-new-privileges 禁止运行期
+    # 经 setuid/setgid 提权；内存上限防止异常输入把宿主内存吃穿（生图链
+    # 路峰值按 1g 留余量，512MB 容器部署可自行下调）。
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 1g
     restart: unless-stopped

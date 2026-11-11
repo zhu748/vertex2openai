@@ -100,6 +100,9 @@ class MonitorPaginationTests(unittest.TestCase):
 
 
 class ImageHopTests(unittest.TestCase):
+    def setUp(self):
+        image_processing.reset_image_clients()  # PRF-P2-3：隔离共享客户端池
+
     def test_each_redirect_resolves_once_and_connects_only_to_checked_address(self):
         requests = []
         def handle(request):

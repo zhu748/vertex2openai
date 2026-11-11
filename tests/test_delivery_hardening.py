@@ -19,6 +19,7 @@ import admission
 from logger import ProxyStats
 from models import OpenAIRequest
 from routes import chat_api, gemini_native
+from upstreams import native_passthrough
 
 
 def request(headers=None, query=None):
@@ -143,7 +144,8 @@ class GenerationTests(unittest.IsolatedAsyncioTestCase):
                  "client": ("127.0.0.1", 1), "server": ("test", 80)}
         with mock.patch.object(chat_api, "_call_upstream", side_effect=self.upstream), \
              mock.patch.object(chat_api, "resumable_enabled", return_value=True):
-            with self.assertRaises(Exception):
+            # B017：断言收窄到实际抛出的 ClientDisconnect（ASGI 断连经中间件归一）
+            with self.assertRaises(ClientDisconnect):
                 await asyncio.wait_for(main.app(scope, receive, send), 1)
             self.assertEqual(seen, [False])
             self.assertTrue(all(not buf.fully_delivered for buf in self.store._buffers.values()))
@@ -152,14 +154,32 @@ class GenerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.generations, 1)
 
     async def test_browser_can_read_resume_headers(self):
+        # SEC-P3-1：CORS 默认同源（不装中间件）——同源浏览器读响应头无需
+        # expose；跨源前端要读到 X-Resume-Id 必须显式设 ALLOWED_ORIGINS。
         with mock.patch.object(chat_api, "_call_upstream", side_effect=self.upstream), \
              mock.patch.object(chat_api, "resumable_enabled", return_value=True):
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://adapter.test") as client:
                 response = await client.post("/v1/chat/completions", json=self.obj.model_dump(),
                                              headers={"Origin": "https://frontend.example", "Authorization": "Bearer " + config.API_KEY})
         self.assertEqual(response.status_code, 200)
-        self.assertIn("x-resume-id", response.headers["access-control-expose-headers"].lower())
+        self.assertNotIn("access-control-expose-headers", response.headers)
         self.assertEqual(response.headers["x-accel-buffering"], "no")
+
+        # 组件级契约：ALLOWED_ORIGINS 显式放行的部署里，浏览器能读到续传头
+        # （构造与 main.py 完全一致的 CORSMiddleware 包裹）。
+        from fastapi.middleware.cors import CORSMiddleware
+        from main import CORS_ALLOW_ORIGINS  # noqa: F401 —— 默认 None（同源）
+        cors_app = CORSMiddleware(
+            app=main.app, allow_origins=["https://frontend.example"], allow_credentials=False,
+            allow_methods=["*"], allow_headers=["*"],
+            expose_headers=["X-Resume-Id", "X-Resumable-Replay", "X-Trace-Id", "Retry-After"])
+        with mock.patch.object(chat_api, "_call_upstream", side_effect=self.upstream), \
+             mock.patch.object(chat_api, "resumable_enabled", return_value=True):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=cors_app), base_url="http://adapter.test") as client:
+                response = await client.post("/v1/chat/completions", json=self.obj.model_dump(),
+                                             headers={"Origin": "https://frontend.example", "Authorization": "Bearer " + config.API_KEY})
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("x-resume-id", response.headers["access-control-expose-headers"].lower())
 
     async def test_opt_out_starts_fresh_while_identical_buffer_is_running(self):
         release = asyncio.Event()
@@ -395,7 +415,7 @@ class NativeRecoveryTests(unittest.IsolatedAsyncioTestCase):
         upstream = httpx.Response(200, headers={"content-type": "text/event-stream"},
                                   content=b'data: {"candidates":[{"content":{"parts":[{"text":"partial"}]}}]}\n\n')
         stats = ProxyStats()
-        with mock.patch.object(gemini_native, "stats", stats):
+        with mock.patch.object(gemini_native, "stats", stats), mock.patch.object(native_passthrough, "stats", stats):
             response = await gemini_native._relay_stream(upstream, keepalive=True)
             body = await collect(response)
         self.assertIn('"partial"', body)
@@ -409,7 +429,7 @@ class NativeRecoveryTests(unittest.IsolatedAsyncioTestCase):
         upstream = httpx.Response(200, headers={"content-type": "text/event-stream"},
                                   content=b'data: {"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"quota"}}\n\n')
         stats = ProxyStats()
-        with mock.patch.object(gemini_native, "stats", stats):
+        with mock.patch.object(gemini_native, "stats", stats), mock.patch.object(native_passthrough, "stats", stats):
             response = await gemini_native._relay_stream(upstream, keepalive=True)
             body = await collect(response)
         self.assertIn('"code": 429', body)
@@ -426,7 +446,7 @@ class NativeRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 closed.append(True)
         upstream = httpx.Response(200, stream=Broken(), headers={"content-type": "text/event-stream"})
         stats = ProxyStats()
-        with mock.patch.object(gemini_native, "stats", stats):
+        with mock.patch.object(gemini_native, "stats", stats), mock.patch.object(native_passthrough, "stats", stats):
             response = await gemini_native._relay_stream(upstream, keepalive=True)
             body = await collect(response)
         self.assertTrue(body.startswith(streaming.HEARTBEAT_FRAME))
@@ -444,8 +464,8 @@ class NativeRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 yield b'data: {"candidates":[{"index":0,"text":"one"}]}\n\n'
                 yield b'data: {"candidates":[{"index":0,"finishReason":"STOP"}]}\n\n'
             return StreamingResponse(frames())
-        with mock.patch.object(gemini_native, "resumable_store", store), \
-             mock.patch.object(gemini_native, "_passthrough_request", side_effect=upstream) as call:
+        with mock.patch.object(native_passthrough, "resumable_store", store), \
+             mock.patch.object(native_passthrough, "_passthrough_request", side_effect=upstream) as call:
             first = await gemini_native._resumable_native(request(), "k", "m", "streamGenerateContent", "alt=sse", b'{}', {})
             body = await collect(first)
             again = await gemini_native._resumable_native(

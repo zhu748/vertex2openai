@@ -1,7 +1,8 @@
 """消息注入、预填充兼容、思维链标签守卫与输出去重。"""
 
 import re
-from typing import List, Optional, Tuple
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
 from models import OpenAIMessage, message_text, normalize_content_part
 
@@ -270,6 +271,35 @@ def strip_prefill_overlap(prefill: str, output: str, min_overlap: int = 8) -> st
         if prefill[-k:] == output[:k]:
             return output[k:]
     return output
+
+
+def first_frames(
+    response_id: str, model: str, prefill_text: Optional[str], n: int
+) -> List[Dict[str, Any]]:
+    """预填充先行帧（QUA-P1-1：自 express_pipeline.stream_frames 移入）。
+
+    把预填充文本作为回复开头先发出；n>1 时为每个候选都发一份，与非
+    流式 _prepend_prefill 的全 choice 行为一致（旧实现只发 choice 0，
+    stream 与非 stream 同请求输出分叉）。无预填充返回空表。
+    """
+    if not prefill_text:
+        return []
+    return [
+        {
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [
+                {
+                    "index": ci,
+                    "delta": {"role": "assistant", "content": prefill_text},
+                    "finish_reason": None,
+                }
+            ],
+        }
+        for ci in range(max(1, n))
+    ]
 
 
 class PrefillDeduper:

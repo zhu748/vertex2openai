@@ -1,0 +1,28 @@
+# ENG-P3-4（2026-11 审查）：Go 依赖树的安全更新通道。
+# proxybridge 经 yuhaiin 间接依赖 gvisor、tailscale 非官方 fork（replace）
+# 与 wireguard-go 等，更新依赖单一维护者——Dependabot 每周开 PR 顶版本，
+# 配合 CI 的 govulncheck 扫描形成双通道；go.sum 锁定语义不变（PR 合并前
+# 一切版本移动都经过评审与测试）。
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /proxybridge
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - proxy-bridge
+    groups:
+      # pion 家族（TURN/传输）同源小版本合并成一个 PR，降低评审噪音。
+      pion:
+        patterns:
+          - github.com/pion/*
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - ci

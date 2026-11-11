@@ -20,6 +20,7 @@ import resumable
 from logger import ProxyStats
 from request_connection import ClientConnection
 from routes import gemini_native
+from upstreams import native_passthrough
 from settings_validation import validate_settings_patch
 from upstreams import cookie_transport
 
@@ -60,7 +61,7 @@ class FirstReplyTests(unittest.IsolatedAsyncioTestCase):
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as upstream:
             with mock.patch.object(main.app.state, "express_key_manager", manager), \
                  mock.patch.object(gemini_native, "API_KEY", "test-client"), \
-                 mock.patch.object(gemini_native, "passthrough_client_pool", SimpleNamespace(get=lambda *args: upstream)), \
+                 mock.patch.object(native_passthrough, "passthrough_client_pool", SimpleNamespace(get=lambda *args: upstream)), \
                  mock.patch.object(gemini_native.app_state, "get_settings", return_value=self.settings):
                 async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://test") as client:
                     return await asyncio.wait_for(client.post('/v1beta/models/gemini-test:streamGenerateContent?alt=sse',
@@ -272,7 +273,7 @@ class FirstReplyTests(unittest.IsolatedAsyncioTestCase):
                         return httpx.Response(200, stream=NativeErrorBytes(calls),
                             headers={"content-type": "text/event-stream", "retry-after": "0"})
                     with mock.patch.object(first_reply, 'timeout_seconds', return_value=timeout), \
-                         mock.patch.object(gemini_native, '_retry_delay', wraps=gemini_native._retry_delay) as delay:
+                         mock.patch.object(native_passthrough, '_retry_delay', wraps=native_passthrough._retry_delay) as delay:
                         response = await self.native_request(respond)
                     self.assertEqual(response.status_code, code)
                     self.assertEqual(response.json(), payload)

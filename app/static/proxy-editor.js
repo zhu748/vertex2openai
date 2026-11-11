@@ -1,0 +1,1073 @@
+/* 代理编辑器（QUA-P1-4：自 channel-config.js 拆出，约 1000 行）。
+ *
+ * 显式命名空间 window.proxyEditorKit（仿 credential-list.js 先例）：
+ * channel-config.js 加载时经 mount(deps) 注入 Cookie 侧闭包
+ * （isLoaded / collect / accounts / render）；dashboard.js 的共享基座
+ * （$ / runAction / toast / esc / responseError / KEYS / proxyDraft /
+ * GLOBAL_SETTINGS 等）沿用 classic script 全局，函数体内延迟解析。
+ * HTML onclick 契约的全局函数名保持不变（文末 Object.assign(window)）。
+ * 运行期状态：编辑器一次只开一个对话框；测试结果仅在内存（不落
+ * localStorage）。 */
+(() => {
+  if (window.proxyEditorKit) return;
+  let proxyEditor = null;
+  let proxyEditorInitialized = false;
+  let cookieDeps = null;
+  // In-memory only: proxy credentials and test results never enter localStorage.
+  const proxyResults = new Map();
+
+  /* Proxy editor stores a draft until Apply; account list/global Save persists it. */
+  // 可拆字段填写的原生代理协议；其余类型（sing-box 节点链接 / 直连）只走粘贴框。
+  const BRIDGE_PROXY_TYPES = ['turn', 'turns', 'sstp'];
+  const STRUCTURED_PROXY_TYPES = [
+    'socks5',
+    'socks5h',
+    'http',
+    'https',
+    'socks4',
+    'socks4a',
+    ...BRIDGE_PROXY_TYPES
+  ];
+  function openProxyEditor(scope = 'global', index = 0, view = 'list') {
+    if (
+      (scope === 'key' && !keysLoaded) ||
+      (scope === 'cookie' && !cookieDeps.isLoaded()) ||
+      (scope === 'global' && !settingsLoaded)
+    ) {
+      toast('配置尚未加载，请先重新加载');
+      return;
+    }
+    if (scope === 'key') collectKeys();
+    if (scope === 'cookie') cookieDeps.collect();
+    const source =
+      scope === 'global'
+        ? proxyDraft($('proxy-input').value)
+        : (scope === 'key' ? KEYS[index] : cookieDeps.accounts()[index]).proxies;
+    if (proxyEditor) return;
+    proxyEditor = {
+      scope,
+      index,
+      proxies: [...source],
+      initial: [...source],
+      editing: null,
+      opener: document.activeElement,
+      view,
+      batch: null,
+      job: null
+    };
+    $('proxy-dialog-title').textContent =
+      scope === 'global'
+        ? '全局代理列表'
+        : (scope === 'key' ? 'Key ' : 'Cookie ') + (index + 1) + ' · 专属代理';
+    $('proxy-dialog-hint').textContent =
+      '从第一条开始，连接失败时按顺序切换。' +
+      (scope === 'global'
+        ? '保存后立即生效。'
+        : '应用到账号草稿后，请点击「' +
+          (scope === 'key' ? '保存 Key 列表' : '保存 Cookie 列表') +
+          '」生效。');
+    $('proxy-test-target').value = scope === 'cookie' ? 'cookie' : 'vertex';
+    $('proxy-import-text').value = '';
+    $('proxy-import-type').value = 'socks5';
+    $('proxy-import-tested').checked = true;
+    $('proxy-import-source').open = true;
+    $('proxy-close-prompt').classList.add('hidden');
+    $('proxy-dialog-save').classList.toggle('hidden', scope !== 'global');
+    $('proxy-dialog-apply').textContent = scope === 'global' ? '应用到页面草稿' : '应用到账号草稿';
+    $('proxy-dialog-apply').classList.toggle('btn', scope !== 'global');
+    $('proxy-dialog-apply').classList.toggle('btn-ghost', scope === 'global');
+    resetProxyForm();
+    renderProxyEditor();
+    renderProxyImport();
+    switchProxyView(view);
+    $('proxy-dialog').showModal();
+  }
+  function proxyFormDirty() {
+    return (
+      [
+        'proxy-paste',
+        'proxy-host',
+        'proxy-port',
+        'proxy-username',
+        'proxy-password',
+        'proxy-name',
+        'proxy-sni',
+        'proxy-ca',
+        'proxy-realm',
+        'proxy-mtu'
+      ].some((id) => $(id).value.trim()) ||
+      $('proxy-type').value === 'direct' ||
+      $('proxy-insecure').checked
+    );
+  }
+  function closeProxyEditor(discard = false) {
+    if (!proxyEditor) return;
+    if (proxyEditor.saving) {
+      toast('正在保存，请稍候');
+      return;
+    }
+    if (
+      !discard &&
+      (JSON.stringify(proxyEditor.initial) !== JSON.stringify(proxyEditor.proxies) ||
+        proxyFormDirty() ||
+        $('proxy-import-text').value.trim())
+    ) {
+      $('proxy-close-prompt').classList.remove('hidden');
+      return;
+    }
+    stopProxyTests();
+    $('proxy-dialog').close();
+    const opener = proxyEditor?.opener;
+    proxyEditor = null;
+    if (opener?.isConnected) opener.focus();
+  }
+  function switchProxyView(view) {
+    if (!proxyEditor || !['list', 'form', 'import'].includes(view)) return;
+    proxyEditor.view = view;
+    for (const name of ['list', 'form', 'import']) {
+      const active = view === name;
+      $('proxy-panel-' + name).classList.toggle('hidden', !active);
+      $('proxy-tab-' + name).setAttribute('aria-selected', String(active));
+      $('proxy-tab-' + name).tabIndex = active ? 0 : -1;
+    }
+    $('proxy-dialog').querySelector('.proxy-dialog-body').scrollTop = 0;
+    updateProxyEditorControls();
+  }
+  function proxyLabel(uri) {
+    if (['direct', 'none', 'off', '直连'].includes(uri.toLowerCase())) return '强制直连';
+    try {
+      const url = new URL(uri.replace(/^(turns?):(?!\/\/)/i, '$1://'));
+      const proto = url.protocol.replace(/:$/, '');
+      let name = '';
+      try {
+        name = decodeURIComponent(url.hash.replace(/^#/, '')).trim();
+      } catch (_) {
+        name = url.hash.replace(/^#/, '').trim();
+      }
+      if (proto === 'vmess') {
+        // vmess:// 整体是 base64(JSON)：解出地址与备注才能区分多条同类节点。
+        try {
+          const b64 = uri.slice('vmess://'.length).replace(/-/g, '+').replace(/_/g, '/');
+          const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+          const payload = JSON.parse(new TextDecoder().decode(bytes));
+          const host = String(payload.add || '') + (payload.port ? ':' + payload.port : '');
+          return 'vmess://' + (host || '（分享链接）') + (payload.ps ? ' · ' + payload.ps : '');
+        } catch (_) {
+          return 'vmess://（分享链接）';
+        }
+      }
+      if (proto === 'ss' && !url.username && !url.password) return 'ss://（分享链接）';
+      if (STRUCTURED_PROXY_TYPES.includes(proto)) {
+        const port =
+          url.port || { turn: '3478', turns: '5349', sstp: '443', http: '80', https: '443' }[proto];
+        const endpoint = url.hostname + (port ? ':' + port : '');
+        return (
+          proto +
+          '://' +
+          (url.username ||
+          url.password ||
+          url.searchParams.has('username') ||
+          url.searchParams.has('password')
+            ? '***@'
+            : '') +
+          endpoint +
+          (name ? ' · ' + name : '')
+        );
+      }
+      // 其余分享链接（vless/trojan/hy2/tuic 等）：显示端点与节点备注。
+      return proto + '://' + url.host + (name ? ' · ' + name : '');
+    } catch (_) {
+      return '待识别的代理地址';
+    }
+  }
+  function proxyMissingFields(uri) {
+    try {
+      const url = new URL(uri.replace(/^(turns?):(?!\/\/)/i, '$1://'));
+      const proto = url.protocol.slice(0, -1);
+      if (!BRIDGE_PROXY_TYPES.includes(proto)) return [];
+      // 与后端 parse_bridge_proxy_uri 同口径：TURN/TURNS 无凭据是合法形态
+      //（匿名分配服务器，RFC 7065 允许无 userinfo 的 URI）；仅 SSTP 的
+      // MS-CHAPv2 认证协议强制，缺了才提醒补齐。
+      if (proto !== 'sstp') return [];
+      return [
+        ['username', '账号'],
+        ['password', '密码']
+      ]
+        .filter(([key]) => !(url[key] || url.searchParams.get(key)))
+        .map(([, label]) => label);
+    } catch (_) {
+      return [];
+    }
+  }
+  function renderProxyEditor() {
+    $('proxy-editor-list').innerHTML =
+      proxyEditor.proxies
+        .map(
+          (uri, index) => `
+  <div class="proxy-row${proxyEditor.editing === index ? ' is-editing' : ''}" data-proxy-index="${index}"><div class="proxy-row-title"><span class="proxy-order">${index + 1}</span><div><strong>${esc(proxyLabel(uri))}</strong><small>${proxyMissingFields(uri).length ? '待补齐' + proxyMissingFields(uri).join(' / ') + ' · ' : ''}${proxyEditor.editing === index ? '正在编辑 · ' : ''}${index === 0 ? '首选出口' : '第 ' + (index + 1) + ' 顺位'}</small></div></div>
+    <div class="proxy-row-actions">
+      ${index > 0 ? `<button type="button" onclick="moveProxy(${index},0)" aria-label="将第 ${index + 1} 条设为首选">设为首选</button><button type="button" onclick="moveProxy(${index},${index - 1})" aria-label="上移第 ${index + 1} 条">↑</button>` : ''}
+      ${index < proxyEditor.proxies.length - 1 ? `<button type="button" onclick="moveProxy(${index},${index + 1})" aria-label="下移第 ${index + 1} 条">↓</button>` : ''}
+      <button type="button" data-proxy-test ${proxyMissingFields(uri).length ? 'disabled title="请先编辑并补齐账号密码"' : ''} onclick="testEditorProxy(${index})">测试</button>
+      <button type="button" onclick="runAction(this,()=>editProxy(${index}))">编辑</button>
+      <button type="button" class="danger" onclick="deleteProxy(${index})" aria-label="删除第 ${index + 1} 条代理">删除</button></div>
+    <div class="proxy-row-result" id="proxy-result-${index}" role="status"></div></div>`
+        )
+        .join('') ||
+      '<p class="empty-state">尚无代理。填写表单添加，或粘贴多条地址批量导入。<br>清空专属列表后跟随全局；清空全局列表后直连。</p>';
+    $('proxy-editor-count').textContent = proxyEditor.proxies.length + ' / 32 条';
+    $('proxy-form-add').textContent =
+      proxyEditor.editing === null ? '加入列表' : '更新第 ' + (proxyEditor.editing + 1) + ' 条';
+    $('proxy-tab-form').textContent = proxyEditor.editing === null ? '单条添加' : '编辑代理';
+    updateProxyResults();
+    updateProxyEditorControls();
+  }
+  function moveProxy(from, to) {
+    const editing = proxyEditor.editing;
+    const [uri] = proxyEditor.proxies.splice(from, 1);
+    proxyEditor.proxies.splice(to, 0, uri);
+    if (editing === from) proxyEditor.editing = to;
+    else if (editing !== null && from < editing && to >= editing) proxyEditor.editing--;
+    else if (editing !== null && from > editing && to <= editing) proxyEditor.editing++;
+    renderProxyEditor();
+  }
+  function deleteProxy(index) {
+    proxyEditor.proxies.splice(index, 1);
+    if (proxyEditor.editing === index) resetProxyForm();
+    else if (proxyEditor.editing !== null && proxyEditor.editing > index) proxyEditor.editing--;
+    renderProxyEditor();
+  }
+  function resetProxyForm({ keepType = false } = {}) {
+    const type = keepType ? $('proxy-type').value : 'socks5';
+    if (proxyEditor) {
+      proxyEditor.editing = null;
+      proxyEditor.recognizedSource = '';
+    }
+    [
+      'proxy-paste',
+      'proxy-host',
+      'proxy-port',
+      'proxy-username',
+      'proxy-password',
+      'proxy-name',
+      'proxy-sni',
+      'proxy-ca',
+      'proxy-realm',
+      'proxy-mtu'
+    ].forEach((id) => ($(id).value = ''));
+    $('proxy-insecure').checked = false;
+    $('proxy-advanced').open = false;
+    $('proxy-type').value = type;
+    $('proxy-form-add').textContent = '加入列表';
+    $('proxy-editor-error').textContent = '';
+    $('proxy-paste-hint').textContent =
+      '支持 用户:密码@主机:端口、主机:端口、标准链接及 JSON；无协议的简写按所选类型识别。';
+    proxyTypeChanged();
+  }
+  function proxyTypeChanged() {
+    const type = $('proxy-type').value;
+    const structured = STRUCTURED_PROXY_TYPES.includes(type);
+    $('proxy-structured-fields').classList.toggle('hidden', !structured);
+    const bridge = BRIDGE_PROXY_TYPES.includes(type),
+      tls = type === 'turns' || type === 'sstp';
+    $('proxy-advanced').classList.toggle('hidden', !bridge);
+    $('proxy-tls-fields').classList.toggle('hidden', !tls);
+    $('proxy-turn-fields').classList.toggle('hidden', type !== 'turn' && type !== 'turns');
+    $('proxy-sstp-fields').classList.toggle('hidden', type !== 'sstp');
+    $('proxy-port').placeholder =
+      { turn: '3478', turns: '5349', sstp: '443', http: '80', https: '443' }[type] || '1080';
+    // 桥接类型里只有 SSTP 协议强制凭据；TURN/TURNS 匿名节点允许留空。
+    const credentialsRequired = type === 'sstp';
+    document.querySelector('label[for="proxy-username"]').textContent = credentialsRequired
+      ? '账号（必填）'
+      : '账号（可选）';
+    document.querySelector('label[for="proxy-password"]').textContent = credentialsRequired
+      ? '密码（必填）'
+      : '密码（可选）';
+    $('proxy-protocol-hint').textContent =
+      type === 'sstp'
+        ? 'SSTP：MS-CHAPv2、IPv4 出口、本机 DNS；默认校验证书。可粘贴 用户:密码@主机:端口 或 主机:端口，再补齐凭据。'
+        : type === 'turn' || type === 'turns'
+          ? 'TURN：需要 RFC 6062 TCP 中继，使用本机 DNS。可粘贴 用户:密码@主机:端口 或 主机:端口；开放服务器可留空凭据（匿名分配），无前缀时沿用所选类型。'
+          : '';
+    // 选中 sing-box 节点时，粘贴框即节点链接输入框。
+    const nodeLink = type === 'singbox';
+    $('proxy-paste-label').textContent = nodeLink ? '节点链接' : '粘贴代理 · 自动识别';
+    $('proxy-paste').placeholder = nodeLink
+      ? 'vless:// vmess:// trojan:// ss:// hysteria2:// tuic:// …（每行一条，可批量）'
+      : '粘贴一条自动填入字段，粘贴多条可批量导入';
+  }
+  async function parseProxyInput(payload) {
+    const response = await fetch('/api/proxy/parse', {
+      method: 'POST',
+      signal: AbortSignal.timeout(15000),
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(await responseError(response, '无法识别代理', result));
+    return result.proxies;
+  }
+  function fillProxyFields(proxy) {
+    let type = proxy.url === 'direct' ? 'direct' : proxy.type;
+    // 分享链接系（vless/vmess/trojan/ss/hysteria2/tuic 及未知协议）统一归入 sing-box 节点。
+    if (type !== 'direct' && !STRUCTURED_PROXY_TYPES.includes(type)) type = 'singbox';
+    $('proxy-type').value = type;
+    for (const field of ['host', 'port', 'username', 'password', 'name'])
+      $('proxy-' + field).value = proxy[field] ?? '';
+    const options = proxy.options || {};
+    for (const field of ['sni', 'ca', 'realm', 'mtu'])
+      $('proxy-' + field).value = options[field] ?? '';
+    $('proxy-insecure').checked = ['true', '1'].includes(
+      String(options.insecure || '').toLowerCase()
+    );
+    $('proxy-advanced').open = Object.keys(options).some((key) => key !== 'transport');
+    if (!STRUCTURED_PROXY_TYPES.includes(type)) $('proxy-paste').value = proxy.url;
+    proxyTypeChanged();
+  }
+  async function recognizeProxyPaste() {
+    const source = $('proxy-paste').value.trim();
+    if (!source) return;
+    const editor = proxyEditor;
+    try {
+      // Preview first: a malformed line must not prevent its neighbours from
+      // reaching the batch review. It also accepts more than 32 candidates.
+      const preview = await fetchProxyPreview(source, $('proxy-type').value, []);
+      if (proxyEditor !== editor || $('proxy-paste').value.trim() !== source) return;
+      if (preview.items.length > 1) {
+        $('proxy-import-text').value = source;
+        $('proxy-import-type').value = STRUCTURED_PROXY_TYPES.includes($('proxy-type').value)
+          ? $('proxy-type').value
+          : 'socks5';
+        $('proxy-import-source').open = true;
+        resetProxyForm({ keepType: true });
+        editor.batch = null;
+        renderProxyImport();
+        switchProxyView('import');
+        toast('已转入批量导入，请识别并测试后选择要导入的代理');
+        return;
+      }
+      const proxies = await parseProxyInput({
+        text: source,
+        type: $('proxy-type').value,
+        draft: true
+      });
+      if (proxyEditor !== editor || $('proxy-paste').value.trim() !== source) return;
+      $('proxy-editor-error').textContent = '';
+      if (proxies.length === 1) {
+        fillProxyFields(proxies[0]);
+        editor.recognizedSource = $('proxy-paste').value.trim();
+        const t = proxies[0].type;
+        const identified =
+          proxies[0].url === 'direct' ? '强制直连' : t === 'share' ? '分享链接' : t.toUpperCase();
+        const missing = (proxies[0].missing_fields || []).map((field) =>
+          field === 'username' ? '账号' : '密码'
+        );
+        $('proxy-paste-hint').textContent =
+          '已识别 ' +
+          identified +
+          '，' +
+          (missing.length ? '请补齐' + missing.join(' / ') + '后加入列表。' : '检查后加入列表。');
+      }
+    } catch (error) {
+      if (proxyEditor === editor) $('proxy-editor-error').textContent = error.message;
+    }
+  }
+  async function editProxy(index) {
+    const editor = proxyEditor;
+    try {
+      const proxies = await parseProxyInput({ text: editor.proxies[index], draft: true });
+      if (proxyEditor !== editor) return;
+      if (proxies.length > 1) {
+        const expanded = [...editor.proxies];
+        expanded.splice(index, 1, ...proxies.map((proxy) => proxy.url));
+        const merged = [...new Set(expanded)];
+        if (merged.length > 32) throw new Error('每个列表最多 32 条代理');
+        editor.proxies = merged;
+        resetProxyForm();
+        renderProxyEditor();
+        toast('已展开 ' + proxies.length + ' 条代理，请选择需要编辑的节点');
+        return;
+      }
+      resetProxyForm();
+      proxyEditor.editing = index;
+      fillProxyFields(proxies[0]);
+      renderProxyEditor();
+      switchProxyView('form');
+      const target = $(
+        STRUCTURED_PROXY_TYPES.includes($('proxy-type').value) ? 'proxy-host' : 'proxy-paste'
+      );
+      target.focus({ preventScroll: true });
+      target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    } catch (error) {
+      if (proxyEditor === editor) $('proxy-editor-error').textContent = error.message;
+    }
+  }
+  async function addProxyDraft(testFirst = false) {
+    const editor = proxyEditor;
+    const type = $('proxy-type').value;
+    const structured = STRUCTURED_PROXY_TYPES.includes(type);
+    try {
+      if (type === 'singbox' && !$('proxy-paste').value.trim())
+        throw new Error('请先在上方粘贴节点链接（vless://、vmess:// 等）');
+      // Directly adding newly pasted text must recognize it too; otherwise the
+      // visible input could be ignored in favour of fields from the previous node.
+      if (
+        (structured || type === 'singbox') &&
+        $('proxy-paste').value.trim() &&
+        $('proxy-paste').value.trim() !== editor.recognizedSource
+      ) {
+        await recognizeProxyPaste();
+        if (proxyEditor !== editor || $('proxy-editor-error').textContent) return false;
+        if (!$('proxy-paste').value.trim()) return false; // Switched to batch review.
+        return addProxyDraft(testFirst);
+      }
+      const payload = structured
+        ? {
+            type,
+            host: $('proxy-host').value.trim(),
+            port: $('proxy-port').value.trim(),
+            username: $('proxy-username').value,
+            password: $('proxy-password').value,
+            name: $('proxy-name').value.trim()
+          }
+        : { text: type === 'direct' ? 'direct' : $('proxy-paste').value.trim() };
+      if (BRIDGE_PROXY_TYPES.includes(type)) {
+        payload.options = {};
+        const fields =
+          type === 'sstp'
+            ? ['sni', 'ca', 'mtu']
+            : type === 'turns'
+              ? ['sni', 'ca', 'realm']
+              : ['realm'];
+        for (const field of fields) {
+          const value = $('proxy-' + field).value.trim();
+          if (value) payload.options[field] = value;
+        }
+        if (type !== 'turn' && $('proxy-insecure').checked) payload.options.insecure = true;
+      }
+      const proxies = await parseProxyInput(payload);
+      if (proxyEditor !== editor) return false;
+      if (proxies.length > 1) {
+        $('proxy-import-text').value = $('proxy-paste').value;
+        resetProxyForm({ keepType: true });
+        switchProxyView('import');
+        return false;
+      }
+      if (testFirst) {
+        if (editor.job) throw new Error('请等待当前测试完成或停止测试');
+        const [result] = await runProxyTests([{ uri: proxies[0].url }], 'form');
+        if (proxyEditor !== editor) return false;
+        if (result.state !== 'passed') throw new Error(result.message);
+      }
+      if (proxyEditor.editing !== null) {
+        proxyEditor.proxies.splice(proxyEditor.editing, 1, proxies[0].url);
+      } else {
+        const merged = [...new Set([...proxyEditor.proxies, ...proxies.map((p) => p.url)])];
+        if (merged.length > 32) throw new Error('每个列表最多 32 条代理');
+        proxyEditor.proxies = merged;
+      }
+      resetProxyForm({ keepType: true });
+      renderProxyEditor();
+      switchProxyView('list');
+      return true;
+    } catch (error) {
+      if (proxyEditor === editor) $('proxy-editor-error').textContent = error.message;
+      return false;
+    }
+  }
+  async function applyProxyEditor(persist = false) {
+    const editor = proxyEditor;
+    if (!editor || editor.saving) return false;
+    if (editor.job) {
+      $('proxy-editor-error').textContent = '请等待测试完成或停止测试后再保存';
+      return false;
+    }
+    const structured = STRUCTURED_PROXY_TYPES.includes($('proxy-type').value);
+    if (
+      (structured &&
+        ['host', 'port', 'username', 'password', 'name'].some((field) =>
+          $('proxy-' + field).value.trim()
+        )) ||
+      $('proxy-paste').value.trim() ||
+      $('proxy-type').value === 'direct'
+    ) {
+      if (!(await addProxyDraft())) return false;
+    }
+    try {
+      editor.saving = true;
+      updateProxyEditorControls();
+      const pending = editor.proxies.findIndex((uri) => proxyMissingFields(uri).length);
+      if (pending !== -1)
+        throw new Error(
+          '第 ' +
+            (pending + 1) +
+            ' 条代理待补齐' +
+            proxyMissingFields(editor.proxies[pending]).join(' / ') +
+            '，请编辑后再应用。'
+        );
+      const normalized = editor.proxies.length
+        ? (await parseProxyInput({ text: JSON.stringify(editor.proxies) })).map((p) => p.url)
+        : [];
+      if (proxyEditor !== editor) return;
+      if (editor.scope === 'global') {
+        if (persist) {
+          const response = await fetch('/api/settings', {
+            method: 'POST',
+            signal: AbortSignal.timeout(30000),
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ proxy_urls: normalized })
+          });
+          const saved = await response.json();
+          if (!response.ok) throw new Error(await responseError(response, '保存失败', saved));
+          if (proxyEditor !== editor) return false;
+          GLOBAL_SETTINGS.proxy_urls = saved.proxy_urls;
+          GLOBAL_SETTINGS.proxy_url = saved.proxy_url;
+          updateProxyPill(saved.proxy_urls.length);
+        }
+        $('proxy-input').value = normalized.join('\n');
+        updateProxyDraft();
+        if (persist) window.consoleForms?.saved('proxy');
+        else window.consoleForms?.refresh();
+      } else {
+        const record = (editor.scope === 'key' ? KEYS : cookieDeps.accounts())[editor.index];
+        record.proxies = normalized;
+        record.proxy = normalized[0] || '';
+        if (editor.scope === 'key') renderKeys();
+        else cookieDeps.render();
+      }
+      editor.saving = false;
+      closeProxyEditor(true);
+      toast(
+        persist && editor.scope === 'global'
+          ? '代理列表已保存并生效'
+          : '代理列表已应用，请保存' +
+              (editor.scope === 'global'
+                ? '代理'
+                : editor.scope === 'key'
+                  ? ' Key 列表'
+                  : ' Cookie 列表') +
+              '后生效'
+      );
+      return true;
+    } catch (error) {
+      if (proxyEditor === editor)
+        $('proxy-editor-error').textContent = '保存未完成，草稿已保留：' + error.message;
+      return false;
+    } finally {
+      editor.saving = false;
+      if (proxyEditor === editor) updateProxyEditorControls();
+    }
+  }
+  function resultKey(uri, target) {
+    return target + '\n' + uri;
+  }
+  function rememberProxyResult(uri, target, result) {
+    const key = resultKey(uri, target);
+    proxyResults.delete(key);
+    proxyResults.set(key, result);
+    while (proxyResults.size > 512) proxyResults.delete(proxyResults.keys().next().value);
+  }
+  function proxyResultText(result) {
+    if (!result) return '未测试';
+    if (['queued', 'testing', 'cancelled'].includes(result.state))
+      return { queued: '等待测试', testing: '正在测试…', cancelled: '测试已停止，尚未完成' }[
+        result.state
+      ];
+    const time = result.testedAt
+      ? ' · ' + new Date(result.testedAt).toLocaleTimeString('zh-CN', { hour12: false })
+      : '';
+    const latency = Number.isFinite(result.latency_ms)
+      ? ' · HTTPS ' +
+        result.latency_ms +
+        ' ms' +
+        (result.setup_ms > 0 ? '（准备 ' + result.setup_ms + ' ms）' : '')
+      : '';
+    return (
+      (result.state === 'passed' ? '✓ 连通通过' : '✕ 本次未通过') +
+      latency +
+      ' · ' +
+      result.message +
+      time
+    );
+  }
+  function updateProxyResults() {
+    if (!proxyEditor) return;
+    const target = $('proxy-test-target').value;
+    proxyEditor.proxies.forEach((uri, index) => {
+      const box = $('proxy-result-' + index);
+      if (!box) return;
+      const result = proxyResults.get(resultKey(uri, target));
+      box.textContent = proxyResultText(result);
+      box.dataset.state = result?.state || 'untested';
+    });
+  }
+  function updateProxyEditorControls() {
+    if (!proxyEditor) return;
+    const job = proxyEditor.job;
+    const saving = !!proxyEditor.saving;
+    const importing = proxyEditor.view === 'import';
+    $('proxy-stop-tests').classList.toggle('hidden', !job);
+    $('proxy-job-state').textContent = job
+      ? '正在测试 ' + job.completed + ' / ' + job.entries.length + ' · 最多 3 条同时探测'
+      : proxyEditor.lastJobMessage || '连通性测试不代表账号或模型调用成功';
+    $('proxy-test-target').disabled = !!job || saving;
+    for (const id of [
+      'proxy-test-all',
+      'proxy-form-test-add',
+      'proxy-dialog-save',
+      'proxy-dialog-apply',
+      'proxy-import-preview',
+      'proxy-import-tested',
+      'proxy-import-type'
+    ])
+      $(id).disabled = !!job || saving;
+    for (const id of ['proxy-dialog-close', 'proxy-dialog-cancel']) $(id).disabled = saving;
+    $('proxy-dialog-save').classList.toggle('hidden', proxyEditor.scope !== 'global' || importing);
+    $('proxy-dialog-apply').classList.toggle('hidden', importing);
+    $('proxy-import-text').readOnly = !!job;
+    document
+      .querySelectorAll('[data-proxy-test]')
+      .forEach(
+        (button, index) =>
+          (button.disabled = !!job || proxyMissingFields(proxyEditor.proxies[index]).length > 0)
+      );
+    $('proxy-save-hint').textContent = importing
+      ? '按原顺序追加，仅导入勾选项'
+      : proxyEditor.scope === 'global'
+        ? '保存后生效；也可先应用到页面草稿'
+        : '专属代理修改后，还需保存对应账号列表';
+    updateProxyImportSelection();
+  }
+  function proxyTargetChanged() {
+    if (!proxyEditor || proxyEditor.job) return;
+    proxyEditor.lastJobMessage = '';
+    // A pass for one Google service must never select a different target's row.
+    if (proxyEditor.batch)
+      for (const row of proxyEditor.batch.items) {
+        if (!row.url || ['invalid', 'duplicate', 'skipped'].includes(row.status)) continue;
+        row.result = proxyResults.get(resultKey(row.url, $('proxy-test-target').value));
+        row.state = row.result?.state || 'ready';
+        row.selected = canImportProxy(row);
+      }
+    updateProxyResults();
+    renderProxyImport();
+    updateProxyEditorControls();
+  }
+  async function probeOneProxy(uri, target, signal) {
+    try {
+      const timeout = AbortSignal.timeout(65000);
+      const response = await fetch('/api/proxy/test', {
+        method: 'POST',
+        signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ proxy_url: uri, target })
+      });
+      const result = await response.json();
+      if (response.status === 401)
+        return {
+          state: 'failed',
+          message: '登录已过期，请重新登录',
+          fatal: true,
+          testedAt: Date.now()
+        };
+      if (!response.ok)
+        return {
+          state: 'failed',
+          message: result.message || (await responseError(response, '测试失败', result)),
+          testedAt: Date.now()
+        };
+      return { ...result, state: result.ok ? 'passed' : 'failed', testedAt: Date.now() };
+    } catch (error) {
+      return {
+        state: signal?.aborted ? 'cancelled' : 'failed',
+        message: signal?.aborted
+          ? '已停止测试'
+          : error.name === 'TimeoutError'
+            ? '探测超时，可稍后重试'
+            : '请求失败，请检查面板连接后重试',
+        testedAt: Date.now()
+      };
+    }
+  }
+  async function runProxyTests(entries, origin = 'list') {
+    const editor = proxyEditor;
+    if (!editor || editor.job || !entries.length) return [];
+    const job = {
+      controller: new AbortController(),
+      entries,
+      origin,
+      completed: 0,
+      target: $('proxy-test-target').value
+    };
+    editor.job = job;
+    editor.lastJobMessage = '';
+    for (const entry of entries) {
+      rememberProxyResult(entry.uri, job.target, { state: 'queued' });
+      if (entry.row) {
+        entry.row.state = 'queued';
+        entry.row.selected = false;
+        entry.row.result = null;
+      }
+    }
+    updateProxyResults();
+    renderProxyImport();
+    updateProxyEditorControls();
+    let cursor = 0;
+    async function worker() {
+      while (!job.controller.signal.aborted && cursor < entries.length) {
+        const entry = entries[cursor++];
+        rememberProxyResult(entry.uri, job.target, { state: 'testing' });
+        if (entry.row) entry.row.state = 'testing';
+        if (proxyEditor === editor) {
+          updateProxyResults();
+          renderProxyImport();
+        }
+        let result = await probeOneProxy(entry.uri, job.target, job.controller.signal);
+        // A closed dialog may already have a new job probing the same URI.
+        // Neither its cache nor its selected import rows belong to this job.
+        if (proxyEditor !== editor || editor.job !== job) return;
+        if (job.controller.signal.aborted) result = { state: 'cancelled', message: '已停止测试' };
+        entry.result = result;
+        rememberProxyResult(entry.uri, job.target, result);
+        job.completed++;
+        if (entry.row) {
+          entry.row.state = result.state;
+          entry.row.result = result;
+          entry.row.selected = result.state === 'passed';
+        }
+        if (result.fatal) {
+          job.controller.abort();
+          if (proxyEditor === editor) $('proxy-editor-error').textContent = result.message;
+        }
+        if (proxyEditor === editor) {
+          updateProxyResults();
+          renderProxyImport();
+          updateProxyEditorControls();
+        }
+      }
+    }
+    try {
+      await Promise.all(Array.from({ length: Math.min(3, entries.length) }, () => worker()));
+    } finally {
+      for (const entry of entries)
+        if (!entry.result) {
+          entry.result = { state: 'cancelled', message: '已停止测试' };
+          if (proxyEditor === editor && editor.job === job)
+            rememberProxyResult(entry.uri, job.target, entry.result);
+          if (entry.row) {
+            entry.row.state = 'cancelled';
+            entry.row.result = entry.result;
+            entry.row.selected = false;
+          }
+        }
+      if (proxyEditor === editor && editor.job === job) {
+        editor.job = null;
+        editor.lastJobMessage =
+          (job.controller.signal.aborted ? '测试已停止' : '测试完成') +
+          ' · 通过 ' +
+          entries.filter((entry) => entry.result.state === 'passed').length +
+          ' / ' +
+          entries.length +
+          ' · 结果仅代表目标站连通性';
+        updateProxyResults();
+        renderProxyImport();
+        updateProxyEditorControls();
+      }
+    }
+    return entries.map((entry) => entry.result);
+  }
+  function stopProxyTests() {
+    proxyEditor?.job?.controller.abort();
+  }
+  function testEditorProxy(index) {
+    const uri = proxyEditor?.proxies[index];
+    if (uri && !proxyMissingFields(uri).length) return runProxyTests([{ uri }]);
+  }
+  function testAllEditorProxies() {
+    if (!proxyEditor) return;
+    return runProxyTests(
+      [...new Set(proxyEditor.proxies)]
+        .filter((uri) => !proxyMissingFields(uri).length)
+        .map((uri) => ({ uri }))
+    );
+  }
+  async function fetchProxyPreview(text, type, existing) {
+    const response = await fetch('/api/proxy/import-preview', {
+      method: 'POST',
+      signal: AbortSignal.timeout(15000),
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, type, existing })
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(await responseError(response, '无法预览导入内容', result));
+    return result;
+  }
+  async function previewProxyImport() {
+    const editor = proxyEditor;
+    if (!editor || editor.job) return;
+    const text = $('proxy-import-text').value,
+      type = $('proxy-import-type').value;
+    try {
+      const batch = await fetchProxyPreview(text, type, editor.proxies);
+      if (
+        proxyEditor !== editor ||
+        $('proxy-import-text').value !== text ||
+        $('proxy-import-type').value !== type
+      )
+        return;
+      batch.items.forEach((row) => {
+        row.state = row.status;
+        row.selected = row.status === 'ready' && !$('proxy-import-tested').checked;
+      });
+      editor.batch = batch;
+      $('proxy-editor-error').textContent = '';
+      renderProxyImport();
+      $('proxy-import-source').open = false;
+      $('proxy-dialog').querySelector('.proxy-dialog-body').scrollTop = 0;
+      if ($('proxy-import-tested').checked) testProxyImport();
+    } catch (error) {
+      if (proxyEditor === editor) $('proxy-editor-error').textContent = error.message;
+    }
+  }
+  function canImportProxy(row) {
+    return row.status === 'ready' && (!$('proxy-import-tested').checked || row.state === 'passed');
+  }
+  function renderProxyImport() {
+    if (!proxyEditor) return;
+    const batch = proxyEditor.batch;
+    $('proxy-import-preview-panel').classList.toggle('hidden', !batch);
+    $('proxy-import-preview').textContent = $('proxy-import-tested').checked
+      ? '识别并测试'
+      : '识别并预览';
+    $('proxy-import-source').querySelector('summary').textContent = batch
+      ? '已识别 ' + batch.items.length + ' 条 · 修改输入'
+      : '粘贴与识别';
+    if (!batch) {
+      $('proxy-import-list').innerHTML = '';
+      $('proxy-import-source').open = true;
+      return;
+    }
+    const items = batch.items;
+    const count = (state) => items.filter((row) => row.state === state).length;
+    const summary = ['识别 ' + items.length + ' 条', '通过 ' + count('passed')];
+    for (const [state, label] of [
+      ['failed', '失败'],
+      ['invalid', '格式错误'],
+      ['duplicate', '重复'],
+      ['skipped', '跳过']
+    ])
+      if (count(state)) summary.push(label + ' ' + count(state));
+    const unfinished = items.filter((row) =>
+      ['ready', 'queued', 'testing', 'cancelled'].includes(row.state)
+    ).length;
+    if (unfinished) summary.push('未完成 ' + unfinished);
+    $('proxy-import-summary').textContent = summary.join(' · ');
+    $('proxy-import-list').innerHTML = items
+      .map(
+        (row) => `<div class="proxy-import-row" data-import-id="${esc(row.id)}">
+  <input type="checkbox" aria-label="选择${esc(row.source)}" ${row.selected ? 'checked' : ''} ${!canImportProxy(row) || proxyEditor.job ? 'disabled' : ''}>
+  <div><strong>${esc(row.name || row.label)}</strong><small>${esc(row.source)}${row.name ? ' · ' + esc(row.label) : ''}</small></div>
+  <div class="proxy-row-result" data-state="${esc(row.state)}">${esc(row.result ? proxyResultText(row.result) : { ready: '未测试', queued: '等待测试', testing: '正在测试…', cancelled: '测试已停止' }[row.state] || row.message)}</div></div>`
+      )
+      .join('');
+    $('proxy-import-retry').disabled =
+      !!proxyEditor.job ||
+      !items.some(
+        (row) => row.status === 'ready' && ['failed', 'cancelled', 'ready'].includes(row.state)
+      );
+    $('proxy-import-select').disabled = !!proxyEditor.job;
+    updateProxyImportSelection();
+  }
+  function updateProxyImportSelection() {
+    if (!proxyEditor) return;
+    const selected =
+      proxyEditor.batch?.items.filter((row) => row.selected && canImportProxy(row)).length || 0;
+    const capacity = Math.max(0, 32 - proxyEditor.proxies.length);
+    $('proxy-import-select').textContent = '按剩余容量选择';
+    $('proxy-import-select').disabled = !!proxyEditor.job || capacity === 0;
+    $('proxy-import-selection').textContent =
+      '已选 ' +
+      selected +
+      ' 条 · 剩余容量 ' +
+      capacity +
+      ' 条' +
+      (selected > capacity ? '，请减少选择' : '');
+    for (const id of ['proxy-import-add', 'proxy-import-commit'])
+      $(id).disabled = !!proxyEditor.job || !selected || selected > capacity;
+    $('proxy-import-commit').textContent =
+      '导入 ' + selected + ' 条' + (proxyEditor.scope === 'global' ? '并保存' : '到账号草稿');
+  }
+  function toggleProxyImport(id, checked) {
+    if (!proxyEditor?.batch || proxyEditor.job) return;
+    const row = proxyEditor.batch.items.find((row) => row.id === id);
+    if (row) row.selected = checked && canImportProxy(row);
+    updateProxyImportSelection();
+  }
+  function selectProxyImport(selected = true) {
+    if (!proxyEditor?.batch || proxyEditor.job) return;
+    let available = Math.max(0, 32 - proxyEditor.proxies.length);
+    for (const row of proxyEditor.batch.items)
+      row.selected = selected && canImportProxy(row) && available-- > 0;
+    renderProxyImport();
+  }
+  function proxyImportPolicyChanged() {
+    if (!proxyEditor || proxyEditor.job) return;
+    if (proxyEditor.batch)
+      for (const row of proxyEditor.batch.items) row.selected = canImportProxy(row);
+    renderProxyImport();
+  }
+  function testProxyImport(onlyFailed = false) {
+    if (!proxyEditor?.batch || proxyEditor.job) return;
+    const items = proxyEditor.batch.items.filter(
+      (row) =>
+        row.status === 'ready' &&
+        (!onlyFailed || ['ready', 'failed', 'cancelled'].includes(row.state))
+    );
+    return runProxyTests(
+      items.map((row) => ({ uri: row.url, row })),
+      'import'
+    );
+  }
+  async function importSelectedProxies(commit = false) {
+    const editor = proxyEditor;
+    if (!editor?.batch || editor.job) return;
+    const selected = editor.batch.items.filter((row) => row.selected && canImportProxy(row));
+    if (!selected.length) return;
+    if (commit && proxyFormDirty()) {
+      $('proxy-editor-error').textContent =
+        '单条表单还有未加入的内容，请先加入列表或清空表单，再导入并保存。';
+      return;
+    }
+    try {
+      // Recheck against the current list: it can change after the preview.
+      const preview = await fetchProxyPreview(
+        JSON.stringify(selected.map((row) => row.url)),
+        $('proxy-import-type').value,
+        editor.proxies
+      );
+      if (proxyEditor !== editor) return;
+      if (preview.items.some((row) => row.status === 'invalid'))
+        throw new Error('选中的代理存在格式错误，请重新识别');
+      const additions = preview.items.filter((row) => row.status === 'ready').map((row) => row.url);
+      if (editor.proxies.length + additions.length > 32)
+        throw new Error('导入后超过 32 条，请减少选择');
+      const previous = [...editor.proxies];
+      editor.proxies.push(...additions);
+      renderProxyEditor();
+      if (commit) {
+        const applied = await applyProxyEditor(editor.scope === 'global');
+        if (!applied && proxyEditor === editor) {
+          editor.proxies = previous;
+          renderProxyEditor();
+          renderProxyImport();
+          switchProxyView('import');
+        }
+      } else {
+        editor.batch = null;
+        $('proxy-import-text').value = '';
+        renderProxyImport();
+        switchProxyView('list');
+        toast(
+          '已加入 ' +
+            additions.length +
+            ' 条，跳过 ' +
+            (selected.length - additions.length) +
+            ' 条重复代理'
+        );
+      }
+    } catch (error) {
+      if (proxyEditor === editor) $('proxy-editor-error').textContent = error.message;
+    }
+  }
+  function initProxyEditor() {
+    if (proxyEditorInitialized) return;
+    if (
+      !['proxy-dialog-close', 'proxy-dialog-cancel', 'proxy-dialog', 'proxy-paste'].every((id) =>
+        $(id)
+      )
+    )
+      throw new Error('代理编辑器页面版本不一致，请刷新面板');
+    $('proxy-dialog-close').addEventListener('click', () => closeProxyEditor());
+    $('proxy-dialog-cancel').addEventListener('click', () => closeProxyEditor(true));
+    $('proxy-dialog').addEventListener('cancel', (event) => {
+      event.preventDefault();
+      closeProxyEditor();
+    });
+    $('proxy-paste').addEventListener('paste', () =>
+      setTimeout(() => {
+        if (proxyEditor) runAction(document.querySelector('.proxy-recognize'), recognizeProxyPaste);
+      }, 0)
+    );
+    for (const id of ['proxy-import-text', 'proxy-import-type'])
+      $(id).addEventListener(id === 'proxy-import-text' ? 'input' : 'change', () => {
+        if (!proxyEditor || proxyEditor.job) return;
+        proxyEditor.batch = null;
+        renderProxyImport();
+      });
+    // 事件委托替代内联 onchange（2026-11 S-6）：esc() 的实体编码在 HTML
+    // 属性解析后会被还原，单引号可闭合内联 JS 字符串——当前数据源虽为
+    // 纯数字，但「换数据源即 XSS」。行 id 从 data-import-id 读取，不再
+    // 进入任何 JS 字符串上下文。
+    $('proxy-import-list').addEventListener('change', (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLInputElement) || target.type !== 'checkbox') return;
+      const row = target.closest('.proxy-import-row');
+      const id = row ? row.getAttribute('data-import-id') : null;
+      if (id !== null) toggleProxyImport(id, target.checked);
+    });
+    document.querySelector('.proxy-nav').addEventListener('keydown', (event) => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+      const names = ['list', 'form', 'import'];
+      const current = names.indexOf(proxyEditor.view);
+      const next =
+        event.key === 'Home'
+          ? 0
+          : event.key === 'End'
+            ? 2
+            : (current + (event.key === 'ArrowRight' ? 1 : 2)) % 3;
+      event.preventDefault();
+      switchProxyView(names[next]);
+      $('proxy-tab-' + names[next]).focus();
+    });
+    proxyEditorInitialized = true;
+  }
+
+  window.proxyEditorKit = {
+    mount(deps) {
+      cookieDeps = deps;
+    },
+    init: initProxyEditor,
+    open: openProxyEditor,
+    hasDraft: () =>
+      !!proxyEditor &&
+      (JSON.stringify(proxyEditor.initial) !== JSON.stringify(proxyEditor.proxies) ||
+        proxyFormDirty() ||
+        !!$('proxy-import-text').value.trim()),
+    sync: updateProxyEditorControls
+  };
+  Object.assign(window, {
+    closeProxyEditor,
+    moveProxy,
+    deleteProxy,
+    resetProxyForm,
+    proxyTypeChanged,
+    recognizeProxyPaste,
+    editProxy,
+    addProxyDraft,
+    applyProxyEditor,
+    testEditorProxy,
+    renderProxyEditor,
+    proxyMissingFields,
+    switchProxyView,
+    proxyTargetChanged,
+    stopProxyTests,
+    testAllEditorProxies,
+    previewProxyImport,
+    proxyImportPolicyChanged,
+    testProxyImport,
+    selectProxyImport,
+    toggleProxyImport,
+    importSelectedProxies
+  });
+})();

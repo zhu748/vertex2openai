@@ -25,6 +25,7 @@ from thought_signatures import (
     encode_thought_signature,
     google_metadata,
     is_thought_part,
+    merge_by_order,
     requires_signature,
     resolve_tool_call_signature,
     signature_from_extra,
@@ -497,32 +498,11 @@ def _convert_messages_to_contents(messages: list, model_name: str = "", native_t
                 _attach_message_signature(ordinary_parts, msg)
 
             google = google_metadata(msg)
-            order = google.get("part_order")
-            if isinstance(order, list):
-                parts, used_calls, used_ordinary = [], set(), set()
-                for item in order:
-                    if not isinstance(item, dict):
-                        continue
-                    idx = item.get("index")
-                    if (
-                        item.get("type") == "tool_call"
-                        and type(idx) is int
-                        and 0 <= idx < len(call_parts)
-                        and idx not in used_calls
-                    ):
-                        parts.append(call_parts[idx])
-                        used_calls.add(idx)
-                    elif (
-                        item.get("type") == "ordinary"
-                        and type(idx) is int
-                        and 0 <= idx < len(ordinary_parts)
-                        and idx not in used_ordinary
-                    ):
-                        parts.append(ordinary_parts[idx])
-                        used_ordinary.add(idx)
-                parts.extend(p for i, p in enumerate(call_parts) if i not in used_calls)
-                parts.extend(p for i, p in enumerate(ordinary_parts) if i not in used_ordinary)
-            else:
+            # QUA-P2-3：part_order 交错重组收敛到 thought_signatures.merge_by_order
+            #（剩余块兕底顺序保留 Cookie 通道既有行为：调用块在前）。
+            parts = merge_by_order(google.get("part_order"), call_parts, ordinary_parts,
+                                   remainder_calls_first=True)
+            if parts is None:
                 parts = call_parts + ordinary_parts
             contents.append({"role": "model", "parts": parts})
             continue

@@ -29,7 +29,10 @@ class IngressBudget:
 
     def reserve(self, amounts):
         with self.lock:
-            if any(used + amount > limit for used, amount, limit in zip(self.used, amounts, self.limits)):
+            # B905：三个平行数组长度恒为 3（构造处保证），strict=True 把
+            # 未来长度漂移从「静默截断」变成显式异常。
+            if any(used + amount > limit
+                   for used, amount, limit in zip(self.used, amounts, self.limits, strict=True)):
                 raise IngressError(503, "请求入口容量已满，请稍后重试。")
             for index, amount in enumerate(amounts):
                 self.used[index] += amount

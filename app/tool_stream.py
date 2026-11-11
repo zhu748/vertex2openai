@@ -10,6 +10,7 @@ Cookie channel parses complete calls directly and does not use this module.
 
 import ast
 from collections import deque
+from typing import Any, Optional
 from dataclasses import dataclass, field
 import math
 import re
@@ -20,6 +21,7 @@ from response_validation import (
     complete_function_arguments,
     has_finish_reason,
 )
+from json_encoding import estimate_json_chars
 
 MAX_TOOL_STREAM_BYTES = 32 * 1024 * 1024
 MAX_TOOL_CALLS = 1024
@@ -28,18 +30,18 @@ _PATH_TOKEN = re.compile(r'''\.([^.[\]]+)|\[(0|[1-9][0-9]*)\]|\[("(?:\\.|[^"\\])
 from request_tracking import SURROGATE_RE as _SURROGATES
 
 
-def _fail(message):
+def _fail(message: str):
     raise ToolStreamError(f"上游工具参数流：{message}")
 
 
-def _complete_arguments(call):
+def _complete_arguments(call: Any):
     try:
         return complete_function_arguments(call)
     except IncompleteResponseError as error:
         raise ToolStreamError(str(error)) from error
 
 
-def _normalize_string(value):
+def _normalize_string(value: str):
     if not _SURROGATES.search(value):
         return value
     try:
@@ -48,7 +50,7 @@ def _normalize_string(value):
         _fail("字符串包含未配对的 Unicode 代理项。")
 
 
-def _path_tokens(path):
+def _path_tokens(path: str):
     # Native partialArgs use singular JSONPaths, never selectors or wildcards.
     if not isinstance(path, str) or not path.startswith("$") or len(path) > 8192:
         _fail("参数路径无效。")
@@ -86,7 +88,7 @@ class _Node(dict):
         super().__init__()
         self.order = []
 
-    def __setitem__(self, key, value):
+    def __setitem__(self, key: Any, value: Any):
         if key not in self:
             self.order.append(key)
         super().__setitem__(key, value)
@@ -99,7 +101,7 @@ class _Arguments:
         self._last_path = None
         self._last_tokens = ()
 
-    def add(self, item):
+    def add(self, item: Any):
         if self._last_tokens and item.json_path == self._last_path:
             tokens = self._last_tokens
         else:
@@ -156,12 +158,12 @@ class _Arguments:
             _fail("参数字段数超过上限。")
 
     @staticmethod
-    def _check_key(node, key):
+    def _check_key(node: Optional[dict], key: Any):
         if node and isinstance(next(iter(node)), int) != isinstance(key, int):
             _fail("同一路径混用了数组和对象。")
 
     def finish(self):
-        def materialize(value):
+        def materialize(value: Any):
             if isinstance(value, _String):
                 if value.open:
                     _fail("字符串尚未结束，函数已结束。")
@@ -197,12 +199,47 @@ class ToolStreamAssembler:
         self.bytes = 0
         self.calls = 0
 
-    def _account(self, part):
-        self.bytes += len(repr(part).encode("utf-8", errors="surrogatepass"))
+    def _account(self, part: Any):
+        """字节记账（PRF-P2-2：repr 物化改按字段增量估长）。
+
+        repr(part) 会递归构造整个 Part 的字符串表示（CJK 六倍展开、
+        base64 / 长参数全量渲染），每个分片都要物化一份；按字段估长
+        只读各字段的 len（O(1)），保持上限闸的粗估口径。
+        """
+        size = 96  # 对象/字段名开销
+        text = getattr(part, "text", None)
+        if isinstance(text, str):
+            size += len(text)
+        signature = getattr(part, "thought_signature", None)
+        if signature is not None:
+            size += len(signature) if isinstance(signature, (bytes, bytearray, str)) else 64
+        inline = getattr(part, "inline_data", None)
+        if inline is not None:
+            blob = getattr(inline, "data", None)
+            if blob is not None:
+                size += len(blob) if isinstance(blob, (bytes, bytearray, str)) else 64
+            mime = getattr(inline, "mime_type", None)
+            if mime:
+                size += len(mime)
+        fc = getattr(part, "function_call", None)
+        if fc is not None:
+            size += 64
+            name = getattr(fc, "name", None)
+            if name:
+                size += len(name)
+            args = getattr(fc, "args", None)
+            if args:
+                size += estimate_json_chars(args)
+            for partial in getattr(fc, "partial_args", None) or []:
+                size += 48
+                value = getattr(partial, "string_value", None)
+                if value:
+                    size += len(value)
+        self.bytes += size
         if self.bytes > MAX_TOOL_STREAM_BYTES:
             _fail("缓冲超过字节上限。")
 
-    def _feed(self, index, part):
+    def _feed(self, index: int, part: Any):
         fc = part.function_call
         active = self.active.setdefault(index, {})
         queue = self.queues.setdefault(index, deque())
@@ -266,7 +303,7 @@ class ToolStreamAssembler:
             call.complete = call.part.model_copy(update={"function_call": complete})
             del active[complete.id]
 
-    def restore_sdk(self, response):
+    def restore_sdk(self, response: Any) -> Any:
         candidates = []
         for ci, candidate in enumerate(response.candidates or []):
             index = candidate.index if candidate.index is not None else ci
@@ -287,7 +324,7 @@ class ToolStreamAssembler:
         return response.model_copy(update={"candidates": candidates})
 
     @staticmethod
-    def _drain(queue):
+    def _drain(queue: deque):
         parts = []
         while queue:
             value = queue[0]
@@ -299,6 +336,6 @@ class ToolStreamAssembler:
             queue.popleft()
         return parts
 
-    def validate_end(self):
+    def validate_end(self) -> None:
         if any(self.active.values()) or any(self.queues.values()):
             _fail("连接在函数参数完成前关闭。")

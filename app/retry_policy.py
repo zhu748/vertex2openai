@@ -38,11 +38,10 @@ RETRYABLE_MARKERS = (
     "rate limit",
     "overloaded",
     "temporarily unavailable",
+    "service unavailable",
     "internal error",
-    # —— 上游补充：服务端 5xx / 超时文本 ——
-    "internal",
+    "internal server error",
     "backend error",
-    "unavailable",
     "deadline_exceeded",
     "deadline exceeded",
     "timed out",

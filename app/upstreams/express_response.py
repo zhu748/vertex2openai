@@ -431,7 +431,7 @@ async def _chunk_openai_response_dict_for_sse(
         # 官方帧序对齐。默认参数绑定避免闭包延迟绑定（B023）。
         first_delta_pending = {"v": True}
 
-        def _sse(delta, _first=first_delta_pending):
+        def _sse(delta: dict, _first: bool=first_delta_pending, _choice_idx: int=choice_idx):
             if _first["v"]:
                 delta = {"role": "assistant", **delta}
                 _first["v"] = False
@@ -441,7 +441,7 @@ async def _chunk_openai_response_dict_for_sse(
                 "created": created_time,
                 "model": model_name,
                 "choices": [
-                    {"index": choice_idx, "delta": delta, "finish_reason": None}
+                    {"index": _choice_idx, "delta": delta, "finish_reason": None}
                 ],
             }
             return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"

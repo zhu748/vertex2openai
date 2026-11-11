@@ -2,6 +2,7 @@
 import asyncio
 import re
 from contextlib import suppress
+from typing import Any, AsyncIterable, AsyncIterator, Callable, Optional
 
 from fastapi.responses import StreamingResponse
 
@@ -9,7 +10,7 @@ from fastapi.responses import StreamingResponse
 SETUP_CLOSE_TIMEOUT_SECONDS = 5.0
 
 
-async def _close_setup_result(setup):
+async def _close_setup_result(setup: asyncio.Task):
     try:
         response = setup.result()
     except (asyncio.CancelledError, Exception):
@@ -21,12 +22,12 @@ async def _close_setup_result(setup):
                 await close()
 
 
-def _close_late_setup(setup):
+def _close_late_setup(setup: asyncio.Task):
     from lifecycle import start_background_task
     start_background_task(_close_setup_result(setup))
 
 
-async def close_setup_task(setup):
+async def close_setup_task(setup: asyncio.Task) -> None:
     """等待/取消快窗口 setup 任务，并关闭其持有的流式结果。
 
     chat_api._call_upstream 与 prepare_sse 的快窗口包装共用：
@@ -82,13 +83,13 @@ class ByteBoundedQueue:
     One oversized frame may pass into an otherwise empty byte budget, so a
     legal upstream event never deadlocks. Control items carry no byte charge.
     """
-    def __init__(self, maxsize=128, max_bytes=2 * 1024 * 1024):
+    def __init__(self, maxsize: int = 128, max_bytes: int = 2 * 1024 * 1024) -> None:
         self._queue = asyncio.Queue(maxsize=maxsize)
         self._max_bytes = max_bytes
         self._bytes = 0
         self._changed = asyncio.Condition()
 
-    async def put(self, item):
+    async def put(self, item: Any) -> None:
         size = len(item) if isinstance(item, (bytes, bytearray)) else 0
         async with self._changed:
             await self._changed.wait_for(
@@ -102,7 +103,7 @@ class ByteBoundedQueue:
                 self._changed.notify_all()
             raise
 
-    async def get(self):
+    async def get(self) -> Any:
         item, size = await self._queue.get()
         async with self._changed:
             self._bytes -= size
@@ -110,7 +111,7 @@ class ByteBoundedQueue:
         return item
 
 
-async def sse_frames(source, max_frame_bytes=64 * 1024 * 1024):
+async def sse_frames(source: AsyncIterable, max_frame_bytes: int=64 * 1024 * 1024) -> AsyncIterator[bytes]:
     """Frame raw SSE before inserting comments or assigning resume IDs.
 
     Network chunks can split JSON, UTF-8 or CRLF. Heartbeats must never be
@@ -150,7 +151,7 @@ async def sse_frames(source, max_frame_bytes=64 * 1024 * 1024):
             await close()
 
 
-async def disconnected(request):
+async def disconnected(request: Optional[Any]) -> bool:
     """客户端是否已断开（request 为 None 或读取异常时按未断开处理）。
 
     express_pipeline 的重试循环与 with_heartbeats 共用这一个实现，
@@ -163,7 +164,7 @@ async def disconnected(request):
         return False
 
 
-async def with_heartbeats(source, request=None, interval=None):
+async def with_heartbeats(source: AsyncIterable, request: Optional[Any]=None, interval: Optional[float]=None) -> AsyncIterator:
     """Keep exactly one pending read; closing the consumer closes the producer.
 
     wait_for(anext(...)) would cancel the upstream read on every heartbeat.
@@ -210,7 +211,8 @@ async def with_heartbeats(source, request=None, interval=None):
                 await close()
 
 
-async def keepalive_sse(source, request=None, interval=None):
+async def keepalive_sse(source: AsyncIterable, request: Optional[Any] = None,
+                        interval: Optional[float] = None) -> AsyncIterator:
     events = with_heartbeats(source, request, interval)
     started = False
     try:
@@ -227,7 +229,8 @@ async def keepalive_sse(source, request=None, interval=None):
                     await close()
 
 
-async def prepare_sse(operation, request, error_body, on_error):
+async def prepare_sse(operation: Callable, request: Optional[Any],
+                      error_body: Optional[Callable], on_error: Optional[Callable]) -> StreamingResponse:
     """Keep preparation and first-reply retries alive without losing fast HTTP errors.
 
     快窗口（_FAST_ERROR_WINDOW，250ms）：上游立即拒绝（DNS 失败/401/429 等

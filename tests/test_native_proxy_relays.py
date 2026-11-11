@@ -3,7 +3,7 @@
 import asyncio
 import os
 import base64
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 import ipaddress
 import json
 from pathlib import Path
@@ -31,7 +31,7 @@ class NativeRelayTests(unittest.IsolatedAsyncioTestCase):
         self.seen = []
         key = ec.generate_private_key(ec.SECP256R1())
         name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
                 .serial_number(x509.random_serial_number()).not_valid_before(now-timedelta(minutes=1))
                 .not_valid_after(now+timedelta(days=1)).add_extension(x509.BasicConstraints(ca=True, path_length=None), True)

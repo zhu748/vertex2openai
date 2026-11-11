@@ -34,7 +34,7 @@ from typing import Any, Optional
 
 import httpx
 from fastapi import Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 import config as app_config
 import model_capabilities as mc
@@ -404,7 +404,7 @@ def _part_json_size(part: dict) -> int:
     extra = 0
     chunk_chars = 64 * 1024
 
-    def shrink(value):
+    def shrink(value: str):
         nonlocal extra
         if isinstance(value, str) and len(value) > chunk_chars:
             for start in range(0, len(value), chunk_chars):
@@ -450,7 +450,7 @@ class NativeAssembler:
         self.has_content = False
 
     # -- 事件喂入 --------------------------------------------------------
-    def feed(self, kind: str, data) -> Optional[dict]:
+    def feed(self, kind: str, data: Any) -> Optional[dict]:
         """处理一个事件；返回需立即下发的新增 part（流式用），None 表示不发。"""
         part: Optional[dict] = None
         if kind == "native_part":
@@ -497,7 +497,7 @@ class NativeAssembler:
         return part
 
     # 流式别名（语义清晰）
-    def stream_event(self, kind: str, data) -> Optional[dict]:
+    def stream_event(self, kind: str, data: Any) -> Optional[dict]:
         return self.feed(kind, data)
 
     # -- 收尾 ------------------------------------------------------------
@@ -622,7 +622,7 @@ async def _events_with_retry(fastapi_request: Request, record: dict, body: dict,
 # ============================================================
 # 端点入口（由 routes/gemini_native.py 调用）
 # ============================================================
-async def _timed_events(request, record, body, model, deadline):
+async def _timed_events(request: Request, record: dict, body: dict, model: str, deadline: float):
     """A single wall-clock budget covers retries, setup and all response chunks."""
     source = _events_with_retry(request, record, body, model)
     async with aclosing(with_heartbeats(source, request)) as events:
@@ -643,7 +643,7 @@ async def _timed_events(request, record, body, model, deadline):
 
 
 async def handle_native_request(fastapi_request: Request, model: str, action: str,
-                                parsed: dict, *, requested_model: str = ""):
+                                parsed: dict, *, requested_model: str = "") -> Response:
     """Apply the same admission and lifetime rules as the Express adapter."""
     resume = (fastapi_request.headers.get("x-resumable", "").lower() in ("1", "true", "yes")
               or fastapi_request.headers.get("x-resume-id")
@@ -701,7 +701,7 @@ async def _handle_native_request_impl(fastapi_request: Request, model: str, acti
                 max_response_bytes=_bridge_response_budget(model))
             first = True
 
-            def encode(payload, *, fragmented=False):
+            def encode(payload: bytes, *, fragmented: bool=False):
                 nonlocal first
                 if use_sse:
                     prefix, suffix = b"data: ", b"\n\n"

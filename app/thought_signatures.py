@@ -8,7 +8,6 @@ import model_capabilities as mc
 from google.genai import types
 from signature_store import (
     SKIP_VALIDATOR_SENTINEL,
-    SignatureRecord,
     SignatureState,
     signature_store,
 )
@@ -152,6 +151,48 @@ def ordinary_parts_from_extra(value: Any, image_loader=None) -> Optional[List[ty
     return parts
 
 
+def merge_by_order(part_order: Any, call_parts, ordinary_parts, *, remainder_calls_first: bool = True):
+    """QUA-P2-3（2026-11 审查收敛）：part_order 交错重组的单一实现。
+
+    google.extra.part_order 记录「工具调用块与普通块」在上游响应中的
+    原始交错顺序（生产者：express_response / cookie_response /
+    message_processing）。此前 message_processing 与 cookie_request
+    各自实现同一套「按 part_order 重放 + 越界与重复索引剔除 + 剩余块
+    兜底追加」算法，仅容器类型与兜底顺序不同；现收敛为泛型单实现。
+    part_order 不是 list 时返回 None，由调用方保留各自的缺省拼装。
+    remainder_calls_first 保留两通道既有兜底顺序（历史行为）：
+    Cookie 通道剩余调用在前，SDK 通道剩余普通块在前。
+    """
+    if not isinstance(part_order, list):
+        return None
+    ordered: list = []
+    used_calls: set = set()
+    used_ordinary: set = set()
+    for item in part_order:
+        if not isinstance(item, dict):
+            continue
+        idx = item.get("index")
+        if (item.get("type") == "tool_call"
+                and type(idx) is int
+                and 0 <= idx < len(call_parts)
+                and idx not in used_calls):
+            ordered.append(call_parts[idx])
+            used_calls.add(idx)
+        elif (item.get("type") == "ordinary"
+                and type(idx) is int
+                and 0 <= idx < len(ordinary_parts)
+                and idx not in used_ordinary):
+            ordered.append(ordinary_parts[idx])
+            used_ordinary.add(idx)
+    if remainder_calls_first:
+        ordered.extend(p for i, p in enumerate(call_parts) if i not in used_calls)
+        ordered.extend(p for i, p in enumerate(ordinary_parts) if i not in used_ordinary)
+    else:
+        ordered.extend(p for i, p in enumerate(ordinary_parts) if i not in used_ordinary)
+        ordered.extend(p for i, p in enumerate(call_parts) if i not in used_calls)
+    return ordered
+
+
 def build_tool_call_id(fc: Any, part: Any, missing_state: SignatureState = SignatureState.UNKNOWN) -> str:
     """Return a short OpenAI call id and cache signed/unsigned topology fallback."""
     real_id = getattr(fc, "id", None) or ""
@@ -161,12 +202,9 @@ def build_tool_call_id(fc: Any, part: Any, missing_state: SignatureState = Signa
         real_id = "call_" + uuid.uuid4().hex[:16]
 
     sig = signature_bytes(part, fc)
-    if sig:
-        signature_store.put_record(real_id, SignatureRecord(SignatureState.SIGNED, sig))
-    elif missing_state is SignatureState.UNSIGNED_FOLLOWER:
-        signature_store.put_unsigned_follower(real_id)
-    else:
-        signature_store.put_unknown(real_id)
+    signature_store.register_call_signature(
+        real_id, sig,
+        unsigned_follower=missing_state is SignatureState.UNSIGNED_FOLLOWER)
     return real_id
 
 

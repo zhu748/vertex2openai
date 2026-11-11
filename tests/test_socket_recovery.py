@@ -17,7 +17,8 @@ import main
 import resumable
 import streaming
 from runtime_state import app_state
-from routes import chat_api, gemini_native
+from routes import chat_api
+from upstreams import native_passthrough
 from upstreams import cookie_delivery, express_sdk, cookie_proxy
 
 
@@ -36,7 +37,7 @@ class SocketRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.store = resumable.ResumableStore()
         self.release = asyncio.Event()
         self.patches = [mock.patch.object(chat_api, "resumable_store", self.store),
-                        mock.patch.object(gemini_native, "resumable_store", self.store)]
+                        mock.patch.object(native_passthrough, "resumable_store", self.store)]
         for patch in self.patches:
             patch.start()
         self.sock = socket.socket()
@@ -196,7 +197,7 @@ class SocketRecoveryTests(unittest.IsolatedAsyncioTestCase):
         body = {"contents": [{"role": "user", "parts": [{"text": "hi"}]}]}
         path = "/v1beta/models/gemini-test:streamGenerateContent?alt=sse"
         with mock.patch.object(main.app.state, "express_key_manager", manager), \
-             mock.patch.object(gemini_native.passthrough_client_pool, "get", return_value=upstream):
+             mock.patch.object(native_passthrough.passthrough_client_pool, "get", return_value=upstream):
             async with self.client.stream("POST", path, headers=headers, json=body) as response:
                 self.assertEqual(response.status_code, 200)
                 sid = response.headers["x-resume-id"]

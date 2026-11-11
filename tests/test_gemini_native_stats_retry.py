@@ -18,6 +18,8 @@ import config
 import main
 from logger import ProxyStats
 from routes import gemini_native
+from upstreams import native_passthrough
+from upstreams import native_catalog
 import retry_policy
 
 COMPLETE_SSE = b'data: {"candidates": [{"content": {"parts": [{"text": "ok"}]}, "finishReason": "STOP"}]}\n\n'
@@ -56,10 +58,10 @@ class NativeStatsRetryTests(unittest.TestCase):
         self.upstream = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         patches = [
             mock.patch.object(main, "stats", self.stats),
-            mock.patch.object(gemini_native, "stats", self.stats),
+            mock.patch.object(gemini_native, "stats", self.stats), mock.patch.object(native_passthrough, "stats", self.stats),
             mock.patch.object(gemini_native, "API_KEY", "client-key"),
             mock.patch.object(main.app.state, "express_key_manager", self.manager),
-            mock.patch.object(gemini_native, "passthrough_client_pool",
+            mock.patch.object(native_passthrough, "passthrough_client_pool",
                               types.SimpleNamespace(get=lambda factory, proxy_uri=None: self.upstream)),
             mock.patch.object(gemini_native.app_state, "get_settings",
                               side_effect=lambda: self.settings.copy()),
@@ -207,7 +209,7 @@ class NativeStatsRetryTests(unittest.TestCase):
                     return httpx.Response(200, json={})
 
                 self.responder = responder
-                with mock.patch.object(gemini_native, "_wait_for_retry", return_value=True) as wait:
+                with mock.patch.object(native_passthrough, "_wait_for_retry", return_value=True) as wait:
                     self.assertEqual(self.post().status_code, 200)
                     delay = wait.await_args.args[1]
                     if expected == 7:
@@ -265,7 +267,7 @@ class NativeStatsRetryTests(unittest.TestCase):
 
     def test_disconnect_during_backoff_stops_without_counting_retry(self):
         self.responder = lambda request: httpx.Response(429, json={"error": {"code": 429}})
-        with mock.patch.object(gemini_native, "_wait_for_retry", return_value=False):
+        with mock.patch.object(native_passthrough, "_wait_for_retry", return_value=False):
             self.assertEqual(self.post().status_code, 499)
         self.assertEqual(len(self.requests), 1)
         self.assert_stats(success=0, error=1)
@@ -297,7 +299,7 @@ class NativeStatsRetryTests(unittest.TestCase):
             await asyncio.sleep(0.15)  # 异步延迟：超过 0.05s 快路径窗口
             return gemini_native._native_error(500, "boom")
 
-        with mock.patch.object(gemini_native, "_passthrough_request", side_effect=slow_passthrough):
+        with mock.patch.object(native_passthrough, "_passthrough_request", side_effect=slow_passthrough):
             response = self.post("streamGenerateContent", params={"alt": "sse"},
                                  headers={"x-goog-api-key": "client-key", "x-resumable": "1"})
         self.assertEqual(response.status_code, 200)  # 慢路径：SSE 先行
@@ -320,7 +322,7 @@ class NativeStatsRetryTests(unittest.TestCase):
             await asyncio.sleep(0.15)
             return await gemini_native._relay_stream(upstream)
 
-        with mock.patch.object(gemini_native, "_passthrough_request", side_effect=slow_passthrough):
+        with mock.patch.object(native_passthrough, "_passthrough_request", side_effect=slow_passthrough):
             response = self.post("streamGenerateContent", params={"alt": "sse"},
                                  headers={"x-goog-api-key": "client-key", "x-resumable": "1"})
         self.assertEqual(response.status_code, 200)
@@ -425,7 +427,7 @@ class NativeStatsRetryTests(unittest.TestCase):
         self.assert_stats(success=0, error=1)
 
     def test_upstream_base_url_trailing_slash_is_normalized(self):
-        with mock.patch.object(gemini_native, "EXPRESS_BASE", "https://example.test/"):
+        with mock.patch.object(native_catalog, "EXPRESS_BASE", "https://example.test/"):
             self.assertEqual(gemini_native._build_upstream_url("gemini-test", "countTokens"),
                              "https://example.test/v1beta1/publishers/google/models/gemini-test:countTokens")
 
@@ -434,7 +436,7 @@ class RetryWaitTests(unittest.IsolatedAsyncioTestCase):
     async def test_disconnect_is_checked_during_backoff(self):
         request = types.SimpleNamespace(is_disconnected=mock.AsyncMock(side_effect=[False, True]))
         with mock.patch.object(retry_policy.asyncio, "sleep", new_callable=mock.AsyncMock) as sleep:
-            self.assertFalse(await gemini_native._wait_for_retry(request, 60))
+            self.assertFalse(await native_passthrough._wait_for_retry(request, 60))
         sleep.assert_awaited_once()
         self.assertLessEqual(sleep.await_args.args[0], 0.5)
 
@@ -458,10 +460,10 @@ class NativeResponseLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     app=types.SimpleNamespace(state=types.SimpleNamespace(express_key_manager=manager)),
                     is_disconnected=mock.AsyncMock(return_value=False))
                 async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: upstream)) as client:
-                    with mock.patch.object(gemini_native, "get_retry_settings", return_value=(retries, 0, 0)), \
+                    with mock.patch.object(native_passthrough, "get_retry_settings", return_value=(retries, 0, 0)), \
                          mock.patch.object(gemini_native, "_resolve_upstream_model_path", return_value="gemini-test"), \
                          mock.patch("proxy_failover.get_effective_proxy_uris_for_account", return_value=[""]), \
-                         mock.patch.object(gemini_native, "passthrough_client_pool", types.SimpleNamespace(get=lambda *args: client)):
+                         mock.patch.object(native_passthrough, "passthrough_client_pool", types.SimpleNamespace(get=lambda *args: client)):
                         task = asyncio.create_task(gemini_native._passthrough_request(
                             request, "gemini-test", "streamGenerateContent", "alt=sse", b"{}"))
                         await asyncio.wait_for(started.wait(), 1)
@@ -487,7 +489,7 @@ class NativeResponseLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 async def send(message):
                     if message["type"] == fail_at:
                         raise OSError("disconnected")
-                with mock.patch.object(gemini_native, "stats", stats):
+                with mock.patch.object(gemini_native, "stats", stats), mock.patch.object(native_passthrough, "stats", stats):
                     response = await gemini_native._relay_stream(upstream)
                     with self.assertRaises((OSError, ClientDisconnect)):
                         await response({"type": "http", "asgi": {"spec_version": "2.4"}}, mock.AsyncMock(), send)
@@ -506,7 +508,7 @@ class NativeResponseLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0)
                 closed.set()
         upstream = httpx.Response(200, stream=Waiting(), headers={"content-type": "text/event-stream"})
-        with mock.patch.object(gemini_native, "stats", ProxyStats()):
+        with mock.patch.object(gemini_native, "stats", ProxyStats()), mock.patch.object(native_passthrough, "stats", ProxyStats()):
             response = await gemini_native._relay_stream(upstream)
             with anyio.CancelScope() as scope:
                 async def send(message):

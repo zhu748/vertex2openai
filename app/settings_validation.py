@@ -5,7 +5,7 @@ import math
 import config
 from proxy_resolver import validate_proxy_uri
 from proxy_config import ProxyFormatError, parse_proxy_list
-from keepalive import validate_keepalive_url
+from keepalive import keepalive_private_targets_allowed, validate_keepalive_url
 
 
 _SETTING_ENUMS = {
@@ -148,7 +148,7 @@ def validate_global_settings_patch(patch: dict) -> dict | None:
         return {"error": "express_ua_custom 必须是字符串。", "field": "express_ua_custom"}
     if "express_ua_custom" in patch:
         custom_ua = patch["express_ua_custom"]
-        if not custom_ua.isascii() or any((ord(c) < 32 or ord(c) == 127 for c in custom_ua)):
+        if not custom_ua.isascii() or any(ord(c) < 32 or ord(c) == 127 for c in custom_ua):
             return {
                 "error": "express_ua_custom 必须为不含控制字符的 ASCII 请求头。",
                 "field": "express_ua_custom",
@@ -158,7 +158,14 @@ def validate_global_settings_patch(patch: dict) -> dict | None:
         if not isinstance(v, str):
             return {"error": "keepalive_url 必须是字符串。", "field": "keepalive_url"}
         v = v.strip()
-        if not validate_keepalive_url(v):
+        # SEC-P2-6：私网/环回目标需 keepalive_allow_private 显式放行——同一
+        # 补丁里同时改两个键时以补丁新值为准（先开开关再填私网 URL）。
+        allow_private = keepalive_private_targets_allowed(
+            override=patch.get("keepalive_allow_private"))
+        if not validate_keepalive_url(v, allow_private=allow_private):
+            if v and validate_keepalive_url(v, allow_private=True):
+                return {"error": "keepalive_url 指向私网/环回地址：请在同一保存里先开启 keepalive_allow_private（默认拒绝，防内网探测）。",
+                        "field": "keepalive_url"}
             return {"error": "keepalive_url 必须是包含主机名的合法 HTTP(S) 地址（例如 https://你的域名/healthz），或留空关闭保活。",
                     "field": "keepalive_url"}
     return validate_settings_patch(patch)

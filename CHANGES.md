@@ -2,6 +2,109 @@
 
 基于原版 `vertex2openai-main`（2026-09-01），持续完善兼容性、可靠性和代码组织。
 
+## 2026-11-11（第十八轮・收尾轮）：QUA/ENG 域清零，审查 85 项全部处置完毕
+
+- 背景：第十七轮清完安全域后，本轮处置审查报告最后剩余的 QUA 域 7 项与 ENG 域 7 项，含一项按审查预案**实测否决**（ENG-P3-5，net.Pipe 复现实验证明与看门狗契约冲突）。至此 2026-11 全面审查的 85 项发现全部闭环：83 项落地、2 项实测否决并留档（PRF-P3-2 join 峰值翻倍、ENG-P3-5 计数契约冲突）。验收：1,427 项 Python 测试（+14 契约）+ 1,083 子测试、check_project **9/9 组**全绿（新增 print 基线闸）、Go 侧 gofmt/vet 零告警 + `go test -race` 全绿（+6 SSTP 状态机离线单测）。
+- QUA-P2-1（错误形状三处分派）：`request_errors` 的 ingress / body_too_large / validation 三函数各自重复同一套 OpenAI/Anthropic/Gemini 路径判断；收敛为 `_error_builder_for(path)` 单点分派（返回协议名 + 构造器，`_PARAM_UNSET` 哨兵区分「param 键缺省」与「param: null」），三函数只留各自 HTTP 语义；Gemini 分支改经 `native_passthrough._native_error` 复用唯一构造点，错误形状与旧实现逐字段一致（契约测试对齐）。
+- QUA-P2-2（签名三态双实现）：`thought_signatures.build_tool_call_id` 与 `cookie_response.openai_tool_call` 各自重复「有签名→SIGNED / 同批后续→UNSIGNED_FOLLOWER / 其余→UNKNOWN」分叉；收敛为 `SignatureStore.register_call_signature(call_id, signature, *, unsigned_follower)` 单点，两个生产方一行调用（express_response 经 build_tool_call_id 自动受益）。
+- QUA-P2-3（part_order 重组双实现）：`message_processing` 与 `cookie_request` 各自约 25 行同构的「按 part_order 重放 + 越界/重复索引剔除 + 剩余块兜底」算法；收敛为 `thought_signatures.merge_by_order()` 泛型单实现，`remainder_calls_first` 参数保留两通道既有兜底顺序差异（Cookie 剩余调用在前 / SDK 剩余普通块在前），part_order 非 list 返回 None 由调用方保留缺省拼装。
+- QUA-P2-4（CJK token 舍入分叉）：`claude_protocol.estimate_text_tokens` 自带银行家舍入 + 下限 1，与 `usage.estimate_token_count` 的向上取整分叉（正则已在早前轮收敛，公式仍两个行为）；统一走 usage 单实现，count_tokens 场景的「非空至少 1」语义在 claude 层包装。
+- QUA-P2-7（环境变量半集中）：STATE_DIR 默认值「.」曾在 4 个文件各写一遍、SINGBOX_*/PROXY_BRIDGE_*/IMAGE_* 等运行时开关散落使用点；`config` 新增集中读取层（`env_raw/env_str/env_flag/env_int/env_float/state_dir`，布尔口径统一 1/true/yes/on），13 个文件 22 处读取点全部迁入；顺带消除 `FORCE_SECURE_COOKIE` 在 lifecycle（非空即真）与 console_auth（布尔字面量）的口径分叉（统一为布尔，`ALLOW_DEFAULT_KEY` 同时接受 on）。
+- QUA-P2-10（日志无级别体系）：`logger` 新增 `log` 门面（info/warn/error/debug，只加文本级别前缀、完整复用 custom_print 脱敏→trace 关联→SSE 推流→有界 stdout 队列管线）；新增 `scripts/check_print_baseline.py` **print 基线闸**（39 文件 / 262 处存量只降不升，字符串字面量与注释不计，`--update` 随迁移下调），纳入 check_project 第 9 组检查——裸 print 禁止新增，存量逐步迁移到 log 门面。
+- QUA-P3-4（私有名 re-export 期限）：`architecture.md` 标注 `api_helpers` 兼容层 6 个 `_` 前缀私有名为**带期限过渡 re-export**（计划 2026-12 清理轮移除，新增测试禁止 patch 兼容层私有名，公共名不在移除范围）。
+- ENG-P3-1（MTU 校验钳位错配）：`main.go` 校验从 576–9000 收紧到 576–1400，与 sstp.go 的 TUN 钳位上限对齐——旧口径下 1400–9000 的用户配置被无声改写为 1400；sstp.go 钳位注释更新（只剩 mtu=0 默认路径）。
+- ENG-P3-2（turn.go 裸断言）：`raw.(*net.TCPConn)` 改 comma-ok + 受控错误码 `server_transport_unsupported`（未来 dialer 返回包装 conn 时不再 panic）；新错误码同步登记 Python 侧 `known` 映射。
+- ENG-P3-3（诊断上限永不复位）：`diagnostic()` 从「进程生命周期 128 条硬上限」改为「每类 code 至多 8 条 + 全局 128 条兜底」——长运行进程早期噪声不再耗尽配额导致新错误模式全部静默；`os.Setenv(SSL_CERT_FILE)` 错误不再静默（受控码 `ca_setenv_failed`，Python 侧同步登记）。`TestDiagnosticTruncatesAndIsBounded` 更新为双上限断言。
+- ENG-P3-5（ReadFrom 零拷贝，**实测否决**）：实现「解包对侧 countingConn → 委托底层 conn.ReadFrom → 返回时计数」后，net.Pipe 复现实验证明其与看门狗契约冲突——splice/内层拷贝的字节数只在**整个拷贝返回时**可得，慢速长传输期间 activity 恒 0，firstByte 分支会把活跃连接误杀（`TestRelayKeepsActiveSlowConnectionOpen` 立即失败）；「src 包 countingReader」又会破坏 splice 的原始 TCPConn 类型要求。回退并按 PRF-P3-2 先例把实测结论留档（重试前提：看门狗先改「心跳 + 字节数」双信号）。
+- ENG-P3-6（SSTP 零离线覆盖）：新增 `proxybridge/sstp_packets_test.go` 6 项离线单测（可离线构造的 LightweightNetTun，net.Pipe 风格时序）：await 阻塞/放行、Close 先于 attach 的 await/Read/Write 全错且计数不误增、attach 撞已 Close 的竞态守卫、Close 幂等且 8 goroutine 并发不 panic、Close 解除挂起 Read、真实包往返（Stack().WriteUDP → Read 计 sent → Write 注回计 received）。
+- ENG-P3-11（Python 侧 NOTICE）：新增 `NOTICE-Python.txt`（10 项直接依赖 + 13 项传递依赖的许可清单，读自安装元数据；curl_cffi 捆绑的 libcurl/BoringSSL 与 cryptography 的 OpenSSL 双授权单列），Dockerfile 将其随镜像分发到 `/usr/local/share/`；附 pip-licenses 再生口径。
+- ENG-P3-13（ruff 扩 B/UP 族 + Go 静态检查）：静态检查组从 8 条规则扩至 19 条（+B023/B007/B017/B904/B905 与 UP009/UP012/UP015/UP017/UP034/UP037/UP041）；app/ 的 5 处 B023 闭包循环变量捕获补默认参数绑定（均同迭代调用、无真实缺陷，防延迟绑定回归），11 处 B904 补 `from e`/`from None`，5 处 B017 盲异常断言收窄到实测类型（ClientDisconnect/HTTPException/ServerError），3 处 B905 zip 补 strict=；tests/ 的 92 处 B023 豁免（夹具合法模式）。CI proxy-bridge 作业新增 `gofmt -l` 硬闸 + `go vet ./...`（全仓 Go 已统一 gofmt -w，旧 8 空格缩进清零）。UP006/UP035/UP045（约 390 处注解风格改写）按审查「逐步扩」意见继续分批。
+- 测试：新增 `tests/test_qua_round18_contracts.py` 14 项契约（merge_by_order 重放/去重/越界/两通道兜底顺序、register 三态、估算统一公式、env 层矩阵、STATE_DIR 单点、三协议错误形状逐字段对齐、log 门面前缀、基线闸计数口径）；Go 侧 +6 项 SSTP 状态机测试。
+- 遗留（后续迭代，均非审查项）：LargeJSONResponse 完整流式化（`.body` 契约五消费方迁移）、复杂度闸下一目标 35（extract_events 40 / _claude_stream_response 37 待拆）、UP006/UP035/UP045 注解风格分批迁移、存量 262 处 print 向 log 门面迁移（基线闸护航）、api_helpers 私有名 re-export 2026-12 清理。
+
+## 2026-11-11（第十七轮）：SEC 域收尾（安全余项 10 项 + PRF-P2-5 补齐）
+
+- 背景：本轮处置审查报告安全域剩余全部 10 项（SEC-P2-2/3/4/6、SEC-P3-1/2/3/5/6/7）并补齐 PRF-P2-5（第十六轮记录的「已在早期轮落地」实为 O-4 的折叠本身——折叠后摘要仍逐块处理整串，弱化窗口并未落地，本轮修正归档）。验收：1,413 项测试（+43 契约与子测试）+ 1,083 子测试、check_project 8/8 组全绿、prettier + jsdom 18 组通过。
+- SEC-P2-2（状态静态加密）：新增 `state_crypto`（可选依赖 `cryptography`，未设密钥零开销）——`STATE_ENCRYPTION_KEY` 设置后 web_state.json 以 Fernet（AES-128-CBC + HMAC-SHA256）+ PBKDF2-HMAC-SHA256（200k 轮、每文件随机盐）密文落盘；明文文件设置密钥后首次保存自动升级；**密文信封 + 无密钥/密钥错误一律拒绝启动**（RuntimeError，不进损坏备份路径——静默降级会把加密状态覆盖丢失）；盐进程级认领复用，PBKDF2 每进程至多派生一次。README 标注该口令与状态文件等同 Google 账号密码。
+- SEC-P2-3（会话双窗口）：控制台会话从固定 30 天改为「签发后 7 天绝对上限 + 闲置 2 小时超时」双窗口，鉴权成功滑动续期；泄漏 token 的完全控制期从最长 30 天收敛到 min(7d, 2h)。新增 `POST /api/sessions/revoke-all` 与控制台「撤销全部会话」按钮（口令疑似泄漏时的一键止损）。
+- SEC-P2-4（明文 HTTP 告警）：登录成功且请求经明文 HTTP（且未设 FORCE_SECURE_COOKIE）时打印进程级一次性醒目告警；已存凭证（Cookie/Express Key）的部署启动时附 TLS 反代提醒；新增 `FORCE_SECURE_COOKIE` 环境变量（反代终止 TLS 但未传 x-forwarded-proto 时强制 Secure Cookie）。
+- SEC-P2-6（保活私网确认）：环回/私网保活目标默认拒绝（被劫持的控制台会话可借保活任务对内网管理面重放 GET 并经 SSE 日志回读状态码——探测 oracle）；新增控制台设置 `keepalive_allow_private` 显式放行（「自我保活」127.0.0.1 与内网监控用户），设置保存校验支持同补丁先开开关再填私网 URL，重定向复检同口径。
+- SEC-P3-1（CORS 同源默认）：`allow_origins=["*"]` 改为默认不装 CORS 中间件（同源部署对 SDK/服务端调用与自带控制台零影响）；新增 `ALLOWED_ORIGINS` 环境变量（逗号分隔显式放行，`*` 恢复旧行为）。两个断言 expose-headers 的既有测试改为「默认缺失 + 组件级 CORSMiddleware 包裹验证」双语义。
+- SEC-P3-2（CSRF Fetch Metadata）：显式拒绝 `Origin: null`（沙箱 iframe 字面值，此前经 urlsplit 得空 netloc 被放行）；采纳 `Sec-Fetch-Site: cross-site` 作为独立否决信号（浏览器强制附加、脚本不可改）；无浏览器头的 curl/SDK 请求不受影响。
+- SEC-P3-3（429 设置指引）：未开 TRUST_PROXY_HEADERS 时登录 429 附「所有来访者共享同一限速桶」的设置指引（反代部署下个别人的爆破会锁死管理员登录）。
+- SEC-P3-5（生图 URL TTL）：下载 URL 有效期从 7 天收紧为默认 24 小时（`IMAGE_URL_TTL_SECONDS` 可调 60s–7d；URL 只含随机 token 不绑定请求者，聊天记录转发后任何人可拉）。
+- SEC-P3-6（代理测试内网闸门）：连通性测试的代理地址为字面私网/环回 IP（含 IPv6 括号字面量与 userinfo 前缀解析）时默认拒绝（错误分类与延迟差异可区分内网端口状态）；新增控制台设置 `proxy_test_allow_private` 与环境变量 `DISABLE_PROXY_TEST`（整体禁用端点）。
+- SEC-P3-7（工程加固）：compose 增加 `cap_drop: [ALL]`、`no-new-privileges`、`mem_limit: 1g`；CI 增加 `pip-audit -r app/requirements.txt` 依赖漏洞审计步骤（出现已知 CVE 即红）；顺带修复 `scripts/measure_join_peak.py` 存量未用导入（静态检查组因此 8/8）。
+- PRF-P2-5（指纹弱化窗口）：超长字符串（>64KB）折叠摘要从逐块编码整串改为「首尾各 4KB 窗口 + 长度」——20MB 内嵌图在事件循环上的 40-80ms 重算降为微秒级；同首尾同长度的中段差异共享缓冲（文档化取舍：指纹是去重键非安全边界，语义等同重复请求）；64KB 以下仍全量摘要（中段单字符差异可区分）。
+- 测试：新增 `tests/test_security_round17.py` 43 项契约（+17 子测试）——加密往返/迁移/拒绝降级启动/盐复用/缺依赖、会话双窗口边界/滑动续期/revoke-all、明文告警一次性/Secure Cookie 三态、CORS 解析矩阵、CSRF Origin:null 与 Sec-Fetch-Site 六态、429 指引、TTL 钳位、保活校验三态、代理私网闸门（含 IPv6 与开关放行、无网络推进证明）、指纹窗口四态。更新 5 个受新默认值影响的既有测试文件。
+- 遗留（后续迭代）：QUA 域余项（QUA-P2-1/2/3/4/7/10、QUA-P3-4、QUA-P1-4 的 dashboard 命名空间部分）、ENG 域余项（ENG-P3-1/2/3/6/11/13 的 go vet/gofmt CI 部分）、LargeJSONResponse 完整流式化、复杂度闸下一目标 35。
+
+## 2026-11-11（第十六轮）：性能余项收尾（PRF 域 9 项，1 项实测否决）
+
+- 背景：第十五轮清完核心请求链路域后，本轮处置审查报告性能域剩余 9 项（PRF-P2-1/2/2/7/8、PRF-P3-1/2/3/4；PRF-P2-5 请求指纹弱化折叠已在早期轮落地）。其中 PRF-P3-2 按审查建议实施后经 tracemalloc 实测**否决**（join 方案峰值反而翻倍），处置记录写入代码注释。验收：1,370 项测试（+14 契约）+ 1,062 子测试、check_project 8/8 组全绿。
+- PRF-P2-1（元数据计量物化）：Cookie 首回复前元数据暂存 `len(str(data).encode())` 在 native_part 含数十 MB base64 时先拼整串再编码只为算字节数；改 str/bytes 直接 len、容器走 `estimate_json_chars` 无拷贝结构估算（上限闸粗估口径不变）。
+- PRF-P2-2（工具流记账）：`ToolStreamAssembler._account` 的 `repr(part)` 递归物化整个 Part 字符串（CJK 六倍展开、base64 全量渲染）；改按字段增量估长（text/signature/inline_data/partial_args 各取 len，dict args 走结构估算）。
+- PRF-P2-7（redact 全文扫描）：custom_print 与 request_tracking 九处「先 4 正则全文扫描、再砍到上限」全部改为先截断再脱敏（logger 预截留 trace 前缀与原长标记的头寸；trace 侧 1200/2000/400/600 上限配 2000/3000/600/900 预截）；顺带修复 `retry(delay, error)` 收到异常对象时 `error[:N]` 下标崩溃（统一 `str()` 强转——此前 redact 内部兜底掩盖了这一点，先截断后必须显式强转）。
+- PRF-P2-8（大请求体读取并发闸）：32MiB 请求体「全量读入 + Pydantic 解析」发生在生成并发闸**之前**，多路大 body 并发时峰值内存瞬时 GB 级。middleware 在鉴权后对「声明 >4MiB 或无长度头（chunked）」的生成类请求加 8 读位信号量：满时快速 503（Retry-After）；释放时机是关键——middleware 的 await 覆盖整个响应生命周期（含 SSE 流式），读位经 receive 包装器在「最后一个 body 块穿过」时释放（FastAPI 解析完成的最早时刻），finally 兜底幂等，不会退化成第二层生成闸。
+- PRF-P3-1（JSON 分帧双拷贝）：`JsonObjects` 累计容器从 StringIO+getvalue 改片段表 + join——getvalue 把内部缓冲整份再拷一次，4K 生图单对象 30-90MB 收集期三份瞬时驻留降为两份。
+- PRF-P3-2（**实测否决**）：按审查建议把 `LargeJSONResponse.render` 改 `b"".join` 后，tracemalloc 实测峰值 16.0MB（8MB 内容）vs BytesIO 的 8.76MB——CPython 的 join(generator) 先物化全部片段列表（2×），join(list) 同为 16.0MB。回退保留 BytesIO 并把实测结论写入 docstring（benchmark 脚本 `scripts/measure_join_peak.py` 留档）；真正能降一档的完整流式下发被 `.body` 契约阻塞（channel_dispatch / claude_api / chat_api 续传泵 / cookie_delivery / gemini_native 五处直接 `json.loads(result.body)`），列入后续迭代。
+- PRF-P3-3（三处微观热点）：控制台日志历史从锁内 `list.pop(0)`（每条 O(n) 前移）改 `deque(maxlen)`；SSE 帧的 `created` 时间戳改秒级缓存（同秒复用一次取值，输出值与逐帧 time.time() 逐值一致）；Cookie 工具调用 ID 的 canonical dumps 去掉 `sort_keys`（确定性只需「同一响应字节流重解析得到同一顺序」，跨响应本就有 response_id 区分）。
+- PRF-P3-4（同步 resolve 防御告警）：`resolve_proxy_uri` 的 sing-box/proxybridge 分支在**实际阻塞超过 50ms 且处于事件循环线程**时打印归因告警（当前调用图已被异步入口钉住，这是防新增调用方误用的护栏；按耗时判定，子进程缓存命中零误报）。
+- 测试：新增 `tests/test_prf_round16_contracts.py` 14 项契约——工具流记账矩阵、redact 截断界与异常对象安全、logger 预截原长标记、读位闸（阈值矩阵 / 末块释放一次性 / 幂等兜底 / 满载快速 503 端到端）、日志历史 deque 淘汰、created 缓存、无 sort_keys 的 ID 确定性、阻塞告警不抛。
+- 遗留（后续迭代）：SEC 域余项（SEC-P2-2/3/6、SEC-P3-1/2/5/6/7）、QUA 域余项（QUA-P2-1/2/3/4/7/10）、LargeJSONResponse 完整流式化（连同五个 .body 消费方迁移）、复杂度闸下一目标 35。
+
+## 2026-11-11（第十五轮）：核心请求链路正确性收尾（REQ 域 11 项）
+
+- 背景：第十二轮四阶段修复覆盖了全部 P1 与高优先 P2，本轮把审查报告核心请求链路域剩余的 11 项发现（REQ-P2-1/2/7、REQ-P3-3~10）全部处置完毕——除 REQ-P2-2/REQ-P3-3 外均为行为修正型（非重构），每项附特征回归。验收：1,356 项测试（+24 契约）+ 1,062 子测试、check_project 8/8 组全绿。
+- REQ-P2-1（content_filter 丢签名）：Express 真流式 content_filter 等空响应路径首回复从未就绪，`pending_metadata` 暂存的思考签名帧随流结束静默丢弃——Gemini 3.x 多轮工具对话强校验签名，丢签名导致下一轮 400。收尾段与首回复分支同口径：先按原顺序冲刷暂存元数据再下发延迟结束帧（正常流该 drain 恒为空：`first_reply.iterate` 的 ready 先于 yield 置位）。
+- REQ-P2-2（大负载离环序列化）：`json_encoding` 新增 `estimate_json_chars`（O(节点数) 结构估算，len(str)/isascii 均 O(1)，不物化拷贝）与 `json_response_offloop`（超 1MiB 在线程池内构造 JSONResponse，复用同一渲染器保证与直路字节级一致）；`resumable_poll` 与 `_resumable_json` 的三处大 payload 返回点全部接入——轮询一次可拉 500 帧、生图 payload 可达 30-90MB，此前同步 dumps 会拖停全站事件循环数百毫秒。
+- REQ-P2-7（兜底锁死）：跨通道兜底中主通道 error 帧后**迟到的 content 帧**此前仍置 `saw_content`，流既不切备用通道、又因错误帧被吞而无 [DONE] 终止语义。修正后 `saw_content` 与 `fallback_started` 互斥（内容先于错误则错误分支本就不触发），迟到内容归入「已判死尝试」与收尾帧一同吞掉，兜底照常接力。
+- REQ-P3-3（count_tokens 图片口径）：O-10 重构引入双重除法（累计时 `//4`、收尾再 `/4`），实际 len/16 与 docstring 承诺的 len/4 不符，Claude Code 依此裁剪上下文每张图低估 4 倍；`tool_result` 内层图片（多模态工具结果，协议支持）此前完全不计数。统一为 `note_image` 计数据长度、收尾一次 /4。
+- REQ-P3-4（取消归因）：Express 三条 CancelledError 路径（真流式/假流式/非流式）此前一律打印「客户端已断开」——服务停机排空与续传超窗取消同样走这里，归因误导排障。新增 `_cancel_attribution`：先查 ASGI 断连，否则明示「服务端取消（停机排空 / 超窗 / 超时）」。
+- REQ-P3-5（轮询参数形状）：`/v1/resumable/{id}` 的 from/limit/wait 改 str 接收 + 手工解析，类型错误统一 400 `invalid_resume_cursor`（不再漏成 FastAPI 422 形状）；顺带拒绝 `inf/nan`（旧 float 解析默默收下 nan，`min(nan,25)` 直接写进断连计时器）。
+- REQ-P3-6（安全分丢失）：Cookie 流式四个错误终点（transport / api_error_text / cookie_error / retryable-fatal）此前丢弃已暂存的 `pending_safety_html`，安全拦截诊断线索消失。新增 `_safety_before_error_frames`：与正常收尾同口径先冲刷安全分（未建连时补 role 帧）再发错误帧。
+- REQ-P3-7（心跳污染续传缓冲）：假流式心跳从 `chatcmpl-keepalive` data 帧改为 `: keep-alive` 注释帧（与真流式同口径）——`pump_stream` 天然过滤注释帧，心跳不再入库占事件序号、断线重放不再收到大量空 delta；`_sse_frame_kind` 两处 keepalive 特判随之删除（旧形状防御性归 other）。
+- REQ-P3-8（断连 502 呈现）：生图收集 `_collect_full_response` 的六处断连错误字典统一带 `code: 499`（`_CLIENT_GONE_RESULT` 常量）——消费方按 `res.get("code", 502)` 取码，缺 code 时客户端断开被呈现为 502 上游错误，污染归因与大盘计数。
+- REQ-P3-9（prefill 丢失）：预填充先行帧从 `has_yielded` 隐式折叠中拆出独立闸门 `_ensure_prefill_frames`（`st.prefill_sent`）——签名/工具事件先到时置真 has_yielded（重试闸语义保留）但从未发过 prefill，后续正文分支被挡住、预填充整段丢失，与 Express 通道（签名暂存 pending_gate、首内容前冲刷后发 prefill）行为分叉；现在签名先到也能正确发出 prefill，且恰好一次。
+- REQ-P3-10（usage 清洗统一）：`_anthropic_usage` 的 pick/detail 与 `ClaudeStreamState.feed_usage` 三处手写 try/int/max 收敛为 `_count_value` 单实现——溢出 float（inf/nan）、bool、非数值一律语义为「字段缺失」（pick 跳到下一别名 / detail 归零 / feed 保留上一快照），同名概念不再两个行为。
+- 测试：新增 `tests/test_req_round15_contracts.py` 24 项契约（+3 子测试）：签名冲刷顺序、大负载字节级一致、迟到内容兜底/内容优先不兜底双路径、len/4 与 tool_result 图片计数、取消归因、轮询 400 形状、安全分先于错误帧、注释帧心跳、生图 499、prefill 独立闸（签名先到/正常/恰好一次）、usage 清洗矩阵。同步更新 `test_request_boundaries_and_cleanup` / `test_upstream_alignment` 中两处 keepalive 分类契约。
+- 遗留（后续迭代）：PRF 域性能余项（PRF-P2-1/2/5/7/8、PRF-P3-1/2/3/4）、SEC 域余项（SEC-P2-2/3/6、SEC-P3-1/2/5/6/7）、QUA 域余项（QUA-P2-1/2/3/4/7/10）、复杂度闸下一目标 35（extract_events 40 / _claude_stream_response 37 待拆）。
+
+## 2026-11-11（第十四轮）：复杂度闸清零基线 + 注解/覆盖铺开
+
+- 背景：第十三轮遗留清单中「deliver_collect_response / _passthrough_request_impl / gemini_fake_stream_generator 再拆分」与「QUA-P2-5 第二阶段」全部落地，另完成 ENG-P3-7 三个低覆盖模块的直接契约测试。四个 C901 超标函数全部拆分完毕，**复杂度闸 ≤40 零基线运行**（审查原计划「逐年下调」，两轮即达成）；≥250 行函数 3 → 0 个。验收：1,332 项测试 + 1,059 子测试、check_project 8/8 组全绿（均为行为保持型重构，测试全程护航）。
+- deliver_collect_response 拆分（337 → 151 行，C901 47 → 过闸）：事件收集（`_collect_whole_body` 游标循环 + 媒体线程分流 + `_apply_whole_body_event` 单事件分发，片段表 + join 的 O(n²) 防护语义保真保留在 `_WholeBodyState`）、结果装配（`_assemble_whole_response`：成功/无正文双路径 + message_obj/payload）、重试编排壳。
+- _passthrough_request_impl 拆分（287 → 253 行，C901 41 → 过闸）：错误分类（`_classify_attempt_error`：NativeStreamError/超时/不完整/连接失败四象限）、流式预取（`_prefetch_stream_reply`：SSE/JSON 数组双形态 + 首帧预取）、缓冲透传（`_buffered_upstream_result`：读取关闭 + 空正文防冒充）。三处拆分均不跨越异常生命周期边界（上游连接的收尸仍归编排壳）。
+- gemini_fake_stream_generator 拆分（261 → 210 行）：重选目标与失败路径记忆（`_fake_stream_retry_target`）、响应发射（`_fake_stream_response_frames`：校验/转换/巨帧 GC——调用方在进入子生成器前置空 `raw_gemini_response`/`api_call_task` 引用，4K 生图内存修复的释放时序逐点保真）、外层错误帧构造（`_fake_stream_error_payload`）。
+- anthropic_to_openai_request 拆分（173 → 105 行，C901 43 → 过闸）：max_tokens 校验、thinking 块（budget→档位映射 + display 白名单 + 钉住语义）、output_config（response_format + effort 意图，`_EFFORT_UNSET` 哨兵区分「未提供」与「auto=None」）各自独立成纯函数；thinking 钉住与 effort 覆盖的交互在调用方一处收口。
+- QUA-P2-5 第二阶段（注解铺开）：first_reply / streaming / tool_stream / message_processing 四个核心管线工具 88 处 ANN001/ANN201 缺口清零（usage.py 复查已全注解）；注解闸自 upstreams 扩至「upstreams + 管线工具」。
+- ENG-P3-7（低覆盖模块补测）：新增 `tests/test_fingerprint_and_tls_contracts.py` 33 项契约——express_fingerprint 62% → **100%**（UA 档案四分支 / 标签补齐三分支 / importlib 三级回退 / 通道覆盖与直连头 / describe 四分支），proxy_tls 73% → **100%**（HTTPS 代理信任六分支：明文原样 / 默认不换 / SSLContext 复用 / verify=False 关校验 / capath / cafile），proxy_resolver 75% → 78%（二进制发现缓存三元组 / 版本缓存与子进程回退 / 收割线程幂等；进程管理内部按审查记录维持 mock 现状）。
+- 复杂度闸注释更新：40 零基线；下一目标 35（extract_events 40 / _claude_stream_response 37 待拆，均为 yield 深嵌套的协议解析器，需独立特征测试护航）。
+
+## 2026-11-11（第十三轮）：审查遗留清单的结构性工程全部落地（七项）
+
+- 背景：第十二轮四阶段修复后，审查报告第四阶段「随迭代持续」清单还剩 7 项结构性债务（QUA-P1-1/2/4、QUA-P2-5/6/9、ENG-P3-4），另顺手完成 QUA-P3-2 复杂度闸锁住拆分成果。全部为行为保持型重构（测试与 patch seam 全量迁移验证），唯一有意的规范化：Cookie 流式四个终点路径的错误帧统一走 `create_openai_error_response`（拿到凭据脱敏 + 标准形状 + 1024 截断，此前两处内联 dict 无脱敏）。验收：1,299 项测试 + 1,059 子测试、`check_project.py` 扩至 8/8 组、jsdom 18 组 + Playwright 浏览器 38 组、prettier 全绿；≥250 行函数 5 → 3 个，无 400+ 行函数。
+- QUA-P1-1（巨型交付函数拆分）：Express `stream_frames` 451 → 164 行编排壳 + `_emit_attempt_frames` 单次尝试子生成器 + `_StreamMeters` 计量类（usage 累计短路 / 候选标记 / 增量计数，仿 PendingMetadataGate 先例）+ `_prepare_candidate_payload` 载荷准备；预填充先行帧构造移入 `prefill.first_frames`。Cookie `deliver_stream_events` 439 → 91 行编排壳 + `_stream_attempt_frames` + `_finalize_cookie_stream` + `_StreamAttemptState`，错误帧与 role 首帧收敛为 `_error_done_frames` / `_role_frames`。拆分中发现并保真还原了「空响应先行的结束帧延迟发射」等三处隐式契约（回归测试全程护航）。
+- QUA-P1-2（重试骨架收敛）：`cookie_delivery` 四条交付路径的重复样板收敛为 `_body_cache_for` / `_attempt_context`（body 双形态 + 降级锁定 + 请求头 + 调试日志）/ `_BackoffPolicy`（六处 `cookie_retry_backoff` 调用的参数包）。
+- QUA-P1-4（前端拆分）：`channel-config.js` 1465 → 429 行（仅 Cookie 账号域），代理编辑器约 1,000 行拆为 `proxy-editor.js`，仿 `credential-list.js` 先例以 `window.proxyEditorKit` 显式命名空间协作（`mount(deps)` 注入 Cookie 侧闭包，5 处跨段引用收口）；HTML onclick 全局契约不变；`ensureChannelConfig` 懒加载改为双脚本顺序补载；顺手修复 dashboard.js 的 prettier 存量漂移（check:format 恢复全绿）。
+- QUA-P2-9（gemini_native 拆分）：1,257 行单文件按职责拆为 `upstreams/native_catalog.py`（目录 / 变体剥离 / URL，197 行）+ `upstreams/native_passthrough.py`（透传编排引擎 + Google 风格错误形状，752 行）+ 路由层（鉴权 + 端点装配 + models 路由，411 行，兼容 re-export 保测试面）。14 个测试文件约 30 处 patch seam 按「引擎内部依赖 → native_passthrough、URL 常量 → native_catalog、stats 双打」原则迁移；对象级 patch（app_state / pool.get）与端点直驱 patch 不受影响。
+- QUA-P2-6（AppState 拆解）：Express Key 与 Cookie 账号的 14 个 CRUD 方法拆出 `CredentialsRepository`（存储 / 持久化经宿主动态取用——reload 会整体替换 `_state`，不能快照引用）；AppState 保留同名委托转发与静态方法别名，36 个依赖方与 `patch.object(app_state, ...)` 测试面零改动。
+- QUA-P2-5（类型注解）：`app/upstreams/` 十个模块 178 处 ANN001/ANN201 缺口全部补齐（含本轮拆分引入的新函数；`CookieGeneration` 经 TYPE_CHECKING 解环）；`check_project.py` 新增「注解闸（upstreams）」防回退。
+- QUA-P3-2（复杂度闸）：`check_project.py` 新增「复杂度闸（C901≤40）」，存量 3 处超限函数（claude_protocol.anthropic_to_openai_request 43 / deliver_collect_response 47 / _passthrough_request_impl 41）逐函数 noqa 基线化，只挡新增、逐年下调；`check_architecture.py` 学会跳过 TYPE_CHECKING 守卫块（类型注解解环的标准手段不再误报环）。
+- ENG-P3-4（Go 依赖治理）：CI 的 proxy-bridge 作业新增 govulncheck 漏洞扫描步骤（对 go.sum 锁定依赖树）；新增 `.github/dependabot.yml`（gomod 每周 + pion 家族分组、actions 每周）——yuhaiin 间接拖入的 gvisor / tailscale fork 依赖链自此有双通道安全更新面；go.sum 锁定语义不变。
+- 文档同步：`docs/architecture.md` 模块表更新 gemini_native / runtime_state / channel-config / proxy-editor 四处职责描述。
+- 遗留（后续迭代）：`deliver_collect_response`（337 行，复杂度 47）与 `_passthrough_request_impl`（287 行，41）的再拆分——两者本轮已通过骨架收敛与引擎隔离降低耦合，进一步拆分需独立特征测试护航；QUA-P2-5 第二三阶段（纯逻辑模块注解铺开 + mypy --strict 模块白名单）；`gemini_fake_stream_generator`（261 行）；ENG-P3-4 长期项（MS-CHAPv2 + PPP 最小自研替代 yuhaiin）。
+
+## 2026-11-11（第十二轮）：按《全面技术审查报告》路线图完成四阶段优化（四提交）
+
+- 背景：五维深度审查（安全 / 核心链路 / 性能 / 质量 / Go 与工程化，85 项发现）给出的四阶段路线图在本轮落地：阶段一安全止血、阶段二正确性与韧性、阶段三性能解锁全部完成，阶段四完成 8 项收敛类（巨型函数拆分与前端模块化两项结构性工程列入后续迭代）。每阶段提交前全量 pytest + `check_project.py` 验收，最终 1,299 项测试、6/6 组检查、jsdom 18 组 + Playwright 浏览器 38 组、`go build/test/vet` 全绿。
+- 阶段一（安全，SEC-P1-1/2、SEC-P2-1/5、SEC-P3-4、QUA-P2-8）：出厂弱口令（`123456` / compose 占位值）默认拒绝启动，保留 `ALLOW_DEFAULT_KEY=true` 显式放行；新增 `ADMIN_PASSWORD` 与 `API_KEY` 拆分（未设置时回退），分享 API Key 不再等于交出控制台；Cookie reveal 接口加二次口令验证（复用登录指数退避限速）并逐次审计留痕，前端 prompt 交互同步；新增 `SecurityHeadersMiddleware`（全响应 nosniff / no-referrer / COOP，HTML 加 CSP + X-Frame-Options）；Dockerfile 追加 `--no-access-log`（uvicorn 访问日志泄 `?key=`）；compose 端口默认绑 `127.0.0.1` 并附 TLS 反代指引；出厂口令常量收敛单一来源。
+- 阶段二（正确性与韧性，REQ-P1-1、REQ-P2-3/4/6、ENG-P2-1/2/3/4）：Express「location 钉定失败 → 裸模型名」免费回退改为按失败路径记忆——换 Key 重选到已失败的钉定路径时直接改用裸模型名，多 Key 轮询下配额烧毁最多放大 3 倍的问题消除（真流式/非流式/假流式三路径 + 轮询回归测试）；续传取消路径的 `buf.fail` 收尸用 `CancelScope(shield=True)` 包裹（二次取消不再留僵尸缓冲）；`x-request-id` 移出幂等键候选（GCP LB / Nginx 每次重试换新值，击穿续传语义）；CSRF 防线仅在 `TRUST_PROXY_HEADERS` 开启时采信 `X-Forwarded-Host`；Go 桥 accept 瞬时错误（EMFILE/ENFILE/ECONNABORTED）有界退避重试不再整个进程退出、SOCKS 成功/失败回包前刷新 deadline（拨号耗尽预算不再吞掉按码 failover 契约）；conftest 单例快照兜底显式告警；宽限窗口测试改事件驱动断言（消除 CI 墙钟 flake）。
+- 阶段三（性能，PRF-P1-1..5、PRF-P2-3/4/6）：媒体池拆分为 prep（prompt 构建，每请求必经）与 media（图片解码 / 落盘 / Cookie 请求体）双执行器，慢 PIL 操作不再队头阻塞全站首字；Express 假流式/非流式的响应转换链（含生图 base64 解码 + 落盘）整体搬媒体线程，Cookie 流式对象按「含内联图片」廉价预检选择性搬运——事件循环上 100-500ms/张的同步落盘停顿消除；`_prune` 全目录扫描按 60 秒窗口摊销（大图强制扫描）；SDK 客户端池上限跟随 Key 数（`SDK_POOL_MAX` 可钉住），7+ Key 轮询不再被固定容量 LRU 误淘汰；`get_effective_settings` 增加修订号 + 每模型缓存（每请求 2-4 次整树 deepcopy 消除，失效矩阵覆盖 mutator / reload / 直写 / 原地 pop）；新增 `request_diagnostics` 热开关可关闭逐帧载荷检查；远程图片抓取按（代理, 证书）共享同步 httpx.Client；已完整交付且无幂等键的续传缓冲改 120 秒短窗口保留（`resumable_delivered_ttl_seconds`），稳态 RSS 基线回落。
+- 阶段四（质量，QUA-P1-3、REQ-P2-5、REQ-P3-1/2、QUA-P3-1/3、ENG-P3-8/9/10/12）：API Key 提取五处平行实现收敛为 `auth.extract_candidate_key`（协议差异只留在错误形状）；`RETRYABLE_MARKERS` 从单词级（internal / unavailable）收窄为短语级（internal error / service unavailable），确定性 4xx 包装文本不再白烧重试；Claude SSE data 行按规范只剥一个前导空格（多行 data 拼接不再损坏缩进）、收尸 `except BaseException` 收窄；32MiB 请求体上限收敛单一来源；architecture.md 失效脚本引用修正、proxy-turn-sstp.md 补记桥内看门狗窗口；coverage 锁 7.13.1、新增最小 pytest.ini（rootdir 发现稳定）、check_project 入口目录预检与 FileNotFoundError 兜底。
+- 兼容性说明：弱口令拒绝启动与 compose 回环绑定是**预期的行为收紧**（升级前请设置强 `API_KEY`）；reveal 需带 `password` 字段（前端已同步，第三方调用方需跟随）；未设置 `ADMIN_PASSWORD` 时控制台口令仍回退 `API_KEY`，存量部署零破坏。
+- 遗留（后续迭代）：QUA-P1-1 两个 400+ 行交付函数拆分、QUA-P1-2 cookie_delivery 重试骨架收敛、QUA-P1-4 前端 proxy-editor 拆分与显式命名空间、QUA-P2-5 类型注解与 mypy 白名单、QUA-P2-6 AppState 拆解、QUA-P2-9 gemini_native 下沉、ENG-P3-4 Go 依赖树削减——均为审查报告第四阶段「随迭代持续」项。
+
 ## 2026-11-11（第十一轮）：按审查路线图完成 P2/P3 结构优化（两批十六提交）
 
 - 背景：代码审查报告（P0→P3 路线图）指出的结构性债务在本轮全部处置完毕：上一批（835936c..ebc50d7）落地 P0 缺陷修复、P1 机械合并（常量收敛、helper 化、死代码清除、冒烟脚本与历史文档归档、重试退避窗口 8 处合一、Go 假 TURN 服务器合并、轮次命名测试改名）；本批完成 P2 全部八项与 P3 两项，每步 `check_project.py` 全绿验收。

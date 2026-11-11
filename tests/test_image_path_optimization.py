@@ -228,7 +228,7 @@ class FlattenTransparencyTests(unittest.TestCase):
         out, mime = self._compress(img)
         self.assertEqual(mime, "image/jpeg")
         pixel = self._open(out).convert("RGB").getpixel((300, 250))
-        self.assertTrue(all(abs(a - b) <= 12 for a, b in zip(pixel, (200, 30, 90))))
+        self.assertTrue(all(abs(a - b) <= 12 for a, b in zip(pixel, (200, 30, 90), strict=True)))  # B905
 
     def test_semi_transparent_rgba_flattens_onto_white(self):
         img = Image.new("RGBA", (600, 500), (0, 0, 0, 0))
@@ -255,7 +255,7 @@ class FlattenTransparencyTests(unittest.TestCase):
         out, mime = self._compress(img)
         self.assertEqual(mime, "image/jpeg")
         pixel = self._open(out).convert("RGB").getpixel((150, 150))
-        self.assertTrue(all(abs(a - b) <= 12 for a, b in zip(pixel, (10, 20, 30))))
+        self.assertTrue(all(abs(a - b) <= 12 for a, b in zip(pixel, (10, 20, 30), strict=True)))  # B905
 
     def test_palette_with_transparency_flattens_onto_white(self):
         img = Image.new("P", (300, 300))

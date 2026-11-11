@@ -1,6 +1,5 @@
 """Bounded incremental JSON object framing for both upstream wire protocols."""
 
-import io
 import json
 import re
 
@@ -27,7 +26,10 @@ class JsonObjects:
         self.quoted = False
         self.escaped = False
         self.size = 0
-        self.buffer = io.StringIO()
+        # 片段表（PRF-P3-1）：StringIO 完成时 getvalue 再拷一份全量
+        #（4K 生图单对象 30-90MB，internal + getvalue + 解析产物三份
+        # 瞬时驻留）；list + join 只在完成时产生一份拼接串。
+        self.buffer = []
         self._array = False
         self._state = "start"
 
@@ -39,7 +41,7 @@ class JsonObjects:
         self.size += len(fragment) if fragment.isascii() else len(fragment.encode("utf-8"))
         if self.size > self.limit:
             raise IncompleteResponseError("上游单个 JSON 对象超过字节上限。")
-        self.buffer.write(fragment)
+        self.buffer.append(fragment)
 
     def _separator(self, token):
         if self._state == "start" and token == "[":
@@ -86,10 +88,10 @@ class JsonObjects:
                 if not self.depth:
                     self._append(chunk[start:match.end()])
                     try:
-                        obj = json.loads(self.buffer.getvalue())
+                        obj = json.loads("".join(self.buffer))
                     except (json.JSONDecodeError, RecursionError) as exc:
                         raise IncompleteResponseError("上游返回无效的 JSON 对象。") from exc
-                    self.buffer = io.StringIO()
+                    self.buffer = []
                     self.size, start = 0, None
                     self._state = "separator" if self._array else "end"
                     outside = match.end()

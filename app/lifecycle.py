@@ -9,7 +9,7 @@ from fastapi import FastAPI
 import config
 import express_key_probe
 from client_pool import close_all_clients
-from console_auth import DEFAULT_API_KEY
+from config import DEFAULT_API_KEY
 from keepalive import keepalive_service
 from model_loader import close_models_refresh, get_models_config, schedule_models_refresh
 from proxy_resolver import (bridge_manager, find_bridge_binary, singbox_available,
@@ -59,6 +59,40 @@ async def _probe_express_projects_on_startup() -> None:
         print(f"⚠️ [密钥探测] 启动探测失败（不影响服务）：{type(e).__name__} - {e}")
 
 
+def enforce_strong_api_key() -> None:
+    """SEC-P1-1（2026-11 收紧）：出厂默认口令默认拒绝启动。
+
+    此前仅公开托管环境（HuggingFace Space）硬失败，普通 Docker 部署
+    只打告警照常服务——照抄 compose 示例部署的用户等于把控制台
+    （可读写完整 Google Cookie）敞开在公网。现在除 ALLOW_DEFAULT_KEY
+    显式放行外一律拒绝；弱口令清单同时覆盖代码默认值与 compose 示例
+    里的占位口令（两者都是公开已知的）。
+    独立成函数便于单独测试（完整 lifespan 依赖外部资源，不宜在单元
+    测试中拉起）。
+    """
+    weak_api_keys = (DEFAULT_API_KEY, "change-me-please")
+    if config.API_KEY not in weak_api_keys:
+        return
+    public_host = any(os.environ.get(k) for k in ("SPACE_ID", "SPACE_HOST", "HF_SPACE_ID"))
+    shown_key = config.API_KEY
+    if config.env_flag("ALLOW_DEFAULT_KEY"):  # QUA-P2-7：布尔口径单点定义（同时接受 on/首尾空白）
+        print(
+            f"⚠️ [安全警告] 已通过 ALLOW_DEFAULT_KEY 显式放行弱口令 {shown_key}，"
+            "仅建议本地调试使用，公网部署必须设置强口令。"
+        )
+        return
+    raise RuntimeError(
+        f"API_KEY 仍为出厂弱口令 {shown_key}，拒绝启动。\n"
+        "该口令同时是控制台登录密码，而控制台可以读写完整的 Google 会话 Cookie，"
+        "弱口令运行形同把 Google 账号敞开。\n"
+        "请设置一个强 API_KEY 后重启；仅本地调试可设 ALLOW_DEFAULT_KEY=true 显式放行。"
+        if not public_host else
+        f"检测到公开托管环境（HuggingFace Space 等）且 API_KEY 仍为弱口令 {shown_key}。\n"
+        "该口令同时是控制台登录密码，而控制台可以读写完整的 Google 会话 Cookie。\n"
+        "请设置一个强 API_KEY 后重启；确需临时放行可设 ALLOW_DEFAULT_KEY=true。"
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _shutting_down
@@ -67,23 +101,7 @@ async def lifespan(app: FastAPI):
     bridge_manager.reopen()
     print("🚀 [服务启动] agentplatform2api 适配器已启动（Express API Key / Cookie 直连 双通道）。")
 
-    # S-1：默认口令 + 公开托管 + 明文 Cookie 是很危险的组合，必须让人看见。
-    # 弱口令清单同时覆盖代码默认值与 compose 示例里的占位口令——两者都是
-    # 公开已知的，用它运行形同把控制台（可读写完整 Google Cookie）敞开。
-    weak_api_keys = (DEFAULT_API_KEY, "change-me-please")
-    if config.API_KEY in weak_api_keys:
-        public_host = any(os.environ.get(k) for k in ("SPACE_ID", "SPACE_HOST", "HF_SPACE_ID"))
-        shown_key = config.API_KEY
-        if public_host and os.environ.get("ALLOW_DEFAULT_KEY", "").lower() not in ("1", "true", "yes"):
-            raise RuntimeError(
-                f"检测到公开托管环境（HuggingFace Space 等）且 API_KEY 仍为弱口令 {shown_key}。\n"
-                "该口令同时是控制台登录密码，而控制台可以读写完整的 Google 会话 Cookie。\n"
-                "请设置一个强 API_KEY 后重启；确需临时放行可设 ALLOW_DEFAULT_KEY=true。"
-            )
-        print(
-            f"🔴 [安全警告] API_KEY 仍是弱口令 {shown_key}！它既是本代理的 Key，也是控制台登录口令，"
-            "请立刻改成强口令。"
-        )
+    enforce_strong_api_key()
     express_key_manager = app.state.express_key_manager
 
     # 多账号 Express Key：环境变量只做**一次性**初始导入，之后以控制台保存的列表为准。
@@ -93,6 +111,15 @@ async def lifespan(app: FastAPI):
     app_state.initialize_channel_mode_once()
     print(f"🔀 [通道调度] {app_state.get_channel_mode()}；"
           f"Cookie 账号 {sum(r['enabled'] for r in app_state.get_cookie_accounts())} 个启用。")
+    # SEC-P2-4：已存凭证（Cookie / Express Key）时提醒 TLS——登录口令与控制台
+    # 里粘贴/回传的完整 Google Cookie 都在明文 HTTP 上裸奔；无法在启动期探测
+    # 实际入站协议（取决于反代），改为一条固定提醒 + 登录时动态告警兜底。
+    _has_credentials = bool(app_state.get_cookie_accounts()) or bool(app_state.get_express_keys())
+    if _has_credentials and not config.env_flag("FORCE_SECURE_COOKIE"):
+        # QUA-P2-7：口径与 console_auth 统一为布尔字面量（此前「非空即真」，
+        # 设 =false / =0 也会被误认为已强制 Secure 而吞掉提醒）。
+        print("🔒 [安全提醒] 已存有 Google 凭证：公网部署务必经 HTTPS 反代暴露本服务"
+              "（并设 FORCE_SECURE_COOKIE=true），否则控制台传输的 Cookie 会明文过网。")
     if express_key_manager.get_total_keys() > 0:
         print(f"✅ [密钥配置] 已加载 {express_key_manager.get_total_keys()} 个 Express API Key。")
     else:

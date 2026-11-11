@@ -40,7 +40,9 @@ class RequestBoundaryTests(unittest.IsolatedAsyncioTestCase):
                 response = await self.client.post(path, content=b"{}", headers={
                     "Content-Length": "129", "Origin": "https://client.example"})
                 self.assertEqual(response.status_code, 413)
-                self.assertEqual(response.headers["access-control-allow-origin"], "*")
+                # SEC-P3-1：CORS 默认同源（不装中间件），不再回
+                # access-control-allow-origin: *；错误形状与缓存头不受影响。
+                self.assertNotIn("access-control-allow-origin", response.headers)
                 self.assertEqual(response.headers["cache-control"], "no-store")
                 self.assert_protocol(response.json(), protocol)
 
@@ -422,7 +424,9 @@ class HotPathOptimizationTests(unittest.TestCase):
             ('data: {"error":{"code":429,"message":"quota"}}\n\n', "error"),
             ('data: [DONE]\n\n', "done"),
             (': keep-alive\n\n', "keepalive"),
-            ('data: {"id":"chatcmpl-keepalive","choices":[]}\n\n', "keepalive"),
+            # REQ-P3-7：假流式心跳改注释帧后，chatcmpl-keepalive data 帧
+            # 不再由任何生产方产生，分类器不再特判（旧形状归 other）。
+            ('data: {"id":"chatcmpl-keepalive","choices":[]}\n\n', "other"),
             ('data: {"choices":[],"usage":{"total_tokens":1}}\n\n', "other"),
         ]
         for frame, expected in cases:

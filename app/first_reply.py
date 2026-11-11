@@ -4,6 +4,7 @@ import math
 import time
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
+from typing import Any, AsyncIterable, AsyncIterator, Awaitable, Callable, Optional
 
 import config as app_config
 from runtime_state import app_state
@@ -26,7 +27,7 @@ _active_wait = ContextVar("first_reply_wait", default=None)
 
 
 @asynccontextmanager
-async def proxy_attempt(enabled):
+async def proxy_attempt(enabled: bool) -> AsyncIterator[None]:
     """Give each configured proxy its own first-reply window within the total deadline."""
     active = _active_wait.get() if enabled else None
     if active is None:
@@ -76,13 +77,13 @@ async def proxy_attempt(enabled):
 class FirstReplyTimeout(TimeoutError):
     code = 504
 
-    def __init__(self, message, *, seconds=None):
+    def __init__(self, message: str, *, seconds: Optional[float] = None) -> None:
         super().__init__(message)
         # 携带触发超时的窗口秒数，供重试日志与请求监控面板展示窗口口径。
         self.seconds = seconds
 
 
-def timeout_seconds(model):
+def timeout_seconds(model: str) -> float:
     try:
         value = float(app_state.get_effective_settings(model).get("first_reply_timeout_seconds", 15))
         return max(0.0, min(app_config.MAX_TIMEOUT_SECONDS, value)) if math.isfinite(value) else 15.0
@@ -91,7 +92,7 @@ def timeout_seconds(model):
 
 
 class FirstReplyGuard:
-    def __init__(self, model, *, seconds=None):
+    def __init__(self, model: str, *, seconds: Optional[float] = None) -> None:
         # seconds：调用方预先算好的窗口。同一请求的重试循环共享一次设置
         # 读取——旧实现每次尝试都新建 Guard，每次都深拷贝整棵设置树
         # （含全部 model_overrides），重试风暴下是纯浪费的热路径开销。
@@ -108,7 +109,7 @@ class FirstReplyGuard:
                 self.trace.data["first_reply_timeout_seconds"] = self.seconds
                 self.trace.data["first_reply_deadline"] = time.time() + self.seconds if self.seconds else None
 
-    async def wait(self, operation):
+    async def wait(self, operation: Awaitable) -> Any:
         if self.ready or not self.seconds:
             return await operation
         deadline = asyncio.timeout(max(0.001, self.deadline - time.monotonic()))
@@ -127,7 +128,7 @@ class FirstReplyGuard:
         finally:
             _active_wait.reset(token)
 
-    def accept(self):
+    def accept(self) -> None:
         if self.ready:
             return
         self.ready = True
@@ -136,7 +137,7 @@ class FirstReplyGuard:
                 self.trace.data["first_reply_deadline"] = None
             self.trace.milestone("first_reply", "收到模型首个有效回复，首回复计时结束。")
 
-    async def iterate(self, source, predicate):
+    async def iterate(self, source: AsyncIterable, predicate: Callable) -> AsyncIterator[Any]:
         # 注意：这里**不能**加 try/finally 去 aclose(iterator)——prefetch 在
         # 首个回复帧后主动 break 并继续经 PrefetchedStream 消费同一 source，
         # 迭代器被消费方提前 abandon 是预期路径（清理交给 prefetch 的
@@ -152,7 +153,7 @@ class FirstReplyGuard:
                 self.accept()
             yield item
 
-    async def prefetch(self, source, predicate, *, max_prefix_bytes=2 * 1024 * 1024):
+    async def prefetch(self, source: AsyncIterable, predicate: Callable, *, max_prefix_bytes: int=2 * 1024 * 1024) -> "PrefetchedStream":
         prefix = []
         size = 0
         try:
@@ -170,7 +171,7 @@ class FirstReplyGuard:
 
 
 class PrefetchedStream:
-    def __init__(self, prefix, source):
+    def __init__(self, prefix: list, source: AsyncIterable) -> None:
         self.prefix = iter(prefix)
         self.source = source
 
@@ -183,11 +184,11 @@ class PrefetchedStream:
         except StopIteration:
             return await anext(self.source)
 
-    async def aclose(self):
+    async def aclose(self) -> None:
         await self.source.aclose()
 
 
-def sdk_has_reply(chunk):
+def sdk_has_reply(chunk: Any) -> bool:
     for candidate in getattr(chunk, "candidates", None) or []:
         for part in getattr(getattr(candidate, "content", None), "parts", None) or []:
             call = getattr(part, "function_call", None)
@@ -198,7 +199,7 @@ def sdk_has_reply(chunk):
     return False
 
 
-def native_has_reply(payload):
+def native_has_reply(payload: Any) -> bool:
     objects = payload if isinstance(payload, list) else [payload]
     for obj in objects:
         if not isinstance(obj, dict):
@@ -213,7 +214,7 @@ def native_has_reply(payload):
     return False
 
 
-async def timed_call(model, operation, *, whole_call=False, seconds=None):
+async def timed_call(model: str, operation: Awaitable, *, whole_call: bool=False, seconds: Optional[float]=None) -> Any:
     """whole_call：该操作要等完整响应（非流式 generate_content / 整取 POST）。
 
     整调用不参与首回复计时（2026-11 语义，见模块头注释）：窗口强制置 0

@@ -78,6 +78,8 @@ COPY --from=singbox-download /usr/local/bin/sing-box /usr/local/bin/sing-box
 RUN /usr/local/bin/sing-box version
 COPY --from=proxy-bridge-build /vertex-proxy-bridge /usr/local/bin/vertex-proxy-bridge
 COPY proxybridge/NOTICE.txt /usr/local/share/vertex-proxy-bridge/NOTICE.txt
+# ENG-P3-11：Python 侧依赖许可清单随镜像分发（pip 包含二进制衍生物）。
+COPY NOTICE-Python.txt /usr/local/share/vertex-proxy-bridge/NOTICE-Python.txt
 
 # Copy application code and local model fallback
 COPY --chown=app:app app/ .
@@ -99,4 +101,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
 
 # Command to run the application
 # Run the FastAPI service on the container port
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "7860"]
+# --no-access-log（SEC-P2-1）：uvicorn 访问日志会把 ?key= 查询参数里的
+# 口令明文打进日志（自定义脱敏 print 钩子不覆盖 uvicorn 的 logging）。
+# 关闭后由应用日志 + 反代日志（脱敏 query）承担可观测性。
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "7860", "--no-access-log"]

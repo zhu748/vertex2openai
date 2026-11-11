@@ -128,15 +128,20 @@ async def within_request_deadline(buf, operation):
         async with asyncio.timeout(max(0.001, remaining)):
             return await (operation() if callable(operation) else operation)
     except TimeoutError:
-        await buf.fail("本轮请求超过总执行期限。", 504, "timeout")
+        # REQ-P2-3：fail 是收尸动作，必须屏蔽二次取消——否则 await buf.fail
+        # 被再次制停时缓冲永远停在 running，只能等默认 30 分钟的兑底 sweep。
+        with anyio.CancelScope(shield=True):
+            await buf.fail("本轮请求超过总执行期限。", 504, "timeout")
         raise
     except asyncio.CancelledError:
-        await buf.fail("上游任务已取消。", 503)
+        with anyio.CancelScope(shield=True):
+            await buf.fail("上游任务已取消。", 503)
         raise
     except Exception as exc:
         from upstream_errors import extract_upstream_error
         code, message = extract_upstream_error(exc)
-        await buf.fail(message, code)
+        with anyio.CancelScope(shield=True):
+            await buf.fail(message, code)
         raise
 
 
@@ -217,6 +222,19 @@ def ttl_seconds() -> float:
         return float(app_config.DEFAULT_SETTINGS["resumable_ttl_seconds"])
 
 
+def delivered_ttl_seconds() -> float:
+    """PRF-P2-6：已完整交付且无显式幂等键的缓冲的短保留窗口。
+
+    mark_delivered 语义下，同指纹重发本就应重新生成（不再重放），把这类
+    缓冲钉满完整 TTL（默认 30 分钟）只拉高稳态 RSS 基线、挤压 512MB
+    容器的图片链峰值。短窗口（默认 120 秒）只覆盖客户端快速重试。
+    """
+    try:
+        return max(15.0, float(_setting("resumable_delivered_ttl_seconds")))
+    except (TypeError, ValueError):
+        return float(app_config.DEFAULT_SETTINGS["resumable_delivered_ttl_seconds"])
+
+
 def max_streams() -> int:
     try:
         return max(1, int(_setting("resumable_max_streams")))
@@ -231,7 +249,10 @@ def compute_stream_id(headers: Any, api_key: str, fingerprint: str) -> Tuple[str
     没有就用「API Key + 请求体」哈希，让**原样重发**天然命中同一缓冲区。
     """
     # X-Resume-Id identifies an existing generation, not a new idempotency key.
-    for h in ("idempotency-key", "x-idempotency-key", "x-request-id"):
+    # REQ-P2-4：不再把 x-request-id 当幂等键——GCP LB / Nginx / 部分 SDK 每次
+    # 重试都会生成**新值**，客户端断线重发时每次都命中不同缓冲并新打上游，
+    # 击穿续传语义；只有客户端显式声明的 Idempotency-Key 才可信任。
+    for h in ("idempotency-key", "x-idempotency-key"):
         try:
             v = (headers.get(h) or "").strip()
         except Exception:
@@ -240,9 +261,9 @@ def compute_stream_id(headers: Any, api_key: str, fingerprint: str) -> Tuple[str
             # 幂等键只做“同一用户 + 同一请求体”之内的显式身份：混入 API Key 与请求指纹，
             # 避免不同用户复用同一键值时串缓冲（A 的回复被 B 读到），也避免同一键配不同
             # 请求体时误重放。客户端原样重发（同键 + 同体）仍稳定命中同一缓冲。
-            digest = hashlib.sha256(f"{api_key}\x00{v}\x00{fingerprint}".encode("utf-8")).hexdigest()[:32]
+            digest = hashlib.sha256(f"{api_key}\x00{v}\x00{fingerprint}".encode()).hexdigest()[:32]
             return f"cid-{digest}", f"客户端请求头 {h}"
-    digest = hashlib.sha256(f"{api_key}\x00{fingerprint}".encode("utf-8")).hexdigest()[:32]
+    digest = hashlib.sha256(f"{api_key}\x00{fingerprint}".encode()).hexdigest()[:32]
     return f"req-{digest}", "请求体指纹"
 
 
@@ -514,7 +535,7 @@ class ResumableBuffer:
                     return
                 try:
                     await asyncio.wait_for(self._cond.wait(), timeout=remain)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     return
 
     async def iter_from(self, seq: int = 0) -> AsyncIterator[Tuple[int, str]]:
@@ -801,12 +822,21 @@ class ResumableStore:
         ttl = ttl_seconds()
         now = time.time()
         removed = 0
+        delivered_ttl = delivered_ttl_seconds()
         async with self._lock:
             for sid, buf in list(self._buffers.items()):
                 ref = buf.finished_at or buf.last_access
-                if buf.done and buf.readers == 0 and (now - ref) > ttl:
-                    await self._discard_locked(sid, "响应缓冲已过期。")
-                    removed += 1
+                if buf.done and buf.readers == 0:
+                    # PRF-P2-6：无显式幂等键（非 cid- 前缀）且已完整交付的
+                    # 缓冲用短窗口；显式幂等键的缓冲按完整 TTL 保留（客户端
+                    # 明确要求可重放）。未完整交付的缓冲是续传价值的本体，
+                    # 仍按完整 TTL 保留。
+                    effective_ttl = ttl
+                    if buf.fully_delivered and not sid.startswith("cid-"):
+                        effective_ttl = min(ttl, delivered_ttl)
+                    if (now - ref) > effective_ttl:
+                        await self._discard_locked(sid, "响应缓冲已过期。")
+                        removed += 1
                 elif not buf.done and time.monotonic() >= buf.deadline_monotonic:
                     # 极端兜底：上游永不结束的僵尸缓冲
                     await self._discard_locked(sid, "上游响应等待超时。")

@@ -25,6 +25,7 @@ from models import OpenAIMessage, OpenAIRequest
 from pydantic import ValidationError
 from response_validation import IncompleteResponseError
 from routes import console, gemini_native
+from upstreams import native_passthrough
 from upstreams import cookie_delivery, cookie_proxy, cookie_request, express_sdk
 from PIL import Image
 
@@ -256,8 +257,8 @@ class NativeJSONTests(unittest.IsolatedAsyncioTestCase):
                                   {"key": "offline", "project_id": "", "proxies": ["direct"]})
         request = SimpleNamespace(is_disconnected=mock.AsyncMock(return_value=False),
             app=SimpleNamespace(state=SimpleNamespace(express_key_manager=manager)))
-        with mock.patch.object(gemini_native, "_passthrough_once", mock.AsyncMock(return_value=upstream)), \
-             mock.patch.object(gemini_native, "passthrough_client_pool",
+        with mock.patch.object(native_passthrough, "_passthrough_once", mock.AsyncMock(return_value=upstream)), \
+             mock.patch.object(native_passthrough, "passthrough_client_pool",
                                SimpleNamespace(get=lambda *args: None)), \
              mock.patch.object(runtime_state.app_state, "get_settings", return_value=
                                dict(config.DEFAULT_SETTINGS, express_location="", retry_max=0)):

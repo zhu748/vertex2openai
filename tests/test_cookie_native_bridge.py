@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Gemini 原生格式 ⇄ Cookie 通道桥接（upstreams/cookie_native）的回归测试。
 
 覆盖：请求转 variables（systemInstruction/tools/结构化输出门控/生图补默认）、

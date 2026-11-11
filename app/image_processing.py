@@ -3,6 +3,7 @@
 import base64
 import io
 import re
+import threading
 import time
 from typing import Optional, Tuple
 
@@ -127,7 +128,7 @@ def optimize_image_bytes(
         raise
     except Image.DecompressionBombError as e:
         # PIL 自身的像素炸弹拦截：同样拒绝而非回传（belt and suspenders）。
-        raise ValueError(f"输入图片像素数超过 PIL 安全上限：{e}")
+        raise ValueError(f"输入图片像素数超过 PIL 安全上限：{e}") from e  # B904
     except Exception as e:
         print(f"⚠️ [图片处理] 输入图片压缩失败，已回退为原图传输：{e}")
         return image_data, original_mime
@@ -199,6 +200,50 @@ def _is_blocked_host(host: str) -> bool:
         return True
 
 
+# PRF-P2-3：按（代理, 证书）签名共享的同步 httpx.Client 池。旧实现每张
+# 远程图新建客户端——多图消息首回复时间线性劣化，每张多付一次
+# TCP/TLS 握手（100-300ms）。httpx.Client 线程安全；超时在请求级传入，
+# 不受共享影响。签名组合有限（无代理 / 全局代理 / 若千 Key 级代理）。
+_IMAGE_CLIENTS: dict = {}
+_IMAGE_CLIENTS_LOCK = threading.Lock()
+_IMAGE_CLIENTS_MAX = 16
+
+
+def reset_image_clients() -> None:
+    """关闭并清空共享图片客户端池（测试隔离用）。"""
+    with _IMAGE_CLIENTS_LOCK:
+        clients = list(_IMAGE_CLIENTS.values())
+        _IMAGE_CLIENTS.clear()
+    for client in clients:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def _shared_image_client(proxy_url):
+    verify = app_config.SSL_CERT_FILE or True
+    key = (proxy_url or "", app_config.SSL_CERT_FILE or "")
+    with _IMAGE_CLIENTS_LOCK:
+        client = _IMAGE_CLIENTS.get(key)
+        if client is not None:
+            return client
+        client_args = {"timeout": 10.0, "follow_redirects": False, "trust_env": False}
+        if proxy_url:
+            client_args["proxy"] = build_httpx_proxy(proxy_url, verify=verify)
+        if getattr(app_config, "SSL_CERT_FILE", None):
+            client_args["verify"] = app_config.SSL_CERT_FILE
+        client = httpx.Client(**client_args)
+        if len(_IMAGE_CLIENTS) >= _IMAGE_CLIENTS_MAX:
+            oldest_key = next(iter(_IMAGE_CLIENTS))
+            try:
+                _IMAGE_CLIENTS.pop(oldest_key).close()
+            except Exception:
+                pass
+        _IMAGE_CLIENTS[key] = client
+        return client
+
+
 def fetch_remote_image(url: str, timeout: float = 10.0) -> Optional[Tuple[bytes, str]]:
     """Download a bounded public image using a pinned, validated destination.
 
@@ -243,42 +288,37 @@ def _fetch_remote_image_once(url, timeout, proxy_url, *, deadline=None):
     # DNS lookup is unnecessary because the checked address is already pinned.
     original_url, address = destination(url)
 
-    client_args = {"timeout": remaining(), "follow_redirects": False, "trust_env": False}
-    if proxy_url:
-        client_args["proxy"] = build_httpx_proxy(proxy_url, verify=app_config.SSL_CERT_FILE or True)
-    if getattr(app_config, "SSL_CERT_FILE", None):
-        client_args["verify"] = app_config.SSL_CERT_FILE
+    # PRF-P2-3：共享客户端（按代理/证书签名池化）；每请求超时在请求级传入。
+    client = _shared_image_client(proxy_url)
+    for _ in range(MAX_REMOTE_IMAGE_REDIRECTS + 1):
+        # Pin the checked address for direct and proxy connections,
+        # preserving Host and TLS SNI. DNS cannot change between the
+        # safety check and the actual connection (DNS rebinding).
+        pinned_url = original_url.copy_with(host=address)
+        image_headers = dict(_IMAGE_FETCH_HEADERS, Host=original_url.netloc.decode("ascii"))
+        with client.stream(
+            "GET",
+            pinned_url,
+            headers=image_headers,
+            timeout=remaining(),
+            extensions={"sni_hostname": original_url.raw_host.decode("ascii")},
+        ) as resp:
+            if resp.is_redirect:
+                # 每跳复查，且重定向响应体无需下载。
+                location = resp.headers.get("location", "")
+                original_url, address = destination(str(original_url.join(location)) if location else "")
+                continue
 
-    with httpx.Client(**client_args) as client:
-        for _ in range(MAX_REMOTE_IMAGE_REDIRECTS + 1):
-            # Pin the checked address for direct and proxy connections,
-            # preserving Host and TLS SNI. DNS cannot change between the
-            # safety check and the actual connection (DNS rebinding).
-            pinned_url = original_url.copy_with(host=address)
-            image_headers = dict(_IMAGE_FETCH_HEADERS, Host=original_url.netloc.decode("ascii"))
-            with client.stream(
-                "GET",
-                pinned_url,
-                headers=image_headers,
-                timeout=remaining(),
-                extensions={"sni_hostname": original_url.raw_host.decode("ascii")},
-            ) as resp:
-                if resp.is_redirect:
-                    # 每跳复查，且重定向响应体无需下载。
-                    location = resp.headers.get("location", "")
-                    original_url, address = destination(str(original_url.join(location)) if location else "")
-                    continue
-
-                resp.raise_for_status()
-                mime = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
-                if mime and not mime.startswith("image/"):
-                    raise ValueError(f"响应不是图片（content-type={mime}）")
-                data = bytearray()
-                for chunk in resp.iter_bytes():
-                    remaining()
-                    if len(data) + len(chunk) > MAX_REMOTE_IMAGE_BYTES:
-                        raise ValueError(f"图片超过 {MAX_REMOTE_IMAGE_BYTES // (1024 * 1024)}MB 上限")
-                    data.extend(chunk)
+            resp.raise_for_status()
+            mime = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+            if mime and not mime.startswith("image/"):
+                raise ValueError(f"响应不是图片（content-type={mime}）")
+            data = bytearray()
+            for chunk in resp.iter_bytes():
                 remaining()
-                return bytes(data), mime or "image/jpeg"
-        raise ValueError("重定向次数过多")
+                if len(data) + len(chunk) > MAX_REMOTE_IMAGE_BYTES:
+                    raise ValueError(f"图片超过 {MAX_REMOTE_IMAGE_BYTES // (1024 * 1024)}MB 上限")
+                data.extend(chunk)
+            remaining()
+            return bytes(data), mime or "image/jpeg"
+    raise ValueError("重定向次数过多")

@@ -2,7 +2,7 @@ import time
 from typing import List, Dict, Any, Set, Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 
-from auth import validate_api_key
+from auth import extract_candidate_key, validate_api_key
 from model_loader import get_express_models
 from runtime_state import app_state
 from anti_truncation import catalog_variant_ids, split_model_alias
@@ -23,11 +23,9 @@ async def get_models_api_key(
     OpenAI 客户端保持原有 detail 形状。
 
     单测直调路由时依赖被整体绕过，与旧版 get_api_key 的行为契约一致。"""
-    if authorization and authorization.startswith("Bearer "):
-        candidate = authorization[len("Bearer "):]
-    else:
-        candidate = (x_api_key or x_goog_api_key
-                     or fastapi_request.query_params.get("key", ""))
+    candidate = extract_candidate_key(
+        fastapi_request, authorization=authorization or "",
+        x_api_key=x_api_key or "", x_goog_api_key=x_goog_api_key or "")
     anthropic = claude_api.is_anthropic_client(fastapi_request)
     if not candidate:
         if anthropic:

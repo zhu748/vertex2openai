@@ -7,7 +7,7 @@ import re
 import time
 import uuid
 from collections.abc import Iterator
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import config as app_config
 from google.genai import types
@@ -27,6 +27,7 @@ from thought_signatures import (
     attach_signature_extra,
     build_tool_call_id,
     google_metadata,
+    merge_by_order,
     ordinary_part_metadata,
     ordinary_parts_from_extra,
     requires_signature,
@@ -219,7 +220,7 @@ def _coerce_tool_response(content: Any) -> Dict[str, Any]:
     return {"result": content}
 
 
-def tool_response_with_media(content: Any, model_name: str = "", *, error_content=False) -> tuple[dict, list]:
+def tool_response_with_media(content: Any, model_name: str = "", *, error_content: bool=False) -> tuple[dict, list]:
     """Replace tool image blocks with references to bounded native image blobs.
 
     Both Anthropic image blocks and OpenAI image_url blocks are accepted.
@@ -230,7 +231,7 @@ def tool_response_with_media(content: Any, model_name: str = "", *, error_conten
     media = []
     total_bytes = 0
 
-    def convert(blocks):
+    def convert(blocks: list):
         nonlocal total_bytes
         converted = []
         for block in blocks:
@@ -447,25 +448,12 @@ def _assistant_tool_parts(
             _attach_message_signature(ordinary_parts, message_sig, signature_kind)
 
     google_extra = google_metadata(message)
-    part_order = google_extra.get("part_order")
-    if isinstance(part_order, list):
-        ordered, used_tools, used_ordinary = [], set(), set()
-        for item in part_order:
-            if isinstance(item, dict) and item.get("type") == "tool_call":
-                i = item.get("index")
-                if type(i) is int and 0 <= i < len(tool_parts) and i not in used_tools:
-                    ordered.append(tool_parts[i])
-                    used_tools.add(i)
-            elif isinstance(item, dict) and item.get("type") == "ordinary":
-                i = item.get("index")
-                if type(i) is int and 0 <= i < len(ordinary_parts) and i not in used_ordinary:
-                    ordered.append(ordinary_parts[i])
-                    used_ordinary.add(i)
-        ordered.extend(
-            p for i, p in enumerate(ordinary_parts) if i not in used_ordinary
-        )
-        ordered.extend(p for i, p in enumerate(tool_parts) if i not in used_tools)
-        parts.extend(ordered)
+    # QUA-P2-3：part_order 交错重组收敛到 thought_signatures.merge_by_order
+    #（剩余块兕底顺序保留 SDK 通道既有行为：普通块在前）。
+    merged = merge_by_order(google_extra.get("part_order"), tool_parts, ordinary_parts,
+                            remainder_calls_first=False)
+    if merged is not None:
+        parts.extend(merged)
     else:
         # Historical behavior emitted calls first. Preserve it unless a
         # response from this bridge supplies exact part_order metadata.
@@ -475,7 +463,7 @@ def _assistant_tool_parts(
 
 
 def _restored_ordinary_parts(message: OpenAIMessage):
-    def images(thought=False):
+    def images(thought: bool=False):
         # Use the normal media conversion once, without replaying metadata.
         plain = message.model_copy(update={"extra_content": None, "reasoning_content": None,
                                            "content": message.reasoning_content if thought else message.content})
@@ -628,7 +616,7 @@ def _rindex_by_identity(seq: list, item: Any) -> int:
     raise ValueError("签名目标 part 不在列表中（不应发生）")
 
 
-def _attach_message_signature(parts: list, message_sig, signature_kind) -> None:
+def _attach_message_signature(parts: list, message_sig: Optional[str], signature_kind: str) -> None:
     """把消息级思考签名挂到目标 part（带工具调用与普通两条恢复路径共用）。
 
     目标选择（与浏览器端语义对齐）：thought 签名挂最后一个思考 part；
@@ -663,7 +651,7 @@ def _attach_message_signature(parts: list, message_sig, signature_kind) -> None:
     )
 
 
-def _iter_content_segments(content_list, on_text, on_image_url) -> None:
+def _iter_content_segments(content_list: list, on_text: Callable, on_image_url: Callable) -> None:
     """遍历 OpenAI 分段 content，把 text / image_url 分段派发给回调。
 
     三条转换管线（工具回合恢复 / 普通消息 / Cookie wire）共用的遍历骨架
@@ -706,7 +694,7 @@ def _image_part_url(part_item: dict) -> str:
     return getattr(img_url_data, "url", "") or ""
 
 
-def _ingest_image_part(image_url: str, append_part) -> None:
+def _ingest_image_part(image_url: str, append_part: Callable) -> None:
     """摄取一张 image_url（data: 或 http(s):）并交给 append_part 构造通道专属 part。
 
     Express（SDK Part）与 Cookie（wire dict）两条消息转换管线共用：
@@ -813,7 +801,7 @@ def _rating_fields(r: Any) -> Tuple[str, str, Optional[float], Optional[float]]:
     的 camelCase 字典，两边共用同一个渲染器。
     """
 
-    def _enum_name(v):
+    def _enum_name(v: Any):
         return getattr(v, "name", None) or (str(v) if v is not None else "")
 
     if isinstance(r, dict):
@@ -855,7 +843,7 @@ def _create_safety_ratings_html(safety_ratings: list) -> str:
     else:
         color = "#bf555d"
 
-    def _fmt(cat, prob, ps, ss):
+    def _fmt(cat: str, prob: Optional[float], ps: Any, ss: Any):
         ps_s = f"{ps:.7f}" if ps is not None else "None"
         ss_s = f"{ss:.8f}" if ss is not None else "None"
         return f"{cat}: {prob} (Score: {ps_s}, Severity: {ss_s})"

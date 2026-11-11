@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-import config
+import config  # QUA-P2-7：环境开关读取集中层
 from auth import constant_time_equal
 from console_auth import (
     AUTH_COOKIE,
@@ -18,7 +18,10 @@ from console_auth import (
     is_authenticated,
     issue_session,
     login_retry_after,
+    proxy_headers_trusted,
     record_login_failure,
+    resolve_admin_password,
+    revoke_all_sessions,
     revoke_session,
     require_auth,
 )
@@ -48,6 +51,23 @@ class LoginBody(BaseModel):
     password: str
 
 
+# SEC-P2-4：强制 Secure Cookie 开关。反代终止 TLS 但未传 x-forwarded-proto
+# 时，动态探测会把会话 Cookie 发成非 Secure；设置 FORCE_SECURE_COOKIE=true
+# 后无条件带 Secure（即使本地 http 调试——代价是浏览器拒发该 Cookie）。
+_FORCE_SECURE_COOKIE = config.env_flag("FORCE_SECURE_COOKIE")  # QUA-P2-7：布尔口径单点定义
+
+# SEC-P2-4：明文 HTTP 传输控制台口令的进程级一次性告警（每个方向只喷一次，
+# 避免高频误配部署在日志里刷屏）。
+_plain_http_warned = False
+
+
+def _request_is_https(request: Request) -> bool:
+    """动态判定请求是否经 TLS 抵达（反代场景看 x-forwarded-proto）。"""
+    if request.url.scheme == "https":
+        return True
+    return request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip() == "https"
+
+
 @router.post("/api/login")
 async def login(body: LoginBody, request: Request):
     ip = client_ip(request)
@@ -55,11 +75,30 @@ async def login(body: LoginBody, request: Request):
     # P2-2：失败三次后指数退避，避免对口令（同时也是 API Key）无限爆破
     remain = login_retry_after(ip)
     if remain > 0:
-        return JSONResponse(status_code=429, content={"error": f"尝试过于频繁，请 {remain} 秒后再试"},
+        # SEC-P3-3：未开 TRUST_PROXY_HEADERS 的反代部署里，全部来访者共享
+        # 同一个限速桶（client_ip 退化为反代地址），个别人的爆破会锁死管理员的
+        # 登录——在 429 里直接给出设置指引，而不是让人对着「尝试过于频繁」猜。
+        message = f"尝试过于频繁，请 {remain} 秒后再试"
+        if not proxy_headers_trusted():
+            message += "。提示：若本服务部署在反向代理后，请设置 TRUST_PROXY_HEADERS=true，否则所有来访者共享同一限速桶"
+        return JSONResponse(status_code=429, content={"error": message},
                             headers={"Retry-After": str(remain), "Cache-Control": "no-store"})
 
-    if config.API_KEY and constant_time_equal(body.password, config.API_KEY):
+    # SEC-P1-2：控制台口令优先用独立的 ADMIN_PASSWORD（未设置时回退 API_KEY）。
+    # 此前直接比对 API_KEY——目标用户常把兼容端点 Key 分享给朋友/社区，
+    # 拿到 Key 即可登录控制台导出完整 Google Cookie，两种信任级别混为一体。
+    admin_password = resolve_admin_password()
+    if admin_password and constant_time_equal(body.password, admin_password):
         clear_login_failure(ip)
+        # SEC-P2-4：明文 HTTP 上的登录（且未强制 Secure Cookie）打醒目告警。
+        # 登录口令、以及控制台里粘贴/回传的完整 Google Cookie 都在这条链路
+        # 上明文过网；公网部署必须配 TLS 反代（README「生产部署」有示例）。
+        global _plain_http_warned
+        if not _plain_http_warned and not _request_is_https(request) and not _FORCE_SECURE_COOKIE:
+            _plain_http_warned = True
+            print("⚠️ [安全警告] 刚在明文 HTTP 连接上完成控制台登录：登录口令已明文过网，"
+                  "控制台后续传输的 Google Cookie 同样暴露。公网部署请配置 HTTPS 反向代理；"
+                  "反代已终止 TLS 但仍看到本告警时，请设置 FORCE_SECURE_COOKIE=true。")
         resp = JSONResponse(content={"ok": True})
         resp.set_cookie(
             AUTH_COOKIE,
@@ -68,8 +107,11 @@ async def login(body: LoginBody, request: Request):
             samesite="lax",
             max_age=SESSION_TTL_SECONDS,
             path="/",
-            # 反代后 request.url.scheme 可能是 http，这里同时看 x-forwarded-proto
-            secure=(request.url.scheme == "https" or request.headers.get("x-forwarded-proto", "") == "https"),
+            # 反代后 request.url.scheme 可能是 http，这里同时看 x-forwarded-proto；
+            # FORCE_SECURE_COOKIE（SEC-P2-4）强制带 Secure，覆盖反代不传头的场景。
+            secure=(_FORCE_SECURE_COOKIE
+                    or request.url.scheme == "https"
+                    or request.headers.get("x-forwarded-proto", "") == "https"),
         )
         return resp
 
@@ -82,6 +124,20 @@ async def login(body: LoginBody, request: Request):
 async def logout(request: Request):
     revoke_session(request.cookies.get(AUTH_COOKIE, ""))
     resp = JSONResponse(content={"ok": True})
+    resp.delete_cookie(AUTH_COOKIE, path="/")
+    return resp
+
+
+@router.post("/api/sessions/revoke-all")
+async def revoke_all(_auth: bool = Depends(require_auth)):
+    """SEC-P2-3：撤销全部控制台会话（含当前会话，撤销后需重新登录）。
+
+    口令疑似泄漏、或在公共电脑登过控制台时的一键止损：旧实现只能等
+    30 天 TTL 自然过期（现已收紧为 7 天 + 2 小时闲置双窗口）。
+    """
+    revoked = revoke_all_sessions()
+    print(f"🔐 [会话] 管理员已撤销全部控制台会话（共 {revoked} 个）。")
+    resp = JSONResponse(content={"ok": True, "revoked": revoked})
     resp.delete_cookie(AUTH_COOKIE, path="/")
     return resp
 
@@ -163,7 +219,7 @@ async def stream_logs_endpoint(request: Request, _auth: bool = Depends(require_a
                     for chunk in _event_chunks(seq, msg):
                         yield chunk
                     last_id = seq
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     yield ": keep-alive heartbeat\n\n"
         finally:
             rt_logger.unsubscribe(q)

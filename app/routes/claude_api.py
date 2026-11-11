@@ -42,7 +42,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from google.genai import types
 
 from admission import GenerationCapacityError, ManagedStreamingResponse
-from auth import constant_time_equal
+from auth import constant_time_equal, extract_candidate_key
 from claude_protocol import (
     ClaudeRequestError,
     ClaudeStreamState,
@@ -118,10 +118,9 @@ async def get_claude_auth(
 ) -> str:
     if not API_KEY:
         raise ClaudeAPIError(claude_error(503, "api_error", "服务端未配置 API_KEY，无法鉴权。"))
-    bearer = ""
-    if authorization and authorization.startswith("Bearer "):
-        bearer = authorization[len("Bearer "):]
-    candidate = x_api_key or bearer or x_goog_api_key or request.query_params.get("key", "")
+    candidate = extract_candidate_key(
+        request, authorization=authorization or "",
+        x_api_key=x_api_key or "", x_goog_api_key=x_goog_api_key or "")
     if not candidate:
         raise ClaudeAPIError(claude_error(
             401, "authentication_error",
@@ -226,7 +225,7 @@ def _claude_stream_response(response: StreamingResponse, display_model: str, *,
             while True:
                 try:
                     item = await asyncio.wait_for(frame_queue.get(), timeout=IDLE_PING_SECONDS)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     # 静默超时：补发 ping 保活（不取消上游读取任务）
                     yield PING_EVENT
                     continue
@@ -302,7 +301,9 @@ def _claude_stream_response(response: StreamingResponse, display_model: str, *,
             producer.cancel()
             try:
                 await producer
-            except BaseException:
+            # REQ-P3-2：收窄吞异常面——BaseException 会连 KeyboardInterrupt /
+            # SystemExit 一起吞掉，收尸路径不应屏蔽进程级信号。
+            except (asyncio.CancelledError, Exception):
                 pass
             close = getattr(response, "aclose", None) or getattr(upstream_iterator, "aclose", None)
             if close is not None:
@@ -415,7 +416,12 @@ def _sse_data_lines(frame_text: str):
     data_parts: list[str] = []
     for line in frame_text.splitlines():
         if line.startswith("data:"):
-            data_parts.append(line[len("data:"):].lstrip(" "))
+            # REQ-P3-1：SSE 规范只剥**一个**前导空格——lstrip(" ") 会剥全部，
+            # 多行 data 拼接后代码块缩进等正文被损坏（对齐 Cookie 通道口径）。
+            payload = line[len("data:"):]
+            if payload.startswith(" "):
+                payload = payload[1:]
+            data_parts.append(payload)
         elif line.startswith(":"):
             continue  # SSE comments do not dispatch or split the current event.
         elif not line.strip():
@@ -510,7 +516,9 @@ async def _count_exact_input_tokens(request_obj, fastapi_request: Request,
         # 压缩——Express 主路径（express_pipeline）与 Cookie 路径（cookie_request）
         # 都已线程化，唯独此处曾在事件循环上直跑：多模态 count_tokens 可把
         # 整个服务冻结 10~40s，所有并发流的心跳集体停摆（2026-10 修复）。
-        contents = await run_media_task(create_gemini_prompt, request_obj.messages, base_model)
+        # PRF-P1-5：prompt 构建是每请求必经的轻载路径，走 prep 池。
+        contents = await run_media_task(create_gemini_prompt, request_obj.messages, base_model,
+                                        heavy=False)
     except Exception:
         return None
     if not contents:

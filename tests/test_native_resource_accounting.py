@@ -12,6 +12,7 @@ import admission
 import resumable
 from request_tracking import RequestTrace, current_trace
 from routes import gemini_native
+from upstreams import native_passthrough
 from upstreams import cookie_native
 
 IMAGE_MODEL = "gemini-3.1-flash-image-4k"
@@ -54,8 +55,8 @@ class NativeImageAdmissionTests(unittest.IsolatedAsyncioTestCase):
 
     def channels(self):
         return (
-            (gemini_native, "_passthrough_request_impl",
-             lambda model, action: gemini_native._passthrough_request(None, model, action, "", b"{}")),
+            (native_passthrough, "_passthrough_request_impl",
+             lambda model, action: native_passthrough._passthrough_request(None, model, action, "", b"{}")),
             (cookie_native, "_handle_native_request_impl",
              lambda model, action: cookie_native._handle_native_request(
                  None, model, action, {}, requested_model=model, deadline=0)),

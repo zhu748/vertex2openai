@@ -40,6 +40,12 @@ jobs:
             requirements-dev.txt
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
+      - name: Dependency vulnerability audit (app requirements)
+        # SEC-P3-7：对应用直传依赖做 pip-audit（含传递依赖）。
+        # 出现已知 CVE 即红——这正是目的：把「带洞发版」拦在合并前。
+        run: |
+          pip install pip-audit
+          pip-audit -r app/requirements.txt
       - name: Offline regression and project checks
         run: python scripts/check_project.py
 
@@ -53,9 +59,27 @@ jobs:
         with:
           go-version-file: proxybridge/go.mod
           cache-dependency-path: proxybridge/go.sum
+      # ENG-P3-13（2026-11 收尾）：go test 只隐式跑 vet 子集，且此前从未
+      # 校验过 gofmt（全仓曾为 8 空格缩进，收尾轮已统一 gofmt -w）。
+      # 未格式化或 vet 可疑结构现在在合并前拦下。
+      - name: Static checks (gofmt + go vet)
+        working-directory: proxybridge
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "以下文件未通过 gofmt（本地执行 gofmt -w . 修复）："; echo "$unformatted"; exit 1
+          fi
+          go vet ./...
       - name: Protocol integration and race checks
         working-directory: proxybridge
         run: go test -race -count=1 -timeout=90s ./...
+      # ENG-P3-4：依赖树含 yuhaiin 间接拖入的 gvisor / tailscale 非官方
+      # fork（NOTICE.txt 已记录 fork 许可缺口），安全更新依赖单一维护者——
+      # govulncheck 对 go.sum 锁定的依赖树做漏洞扫描（CI 侧兜底；go.sum
+      # 保持锁定，扫描不改变依赖版本）。
+      - name: Vulnerability scan (govulncheck)
+        working-directory: proxybridge
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
       # CGO_ENABLED=0 的生产编译由 Docker 构建完成，不再生成未使用的副本。
 
   build:

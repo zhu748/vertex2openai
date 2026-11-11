@@ -35,9 +35,19 @@ def imported_modules(node, module, packages):
 
 
 def eager_imports(tree, module, packages):
-    """Imports executed while loading a module; function bodies are lazy."""
+    """Imports executed while loading a module; function bodies are lazy.
+
+    `if TYPE_CHECKING:` 块在运行期恒为假，其中的 import 不构成加载期
+    依赖——类型注解解环的标准手段（QUA-P2-5 注解引入），不计入环检测。
+    """
     for node in ast.iter_child_nodes(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        if (
+            isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "TYPE_CHECKING"
+        ):
             continue
         yield from imported_modules(node, module, packages)
         yield from eager_imports(node, module, packages)

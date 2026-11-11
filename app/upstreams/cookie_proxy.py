@@ -14,7 +14,7 @@ import httpx
 import model_capabilities as mc
 from anti_truncation import TextTransport, prepare_transport, split_model_alias
 from fastapi import Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from models import OpenAIRequest
 from request_tracking import configure as track_configure
 from runtime_state import app_state
@@ -90,7 +90,7 @@ class CookieGeneration:
     is_stream: bool
     is_image: bool
 
-    async def response(self):
+    async def response(self) -> Response:
         """按请求形态分发到 cookie_delivery 的四条交付路径。"""
         if self.is_stream and self.is_image:
             return StreamingResponse(
@@ -347,8 +347,8 @@ class CookieProxyUpstream(BaseUpstream):
         request_obj: OpenAIRequest,
         fastapi_request: Request,
         *,
-        credential_record=None,
-    ):
+        credential_record: dict=None,
+    ) -> Response:
         prepared = _prepare_cookie_generation(
             request_obj, fastapi_request, credential_record
         )

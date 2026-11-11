@@ -19,6 +19,8 @@ import request_tracking as tracking
 import resumable
 from logger import ProxyStats
 from routes import chat_api, console, gemini_native
+from starlette.requests import ClientDisconnect  # B017 断言收窄用
+from upstreams import native_passthrough
 
 
 def frame(text="answer", reasoning=None, finish=None):
@@ -186,7 +188,8 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                 raise OSError("frontend disappeared")
 
         with mock.patch.object(chat_api.express_upstream, "chat_completions", side_effect=upstream) as call:
-            with self.assertRaises(Exception):
+            # B017：断言收窄到实际抛出的 ClientDisconnect（ASGI 断连经中间件归一）
+            with self.assertRaises(ClientDisconnect):
                 await asyncio.wait_for(self.asgi(broken_send), 2)
             original = self.registry.get(response_headers[b"x-trace-id"].decode())
             self.assertTrue(original.snapshot()["generation_active"])
@@ -222,7 +225,8 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                 raise OSError("send failed")
 
         with mock.patch.object(chat_api.express_upstream, "chat_completions", side_effect=upstream):
-            with self.assertRaises(Exception):
+            # B017：断言收窄到实际抛出的 ClientDisconnect（ASGI 断连经中间件归一）
+            with self.assertRaises(ClientDisconnect):
                 await asyncio.wait_for(self.asgi(broken_send, {"x-resumable": "false"}), 2)
         await asyncio.wait_for(closed.wait(), 1)
         record = self.registry.list()["items"][0]
@@ -244,7 +248,19 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
             with mock.patch.object(chat_api.express_upstream, "chat_completions", side_effect=upstream):
                 response = await client.post("/v1/chat/completions", json=self.payload, headers={**self.headers, "Origin": "https://frontend.test"})
             request_id = response.headers["x-trace-id"]
-            self.assertIn("x-trace-id", response.headers["access-control-expose-headers"].lower())
+            # SEC-P3-1：默认同源部署不附 CORS 头；跨源部署（ALLOWED_ORIGINS
+            # 显式放行 frontend.test）浏览器可读 x-trace-id —— 组件级验证。
+            self.assertNotIn("access-control-expose-headers", response.headers)
+            from fastapi.middleware.cors import CORSMiddleware
+            cors_app = CORSMiddleware(
+                app=main.app, allow_origins=["https://frontend.test"], allow_credentials=False,
+                allow_methods=["*"], allow_headers=["*"],
+                expose_headers=["X-Resume-Id", "X-Resumable-Replay", "X-Trace-Id", "Retry-After"])
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=cors_app), base_url="http://test") as cors_client:
+                with mock.patch.object(chat_api.express_upstream, "chat_completions", side_effect=upstream):
+                    cors_response = await cors_client.post("/v1/chat/completions", json=self.payload,
+                                                           headers={**self.headers, "Origin": "https://frontend.test"})
+            self.assertIn("x-trace-id", cors_response.headers["access-control-expose-headers"].lower())
             client.cookies.set(console_auth.AUTH_COOKIE, console_auth.issue_session())
             detail = (await client.get("/api/requests/" + request_id)).json()
             self.assertEqual(detail["model"], "gemini-test")
@@ -307,7 +323,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as upstream:
             with mock.patch.object(main.app.state, "express_key_manager", manager), \
                  mock.patch.object(gemini_native, "API_KEY", "native-client"), \
-                 mock.patch.object(gemini_native, "passthrough_client_pool", SimpleNamespace(get=lambda *args: upstream)), \
+                 mock.patch.object(native_passthrough, "passthrough_client_pool", SimpleNamespace(get=lambda *args: upstream)), \
                  mock.patch.object(gemini_native.app_state, "get_settings", return_value=settings), \
                  mock.patch.object(gemini_native.app_state, "get_setting", side_effect=lambda k, d=None: settings.get(k, d)):
                 async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://test") as client:

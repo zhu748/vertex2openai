@@ -12,6 +12,7 @@
   <script data-cfasync="false" defer="" src="/static/console-models.js"></script>
   <script data-cfasync="false" defer="" src="/static/console-overview.js"></script>
   <script data-cfasync="false" defer="" src="/static/console-logs.js"></script>
+  <script data-cfasync="false" defer="" src="/static/proxy-editor.js"></script>
   <script data-cfasync="false" defer="" src="/static/channel-config.js"></script>
   <script data-cfasync="false" defer="" src="/static/console-forms.js"></script>
   <script data-cfasync="false" defer="" src="/static/request-monitor.js"></script>
@@ -59,6 +60,8 @@
       </span>
       <span id="uptime">运行中</span>
      </span>
+     <!-- SEC-P2-3：撤销全部会话（口令疑似泄漏/公共电脑登录后的一键止损） -->
+     <button class="pill" onclick="revokeAllSessions()" style="cursor:pointer" title="撤销全部已登录会话（含其它设备）">撤销全部会话</button>
      <button class="pill" onclick="logout()" style="cursor:pointer" title="退出登录">退出</button>
     </div>
    </header>

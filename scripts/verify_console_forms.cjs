@@ -24,7 +24,7 @@ async function main(){
  const record={id:'trace-1234567890abcdef',model:'text',protocol:'openai',channel:'express',mode:'stream',phase:'streaming',status:'running',connection:'open',created_at:Date.now()/1000,duration_ms:1000,timings:{},attempts:1,retries:0,finish_reasons:[],usage:{},events:[],logs:[]};
  let scrollPosition=0,transport=null,requestTotal=1;
  Object.defineProperty(w,'scrollY',{get:()=>scrollPosition});
- w.AbortSignal=AbortSignal;w.AbortController=AbortController;w.matchMedia=()=>({matches:false});w.scrollTo=({top})=>{scrollPosition=top;};w.HTMLElement.prototype.scrollIntoView=()=>{};w.confirm=()=>true;
+ w.AbortSignal=AbortSignal;w.AbortController=AbortController;w.matchMedia=()=>({matches:false});w.scrollTo=({top})=>{scrollPosition=top;};w.HTMLElement.prototype.scrollIntoView=()=>{};w.confirm=()=>true;w.prompt=()=>'console-password';
  w.CSS={escape:s=>s};w.HTMLDialogElement.prototype.showModal=function(){this.open=true;};w.HTMLDialogElement.prototype.close=function(){this.open=false;this.dispatchEvent(new w.Event('close'));};
  const eventSources=[];
  w.EventSource=class {constructor(url){this.url=url;eventSources.push(this);}close(){}};
@@ -104,7 +104,7 @@ async function main(){
   cookieRow.querySelector('.c-cookie-reveal').click();await tick();
   assert.equal(cookiePreview().value,savedCookie);assert.equal(cookiePreview().readOnly,true);
   assert.equal(cookiePreview().hidden,false);assert.equal(w.consoleForms.dirty(),false);
-  assert.deepEqual(requests.filter(r=>r.path==='/api/cookie-accounts/reveal').at(-1).body,{id:'cookie-one'});
+  assert.deepEqual(requests.filter(r=>r.path==='/api/cookie-accounts/reveal').at(-1).body,{id:'cookie-one',password:'console-password'});
   cookieRow.querySelector('.c-cookie-reveal').click();
   assert.equal(cookiePreview().hidden,true);assert.equal(cookiePreview().value,'');
   savedCookie='SAPISID=ui-cookie-refreshed; SID=ui-cookie-sid';

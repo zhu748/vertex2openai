@@ -205,9 +205,11 @@ class SSEFrameKindTests(unittest.TestCase):
 
     def test_keepalive_comment_and_data_frames(self):
         self.assertEqual(chat_api._sse_frame_kind(": keep-alive\n\n")[0], "keepalive")
+        # REQ-P3-7：假流式心跳改注释帧后，旧 chatcmpl-keepalive data 形状
+        # 不再特判为 keepalive（无生产方，防御性归 other，不会进入兜底判定）。
         ka = json.dumps({"id": "chatcmpl-keepalive", "choices": [
             {"index": 0, "delta": {"content": ""}, "finish_reason": None}]})
-        self.assertEqual(chat_api._sse_frame_kind(f"data: {ka}\n\n")[0], "keepalive")
+        self.assertEqual(chat_api._sse_frame_kind(f"data: {ka}\n\n")[0], "other")
 
     def test_done_frame(self):
         self.assertEqual(chat_api._sse_frame_kind("data: [DONE]\n\n")[0], "done")

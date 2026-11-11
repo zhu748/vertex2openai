@@ -1,0 +1,73 @@
+Third-party software notices for the Python side of vertex2openai.
+Versions are pinned in app/requirements.txt; licenses below are read from the
+installed distributions' metadata (License / License-Expression fields).
+
+ENG-P3-11（2026-11 收尾轮）：此前只有 Go 侧（proxybridge/NOTICE.txt）有
+完整许可清单，Python 侧依赖（含 curl_cffi 捆绑的 curl / BoringSSL 衍生物）
+无对应 NOTICE。本文件补齐发行清单。
+
+再生方式（依赖升级后执行并提交差异）：
+
+    pip install pip-licenses
+    pip-licenses --from=mixed --with-authors --with-urls --format=plain
+
+或在已安装环境直接读取元数据（本文件即按此口径生成，避免引入新工具）。
+
+收录范围：直接依赖 + 随镜像安装的传递依赖。运行时按需 import 的可选
+依赖（如 STATE_ENCRYPTION_KEY 启用时的 cryptography）同样随镜像分发，
+一并列出。
+
+┌──────────────────────────────────────────────────────────────────────┐
+│ 一、直接依赖（app/requirements.txt 全部条目）                         │
+├──────────────────┬──────────────┬────────────────────────────────────┤
+│ 包               │ 版本         │ 许可                               │
+├──────────────────┼──────────────┼────────────────────────────────────┤
+│ anyio            │ 4.15.1       │ MIT                                │
+│ curl_cffi        │ 0.16.3       │ MIT（见下方捆绑组件说明）           │
+│ fastapi          │ 0.143.3      │ MIT                                │
+│ google-genai     │ 2.31.0       │ Apache-2.0                         │
+│ httpx[socks]     │ 0.28.1       │ BSD-3-Clause                       │
+│ Pillow           │ 13.0.0       │ MIT-CMU (HPND descendants)         │
+│ pydantic         │ 2.14.1       │ MIT                                │
+│ pydantic-settings│ 2.16.0       │ MIT                                │
+│ starlette        │ 1.8.0        │ BSD-3-Clause                       │
+│ uvicorn          │ 0.54.0       │ BSD-3-Clause                       │
+└──────────────────┴──────────────┴────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────────┐
+│ 二、传递依赖（随镜像安装）                                            │
+├──────────────────┬──────────────┬────────────────────────────────────┤
+│ 包               │ 版本         │ 许可                               │
+├──────────────────┼──────────────┼────────────────────────────────────┤
+│ annotated-types  │ 0.7.0        │ MIT                                │
+│ certifi          │ 2026.2.25    │ MPL-2.0                            │
+│ cffi             │ 2.0.0        │ MIT                                │
+│ cryptography     │ 44.0.3       │ Apache-2.0 OR BSD-3-Clause         │
+│ filelock         │ 3.25.2       │ MIT                                │
+│ h11              │ 0.16.0       │ MIT                                │
+│ httpcore         │ 1.0.9        │ BSD-3-Clause                       │
+│ idna             │ 3.11         │ BSD-3-Clause                       │
+│ pycparser        │ 3.0          │ BSD-3-Clause                       │
+│ sniffio          │ 1.3.1        │ MIT OR Apache-2.0                  │
+│ socksio          │ 1.0.0        │ MIT                                │
+│ typing-extensions│ 4.16.0       │ PSF-2.0                            │
+│ typing-inspection│ 0.4.5        │ MIT                                │
+└──────────────────┴──────────────┴────────────────────────────────────┘
+
+三、捆绑组件说明（二进制衍生物，随 wheel 分发）
+
+  - curl_cffi 的二进制 wheel 静态链接 libcurl 与 BoringSSL：
+      * libcurl —— curl license（MIT 风格，带例外条款）；
+      * BoringSSL —— OpenSSL License / ISC（原 OpenSSL 授权词，
+        BoringSSL fork 遵循同一授权词并附 Google 修改声明）。
+    两者的完整许可文本见 curl_cffi wheel 内的 LICENSES 目录；
+    分发镜像时应随包保留。
+  - cryptography 的 Rust 组件遵循 Apache-2.0 OR BSD-3-Clause
+    双许可（上游 selectable），其绑定的 OpenSSL 遵循
+    OpenSSL License / Apache-2.0（3.x 起双授权）。
+
+四、协议兼容声明
+
+  本项目对外的 OpenAI / Anthropic 兼容接口仅为协议实现，不包含、
+  不链接上述公司的任何 SDK；Google 侧调用经官方 google-genai SDK
+  （Apache-2.0）与 Google Cloud 控制台私有接口完成。

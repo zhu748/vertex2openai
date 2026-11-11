@@ -24,6 +24,8 @@ from contextvars import ContextVar
 from contextlib import contextmanager
 from typing import Optional
 
+from config import env_float, env_str, state_dir  # QUA-P2-7：集中读取层
+
 from proxies.protocols import (
     ALL_PROXY_SCHEMES,
     _uri_scheme,
@@ -134,7 +136,7 @@ def find_singbox_binary() -> Optional[str]:
     global _singbox_bin_cache
     if _singbox_bin_cache is not None:
         return _singbox_bin_cache or None
-    env_path = str(os.environ.get("SINGBOX_BIN") or "").strip()
+    env_path = env_str("SINGBOX_BIN")  # QUA-P2-7：环境读取走 config 集中层
     candidates: list[str] = []
     if env_path:
         candidates.append(env_path)
@@ -187,10 +189,8 @@ def singbox_version() -> str:
 
 
 def _idle_minutes() -> float:
-    try:
-        return max(0.0, float(os.environ.get("SINGBOX_IDLE_MINUTES", "30")))
-    except ValueError:
-        return 30.0
+    # QUA-P2-7：非法/未设置默认 30 分钟；钳位（下限 0 = 不回收）留在本模块。
+    return max(0.0, env_float("SINGBOX_IDLE_MINUTES", 30.0))
 
 
 def _state_dir() -> str:
@@ -198,7 +198,7 @@ def _state_dir() -> str:
     # 配置路径若仍是相对路径（./singbox/…），会被解析到 chdir 之后的位置
     # （./singbox/singbox/…，必然读不到，进程秒退）。STATE_DIR 未设置时
     # 默认落在进程启动时 CWD 下的 singbox/。
-    base = os.environ.get("STATE_DIR", ".")
+    base = state_dir()  # QUA-P2-7：STATE_DIR 单点定义
     return os.path.abspath(os.path.join(base, "singbox"))
 
 
@@ -562,7 +562,7 @@ class SingboxManager(ProxyProcessManager):
         except ProxyResolveError:
             raise
         except Exception as e:
-            raise ProxyResolveError(f"解析代理链接失败：{type(e).__name__}: {e}")
+            raise ProxyResolveError(f"解析代理链接失败：{type(e).__name__}: {e}") from e  # B904
 
         outbound = dict(outbound)
         outbound["tag"] = "proxy"
@@ -571,7 +571,7 @@ class SingboxManager(ProxyProcessManager):
         try:
             os.makedirs(directory, exist_ok=True)
         except OSError as e:
-            raise ProxyResolveError(f"无法创建 sing-box 状态目录（{directory}）：{e}")
+            raise ProxyResolveError(f"无法创建 sing-box 状态目录（{directory}）：{e}") from e  # B904
         digest = hashlib.sha1(uri.encode("utf-8")).hexdigest()[:16]
         # 清掉同 URI 的旧实例残留（崩溃重启/端口变化后避免配置与日志文件无限积累）
         try:
@@ -607,7 +607,7 @@ class SingboxManager(ProxyProcessManager):
             except OSError:
                 pass
         except OSError as e:
-            raise ProxyResolveError(f"无法写入 sing-box 配置文件（{config_path}）：{e}")
+            raise ProxyResolveError(f"无法写入 sing-box 配置文件（{config_path}）：{e}") from e  # B904
 
         # 日志同样收紧权限（可能带节点信息）；打开失败按既定错误契约抛
         # ProxyResolveError（旧实现裸抛 OSError，调用链只捕本类型会变未分类 500）。
@@ -619,7 +619,7 @@ class SingboxManager(ProxyProcessManager):
             except OSError:
                 pass
         except OSError as e:
-            raise ProxyResolveError(f"无法打开 sing-box 日志文件（{log_path}）：{e}")
+            raise ProxyResolveError(f"无法打开 sing-box 日志文件（{log_path}）：{e}") from e  # B904
         try:
             process = subprocess.Popen(
                 [binary, "run", "-c", config_path, "-D", directory],
@@ -629,7 +629,7 @@ class SingboxManager(ProxyProcessManager):
                 start_new_session=True,  # 进程组独立，Ctrl+C 不误杀
             )
         except OSError as e:
-            raise ProxyResolveError(f"启动 sing-box 失败（{binary}）：{e}")
+            raise ProxyResolveError(f"启动 sing-box 失败（{binary}）：{e}") from e  # B904
         finally:
             # 子进程已继承句柄；父进程立刻关闭（成功/失败路径都不泄漏 fd）。
             log_file.close()
@@ -661,7 +661,7 @@ class SingboxManager(ProxyProcessManager):
 
 def find_bridge_binary() -> Optional[str]:
     candidates = [
-        os.environ.get("PROXY_BRIDGE_BIN", ""),
+        env_str("PROXY_BRIDGE_BIN"),  # QUA-P2-7：环境读取走 config 集中层
         "/usr/local/bin/vertex-proxy-bridge",
         os.path.abspath(
             os.path.join(os.path.dirname(__file__), "..", "bin", "vertex-proxy-bridge")
@@ -788,10 +788,8 @@ class ProxyBridgeManager(ProxyProcessManager):
         )
 
     def _idle_minutes(self):
-        try:
-            return max(0.0, float(os.environ.get("PROXY_BRIDGE_IDLE_MINUTES", "30")))
-        except ValueError:
-            return 30.0
+        # QUA-P2-7：非法/未设置默认 30 分钟；钳位（下限 0 = 不回收）留在本模块。
+        return max(0.0, env_float("PROXY_BRIDGE_IDLE_MINUTES", 30.0))
 
     def _launch(self, uri, port):
         try:
@@ -809,7 +807,7 @@ class ProxyBridgeManager(ProxyProcessManager):
         config.pop("options", None)
         config["listen_port"] = port
         directory = os.path.abspath(
-            os.path.join(os.environ.get("STATE_DIR", "."), "proxy-bridge")
+            os.path.join(state_dir(), "proxy-bridge")  # QUA-P2-7：STATE_DIR 单点定义
         )
         digest = hashlib.sha256(uri.encode()).hexdigest()[:16]
         prefix = f"bridge-{os.getpid()}-{self._file_namespace}-{digest}-"
@@ -869,9 +867,13 @@ class ProxyBridgeManager(ProxyProcessManager):
                 known = {
                     "ca_read_failed": "无法读取 CA 证书文件",
                     "ca_invalid_pem": "CA 文件不是有效的 PEM 证书",
+                    # ENG-P3-3（2026-11 收尾）：SSL_CERT_FILE 设置失败不再静默
+                    "ca_setenv_failed": "无法设置 CA 环境变量（路径含非法字符）",
                     "config_read_failed": "无法读取转换器配置文件",
                     "server_connect_failed": "无法连接代理服务器（TCP 层）",
                     "server_tls_failed_check_ca_sni": "代理服务器 TLS 握手失败（检查 CA 证书与 SNI）",
+                    # ENG-P3-2（2026-11 收尾）：包装 conn 防御分支（dialer 未来变更时触发）
+                    "server_transport_unsupported": "代理服务器连接返回非 TCP 传输（dialer 包装异常）",
                     "sstp_custom_ca_requires_linux": "SSTP 自定义 CA 当前需要 Linux",
                     "sstp_auth_failed_requires_mschapv2": "SSTP 认证失败，需正确的 MS-CHAPv2 账号密码",
                     "sstp_handshake_failed_check_tls_credentials_and_mschapv2": "SSTP TLS / PPP 握手失败",
@@ -966,6 +968,29 @@ atexit.register(bridge_manager.shutdown_all)
 # ============================================================
 
 
+def _warn_sync_resolve_blocked_loop(kind: str, started: float) -> None:
+    """PRF-P3-4（2026-11）：同步 resolve 真阻塞了事件循环时告警。
+
+    冷启动 sing-box / proxybridge 是同步 subprocess 调用（实测可达
+    10-35 秒窗口）；当前调用图已被异步入口（resolve_proxy_uri_async /
+    预热）钉住，这里是防御性加固——新增调用方误在异步处理器里直调
+    同步版时，日志直接指出根因，而不是表现为「全站无响应」。
+    按实际耗时判定（>50ms 才告警），子进程缓存命中的纯查找零误报。
+    """
+    elapsed = time.monotonic() - started
+    if elapsed <= 0.05:
+        return
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return  # 工作线程 / 无循环：同步调用合法
+    print(
+        f"⚠️ [代理解析] resolve_proxy_uri({kind}) 在事件循环线程上同步冷启动子进程，"
+        f"本次阻塞 {elapsed:.1f} 秒（全部并发请求停摆）；"
+        "异步上下文请改用 resolve_proxy_uri_async，或先经它预热使缓存命中。"
+    )
+
+
 def resolve_proxy_uri(uri: Optional[str]) -> str:
     """任意代理 URI → httpx / curl_cffi 可直接使用的代理 URL。
 
@@ -991,11 +1016,15 @@ def resolve_proxy_uri(uri: Optional[str]) -> str:
     if kind == "native":
         return value
     if kind == "singbox":
+        _started = time.monotonic()
         url = singbox_manager.get_local_socks5(value)
+        _warn_sync_resolve_blocked_loop("sing-box", _started)
         ensure_reaper()
         return url
     if kind == "bridge":
+        _started = time.monotonic()
         url = bridge_manager.get_local_socks5(value)
+        _warn_sync_resolve_blocked_loop("proxybridge", _started)
         ensure_reaper()
         return url
     scheme = _uri_scheme(value)

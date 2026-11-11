@@ -76,13 +76,48 @@ class ImageDeliveryTests(unittest.TestCase):
         self.assertIsNone(delivery.resolve_image("../web_state.json"))
 
     def test_disk_budget_evicts_oldest_and_file_limit_rejects(self):
+        # PRF-P2-4 摊销后配额扫描按 60 秒窗口摊销；本测试验证**淘汰逻辑**，
+        # 故显式把窗口归零（摊销语义由下方 test_prune_is_amortized 覆盖）。
         first = delivery.image_markdown(b"old", "image/png").rsplit("/", 1)[1][:-1]
-        with mock.patch.object(delivery, "MAX_STORE_BYTES", 5):
+        with mock.patch.object(delivery, "MAX_STORE_BYTES", 5), \
+                mock.patch.object(delivery, "_PRUNE_INTERVAL_SECONDS", 0.0):
             delivery.image_markdown(b"new", "image/png")
         self.assertIsNone(delivery.resolve_image(first))
         with mock.patch.object(delivery, "MAX_FILE_BYTES", 2):
             with self.assertRaises(ValueError):
                 delivery.image_markdown(b"big", "image/png")
+
+    def test_prune_is_amortized_and_big_images_force_a_scan(self):
+        # PRF-P2-4：60 秒窗口内的小图不再每次全目录扫描（生图突发下的
+        # 重复 iterdir+stat 消除）；大图（≥4MiB）始终强制扫描。
+        delivery._last_prune_monotonic = time.monotonic()  # 刚扫描过
+        with mock.patch.object(delivery, "_prune", wraps=delivery._prune) as prune:
+            delivery.image_markdown(b"small", "image/png")
+            self.assertEqual(prune.call_count, 0)  # 窗口内小图：跳过
+            # 6MiB base64 → 解码后约 4.5MiB，超过强制扫描阈值。
+            delivery.image_markdown("A" * (6 * 1024 * 1024), "image/png", encoded=True)
+            self.assertEqual(prune.call_count, 1)  # 大图：强制扫描
+        delivery._last_prune_monotonic = time.monotonic() - delivery._PRUNE_INTERVAL_SECONDS - 1
+        with mock.patch.object(delivery, "_prune", wraps=delivery._prune) as prune:
+            delivery.image_markdown(b"small-again", "image/png")
+            self.assertEqual(prune.call_count, 1)  # 窗口过期：恢复扫描
+
+    def test_has_inline_image_precheck_is_cheap_and_correct(self):
+        # PRF-P1-1：流式逐对象路径的预检——命中内联图片才搬媒体线程。
+        part = {"inlineData": {"mimeType": "image/png", "data": "abc"}}
+        candidate = {"content": {"parts": [part]}}
+        data = {"candidates": [candidate]}
+        cookie_obj = {"results": [{"data": data}]}
+        self.assertTrue(delivery.has_inline_image(cookie_obj))
+        self.assertFalse(delivery.has_inline_image(
+            {"candidates": [{"content": {"parts": [{"text": "hi"}]}}]}))
+        self.assertFalse(delivery.has_inline_image({"inlineData": None}))
+        self.assertFalse(delivery.has_inline_image("plain-string"))
+        # 深度超过封顶的嵌套不再递归（防病态深度）。
+        deep = {"inlineData": {"data": "x"}}
+        for _ in range(20):
+            deep = {"wrap": deep}
+        self.assertFalse(delivery.has_inline_image(deep))
 
     def test_storage_failure_does_not_return_inline_blob(self):
         with mock.patch.object(delivery, "store_directory", side_effect=OSError("disk full")):

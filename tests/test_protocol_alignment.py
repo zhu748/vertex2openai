@@ -25,6 +25,7 @@ import config
 import main
 from logger import ProxyStats
 from routes import claude_api, gemini_native
+from upstreams import native_passthrough
 
 AVAILABLE = ["gemini-3.8-flash", "gemini-3.1-pro-preview", "gemini-3.1-flash-lite"]
 
@@ -204,10 +205,10 @@ class SearchVariantPassthroughTests(unittest.TestCase):
         self.upstream = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         patches = [
             mock.patch.object(main, "stats", self.stats),
-            mock.patch.object(gemini_native, "stats", self.stats),
+            mock.patch.object(gemini_native, "stats", self.stats), mock.patch.object(native_passthrough, "stats", self.stats),
             mock.patch.object(gemini_native, "API_KEY", "client-key"),
             mock.patch.object(main.app.state, "express_key_manager", self.manager),
-            mock.patch.object(gemini_native, "passthrough_client_pool",
+            mock.patch.object(native_passthrough, "passthrough_client_pool",
                               types.SimpleNamespace(get=lambda factory, proxy_uri=None: self.upstream)),
             mock.patch.object(gemini_native.app_state, "get_settings",
                               side_effect=lambda: self.settings.copy()),

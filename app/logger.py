@@ -7,6 +7,7 @@ import time
 import asyncio
 import re
 import threading
+from collections import deque
 from typing import List, Optional
 from request_tracking import current_trace, redact
 
@@ -79,7 +80,9 @@ class SSELogger:
     def __init__(self, max_history: int = 100, queue_size: int = 500):
         self.max_history = max_history
         self.queue_size = queue_size
-        self.history: List[tuple] = []   # [(seq, formatted_msg)]，seq 全局递增
+        # PRF-P3-3：deque(maxlen) 自动淘汰——旧实现在锁内 list.pop(0)，
+        # 每条日志一次 O(n) 整体前移（异常风暴时高频路径）。
+        self.history: deque = deque(maxlen=max_history)  # [(seq, formatted_msg)]，seq 全局递增
         self._seq = 0
         self._subscribers: List[tuple] = []       # [(queue, loop)]
         self._lock = threading.Lock()
@@ -130,9 +133,7 @@ class SSELogger:
             # 后全量重放 100 条历史，前端无条件 append 导致日志成片重复）。
             self._seq += 1
             seq = self._seq
-            self.history.append((seq, formatted_msg))
-            if len(self.history) > self.max_history:
-                self.history.pop(0)
+            self.history.append((seq, formatted_msg))  # deque(maxlen) 自动淘汰最旧
             # Schedule under the sequence lock: concurrent worker threads must
             # not enqueue seq N+1 before N, or reconnect deduplication loses N.
             for q, loop in self._subscribers:
@@ -266,6 +267,12 @@ def custom_print(*args, **kwargs):
             # redact 幂等（四个替换互不再生匹配点），整条钩子只算一次，
             # 旧实现对同一条消息在 stdout 拷贝与推流分支各算一遍（每条
             # 4 个正则 × 全文扫描，2026-10 去重）。
+            # PRF-P2-7（2026-11 收敛）：先截断再脱敏——异常风暴时 MB 级
+            # 消息先吃 4 个正则全文扫描、再被 _enqueue_stdout 砍到 16K，
+            # 成本 O(全文)；预截时留出头寸（trace 前缀 + 原长标记），
+            # 下游 16K 上限行为不变，扫描成本降为 O(上限)。
+            if raw_msg and len(raw_msg) > _MAX_STDOUT_CHARS - 64:
+                raw_msg = raw_msg[:_MAX_STDOUT_CHARS - 64] + f"…（已截断，原长度 {len(raw_msg)} 字符）"
             redacted = redact(raw_msg) if raw_msg else raw_msg
             end, flush = kwargs.get("end", "\n"), kwargs.get("flush", False)
             # stdout 写入改经有界队列 + 后台写线程：管道背压不再阻塞事件
@@ -312,3 +319,41 @@ def custom_print(*args, **kwargs):
 
 
 builtins.print = custom_print
+
+
+class _LeveledLog:
+    """QUA-P2-10（2026-11 审查收敛）：带级别的日志门面（info/warn/error/debug）。
+
+    旧代码 262 处裸 print、emoji 当级别用（⚠️≈警告、✅≈信息），没有级别
+    体系可言，消费方无法按级别过滤。本门面复用既有推流管线
+    （custom_print：脱敏 → trace 关联 → SSE 推流 → 有界 stdout 队列），
+    只补一层文本级别前缀，为后续按级别过滤 / 采样留出落点：
+
+        from logger import log
+        log.info("服务已启动")
+        log.warn("重试预算接近上限")
+        log.error("上游持续 5xx", exc)
+
+    裸 print 禁止新增（check_project 的 print 基线闸只降不升），存量随
+    迭代逐步迁移到本门面；迁移时直接替换 `print("⚠️ x")` 为
+    `log.warn("x")` 即可，管线行为完全一致。
+    """
+
+    @staticmethod
+    def _emit(level: str, message: str) -> None:
+        custom_print(f"[{level}] {message}")
+
+    def debug(self, message: str) -> None:
+        self._emit("DEBUG", message)
+
+    def info(self, message: str) -> None:
+        self._emit("INFO", message)
+
+    def warn(self, message: str) -> None:
+        self._emit("WARN", message)
+
+    def error(self, message: str) -> None:
+        self._emit("ERROR", message)
+
+
+log = _LeveledLog()

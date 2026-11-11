@@ -15,8 +15,12 @@ MAX_TIMEOUT_SECONDS = 7200.0
 
 class AppSettings(BaseSettings):
     # 默认口令仅限本机体验；生产/公网部署必须用环境变量覆盖（启动时若
-    # 仍在用默认值会在日志里打醒目告警，见 lifecycle.py）。
+    # 仍在用默认值会直接拒绝启动，见 lifecycle.py）。
     API_KEY: str = DEFAULT_API_KEY
+    # 控制台管理口令（可选，SEC-P1-2）：与 API_KEY 分离，避免「把兼容端点
+    # Key 分享给朋友 = 交出控制台（可导出完整 Google Cookie）」。
+    # 留空 = 回退用 API_KEY 登录控制台（过渡期兼容旧部署）。
+    ADMIN_PASSWORD: Optional[str] = None
     VERTEX_EXPRESS_API_KEY: Optional[str] = None
     VERTEX_EXPRESS_API_KEYS: Optional[str] = None  # JSON records or comma/newline-separated keys
     UPSTREAM_MODE: Optional[str] = None  # api_key | web_proxy | mixed; inferred on first boot
@@ -57,6 +61,10 @@ class AppSettings(BaseSettings):
 _settings = AppSettings()
 
 API_KEY = _settings.API_KEY
+
+# 控制台登录口令（SEC-P1-2）：设置后控制台登录 / Cookie reveal 二次验证
+# 均用它，与 API_KEY（仅生成端点鉴权）解耦；未设置时回退 API_KEY。
+ADMIN_PASSWORD = _settings.ADMIN_PASSWORD
 
 ENV_EXPRESS_KEYS = parse_key_records(_settings.VERTEX_EXPRESS_API_KEYS
                                    if _settings.VERTEX_EXPRESS_API_KEYS is not None
@@ -197,6 +205,11 @@ DEFAULT_SETTINGS = {
     # 背景：预填充只把话头停在开标签上，没有任何一句话要求模型"必须先完成思考"，
     # 实测模型经常跳过思考直接写正文，前端正则于是抓不到思维链（多数情况没有思维链）。
     "prefill_cot_guard": True,
+    # 请求监控诊断粒度（PRF-P1-4，默认全量）：true = 帧载荷逐帧检查
+    # （内容字符数/工具调用/finish_reason/usage/首回复里程碑）；false = 只
+    # 保留字节数与帧数计数，跳过 json.loads 与逐字段检查——高并发大帧
+    # 场景可关掉这层「隐形税」（每帧约 15-30µs × 双观察者）。
+    "request_diagnostics": True,
     # ===== 标准（Express）模式的 location 钉定（实测有效，见 README“标准模式的 location”）=====
     # 背景：只发裸模型名时，请求走 express 端点格式
     #   https://aiplatform.googleapis.com/v1/publishers/google/models/{model}:generateContent
@@ -260,6 +273,9 @@ DEFAULT_SETTINGS = {
     # 上游由后台泵读取，与前端连接解绑；受执行期限、续传窗口和容量预算约束。
     "resumable_enabled": True,            # 总开关；关掉则回到原有直通行为
     "resumable_ttl_seconds": 1800,        # 已完成的缓冲保留时长（秒），超时清掉
+    # PRF-P2-6：已完整交付且无显式幂等键的缓冲的短保留窗口——这类缓冲
+    # 在 mark_delivered 语义下不会被重放，钉满完整 TTL 只拉高稳态 RSS。
+    "resumable_delivered_ttl_seconds": 120,
     "resumable_disconnect_grace_seconds": 10.0,  # 最后客户端断开后，相同请求可复用的窗口
     "resumable_max_streams": 200,         # 缓冲总数上限，超限淘汰最旧的已完成缓冲
     "resumable_max_buffer_mb": 64,       # 单次回复的编码字节上限
@@ -279,6 +295,13 @@ DEFAULT_SETTINGS = {
     # 环境变量仅作初始值，控制台「运行设置」页可热改；留空 = 不启动。
     "keepalive_url": KEEPALIVE_URL,
     "keepalive_interval": KEEPALIVE_INTERVAL_SECONDS,
+    # SEC-P2-6：允许私网/环回保活目标。默认拒绝——被劫持的控制台会话可
+    # 借保活任务对内网管理面稳定重放 GET 并经 SSE 日志回读状态码（探测
+    # oracle）；「自我保活」（127.0.0.1）与内网监控用户需显式开启。
+    "keepalive_allow_private": False,
+    # SEC-P3-6：允许代理连通性测试使用内网代理地址。默认拒绝（同上探测
+    # 风险，错误分类与延迟差异可区分内网端口状态）；确需测试内网节点时开启。
+    "proxy_test_allow_private": False,
     # 按模型单独保存的参数覆盖：{ "模型ID": { 键: 值, ... } }
     # 仅覆盖“与模型相关”的参数（见 PER_MODEL_KEYS）；优先级 请求 > 模型专属 > 全局 > 内置。
     # 下面三个是**内置模型默认**（非演示条目）：这几款模型官方流式实现会
@@ -317,3 +340,61 @@ PER_MODEL_KEYS = [
     # 思维链守卫按模型分开很自然：只给跑角色扮演预设的模型开。
     "prefill_cot_guard",
 ]
+
+
+# ============================================================
+# QUA-P2-7（2026-11 审查收敛）：运行时环境变量的集中读取层
+# ============================================================
+# 此前 STATE_DIR 默认值「.」在 4 个文件各写一遍，SINGBOX_* / PROXY_BRIDGE_*
+# / IMAGE_* 等运行时开关散落在使用点——环境变量清单没有单点可见性，改名
+# 或调整解析口径时只能全仓搜索；同一变量在两处口径不一致（如
+# FORCE_SECURE_COOKIE 曾在 lifecycle 按「非空即真」、在 console_auth 按
+# 布尔字面量解析）也无从察觉。本层统一「读环境 + 默认值 + 解析口径」；
+# 业务语义（钳位范围、缓存、开关组合）留在使用方。AppSettings（pydantic）
+# 已有的声明式清单不迁移。
+# 布尔口径统一为 1/true/yes/on（大小写与首尾空白不敏感）。
+
+import os
+
+
+def env_raw(name: str) -> str:
+    """读取环境变量原值；未设置返回空串（与「设置为空串」不区分）。"""
+    return os.environ.get(name, "")
+
+
+def env_str(name: str, default: str = "") -> str:
+    """读取去首尾空白的非空字符串；未设置/空白返回 default。"""
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip()
+
+
+def env_flag(name: str) -> bool:
+    """布尔开关：仅 1/true/yes/on（大小写与首尾空白不敏感）视为开。"""
+    return env_raw(name).strip().lower() in ("1", "true", "yes", "on")
+
+
+def env_int(name: str, default: int) -> int:
+    """整数环境变量；未设置/非法返回 default（使用方自行钳位）。"""
+    try:
+        return int(env_raw(name))
+    except ValueError:
+        return default
+
+
+def env_float(name: str, default: float) -> float:
+    """浮点环境变量；未设置/非法返回 default（使用方自行钳位）。"""
+    try:
+        return float(env_raw(name))
+    except ValueError:
+        return default
+
+
+def state_dir() -> str:
+    """持久化状态根目录（web_state.json / 生图目录 / sing-box / 桥接套接字）。
+
+    默认「.」= 进程启动时的工作目录；显式设为空串时同样回落「.」
+    （空路径在 makedirs/abspath 上只会制造难排查的相对路径事故）。
+    """
+    return env_raw("STATE_DIR").strip() or "."

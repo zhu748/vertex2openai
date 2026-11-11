@@ -12,7 +12,7 @@ Gemini 原生请求通过 Express REST 透传，或经 Cookie 原生桥接交付
 | `app/lifecycle.py` | 启动初始化、后台任务登记、关闭连接池与代理进程 |
 | `app/routes/chat_api.py` | OpenAI 请求分流、请求期限、续传与轮询 |
 | `app/routes/claude_api.py`、`app/claude_protocol.py` | Anthropic 路由、消息/事件转换与 count_tokens 请求准备 |
-| `app/routes/gemini_native.py` | Gemini 原生鉴权、REST 透传和响应交付 |
+| `app/routes/gemini_native.py` | Gemini 原生鉴权与路由装配；透传编排在 `upstreams/native_passthrough.py`，目录/变体/URL 在 `upstreams/native_catalog.py`（QUA-P2-9 拆分） |
 | `app/routes/models_api.py` | OpenAI 模型清单 |
 | `app/routes/console.py` | 页面、登录退出、统计和日志流 |
 | `app/routes/settings_api.py` | 全局设置、模型设置和能力摘要 |
@@ -24,14 +24,14 @@ Gemini 原生请求通过 Express REST 透传，或经 Cookie 原生桥接交付
 | `app/auth.py`、`app/console_auth.py` | 分别处理 API Key 鉴权、控制台会话与登录限速 |
 | `app/request_errors.py`、`app/http_io.py` | 请求边界错误的协议映射、敏感校验输入剥离，以及辅助 HTTP 响应的有界读取 |
 | `app/settings_validation.py` | 管理入口的类型、范围和专项设置校验 |
-| `app/runtime_state.py`、`app/config.py` | 可持久化运行状态、环境变量和内置默认值 |
+| `app/runtime_state.py`、`app/config.py` | 可持久化运行状态（凭证 CRUD 已拆出 `CredentialsRepository`，QUA-P2-6）、环境变量和内置默认值 |
 | `app/credential_config.py`、`app/credential_manager.py` | 多 Key / Cookie 环境导入、混合账号选择，以及 Cookie 与项目绑定 |
 | `app/express_key_probe.py`、`app/cookie_probe.py` | 有界凭证探测；固定 worker、共享并发限制、总期限与响应读取预算 |
 | `app/proxy_config.py`、`app/proxy_failover.py` | 代理输入归一化、有序候选链、账号到全局回退及交付前切换 |
 | `app/proxies/protocols.py` | URI 分类、脱敏、校验与 sing-box outbound 转换；不管理进程或网络连接 |
 | `app/proxy_resolver.py` | sing-box / proxybridge 发现、启动、复用、空闲回收与本地出口生命周期 |
 | `app/proxy_import.py` | 有界批量导入预览、逐条错误定位、连接去重；正式保存仍使用严格解析器 |
-| `app/static/channel-config.js` | Cookie 账号列表、账号回退策略，以及共用代理编辑弹窗 |
+| `app/static/channel-config.js` | Cookie 账号列表与账号回退策略；代理编辑弹窗在 `proxy-editor.js`（QUA-P1-4 拆分，`window.proxyEditorKit` 显式命名空间） |
 | `app/console_assets.py` | 控制台资源内容版本与缓存重新验证，防止部署后混用新旧脚本 |
 | `app/upstreams/` | 两种上游协议，以及共用的消息准备流程 |
 | `app/upstreams/cookie_request.py` | batchGraphql 请求参数、消息及工具协议转换 |
@@ -83,6 +83,13 @@ Gemini 原生请求通过 Express REST 透传，或经 Cookie 原生桥接交付
 
 已有的 `proxy_resolver` 公共解析入口和 `api_helpers` 响应转换入口以显式导入方式保留，
 避免现有调用方随内部拆分失效；新增内部调用优先引用实际归属模块。
+QUA-P3-4（2026-11 审查）：`api_helpers` 兼容层里 6 个 `_` 前缀私有名
+（`_build_chunk_payload` / `_call_retry_factory` / `_chunk_openai_response_dict_for_sse`
+/ `_record_usage` / `_warn_bad_credential` 及 `chat_api` 的同类 seam）属**带期限的过渡
+re-export**，计划在 2026-12 的清理轮移除——届时测试 patch 落点应已全部迁至
+`upstreams.express_pipeline` 等实际归属模块（新增测试禁止再 patch 兼容层私有名，
+存量 26 处随触及逐步迁移）。公共名（`SDKGeneration` / `execute_gemini_call` 等）
+是稳定 API，不在移除范围。
 `scripts/check_architecture.py` 静态检查三处模块的反向依赖（含函数内导入），
 并检查应用模块加载时的导入环；动态导入和运行时调用关系仍需人工复查。
 
@@ -94,7 +101,8 @@ Gemini 原生请求通过 Express REST 透传，或经 Cookie 原生桥接交付
 | `console-models.js` | 模型选择、能力摘要、全局/模型配置草稿与保存 |
 | `console-overview.js` | 概览统计与近期指标刷新，内部持有轮询状态 |
 | `console-logs.js` | 有界 SSE 日志、过滤和滚动，暴露 `consoleLogs.onShow()` |
-| `channel-config.js` | Cookie 账号、回退策略和共用代理编辑器 |
+| `channel-config.js` | Cookie 账号与回退策略 |
+| `proxy-editor.js` | 共用代理编辑器：草稿、测试、导入（经 `proxyEditorKit` 命名空间协作） |
 | `console-forms.js` | 专项设置表单、校验与保存交互 |
 | `request-monitor.js` | 请求监控、分页、详情与关联日志 |
 | `console-bootstrap.js` | 最后加载：启动、共享事件绑定和可选通道脚本恢复 |
@@ -246,9 +254,8 @@ Pydantic 校验错误保留最多 50 个字段位置与说明，不返回原始 
 每个测试文件单独启动 Python 进程，隔离模块级状态和事件循环资源。
 
 单组测试可以直接运行，例如 `python tests/test_console_routes.py`。
-`verify_round17.py` 和 `verify_singbox_e2e.py` 属于手动网络诊断，不属于离线回归。
-`smoke_final.py` 是离线全服务冒烟（TestClient 启动完整应用验证核心端点），
-`verify_first_reply_timing.py` 复现并验证首回复超时的重试归因行为；两者均为
+`verify_singbox_e2e.py` 与 `verify_proxy_bridge_sstp.py` 属于手动网络诊断，不属于离线回归。
+`verify_first_reply_timing.py` 复现并验证首回复超时的重试归因行为，为
 手动诊断脚本，可离线运行，不依赖真实凭据。
 新增离线回归请放在 `tests/test_*.py`，由统一入口自动发现。
 

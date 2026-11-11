@@ -36,14 +36,28 @@ _MAX_REDIRECTS = 5
 _METADATA_HOSTS = frozenset({"metadata.google.internal", "metadata.goog"})
 
 
-def _keepalive_host_allowed(host: str) -> bool:
-    """保活目标的地址段裁决（2026-11 S-3）。
+def keepalive_private_targets_allowed(override=None) -> bool:
+    """SEC-P2-6：是否允许私网/环回保活目标（控制台设置，默认关）。
+
+    override 用于设置保存校验：同一补丁里同时改 keepalive_url 和
+    keepalive_allow_private 时，以补丁里的新值为准。
+    """
+    if override is not None:
+        return bool(override)
+    try:
+        return bool(app_state.get_setting("keepalive_allow_private", False))
+    except Exception:
+        return False
+
+
+def _keepalive_host_allowed(host: str, allow_private: bool = False) -> bool:
+    """保活目标的地址段裁决（2026-11 S-3；SEC-P2-6 收紧）。
 
     云元数据 / 链路本地段（169.254.169.254、metadata.google.internal 等）
-    绝不是合法保活目标：会话被伪造后可借保活任务盲探元数据端点收割凭据。
-    环回与私网段**保留**：把 URL 填成自己的 http://127.0.0.1:port/healthz
-    是文档化的「自我保活」用法，操作者已通过控制台鉴权，目标是其自己的
-    实例/内网监控。
+    无论如何都不是合法保活目标：会话被伪造后可借保活任务盲探元数据端点
+    收割凭据。环回与私网段需显式开启 keepalive_allow_private：被劫持的
+    控制台会话可用保活任务对内网管理面稳定重放 GET 并经 SSE 日志回读
+    状态码（探测 oracle），默认拒绝、自我保活用户显式确认后放行。
     """
     if host.lower() in _METADATA_HOSTS:
         return False
@@ -51,11 +65,14 @@ def _keepalive_host_allowed(host: str) -> bool:
         addr = ipaddress.ip_address(host)
     except ValueError:
         return True  # 普通域名无法静态判段；解析交给出站层
-    return not (addr.is_link_local or addr.is_multicast
-                or addr.is_reserved or addr.is_unspecified)
+    if addr.is_link_local or addr.is_multicast or addr.is_reserved or addr.is_unspecified:
+        return False
+    if addr.is_loopback or addr.is_private:
+        return allow_private
+    return True
 
 
-def validate_keepalive_url(url: str) -> bool:
+def validate_keepalive_url(url: str, allow_private: bool = False) -> bool:
     if not url:
         return True
     try:
@@ -75,8 +92,9 @@ def validate_keepalive_url(url: str) -> bool:
     if "@" in authority:
         return False
     # 2) 链路本地 / 云元数据地址段拒绝（见 _keepalive_host_allowed）。
-    #    重定向目标经本函数复检，同一口径。
-    return _keepalive_host_allowed(parsed.host)
+    #    重定向目标经本函数复检，同一口径；私网/环回需 allow_private
+    #    显式放行（SEC-P2-6）。
+    return _keepalive_host_allowed(parsed.host, allow_private=allow_private)
 
 
 class KeepAliveService:
@@ -93,6 +111,9 @@ class KeepAliveService:
         return url, int(interval)
 
     async def _run(self, url: str, interval: int):
+        # 私网/环回裁决在任务启动时固定（SEC-P2-6）：运行中改设置需重启任务
+        # 生效（settings_api 的 restart 已覆盖）。
+        allow_private = keepalive_private_targets_allowed()
         print(f"💓 [保活] 任务启动：GET {url}，间隔 {interval}s。")
         try:
             # 客户端随任务生命周期创建/关闭：重启（改配置）会换新客户端，
@@ -113,7 +134,7 @@ class KeepAliveService:
                                         if redirect == _MAX_REDIRECTS:
                                             raise ValueError("保活重定向次数超过上限。")
                                         current = current.join(response.headers["location"])
-                                        if not validate_keepalive_url(str(current)):
+                                        if not validate_keepalive_url(str(current), allow_private=allow_private):
                                             raise ValueError("保活重定向地址无效。")
                                         continue
                                     print(f"💓 [保活] GET {url} -> {response.status_code}")
@@ -145,8 +166,12 @@ class KeepAliveService:
         if not url:
             # 未配置：静默跳过，不在每次启动时给不使用保活的用户刷日志。
             return
-        if not validate_keepalive_url(url):
-            print("⚠️ [保活] URL 必须是包含主机名的合法 HTTP(S) 地址，保活未启动。")
+        if not validate_keepalive_url(url, allow_private=keepalive_private_targets_allowed()):
+            if validate_keepalive_url(url, allow_private=True):
+                print("⚠️ [保活] 目标是私网/环回地址：被劫持的控制台会话可借保活任务探测内网。"
+                      "确属自我保活/内网监控场景时，请在控制台「运行设置」开启 keepalive_allow_private 后重启。")
+            else:
+                print("⚠️ [保活] URL 必须是包含主机名的合法 HTTP(S) 地址，保活未启动。")
             return
         if interval < _MIN_INTERVAL_SECONDS:
             print(f"⚠️ [保活] 间隔 {interval}s 低于下限 {_MIN_INTERVAL_SECONDS}s，保活未启动。")

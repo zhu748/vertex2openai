@@ -6,9 +6,15 @@ first-reply/proxy handling. It does not construct downstream API responses.
 
 import re
 import time
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, AsyncIterator, Callable, Optional
+
+import httpx
+from fastapi import Request
 
 from cookie_auth import BATCH_GRAPHQL_URL
+import image_delivery
+from json_encoding import estimate_json_chars
+from media_tasks import run_media_task
 from http_io import read_upstream_bytes
 from first_reply import FirstReplyGuard, FirstReplyTimeout, native_has_reply, timeout_seconds
 from request_tracking import upstream_attempt, upstream_chunk
@@ -139,7 +145,7 @@ def is_native_tool_error_response(status_code: int, payload: str) -> bool:
     return has_error_envelope and is_native_tool_error(payload)
 
 
-def _event_has_reply(event):
+def _event_has_reply(event: tuple):
     kind, data = event
     if kind == "native_part":
         return native_has_reply({"candidates": [{"content": {"parts": [data]}}]})
@@ -163,7 +169,7 @@ _GRPC_TO_HTTP = {
 }
 
 
-def grpc_status_code(data) -> int | None:
+def grpc_status_code(data: Any) -> int | None:
     """从 GraphQL 错误块提取 gRPC 状态码（extensions.status.code）。"""
     if not isinstance(data, dict):
         return None
@@ -179,7 +185,7 @@ def grpc_status_code(data) -> int | None:
     return code
 
 
-def api_error_details(data) -> tuple[int, str]:
+def api_error_details(data: Any) -> tuple[int, str]:
     """GraphQL 错误块 → (HTTP 状态码, 消息) 的**唯一**分类入口。
 
     优先级：显式 code 字段 > gRPC 状态码（extensions.status.code）>
@@ -206,7 +212,7 @@ def api_error_details(data) -> tuple[int, str]:
     return code, message
 
 
-async def retry_heartbeats(total_sec: float, hb_interval: float = 3.0, request=None):
+async def retry_heartbeats(total_sec: float, hb_interval: float = 3.0, request: Request=None) -> AsyncIterator[str]:
     """边等待边吐心跳的异步生成器：每 hb_interval 秒 yield 一次心跳，直到累计 total_sec。"""
     waited = 0.0
     step = max(0.5, min(hb_interval, total_sec)) if total_sec > 0 else 0
@@ -222,7 +228,7 @@ async def retry_heartbeats(total_sec: float, hb_interval: float = 3.0, request=N
 # cookie_native 里平行存在 8 份，日志格式、attempt 口径与退避注释各自
 # 漂移（生图/流式/非流式/原生桥四种措辞、中文/半角冒号混用）。收敛后
 # 8 个调用点只保留各自不同的部分：错误来源、断连终态与交付形态。
-def _cookie_backoff_delay(*, retry_after, backoff_sec, attempt, jitter_sec, error, label, log_tag) -> float:
+def _cookie_backoff_delay(*, retry_after: Optional[str], backoff_sec: float, attempt: int, jitter_sec: float, error: str, label: str, log_tag: str) -> float:
     """计算 Cookie 通道退避延迟并打统一格式的重试日志。
 
     Cookie 重试循环**复用同一 Cookie 身份**，上游的 Retry-After 对该身份
@@ -236,8 +242,8 @@ def _cookie_backoff_delay(*, retry_after, backoff_sec, attempt, jitter_sec, erro
     return delay
 
 
-async def cookie_retry_backoff(request, *, retry_after, backoff_sec, attempt, jitter_sec,
-                               error, label, log_tag="[Studio]") -> bool:
+async def cookie_retry_backoff(request: Request, *, retry_after: Optional[str], backoff_sec: float, attempt: int, jitter_sec: float,
+                               error: str, label: str, log_tag: str="[Studio]") -> bool:
     """Cookie 通道退避窗口（静默等待版，非流式/生图整取路径用）。
 
     返回 False 表示客户端已断开，调用方按各自交付形态收尾
@@ -249,8 +255,8 @@ async def cookie_retry_backoff(request, *, retry_after, backoff_sec, attempt, ji
     return await wait_for_retry(request, delay)
 
 
-async def cookie_retry_backoff_heartbeats(request, *, retry_after, backoff_sec, attempt,
-                                           jitter_sec, error, label, log_tag="[Studio]"):
+async def cookie_retry_backoff_heartbeats(request: Request, *, retry_after: Optional[str], backoff_sec: float, attempt: int,
+                                           jitter_sec: float, error: str, label: str, log_tag: str="[Studio]") -> AsyncIterator[str]:
     """Cookie 通道退避窗口（流式心跳版，流式/原生桥路径用）。
 
     等待期间持续吐 SSE 心跳帧保活，前端不会在 429 长等待期间超时断开。
@@ -267,7 +273,7 @@ async def cookie_retry_backoff_heartbeats(request, *, retry_after, backoff_sec, 
 class StreamRequestError(str):
     """保持错误字符串兼容性，并把 HTTP 退避信息带到流式重试层。"""
 
-    def __new__(cls, message, retry_after=None, status_code=None, *, cause=None):
+    def __new__(cls, message: str, retry_after: Optional[str]=None, status_code: Optional[int]=None, *, cause: Optional[BaseException]=None):
         value = super().__new__(cls, message)
         value.retry_after = retry_after
         value.status_code = status_code
@@ -344,7 +350,13 @@ async def _execute_stream_request_generator_once(
                 # 上游已回 200 后的本地解析/校验错误不是坏出口的证据（同一内容
                 # 换出口也会一样坏），包装为 ToolStreamError 以免触发代理轮换。
                 try:
-                    events = list(extract_events(obj, preserve_parts=preserve_parts))
+                    # PRF-P1-1：含内联图片的对象在媒体线程解析（base64 解码 +
+                    # 落盘不能停在事件循环上）；纯文本对象原地零开销解析。
+                    if image_delivery.has_inline_image(obj):
+                        events = await run_media_task(
+                            list, extract_events(obj, preserve_parts=preserve_parts), heavy=True)
+                    else:
+                        events = list(extract_events(obj, preserve_parts=preserve_parts))
                 except IncompleteResponseError as error:
                     raise ToolStreamError(str(error)) from error
                 # 正文/工具内容已到即停止留存诊断样本（样本只服务「无正文」
@@ -486,15 +498,15 @@ async def _execute_stream_request_generator_raw(
 
 
 async def stream_events(
-    client,
-    headers,
-    body,
-    sampler=None,
-    fallback_body=None,
+    client: httpx.AsyncClient,
+    headers: dict,
+    body: dict,
+    sampler: Optional[RawSampler]=None,
+    fallback_body: Optional[Callable]=None,
     *,
-    model="",
-    preserve_parts=False,
-):
+    model: str="",
+    preserve_parts: bool=False,
+) -> AsyncIterator[tuple]:
     chain = getattr(client, "chain", None)
     # 首回复窗口每请求只读一次设置（while 循环里换出口/重试会反复新建 Guard）。
     fr_seconds = timeout_seconds(model)
@@ -552,7 +564,17 @@ async def stream_events(
                     yield item
                     return
                 if not guard.ready:
-                    pending.add(item, len(str(data).encode("utf-8")))
+                    # PRF-P2-1（2026-11 收敛）：元数据计量不再 str(data)
+                    # 物化——native_part 含数十 MB base64 时先拼整串再
+                    # UTF-8 编码只为算字节数；改无拷贝递归估长（str/bytes
+                    # 直接 len，容器走结构估算），上限闸粗估口径不变。
+                    if isinstance(data, str):
+                        pending_size = len(data)
+                    elif isinstance(data, (bytes, bytearray)):
+                        pending_size = len(data)
+                    else:
+                        pending_size = estimate_json_chars(data)
+                    pending.add(item, pending_size)
                     continue
                 for prefix in pending.drain():
                     yield prefix

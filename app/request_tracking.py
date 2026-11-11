@@ -79,7 +79,7 @@ class RequestTrace:
             if phase:
                 self.data["phase"] = phase
             item = {"kind": kind, "at": time.time(), "elapsed_ms": round((time.monotonic() - self.started) * 1000),
-                    "message": redact(message)[:1200]}
+                    "message": redact(str(message)[:2000])[:1200]}
             self._append(self.events, item)
         print(f"🧭 [请求跟踪] [{self.id}] {item['message']}")
 
@@ -105,7 +105,7 @@ class RequestTrace:
 
     def log(self, message):
         with self._lock:
-            self._append(self.logs, {"at": time.time(), "message": redact(message)[:2000]})
+            self._append(self.logs, {"at": time.time(), "message": redact(str(message)[:3000])[:2000]})
 
     def milestone(self, key, message, *, phase=None):
         with self._lock:
@@ -131,9 +131,9 @@ class RequestTrace:
     def retry(self, delay, error):
         with self._lock:
             self.data["retry_at"] = time.time() + delay
-            self.data["last_error"] = redact(error)[:1200]
+            self.data["last_error"] = redact(str(error)[:2000])[:1200]
             self.data["first_reply_deadline"] = None
-        self.event("retry_wait", f"上游失败，{delay:.1f} 秒后重试：{redact(error)[:400]}", phase="retry_wait")
+        self.event("retry_wait", f"上游失败，{delay:.1f} 秒后重试：{redact(str(error)[:600])[:400]}", phase="retry_wait")
 
     def add_retry(self):
         with self._lock:
@@ -147,10 +147,10 @@ class RequestTrace:
     def fail(self, message, code=None):
         with self._lock:
             self.data["outcome"] = "error"
-            self.data["last_error"] = redact(message)[:1200]
+            self.data["last_error"] = redact(str(message)[:2000])[:1200]
             if isinstance(code, int) and 400 <= code <= 599:
                 self.data["error_code"] = code
-        self.event("error", f"请求失败：{redact(message)[:600]}", phase="error")
+        self.event("error", f"请求失败：{redact(str(message)[:900])[:600]}", phase="error")
 
     def cancel(self, message):
         with self._lock:
@@ -174,7 +174,7 @@ class RequestTrace:
             if self.data["outcome"] != "error":
                 self.data["outcome"] = outcome
             if message:
-                self.data["last_error"] = redact(message)[:1200]
+                self.data["last_error"] = redact(str(message)[:2000])[:1200]
             self._settle()
         self.event("generation_end", f"上游生成结束：{self.data['outcome']}。",
                    phase=self.data["outcome"] if not self.data["http_active"] else "delivery")
@@ -263,13 +263,25 @@ class RequestTrace:
 
 class PayloadObserver:
     """Inspect bounded SSE/JSON copies, never keep prompt or generated text."""
-    def __init__(self, trace, *, sent=False, sse=True):
+    def __init__(self, trace, *, sent=False, sse=True, inspect=None):
         self.trace, self.sent, self.sse = trace, sent, sse
         self.buffer = bytearray()
         self.skipping = False
         # 已确认无分隔符的前缀长度：下个块从末尾 3 字节重叠处继续扫，
         # 避免每块都从 0 重扫整个缓冲（最坏 O(n²)）。
         self._scan = 0
+        # PRF-P1-4：帧载荷检查（json.loads + inspect_payload）可经
+        # request_diagnostics 设置关闭——诊断层此前无开关无采样，每帧
+        # 15-30µs 的检查费在帧吞吐与帧大小线性放大时是隐形税；关闭后
+        # 仍保留字节数与帧数计数，仅牺牲内容/用量/里程碑类细粒度。
+        # 每观察者只读一次设置（观察者生命周期 = 单请求）。
+        if inspect is None:
+            try:
+                from runtime_state import app_state as _app_state
+                inspect = bool(_app_state.get_setting("request_diagnostics", True))
+            except Exception:
+                inspect = True
+        self._inspect = inspect
 
     def feed(self, chunk, final=False):
         raw = chunk.encode("utf-8") if isinstance(chunk, str) else bytes(chunk)
@@ -331,6 +343,10 @@ class PayloadObserver:
             self._scan = max(0, len(self.buffer) - 3)
 
     def _payload(self, raw):
+        if not self._inspect:
+            # 诊断降级：只保留字节数/帧数计数（feed 与 _ingest_sse 已计），
+            # 跳过 json.loads 与逐字段检查。
+            return
         try:
             payload = json.loads(raw)
             for item in payload if isinstance(payload, list) else [payload]:

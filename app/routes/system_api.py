@@ -1,6 +1,7 @@
 """公开健康检查与控制台代理连通性测试。"""
 
 import asyncio
+import ipaddress
 import threading
 import time
 from typing import Literal
@@ -25,6 +26,44 @@ PROXY_TEST_TARGET = "https://aiplatform.googleapis.com/"
 PROXY_TEST_TIMEOUT_SECONDS = 8.0
 PROXY_TEST_TOTAL_SECONDS = 55.0
 _probe_slots = threading.BoundedSemaphore(4)
+
+# SEC-P3-6：生产环境可整体禁用代理连通性测试端点（已鉴权管理员仍可借它
+# 探测内网端口状态；多租户/共享运维场景建议开启本开关）。
+_PROXY_TEST_DISABLED = config.env_flag("DISABLE_PROXY_TEST")  # QUA-P2-7：布尔口径单点定义
+
+
+def _proxy_host_is_private(target: str) -> bool:
+    """SEC-P3-6：代理地址主机是否为字面私网/环回 IP。
+
+    只判字面 IP（域名无法静态判段，交给出站层）：填内网代理地址探测时，
+    错误分类与延迟差异可区分内网端口状态，默认拒绝；控制台开启
+    proxy_test_allow_private 后放行（确需测试内网节点的场景）。
+    """
+    try:
+        host_part = (target.split("://", 1)[1] if "://" in target else target).split("/", 1)[0]
+        host_part = host_part.rsplit("@", 1)[-1]  # 去掉 userinfo
+        if host_part.startswith("["):
+            # IPv6 字面量：[::1]:1080 —— 括号内才是地址。
+            parsed_host = host_part[1:host_part.index("]")] if "]" in host_part else host_part[1:]
+        else:
+            parsed_host = host_part.split(":")[0]
+        addr = ipaddress.ip_address(parsed_host.strip())
+    except (ValueError, IndexError):
+        return False  # 域名或畸形值：域名交给后续链路，畸形已被格式校验拦
+    return addr.is_private or addr.is_loopback or addr.is_link_local
+
+
+def _private_proxy_denied_response(target: str) -> JSONResponse:
+    return JSONResponse(content={
+        "ok": False,
+        "via_proxy": True,
+        "proxy": mask_proxy_url(target),
+        "latency_ms": 0,
+        "error": "private_address_blocked",
+        "code": "private_address_blocked",
+        "message": "代理地址指向私网/环回段：错误分类与延迟差异可被用来探测内网端口，默认拒绝。"
+                   "确需测试内网节点时，请在控制台「运行设置」开启 proxy_test_allow_private。",
+    })
 
 
 def _healthz_payload() -> dict:
@@ -139,6 +178,11 @@ async def parse_proxy(body: ProxyParseBody, _auth: bool = Depends(require_auth))
 async def test_proxy(body: ProxyTestBody, _auth: bool = Depends(require_auth), request: Request = None):
     from proxy_resolver import ProxyUsage, current_proxy_usage
 
+    # SEC-P3-6：生产可经 DISABLE_PROXY_TEST 整体禁用本端点。
+    if _PROXY_TEST_DISABLED:
+        return JSONResponse(status_code=403, content={"ok": False, "code": "disabled",
+                                                     "message": "代理连通性测试已被 DISABLE_PROXY_TEST 禁用。"})
+
     if not _probe_slots.acquire(blocking=False):
         return JSONResponse(status_code=429, content={"ok": False, "code": "busy", "message": "其他代理正在测试，请稍后重试。"},
                             headers={"Cache-Control": "no-store", "Retry-After": "2"})
@@ -205,6 +249,10 @@ async def _test_proxy_candidate(body: ProxyTestBody):
     # 前端为空时测当前已生效的代理；两者都空 = 测直连（验证平台能否直达 Google）。
     target = candidate or effective
     via_proxy = classify_proxy_uri(target) != "direct"
+    # SEC-P3-6：内网代理地址默认拒绝（探测面），开关见 proxy_test_allow_private。
+    if via_proxy and _proxy_host_is_private(target) and not bool(
+            app_state.get_setting("proxy_test_allow_private", False)):
+        return _private_proxy_denied_response(target)
     # 多协议转换：vless/vmess/trojan/ss/socks4/hysteria2/tuic 在此转成本地
     # socks5（首个请求时惰性启动 sing-box）。转换失败（sing-box 缺失等）
     # 给出可操作的安装指引；未发出任何请求、也绝不降级直连。

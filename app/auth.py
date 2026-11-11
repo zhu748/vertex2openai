@@ -5,6 +5,33 @@ from typing import Optional
 from config import API_KEY
 
 
+def extract_candidate_key(
+    request: Request,
+    *,
+    authorization: str = "",
+    x_api_key: str = "",
+    x_goog_api_key: str = "",
+    allow_query: bool = True,
+) -> str:
+    """统一提取候选 API Key（QUA-P1-3）：x-api-key > x-goog-api-key > Bearer > ?key=。
+
+    此前同一段提取逻辑在 auth / claude_api / gemini_native / models_api
+    四处平行实现，回退顺序各有微妙差异——差异本应只体现在各协议的
+    「错误响应形状」，提取逻辑本身不应分叉。统一顺序：协议专用头
+    （x-api-key / x-goog-api-key）最优先，通用 Bearer 次之，查询参数
+    最后（SEC-P2-1：?key= 会明文进访问日志，仅作兼容兑底）。
+    """
+    bearer = ""
+    if authorization.startswith("Bearer "):
+        bearer = authorization[len("Bearer "):]
+    for candidate in (x_api_key, x_goog_api_key, bearer):
+        if candidate:
+            return str(candidate)
+    if allow_query:
+        return request.query_params.get("key", "")
+    return ""
+
+
 def constant_time_equal(candidate: str, expected: str) -> bool:
     """UTF-8 字节比较，避免 compare_digest(str) 遇到非 ASCII 口令抛异常。"""
     try:
@@ -56,10 +83,9 @@ async def get_api_key_flexible(
     发起生成与轮询 /v1/resumable/{id}（旧实现只认 Bearer，原生客户端
     用 x-goog-api-key 轮询分片会被 401，2026-10 修复）。
     """
-    bearer = ""
-    if authorization and authorization.startswith("Bearer "):
-        bearer = authorization[len("Bearer "):]
-    candidate = x_goog_api_key or bearer or request.query_params.get("key", "")
+    candidate = extract_candidate_key(
+        request, authorization=authorization or "",
+        x_goog_api_key=x_goog_api_key or "")
     if not candidate:
         raise HTTPException(
             status_code=401,

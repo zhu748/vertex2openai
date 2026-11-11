@@ -273,7 +273,7 @@ def _require_port(parts, scheme: str, *, default: int | None = None) -> int:
     try:
         port = parts.port
     except ValueError as e:
-        raise ProxyResolveError(f"{scheme} 链接端口不合法：{e}")
+        raise ProxyResolveError(f"{scheme} 链接端口不合法：{e}") from e  # B904
     if port is None:
         if default is not None:
             return default
@@ -332,7 +332,7 @@ def _parse_vmess(uri: str) -> dict:
     try:
         data = json.loads(_b64decode_text(payload))
     except Exception as e:
-        raise ProxyResolveError(f"vmess 链接的 base64/JSON 无法解码：{e}")
+        raise ProxyResolveError(f"vmess 链接的 base64/JSON 无法解码：{e}") from e  # B904
     if not isinstance(data, dict):
         raise ProxyResolveError("vmess 链接解码后不是 JSON 对象。")
     server = str(data.get("add") or "").strip()
@@ -341,7 +341,7 @@ def _parse_vmess(uri: str) -> dict:
     try:
         port = int(data.get("port"))
     except (TypeError, ValueError):
-        raise ProxyResolveError("vmess 链接缺少有效端口（port 字段）。")
+        raise ProxyResolveError("vmess 链接缺少有效端口（port 字段）。") from None  # B904：消息自足，原始 TypeError/ValueError 只是噪声
     if not (1 <= port <= 65535):
         raise ProxyResolveError(f"vmess 链接端口必须在 1–65535 范围内（收到 {port}）。")
     uuid = str(data.get("id") or "").strip()
@@ -459,14 +459,14 @@ def _parse_ss(uri: str) -> dict:
             except Exception:
                 raise ProxyResolveError(
                     "ss 链接的 userinfo 无法解码（应为 base64(method:password)）。"
-                )
+                ) from None  # B904：解码失败细节对该用户错误无增量价值
         else:
             percent_encoded = True
     else:  # 旧式：整体 base64(method:pass@host:port)
         try:
             decoded = _b64decode_text(body)
         except Exception as e:
-            raise ProxyResolveError(f"ss 链接无法解码：{e}")
+            raise ProxyResolveError(f"ss 链接无法解码：{e}") from e  # B904
         if "@" not in decoded:
             raise ProxyResolveError(
                 "ss 链接格式不认识（既非 SIP002 也非旧式 base64）。"

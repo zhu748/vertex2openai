@@ -49,9 +49,9 @@ class SignatureStore:
         self._ttl = ttl_seconds
         self._max = max_entries
         self._lock = threading.Lock()
-        self._data: "OrderedDict[str, tuple[float, SignatureRecord]]" = OrderedDict()
+        self._data: OrderedDict[str, tuple[float, SignatureRecord]] = OrderedDict()
         # Reads reorder the LRU, while absolute expiry follows the last write.
-        self._expiry: "OrderedDict[str, float]" = OrderedDict()
+        self._expiry: OrderedDict[str, float] = OrderedDict()
 
     def put_record(self, call_id: str, record: SignatureRecord) -> None:
         if not call_id:
@@ -63,6 +63,23 @@ class SignatureStore:
             self._expiry[call_id] = now
             self._expiry.move_to_end(call_id)
             self._evict(now)
+
+    def register_call_signature(self, call_id: str, signature: Optional[bytes],
+                                *, unsigned_follower: bool = False) -> None:
+        """QUA-P2-2（2026-11 审查收敛）：工具调用签名三态写入的单一入口。
+
+        此前 thought_signatures.build_tool_call_id 与
+        cookie_response.openai_tool_call 各自重复同一套
+        「有签名→SIGNED / 同批后续调用无签名→UNSIGNED_FOLLOWER /
+        其余→UNKNOWN」分叉；现在生产方只需提供签名字节与
+        「是否同批后续调用」的判定，拓扑语义归本模块单点维护。
+        """
+        if signature:
+            self.put_record(call_id, SignatureRecord(SignatureState.SIGNED, signature))
+        elif unsigned_follower:
+            self.put_unsigned_follower(call_id)
+        else:
+            self.put_unknown(call_id)
 
     def put_unsigned_follower(self, call_id: str) -> None:
         self.put_record(call_id, SignatureRecord(SignatureState.UNSIGNED_FOLLOWER))

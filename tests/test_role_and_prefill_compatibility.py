@@ -26,6 +26,7 @@ from unittest import mock
 sys.path.insert(0, str(Path := __import__("pathlib").Path(__file__).resolve().parents[1] / "app"))
 
 import httpx
+from fastapi import HTTPException  # B017 断言收窄用
 from google.genai import types as genai_types
 
 import auth
@@ -151,7 +152,7 @@ class LogprobsTests(unittest.TestCase):
         self.assertEqual([e["token"] for e in entries], ["你好", "！"])
         self.assertAlmostEqual(entries[0]["logprob"], -0.05)
         self.assertEqual([t["token"] for t in entries[0]["top_logprobs"]], ["你好", "您好"])
-        self.assertEqual(entries[0]["bytes"], list("你好".encode("utf-8")))
+        self.assertEqual(entries[0]["bytes"], list("你好".encode()))
 
     def test_missing_or_barren_result_yields_none(self):
         self.assertIsNone(logprobs_payload_from_candidate(genai_types.Candidate()))
@@ -203,7 +204,8 @@ class ResumablePollGuardTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_flexible_auth_rejects_wrong_key(self):
         with mock.patch.object(auth, "API_KEY", "right"):
-            with self.assertRaises(Exception):
+            # B017：断言收窄到实际抛出的 401 HTTPException
+            with self.assertRaises(HTTPException):
                 await auth.get_api_key_flexible(
                     SimpleNamespace(query_params={}), "Bearer wrong", None)
 
@@ -285,7 +287,7 @@ class LogStreamResumeTests(unittest.TestCase):
         try:
             while True:
                 received.append(await asyncio.wait_for(gen.__anext__(), timeout=0.3))
-        except (StopAsyncIteration, asyncio.TimeoutError):
+        except (TimeoutError, StopAsyncIteration):
             pass
         return received
 

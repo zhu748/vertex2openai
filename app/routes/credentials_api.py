@@ -9,7 +9,15 @@ from pydantic import BaseModel
 
 import config
 import express_key_probe
-from console_auth import require_auth
+from auth import constant_time_equal
+from console_auth import (
+    clear_login_failure,
+    client_ip,
+    login_retry_after,
+    record_login_failure,
+    require_auth,
+    resolve_admin_password,
+)
 from cookie_auth import validate_cookie
 from credential_config import parse_cookie_header
 from cookie_probe import probe_all as probe_cookie_accounts
@@ -196,16 +204,40 @@ class CookieTestBody(BaseModel):
     id: str = ""  # 指定账号 ID；空 = 测试全部启用账号
 
 
+class RevealBody(CookieTestBody):
+    # SEC-P3-4：读取 Cookie 明文前需二次输入控制台口令。会话 Cookie 被
+    # 劫持（XSS / 设备失窃）时，攻击者没有口令仍拿不到凭证本体。
+    password: str = ""
+
+
 @router.post("/api/cookie-accounts/reveal")
-async def reveal_cookie_account(body: CookieTestBody, _auth: bool = Depends(require_auth)):
-    """Return one saved Cookie only after an explicit console action."""
+async def reveal_cookie_account(body: RevealBody, request: Request, _auth: bool = Depends(require_auth)):
+    """Return one saved Cookie only after password re-confirmation.
+
+    二次验证口径与登录一致（优先 ADMIN_PASSWORD，未设置回退 API_KEY），
+    并复用登录的指数退避限速：被劫持的会话无法高频爆破口令。
+    每次 reveal（含失败尝试）都写审计日志，凭证读取留痕。
+    """
     headers = {"Cache-Control": "no-store", "Pragma": "no-cache"}
     account_id = body.id.strip()
+    ip = client_ip(request)
+    remain = login_retry_after(ip)
+    if remain > 0:
+        return JSONResponse(status_code=429, content={"error": f"尝试过于频繁，请 {remain} 秒后再试"},
+                            headers={**headers, "Retry-After": str(remain)})
+    admin_password = resolve_admin_password()
+    if not admin_password or not constant_time_equal(body.password, admin_password):
+        record_login_failure(ip)
+        print(f"🔔 [审计] Cookie reveal 二次口令验证失败：账号 {account_id or '未指定'}，来自 {ip}。")
+        return JSONResponse(status_code=403, content={"error": "控制台口令验证失败，无法读取 Cookie。"},
+                            headers=headers)
+    clear_login_failure(ip)
     if not account_id:
         return JSONResponse(status_code=400, content={"error": "请选择一个已保存的 Cookie 账号。"}, headers=headers)
     record = next((rec for rec in app_state.get_cookie_accounts() if rec["id"] == account_id), None)
     if record is None:
         return JSONResponse(status_code=404, content={"error": "Cookie 账号不存在或已删除。"}, headers=headers)
+    print(f"🔔 [审计] Cookie reveal：账号 {record['id']} 的 Cookie 明文由 {ip} 读取。")
     return JSONResponse(content={"id": record["id"], "cookie": record["cookie"]}, headers=headers)
 
 

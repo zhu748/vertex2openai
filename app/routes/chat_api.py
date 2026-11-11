@@ -9,6 +9,7 @@ import asyncio
 from functools import partial
 import hashlib
 import json
+import math
 import time
 import traceback
 
@@ -22,6 +23,7 @@ from admission import (count_slow_setup_failure, image_limiter as image_limiter,
                        limit_generation, run_with_image_limit, SETUP_FAST_WINDOW_SECONDS)
 from response_validation import IncompleteResponseError
 from request_tracking import configure as track_configure
+from json_encoding import json_response_offloop
 
 # 第二轮：弱网可靠传输 —— 服务端响应缓冲 + 序列号事件 + 断线重放 / 分片轮询。
 # 上游读取由后台泵驱动，与前端连接解绑；已收到的事件保存在有界缓冲。
@@ -97,15 +99,32 @@ call_upstream = _call_upstream
 # 免去一次 20MB 级的 json.dumps 全量序列化与转义扫描。
 _FP_LONG_STRING = 4096
 _FP_CHUNK = 1 << 20
+# PRF-P2-5：超长字符串再降一档——只对首尾窗口 + 长度做摘要，不再逐块
+# 编码整串（20MB 内嵌图在事件循环上约 40-80ms，重发请求每次重算）。
+# 首尾 4KB 对 base64 图片几乎必然不同（碰撞概率可忽略，指纹只做去重键
+# 非安全边界）；中段差异同头尾同长度的理论碰撞会共享缓冲，语义等同
+# 「重复请求」，风险可接受。
+_FP_WEAK_WINDOW = 64 * 1024      # 超过该长度启用首尾窗口折叠
+_FP_WINDOW_SLICE = 4096          # 首尾各取 4KB
+
+
+def _fp_digest(value: str) -> str:
+    """长字符串的稳定摘要：中短串全量、超长串只取首尾窗口（PRF-P2-5）。"""
+    digest = hashlib.sha256()
+    if len(value) > _FP_WEAK_WINDOW:
+        digest.update(value[:_FP_WINDOW_SLICE].encode("utf-8"))
+        digest.update(b"\x00...fp-window...\x00")
+        digest.update(value[-_FP_WINDOW_SLICE:].encode("utf-8"))
+    else:
+        for i in range(0, len(value), _FP_CHUNK):
+            # str 切片不会劈开码点，分块编码与整串编码逐字节一致。
+            digest.update(value[i:i + _FP_CHUNK].encode("utf-8"))
+    return digest.hexdigest()
 
 
 def _fp_fold(value):
     if isinstance(value, str) and len(value) > _FP_LONG_STRING:
-        digest = hashlib.sha256()
-        for i in range(0, len(value), _FP_CHUNK):
-            # str 切片不会劈开码点，分块编码与整串编码逐字节一致。
-            digest.update(value[i:i + _FP_CHUNK].encode("utf-8"))
-        return f"\x00folded:{len(value)}:{digest.hexdigest()}"
+        return f"\x00folded:{len(value)}:{_fp_digest(value)}"
     if isinstance(value, dict):
         return {k: _fp_fold(v) for k, v in value.items()}
     if isinstance(value, list):
@@ -192,8 +211,8 @@ async def _resumable_stream(fastapi_request: Request, request_obj: OpenAIRequest
             close = getattr(resp, "aclose", None) or getattr(resp.body_iterator, "aclose", None)
             if close:
                 await close()
-            return JSONResponse(status_code=buf.status_code, content=buf.payload or
-                                create_openai_error_response(503, "响应缓冲已释放。", "buffer_evicted"))
+            return await json_response_offloop(status_code=buf.status_code, content=buf.payload or
+                                                create_openai_error_response(503, "响应缓冲已释放。", "buffer_evicted"))
         pump_task = hold_ingress(asyncio.create_task(within_request_deadline(buf, lambda: pump_stream(buf, resp.body_iterator))))
         # 泵结束的收尾必须走 resp.aclose（若可用）而不是只关 body_iterator：
         # resp 是 ManagedStreamingResponse，只有 aclose 才会执行 cleanup 链
@@ -250,9 +269,9 @@ async def _resumable_json(fastapi_request: Request, request_obj: OpenAIRequest, 
                 status_code=504,
                 content=create_openai_error_response(504, "上游响应超时，缓冲未完成。", "timeout"),
                 headers=_resume_headers(stream_id, replay=True))
-        return JSONResponse(status_code=buf.status_code, content=buf.payload,
-                            headers=_resume_headers(stream_id, replay=True),
-                            background=BackgroundTask(buf.mark_delivered))
+        return await json_response_offloop(status_code=buf.status_code, content=buf.payload,
+                                           headers=_resume_headers(stream_id, replay=True),
+                                           background=BackgroundTask(buf.mark_delivered))
 
     detached = DetachedRequest(fastapi_request)
 
@@ -297,9 +316,11 @@ async def _resumable_json(fastapi_request: Request, request_obj: OpenAIRequest, 
             headers=_resume_headers(stream_id))
     # 响应体发送完成后才标记交付；发送失败时保留同一份回复供重试。
     print(f"📦 [响应缓冲] {stream_id}（{id_src}）：非流式完整回复已落缓冲（HTTP {buf.status_code}）。")
-    return JSONResponse(status_code=buf.status_code, content=buf.payload,
-                        headers=_resume_headers(stream_id),
-                        background=BackgroundTask(buf.mark_delivered))
+    # REQ-P2-2：payload 含生图 base64 时可达 30-90MB，同步 dumps 会拖停
+    # 全站事件循环，大负载统一走 json_response_offloop 的线程池路径。
+    return await json_response_offloop(status_code=buf.status_code, content=buf.payload,
+                                       headers=_resume_headers(stream_id),
+                                       background=BackgroundTask(buf.mark_delivered))
 
 
 @router.post("/v1/chat/completions")
@@ -355,9 +376,9 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
 @router.get("/v1/resumable/{stream_id}")
 async def resumable_poll(stream_id: str, fastapi_request: Request,
                          api_key: str = Depends(get_api_key_flexible),
-                         from_: int = Query(0, alias="from"),
-                         limit: int = Query(200),
-                         wait: float = Query(0.0)):
+                         from_: str = Query("0", alias="from"),
+                         limit: str = Query("200"),
+                         wait: str = Query("0")):
     """
     分片轮询拉取：GET /v1/resumable/{id}?from=<seq>&limit=200&wait=10
 
@@ -369,7 +390,30 @@ async def resumable_poll(stream_id: str, fastapi_request: Request,
     归属：rid 只能被创建它的那把 Key 轮询（rid 本身混入 Key+指纹，跨 Key
     读取意味着拿到了他人的生成 ID，2026-10 收紧）。
     """
-    if from_ < 0:
+    # REQ-P3-5：参数一律 str 接收 + 手工解析，类型错误统一走本端点的
+    # OpenAI 错误形状（400 invalid_resume_cursor），不再漏成 FastAPI
+    # 422 形状（与续传主路径 resume_cursor 的口径一致）。
+    try:
+        start_from = int(from_)
+    except ValueError:
+        return JSONResponse(status_code=400, content=create_openai_error_response(
+            400, "轮询游标 from 必须是整数。", "invalid_resume_cursor"))
+    try:
+        poll_limit = int(limit)
+    except ValueError:
+        return JSONResponse(status_code=400, content=create_openai_error_response(
+            400, "轮询参数 limit 必须是整数。", "invalid_resume_cursor"))
+    try:
+        poll_wait = float(wait)
+    except ValueError:
+        return JSONResponse(status_code=400, content=create_openai_error_response(
+            400, "轮询参数 wait 必须是数字。", "invalid_resume_cursor"))
+    if not math.isfinite(poll_wait):
+        # inf/nan 会毒化 note_client_activity 的窗口计算（旧 float 解析
+        # 默默收下 nan，min(nan, 25) = nan 直接写进断连计时器）。
+        return JSONResponse(status_code=400, content=create_openai_error_response(
+            400, "轮询参数 wait 必须是有限数字。", "invalid_resume_cursor"))
+    if start_from < 0:
         # 与续传主路径（resume_cursor 对负数返回 400）保持同一口径：
         # 静默锐 0 会把客户端的游标 bug 掩盖成「从头全量重放」。
         return JSONResponse(status_code=400, content=create_openai_error_response(
@@ -389,15 +433,15 @@ async def resumable_poll(stream_id: str, fastapi_request: Request,
                 404, f"未找到响应缓冲 {stream_id}（可能已过期被清理）。", "not_found"))
     # 轮询即客户端活动：断线后的缓冲凭轮询滑动续传窗口，不会被「断开
     # 超窗取消上游」误伤（长轮询按声明的 wait 预支在途窗口）。
-    buf.note_client_activity(min(wait, 25.0))
-    limit = max(1, min(limit, 500))
-    if wait > 0 and not buf.done:
-        await buf.wait_for(max(0, from_), min(wait, 25.0))
-    start = from_
+    buf.note_client_activity(min(poll_wait, 25.0))
+    poll_limit = max(1, min(poll_limit, 500))
+    if poll_wait > 0 and not buf.done:
+        await buf.wait_for(max(0, start_from), min(poll_wait, 25.0))
+    start = start_from
     if start > buf.next_seq:
         return JSONResponse(status_code=409, content=create_openai_error_response(
             409, "轮询游标超过缓冲末尾。", "invalid_resume_cursor"))
-    events = buf.snapshot(start, limit)
+    events = buf.snapshot(start, poll_limit)
     end = start + len(events)
     done = buf.done and end >= buf.next_seq
     delivered = done and start <= buf.next_seq
@@ -414,7 +458,8 @@ async def resumable_poll(stream_id: str, fastapi_request: Request,
     if buf.kind == "json" and buf.done:
         # JSON 没有事件分片；轮询必须实际交付正文，不能只报告 done。
         content.update(payload=buf.payload, status_code=buf.status_code)
-    return JSONResponse(
+    # REQ-P2-2：轮询一次可拉 500 帧（巨帧可达数 MB），大响应离环序列化。
+    return await json_response_offloop(
         content=content,
         headers=_resume_headers(stream_id),
         background=BackgroundTask(buf.mark_delivered) if delivered else None)

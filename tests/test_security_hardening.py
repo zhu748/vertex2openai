@@ -7,6 +7,7 @@
 """
 import os
 import unittest
+from unittest import mock
 
 # 单进程模式（python scripts/check_project.py）没有 conftest 注入：与
 # 其他测试文件一致，导入 main 前钉死鉴权口令与离线模型清单。
@@ -33,17 +34,27 @@ class KeepaliveUrlHardeningTests(unittest.TestCase):
             with self.subTest(url=bad):
                 self.assertFalse(validate_keepalive_url(bad))
 
-    def test_loopback_and_private_targets_remain_valid(self):
-        # 文档化的「自我保活」用法必须保留（操作者已鉴权，目标是自己实例）。
-        for good in (
+    def test_loopback_and_private_targets_need_explicit_opt_in(self):
+        # SEC-P2-6（2026-11 收紧）：私网/环回默认拒绝——被劫持的控制台会话
+        # 可借保活任务对内网管理面重放 GET 并经 SSE 日志回读状态码（探测
+        # oracle）；「自我保活」用户显式开启 keepalive_allow_private 后放行。
+        for target in (
             "https://example.com/healthz",
-            "http://127.0.0.1:8050/healthz",
-            "http://10.0.0.5:9090/ping",
             "https://my-monitor.internal.local/beat",
             "",
         ):
-            with self.subTest(url=good):
-                self.assertTrue(validate_keepalive_url(good))
+            with self.subTest(url=target):
+                self.assertTrue(validate_keepalive_url(target))
+        for private in (
+            "http://127.0.0.1:8050/healthz",
+            "http://10.0.0.5:9090/ping",
+            "http://192.168.1.10:8080/beat",
+        ):
+            with self.subTest(url=private, allow_private=False):
+                self.assertFalse(validate_keepalive_url(private))
+            with self.subTest(url=private, allow_private=True):
+                # 显式确认后保留文档化的「自我保活」用法。
+                self.assertTrue(validate_keepalive_url(private, allow_private=True))
 
 
 class HealthzDisclosureTests(unittest.TestCase):
@@ -73,16 +84,31 @@ class ConsoleCsrfTests(unittest.TestCase):
         self.assertEqual(response.status_code, 403)
 
     def test_same_origin_write_passes_csrf_gate(self):
-        # 同源（或反代 X-Forwarded-Host）写请求放行（后续鉴权自行处理）。
+        # 同源写请求放行（后续鉴权自行处理）。
         with TestClient(main.app) as client:
             same = client.post("/api/settings", json={},
                                headers={"Origin": "http://testserver"})
             self.assertNotEqual(same.status_code, 403)
-            forwarded = client.post(
+
+    def test_forwarded_host_requires_trust_flag(self):
+        # REQ-P2-6：X-Forwarded-Host 仅在 TRUST_PROXY_HEADERS 开启时采信。
+        # 直连部署下该头可由客户端自带伪造——用它让任意 Origin 通过校验
+        # 等于击穿整条 CSRF 防线。
+        import console_auth
+        with TestClient(main.app) as client:
+            spoofed = client.post(
                 "/api/settings", json={},
                 headers={"Origin": "https://public.example.com",
                          "X-Forwarded-Host": "public.example.com"})
-            self.assertNotEqual(forwarded.status_code, 403)
+            self.assertEqual(spoofed.status_code, 403)
+
+            with mock.patch.object(console_auth, "_TRUST_PROXY_HEADERS", True):
+                forwarded = client.post(
+                    "/api/settings", json={},
+                    headers={"Origin": "https://public.example.com",
+                             "X-Forwarded-Host": "public.example.com"})
+                # 可信反代部署：反代会重写 Host，以 X-Forwarded-Host 为准放行。
+                self.assertNotEqual(forwarded.status_code, 403)
 
     def test_non_browser_write_without_origin_passes(self):
         # curl/SDK 不带 Origin：不受 CSRF 防线影响（鉴权另有防线）。

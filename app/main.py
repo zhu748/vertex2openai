@@ -1,6 +1,7 @@
 """ASGI 入口：组装路由、中间件与异常处理。"""
 from pathlib import Path
 
+from config import env_str  # QUA-P2-7：环境读取集中层
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,7 +11,7 @@ from console_assets import ConsoleStaticFiles
 from express_key_manager import ExpressKeyManager
 from lifecycle import lifespan
 from logger import stats
-from middleware import StatsMiddleware
+from middleware import SecurityHeadersMiddleware, StatsMiddleware
 from image_delivery import ImageDeliveryMiddleware
 from request_connection import BodyTooLargeError
 from request_errors import body_too_large_response, ingress_error_response, validation_error_response
@@ -29,20 +30,46 @@ from routes import (
 from runtime_state import StatePersistenceError
 
 
+def parse_cors_origins(raw: str) -> list[str] | None:
+    """SEC-P3-1：解析 ALLOWED_ORIGINS 环境变量。
+
+    返回 None = 默认同源（不安装 CORS 中间件，浏览器跨源一律读不到响应，
+    对 SDK/服务端调用与自带控制台零影响）；返回列表 = 显式放行的来源，
+    其中 "*" 恢复旧的任意来源行为（需要浏览器跨源直连 API 时自行承担）。
+    逗号 / 空白分隔均可。
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    if raw == "*":
+        return ["*"]
+    return [item for item in raw.replace(",", " ").split() if item]
+
+
+CORS_ALLOW_ORIGINS = parse_cors_origins(env_str("ALLOWED_ORIGINS"))  # QUA-P2-7：环境读取走 config 集中层
+
+
 app = FastAPI(title="agentplatform2api", lifespan=lifespan)
 app.state.express_key_manager = ExpressKeyManager()
 app.mount("/static", ConsoleStaticFiles(directory=Path(__file__).parent / "static"), name="static")
 
 app.add_middleware(StatsMiddleware, stats=lambda: stats)
 app.add_middleware(ImageDeliveryMiddleware)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["X-Resume-Id", "X-Resumable-Replay", "X-Trace-Id", "Retry-After"],
-)
+# SEC-P2-5：全部响应附 nosniff/no-referrer，HTML 额外附 CSP + X-Frame-Options
+# （纵深防御；CORS 预检由更外层的 CORSMiddleware 直接应答，无需这些头）。
+app.add_middleware(SecurityHeadersMiddleware)
+# SEC-P3-1：CORS 默认同源（不装中间件）。旧行为 allow_origins=["*"] 会让
+# 任意站点无凭据探测全部端点；需要浏览器跨源直连时显式设 ALLOWED_ORIGINS
+#（逗号分隔），或 ALLOWED_ORIGINS="*" 恢复任意来源。
+if CORS_ALLOW_ORIGINS is not None:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=CORS_ALLOW_ORIGINS,
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["X-Resume-Id", "X-Resumable-Replay", "X-Trace-Id", "Retry-After"],
+    )
 
 
 @app.exception_handler(StatePersistenceError)

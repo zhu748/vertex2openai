@@ -36,7 +36,12 @@ func (c config) startSSTP(ctx context.Context, cancel context.CancelFunc) (dialF
 		if !x509.NewCertPool().AppendCertsFromPEM(pem) {
 			return nil, nil, errors.New("ca_invalid_pem")
 		}
-		os.Setenv("SSL_CERT_FILE", c.CAFile)
+		// ENG-P3-3：Setenv 失败（如 CA 路径含 NUL）不能静默——否则
+		// 自定义 CA 悄悄失效，TLS 验证回退到系统根，用户以为已钉住
+		// 私有 CA 实则没有。受控错误码，Python 侧 known 映射展示。
+		if err := os.Setenv("SSL_CERT_FILE", c.CAFile); err != nil {
+			return nil, nil, errors.New("ca_setenv_failed")
+		}
 	}
 	packets := newSSTPPackets()
 	name := "v2o-sstp-" + strconv.FormatInt(time.Now().UnixNano(), 10)
@@ -103,6 +108,8 @@ func (c config) startSSTP(ctx context.Context, cancel context.CancelFunc) (dialF
 	}
 	mtu := c.MTU
 	if mtu == 0 || mtu > 1400 {
+		// ENG-P3-1：配置校验已收紧到 576–1400（main.go），这里的钳位
+		// 只剩 mtu==0 的默认路径；保留上限防御以防未来校验回退。
 		mtu = 1400
 	}
 	network, err := wireguard.CreateLightweightNetTUN([]netip.Prefix{netip.PrefixFrom(ip.Unmap(), 32)}, mtu)

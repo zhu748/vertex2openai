@@ -78,7 +78,7 @@ async def fetch_and_parse_models_config() -> Optional[Dict[str, List[str]]]:
     for index, url in enumerate(urls_to_try, start=1):
         print(f"🌐 [模型配置] 正在获取远程模型配置（第 {index} 个地址）：{url}")
         try:
-            async def fetch(raw, resolved):
+            async def fetch(raw, resolved, url=url):  # B023：默认参数绑定循环变量（同迭代调用，防延迟绑定回归）
                 options = dict(client_args)
                 if resolved:
                     options["proxy"] = build_httpx_proxy(resolved, verify=app_config.SSL_CERT_FILE or True)

@@ -27,15 +27,39 @@ from typing import Any, Callable, Optional
 from google import genai
 
 import config as app_config
-from runtime_state import get_effective_proxy_url
+from runtime_state import app_state, get_effective_proxy_url
 from proxy_resolver import resolve_proxy_uri, current_proxy_usage
 from express_fingerprint import get_express_ua_profile, get_express_ua_custom
 from http_options import get_http_options
 
-# SDK Client 池上限：Key 池轮换时最多同时保留这么多个（LRU 淘汰最久未用）
+# SDK Client 池基准上限；实际生效上限在 SdkClientPool.get 里随 Key 数动态
+# 上调（PRF-P1-2，见 _sdk_pool_max），控制台增删 Key 后自动跟随。
 _SDK_POOL_MAX = 6
 # 空闲客户端复用窗口；活跃请求由显式引用保护，不受此时限影响
 _GRACE_CLOSE_SECONDS = 60.0  # idle reuse window; active leases never expire
+
+
+def _sdk_pool_max() -> int:
+    """SDK 池动态上限（PRF-P1-2）：跟随 Express Key 数量。
+
+    旧实现固定 LRU 上限 6：配置 7+ 把 Key 且开启轮询时，每把 Key 轮到时
+    其客户端几乎必已被淘汰——退化为每请求新建 genai.Client（新 httpx
+    连接池 + TCP/TLS 握手 100-300ms）+ 60 秒延迟关闭任务，池化收益在
+    最需要它的多 Key 场景完全反转，极端并发下逼近 _max_pending 上限。
+    空闲 SDK 客户端的内存开销极小，跟随 Key 数没有代价。
+    SDK_POOL_MAX 环境变量可显式钉住（≥1），适合内存受限部署。
+    """
+    pinned = app_config.env_str("SDK_POOL_MAX")  # QUA-P2-7：环境读取走 config 集中层
+    if pinned:
+        try:
+            return max(1, int(pinned))
+        except ValueError:
+            print(f"⚠️ [SDK 池] SDK_POOL_MAX={pinned!r} 不是合法整数，忽略并改用动态上限。")
+    try:
+        # +2：给「同 Key 换签名」的短暂双份窗口（代理/指纹热改）留余量。
+        return max(_SDK_POOL_MAX, len(app_state.get_express_keys()) + 2)
+    except Exception:
+        return _SDK_POOL_MAX
 
 
 def _resolve_proxy_for_signature(key_proxy: Optional[str]) -> str:
@@ -201,14 +225,14 @@ _closer = _GracefulCloser()
 
 
 class SdkClientPool:
-    """genai.Client 池：api_key → (签名, Client)，LRU 上限 _SDK_POOL_MAX。"""
+    """genai.Client 池：api_key → (签名, Client)，LRU 上限随 Key 数动态上调。"""
 
     def __init__(self, maxsize: int = _SDK_POOL_MAX):
         self._lock = threading.Lock()
         self._maxsize = max(1, int(maxsize))
         self._clients: dict[str, tuple[tuple, Any]] = {}
 
-    def get(self, api_key: str, key_proxy: Optional[str] = None) -> Any:
+    def get(self, api_key: str, key_proxy: Optional[str] = None, *, maxsize: Optional[int] = None) -> Any:
         """取（或建）该 Key 的池化 Client。只允许在事件循环内调用。
 
         key_proxy：本次调用使用的出站代理**原始 URI**（Key 级优先/全局
@@ -216,10 +240,18 @@ class SdkClientPool:
         None = 跟随全局；"" = 直连；其余 = 该 URI（vless:// 等分享链接
         在签名/构造时统一转本地 socks5）。
 
+        maxsize：PRF-P1-2 动态上限提示（仅上调不收缩）——Express 通道
+        传入跟随 Key 数的上限，多 Key 轮询不再被固定容量误淘汰；
+        不传则维持构造时的容量（测试直连池时行为不变）。
+
         调用方**不要关闭**返回的 Client——它的生命周期由池管理
         （签名变化 / LRU 淘汰时延迟统一回收）。
         """
         api_key = api_key or ""
+        if maxsize is not None and maxsize > self._maxsize:
+            with self._lock:
+                if maxsize > self._maxsize:
+                    self._maxsize = maxsize
         sig = _sdk_signature(key_proxy)
         with self._lock:
             entry = self._clients.get(api_key)
@@ -384,8 +416,11 @@ def get_pooled_express_client(api_key: str, key_proxy: Optional[str] = None) -> 
     调用方用 runtime_state.get_effective_proxy_uri_for_key(key_record)
     完成「Key 级优先 / direct / 全局兑底」的裁决后再传入。
     解析失败（如 sing-box 缺失）抛 ProxyResolveError。
+
+    PRF-P1-2：池上限随 Key 数动态上调（SDK_POOL_MAX 可钉住），
+    多 Key 轮询时客户端不再被固定容量 LRU 误淘汰。
     """
-    return express_sdk_pool.get(api_key, key_proxy)
+    return express_sdk_pool.get(api_key, key_proxy, maxsize=_sdk_pool_max())
 
 
 # 额外池的关闭注册表（2026-11 P3-2 解 impersonate ↔ client_pool 环）：

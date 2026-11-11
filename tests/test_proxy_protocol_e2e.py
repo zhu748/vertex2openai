@@ -6,7 +6,7 @@ The default offline suite skips these tests when the binary is not supplied.
 
 import asyncio
 import base64
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 import ipaddress
 import json
 import os
@@ -78,7 +78,7 @@ class RealProxyProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.url = f"http://127.0.0.1:{port}/probe"
         key = ec.generate_private_key(ec.SECP256R1())
         name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
                 .serial_number(x509.random_serial_number()).not_valid_before(now-timedelta(minutes=1))
                 .not_valid_after(now+timedelta(days=1)).add_extension(x509.BasicConstraints(ca=True, path_length=None), True)

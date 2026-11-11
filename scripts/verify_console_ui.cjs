@@ -92,12 +92,18 @@ async function main() {
     browser = await chromium.launch({headless: true,
       executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || undefined,
       args: ['--no-sandbox']});
-    const context = await browser.newContext({viewport: {width: 1440, height: 1000}});
+    // SEC-P2-5 后服务端响应携带 CSP（script-src 无 unsafe-eval），
+    // Playwright 的 evaluate/waitForFunction 需要页内 eval——测试上下文
+    // 显式 bypassCSP（生产 CSP 不放宽，仅测试工具链豁免）。
+    const context = await browser.newContext({viewport: {width: 1440, height: 1000}, bypassCSP: true});
     // Ordinary remote HTTP origins do not expose randomUUID. Account creation
     // must work there too; the server owns durable Cookie account identities.
     await context.addInitScript(() => Object.defineProperty(Crypto.prototype, 'randomUUID', {value: undefined}));
     const errors = [], external = [];
-    context.on('page', page => {page.on('pageerror', error => errors.push(error.message));page.on('dialog', dialog => dialog.accept());});
+    context.on('page', page => {page.on('pageerror', error => errors.push(error.message));
+      // SEC-P3-4：Cookie reveal 的二次口令 prompt 用控制台口令应答
+      //（口令 = API_KEY 'ui-browser-test'，未设 ADMIN_PASSWORD 时回退）。
+      page.on('dialog', dialog => dialog.type() === 'prompt' ? dialog.accept('ui-browser-test') : dialog.accept());});
     await context.route('**/*', route => {
       if (!route.request().url().startsWith(origin)) {external.push(route.request().url());return route.abort();}
       return route.continue();

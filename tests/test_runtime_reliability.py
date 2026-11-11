@@ -416,6 +416,9 @@ class SdkTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ImageFetchTests(unittest.TestCase):
+    def setUp(self):
+        image_processing.reset_image_clients()  # PRF-P2-3：隔离共享客户端池
+
     def test_download_stops_at_size_limit_and_closes_response(self):
         read, closed = [], []
 

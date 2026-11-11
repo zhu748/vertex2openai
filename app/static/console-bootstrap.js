@@ -24,28 +24,38 @@ async function ensureChannelConfig() {
   if (window.consoleChannels) return window.consoleChannels;
   if (!channelConfigLoading) {
     channelConfigLoading = new Promise((resolve, reject) => {
-      const script = document.createElement('script');
-      const source =
-        document.querySelector('script[src^="/static/channel-config.js"]')?.src ||
-        '/static/channel-config.js';
-      const url = new URL(source, location.href);
-      url.searchParams.set('retry', Date.now());
-      script.src = url.href;
-      script.async = false;
-      script.dataset.cfasync = 'false';
+      // QUA-P1-4：代理编辑器拆为独立文件后，懒加载重试需先补齐
+      // proxy-editor.js（幂等：其 IIFE 有 window.proxyEditorKit 守卫），
+      // 再注入 channel-config.js（其 mount 依赖 proxyEditorKit 已就位）。
+      const sources = ['/static/proxy-editor.js', '/static/channel-config.js'];
+      const scripts = [];
+      let settled = false;
       const timer = setTimeout(() => finish(new Error('账号与代理编辑器加载超时')), 10000);
       function finish(error) {
+        if (settled) return;
+        settled = true;
         clearTimeout(timer);
-        script.onload = script.onerror = null;
+        for (const script of scripts) script.onload = script.onerror = null;
         if (error) {
-          script.remove();
+          for (const script of scripts) script.remove();
           reject(error);
         } else resolve(window.consoleChannels);
       }
-      script.onload = () =>
-        finish(window.consoleChannels ? null : new Error('账号与代理编辑器版本不一致'));
-      script.onerror = () => finish(new Error('账号与代理编辑器加载失败'));
-      document.head.append(script);
+      sources.forEach((src, i) => {
+        const script = document.createElement('script');
+        const url = new URL(src, location.href);
+        url.searchParams.set('retry', Date.now());
+        script.src = url.href;
+        script.async = false;
+        script.dataset.cfasync = 'false';
+        script.onload = () => {
+          if (i === sources.length - 1)
+            finish(window.consoleChannels ? null : new Error('账号与代理编辑器版本不一致'));
+        };
+        script.onerror = () => finish(new Error('账号与代理编辑器加载失败'));
+        scripts.push(script);
+        document.head.append(script);
+      });
     });
   }
   try {

@@ -5,7 +5,6 @@ Only OpenAI chat requests opt in; native Gemini Parts retain their wire format.
 """
 import base64
 from contextvars import ContextVar
-import os
 from pathlib import Path
 import re
 import secrets
@@ -14,22 +13,75 @@ import time
 
 from starlette.requests import Request
 
+from config import env_int, env_str, state_dir  # QUA-P2-7：集中读取层
+
 
 image_base_url = ContextVar("image_base_url", default="")
 _MIMES = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}
 _NAME = re.compile(r"[a-f0-9]{48}\.(?:png|jpg|webp|gif)\Z")
 _LOCK = threading.Lock()
-TTL_SECONDS = 7 * 86400
+
+
+def _resolve_ttl_seconds() -> int:
+    """SEC-P3-5：生图 URL 有效期默认从 7 天收紧到 24 小时（可配）。
+
+    下载 URL 只含随机能力 token、不绑定请求者：聊天记录被转发后，任何
+    拿到链接的人都能在有效期内反复拉图。旧默认 7 天给了泄漏链接过长的
+    存活窗口；24 小时对「当轮对话回看」绰绰有余。IMAGE_URL_TTL_SECONDS
+    可调（60 秒 – 7 天，越界钳位），需要旧行为设 604800。
+    """
+    # QUA-P2-7：环境读取走 config 集中层（非法/未设置返回默认 24h），
+    # 钳位语义留在本模块。
+    return max(60, min(env_int("IMAGE_URL_TTL_SECONDS", 24 * 3600), 7 * 86400))
+
+
+TTL_SECONDS = _resolve_ttl_seconds()
 MAX_FILE_BYTES = 64 * 1024 * 1024
 MAX_STORE_BYTES = 512 * 1024 * 1024
 CHUNK = 256 * 1024  # divisible by four: independent base64 decoding
+# PRF-P2-4：_prune 摊销——每次存图都全目录 iterdir+stat（全局锁内）在生图
+# 突发下是可观的重复扫描；配额回收允许至多 60 秒的漂移窗口，且大图
+#（>4MiB）始终强制扫描（突发窗口内的超配被下一个大图或下一个窗口纠正）。
+_PRUNE_INTERVAL_SECONDS = 60.0
+_PRUNE_FORCE_INCOMING_BYTES = 4 * 1024 * 1024
+# 负值初始化：进程启动后首次写图必须真实扫描一次（目录里可能有上一
+# 次运行留下的过期文件），此后才进入摊销窗口。
+_last_prune_monotonic = -_PRUNE_INTERVAL_SECONDS
+
+
+_INLINE_IMAGE_KEYS = ("inlineData", "inline_data")
+
+
+def has_inline_image(node, depth: int = 0) -> bool:
+    """dict 树里是否携带内联图片（inlineData / inline_data）。
+
+    只按容器结构递归（深度封顶），不触碰字符串内部——MB 级 base64
+    数据被常数时间跳过。供流式逐对象解析路径做「是否值得把整个对象
+    搬进媒体线程落盘」的廉价预检（PRF-P1-1）：纯文本对象零额外开销，
+    只有真正含图的对象才支付线程切换与媒体池闸门。
+    """
+    if depth > 12:
+        return False
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in _INLINE_IMAGE_KEYS:
+                if value:
+                    return True
+                continue
+            if has_inline_image(value, depth + 1):
+                return True
+        return False
+    if isinstance(node, (list, tuple)):
+        return any(has_inline_image(item, depth + 1) for item in node)
+    return False
 
 
 def store_directory():
-    return Path(os.environ.get("STATE_DIR", ".")) / "generated-images"
+    return Path(state_dir()) / "generated-images"  # QUA-P2-7：STATE_DIR 单点定义
 
 
 def _prune(directory, incoming):
+    global _last_prune_monotonic
     now = time.time()
     entries = []
     for path in directory.iterdir():
@@ -58,6 +110,14 @@ def _prune(directory, incoming):
             break
         path.unlink(missing_ok=True)
         total -= size
+    _last_prune_monotonic = time.monotonic()
+
+
+def _prune_due(incoming: int) -> bool:
+    """PRF-P2-4：距上次扫描不足 60 秒且非大图时跳过全目录扫描。"""
+    if incoming >= _PRUNE_FORCE_INCOMING_BYTES:
+        return True
+    return time.monotonic() - _last_prune_monotonic >= _PRUNE_INTERVAL_SECONDS
 
 
 def image_markdown(data, mime_type, *, encoded=False, label="Image"):
@@ -87,7 +147,11 @@ def image_markdown(data, mime_type, *, encoded=False, label="Image"):
     # 并发被完全串行化，一张慢图队头阻塞全部下载。
     with _LOCK:
         directory.mkdir(parents=True, exist_ok=True)
-        _prune(directory, size)
+        # PRF-P2-4：摊销扫描——不足 60 秒且非大图时跳过；写盘本体已由
+        # 调用方搬进媒体线程（PRF-P1-1），这里不再有事件循环阻塞问题，
+        # 摊销只为消除生图突发下的重复全目录扫描（锁内串行化）。
+        if _prune_due(size):
+            _prune(directory, size)
     try:
         with temporary.open("xb") as output:
             for offset in range(0, len(data), CHUNK):
@@ -122,9 +186,9 @@ class ImageDeliveryMiddleware:
         token = None
         if (scope["type"] == "http" and scope.get("method") == "POST"
                 and scope.get("path") == "/v1/chat/completions"
-                and os.environ.get("IMAGE_OUTPUT_MODE", "url").lower() != "inline"):
-            base = (os.environ.get("IMAGE_PUBLIC_BASE_URL")
-                    or os.environ.get("RENDER_EXTERNAL_URL")
+                and env_str("IMAGE_OUTPUT_MODE", "url").lower() != "inline"):
+            base = (env_str("IMAGE_PUBLIC_BASE_URL")
+                    or env_str("RENDER_EXTERNAL_URL")
                     or str(Request(scope).base_url))
             token = image_base_url.set(base.rstrip("/"))
         try:

@@ -400,7 +400,13 @@ TCP+TLS 握手（每次约省 100~300ms 与相应 CPU）；429 重试场景收�
 
 | 变量 | 必填 | 默认值 | 说明 |
 |---|---:|---|---|
-| `API_KEY` | 是 | `123456` | 保护本代理的 Key，同时也是**控制台登录密码**。客户端请求用 `Authorization: Bearer <API_KEY>`。 |
+| `API_KEY` | 是 | `123456` | 保护本代理的 Key，客户端请求用 `Authorization: Bearer <API_KEY>`。未设 `ADMIN_PASSWORD` 时同时也是控制台登录密码（不推荐，见下行）。 |
+| `ADMIN_PASSWORD` | 否 | 空 | 控制台登录专用口令（与 API_KEY 分离）。把兼容端点 Key 分享给朋友/社区时**必须**设置，否则拿到 Key 的人即可登录控制台导出完整 Google Cookie。设置后 reveal 接口二次验证也用它。 |
+| `STATE_ENCRYPTION_KEY` | 否 | 空 | `web_state.json` 可选静态加密口令（Fernet + PBKDF2，需镜像内 `cryptography` 包）。设置后状态文件（含完整 Google Cookie 与 Express Key）以密文落盘；**该口令与备份文件等同 Google 账号密码，请分开保管**。明文文件在设置后首次保存自动升级为密文；忘掉口令 = 数据无法恢复。 |
+| `FORCE_SECURE_COOKIE` | 否 | 空 | 设 `true` 后会话 Cookie 无条件带 `Secure`（用于反代已终止 TLS 但未传 `x-forwarded-proto` 的部署）。 |
+| `ALLOWED_ORIGINS` | 否 | 空（同源） | 默认不安装 CORS（仅同源可读，对 SDK/服务端调用零影响）。需要浏览器跨源直连 API 时填逗号分隔来源（如 `https://a.com,https://b.com`），或 `*` 恢复旧的任意来源行为。 |
+| `IMAGE_URL_TTL_SECONDS` | 否 | `86400` | 生图下载 URL 有效期（秒），默认 24 小时，可调 60 – 604800（7 天上限）。链接不绑定请求者，缩短可降低转发泄漏窗口。 |
+| `DISABLE_PROXY_TEST` | 否 | 空 | 设 `true` 禁用控制台的代理连通性测试端点（多租户/共享运维场景建议开启）。 |
 | `VERTEX_EXPRESS_API_KEY` | 否 | 空 | Gemini Express Key，支持逗号 / 换行分隔或 JSON 数组。首次启动导入，之后以控制台列表为准。 |
 | `VERTEX_EXPRESS_API_KEYS` | 否 | 空 | 多 Key 配置，优先于单数变量。支持字符串数组，或带 `key`、`project_id`、`proxies`、`proxy_fallback`、`enabled`、`note` 的对象数组。 |
 | `UPSTREAM_MODE` | 否 | 自动 | `api_key`（仅 Key）、`web_proxy`（仅 Cookie）、`mixed`（混合）。首次启动同时配置两类凭证时自动使用混合模式；已有控制台通道选择继续保留。 |
@@ -427,7 +433,7 @@ TCP+TLS 握手（每次约省 100~300ms 与相应 CPU）；429 重试场景收�
 | `ALLOW_DEFAULT_KEY` | 否 | 空 | 仅用于在公开托管环境（如 HF Space）临时放行默认 `API_KEY`，正常部署不要设置。 |
 | `SINGBOX_BIN` | 否 | 自动探测 | sing-box 可执行文件路径（默认依次找 `$SINGBOX_BIN` → `/usr/local/bin` 等常见路径 → 仓库根 `bin/sing-box` → `PATH`）。仅影响 vless/vmess 等分享链接协议；缺失时这些协议明确报错、不降级直连。 |
 | `SINGBOX_IDLE_MINUTES` | 否 | `30` | sing-box 空闲实例回收阈值（分钟；`0` = 永不回收）。每个代理链接占一个本地端口与一个子进程，长时间不用自动回收、下次请求时秒级重启。 |
-| `KEEPALIVE_URL` | 否 | 空 | 出站保活：定期 GET 该 URL（默认 60 秒一次）。填自己的 `https://你的域名/healthz` 可防止免费托管平台（Render / HF Space 等）冻结闲置实例，也可驱动外部监控。留空 = 不启动；请求直连出站、不走出站代理。仅作初始值，控制台「运行设置」页可热改。 |
+| `KEEPALIVE_URL` | 否 | 空 | 出站保活：定期 GET 该 URL（默认 60 秒一次）。填自己的 `https://你的域名/healthz` 可防止免费托管平台（Render / HF Space 等）冻结闲置实例，也可驱动外部监控。留空 = 不启动；请求直连出站、不走出站代理。仅作初始值，控制台「运行设置」页可热改。私网/环回目标（如 `http://127.0.0.1:port/healthz` 自我保活）需在控制台开启 `keepalive_allow_private`（默认拒绝，防内网探测）。 |
 | `KEEPALIVE_INTERVAL` | 否 | `60` | 保活请求间隔（秒），下限 5，上限 86400。仅作初始值，控制台可热改。 |
 
 ### Render 生图与客户端内存
@@ -526,7 +532,14 @@ PROXY_URLS='["socks5://global-first:1080","http://global-second:8080"]'
 | **Express 流式 usage** | 从不下发，客户端显示 0 | 支持 `stream_options.include_usage` |
 | **控制台 Cookie 回显** | 明文返回完整 Cookie | 列表仅返回“已配置/字段数/总长度”；登录后点击单账号“显示 / 复制”才读取最新完整值，响应禁止缓存；编辑框留空＝保持原 Cookie 不变 |
 | **登录** | 无限速、会话 token 为确定值 | 失败 3 次后指数退避；随机会话 token，可单独失效 |
-| **状态文件** | 每次读设置都同步读盘、非原子写 | 内存优先 + 原子写 + 权限 0600 + 支持 `STATE_DIR` |
+| **控制台会话有效期** | 固定 30 天 | 双窗口：签发后 7 天必须重新登录 + 闲置 2 小时失效（每次操作滑动续期）；新增「撤销全部会话」按钮与 `POST /api/sessions/revoke-all` |
+| **CORS** | `allow_origins=["*"]`（任意站点可无凭据探测） | 默认同源（不装 CORS 中间件）；需要跨源时显式设 `ALLOWED_ORIGINS` |
+| **CSRF 判定** | 仅比对 Origin 与 Host | 额外拒绝 `Origin: null`（沙箱 iframe）与 `Sec-Fetch-Site: cross-site`（浏览器强制头） |
+| **保活私网目标** | 环回/私网 URL 直接放行 | 默认拒绝（防被劫持会话借保活探测内网）；自我保活/内网监控需在控制台开启 `keepalive_allow_private` |
+| **代理测试内网地址** | 任意代理地址可直接测试 | 字面私网/环回 IP 默认拒绝；确需测试内网节点请开启 `proxy_test_allow_private`，或设 `DISABLE_PROXY_TEST` 整体禁用 |
+| **生图 URL 有效期** | 7 天 | 默认 24 小时（`IMAGE_URL_TTL_SECONDS` 可调，上限仍为 7 天） |
+| **状态文件** | 每次读设置都同步读盘、非原子写 | 内存优先 + 原子写 + 权限 0600 + 支持 `STATE_DIR`；可选 `STATE_ENCRYPTION_KEY` 静态加密 |
+| **登录 429 提示** | 只提示等待秒数 | 额外附 `TRUST_PROXY_HEADERS` 设置指引（反代部署未开该变量时全站共享限速桶） |
 | **文本保真** | 所有消息的多空格/缩进被压平 | 仅在确实抽走内联图片时才压平 |
 | **2.5 Flash-Lite 思考预算** | 下限按 0 处理 | 下限 512（`0` 仍表示关闭） |
 | **生图比例白名单** | 所有生图模型共用同一套比例 | 按模型分别校验；Flash Image 支持含 `9:21` 在内的扩展比例，Pro Image 使用较小白名单 |

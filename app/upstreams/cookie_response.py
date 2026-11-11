@@ -5,13 +5,15 @@ import hashlib
 import json
 import re
 import time
-from typing import Any, AsyncGenerator, Iterator, Optional
+from typing import Any, AsyncGenerator, AsyncIterator, Callable, Iterator, Optional
+
+import httpx
 from models import file_data_markdown
 from message_processing import iter_giant_content
 
 from response_validation import IncompleteResponseError, complete_function_arguments, validate_generation_finish_reason
 from json_stream import MAX_JSON_OBJECT_BYTES, JsonObjects as _JsonObjects
-from signature_store import SignatureRecord, SignatureState, signature_store
+from signature_store import signature_store
 from thought_signatures import (
     attach_signature_extra,
     encode_thought_signature,
@@ -20,9 +22,26 @@ from thought_signatures import (
 )
 
 
+# PRF-P3-3：created 时间戳秒级缓存——同秒内的全部帧复用一次取值
+#（免去每帧一次时钟系统调用）；输出值与逐帧 time.time() 完全一致
+#（秒粒度下本就同值），OpenAI 语义上同响应各帧共用创建时刻。
+_created_cache = (0, 0)
+
+
+def _current_created() -> int:
+    global _created_cache
+    now = int(time.time())
+    if now != _created_cache[0]:
+        _created_cache = (now, now)
+    return _created_cache[1]
+
+
 def _stable_cookie_tool_call_id(response_id: str, call_index: int, name: str, args: Any) -> str:
     """Generate a deterministic fallback when batchGraphql omits a call id."""
-    canonical = json.dumps(args or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    # PRF-P3-3：去掉 sort_keys——确定性只需「同一响应字节流重解析得到
+    # 同一顺序」（上游 JSON 解析顺序稳定），跨响应本就有 response_id
+    # 区分；sort_keys 的全量键排序对长参数是无谓开销。
+    canonical = json.dumps(args or {}, ensure_ascii=False, separators=(",", ":"))
     digest = hashlib.sha256(f"{response_id}\0{call_index}\0{name}\0{canonical}".encode()).hexdigest()[:20]
     return f"call_{digest}"
 
@@ -64,12 +83,9 @@ def openai_tool_call(response_id: str, call_index: int, call: dict, *, include_a
     name, args = call["name"], call.get("args") or {}
     call_id = call.get("id") or _stable_cookie_tool_call_id(response_id, call_index, name, args)
     signature = signature_bytes_from_wire(call.get("thought_signature"))
-    if signature:
-        signature_store.put_record(call_id, SignatureRecord(SignatureState.SIGNED, signature))
-    elif call_index > 0:
-        signature_store.put_unsigned_follower(call_id)
-    else:
-        signature_store.put_unknown(call_id)
+    # QUA-P2-2：三态拓扑写入收敛到 register_call_signature 单一入口。
+    signature_store.register_call_signature(
+        call_id, signature, unsigned_follower=call_index > 0)
     payload = {
         "id": call_id,
         "type": "function",
@@ -82,7 +98,7 @@ def openai_tool_call(response_id: str, call_index: int, call: dict, *, include_a
 
 
 async def iter_json_objects(
-    response, max_object_bytes: int = MAX_JSON_OBJECT_BYTES, *, on_text_chunk=None
+    response: "httpx.Response", max_object_bytes: int = MAX_JSON_OBJECT_BYTES, *, on_text_chunk: Optional[Callable]=None
 ) -> AsyncGenerator[dict, None]:
     """解析 batchGraphql 的连续对象，忽略数组分隔符及防 XSSI 前缀。
 
@@ -146,7 +162,7 @@ class CompleteTextObjectCursor:
         self._decoder = json.JSONDecoder()
         self._ascii = text.isascii()
 
-    def next_object(self):
+    def next_object(self) -> Optional[dict]:
         """返回下一个对象；没有更多对象时返回 None；无效 JSON 抛 IncompleteResponseError。"""
         text = self._text
         start = text.find("{", self._position)
@@ -186,10 +202,10 @@ class TextSource:
     每次重新编译类体），提升为模块级单一实现。
     """
 
-    def __init__(self, text):
+    def __init__(self, text: str):
         self.text = text
 
-    async def aiter_text(self):
+    async def aiter_text(self) -> AsyncIterator[str]:
         yield self.text
 
 
@@ -215,7 +231,7 @@ class RawSampler:
         self.count = 0
         self._retaining = True
 
-    def add(self, obj: dict):
+    def add(self, obj: dict) -> None:
         self.count += 1
         if not self._retaining:
             return
@@ -226,7 +242,7 @@ class RawSampler:
             if len(self._tail) > self.keep:
                 self._tail.pop(0)
 
-    def stop_retaining(self):
+    def stop_retaining(self) -> None:
         """正文已到：立即丢弃已存样本并停止留存（幂等；count 继续累计）。"""
         self._retaining = False
         self._head.clear()
@@ -243,7 +259,7 @@ class RawSampler:
         return "\n".join(lines)
 
 
-def _wire_object(value, label, *, allow_null=True):
+def _wire_object(value: Any, label: str, *, allow_null: bool=True):
     if value is None and allow_null:
         return {}
     if not isinstance(value, dict):
@@ -251,7 +267,7 @@ def _wire_object(value, label, *, allow_null=True):
     return value
 
 
-def _wire_list(value, label):
+def _wire_list(value: Any, label: str):
     if value is None:
         return []
     if not isinstance(value, list):
@@ -259,7 +275,7 @@ def _wire_list(value, label):
     return value
 
 
-def extract_events(obj: dict, *, preserve_parts: bool = False):
+def extract_events(obj: dict, *, preserve_parts: bool = False) -> Iterator[tuple]:
     obj = _wire_object(obj, "响应", allow_null=False)
     # 真值判断而非 "error" in obj：该端点的 Proto JSON 会序列化默认空值
     # （同文件 thoughtSignature/functionCall 的空值过滤同理），若某个块
@@ -441,7 +457,7 @@ def make_openai_chunk(
     chunk = {
         "id": response_id,
         "object": "chat.completion.chunk",
-        "created": int(time.time()),
+        "created": _current_created(),
         "model": model,
         "choices": [
             {

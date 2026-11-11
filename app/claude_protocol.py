@@ -503,6 +503,102 @@ def _optional_number(body: dict, key: str) -> Optional[float]:
     return value
 
 
+_EFFORT_UNSET = object()  # output_config 未提供 effort 的哨兵（区别于 None=auto）
+
+
+def _parse_max_tokens(body: dict, require_max_tokens: bool) -> Optional[int]:
+    """max_tokens 校验（拆分自 anthropic_to_openai_request）。
+
+    必填性由调用方决定（/v1/messages 必填，count_tokens 不要求）。
+    """
+    max_tokens = body.get("max_tokens")
+    if max_tokens is not None:
+        if isinstance(max_tokens, bool) or not isinstance(max_tokens, (int, float)) \
+                or (isinstance(max_tokens, float) and not float(max_tokens).is_integer()):
+            raise ClaudeRequestError("max_tokens must be an integer >= 1")
+        max_tokens = int(max_tokens)
+        if max_tokens < 1:
+            raise ClaudeRequestError("max_tokens must be an integer >= 1")
+    elif require_max_tokens:
+        raise ClaudeRequestError("max_tokens is required")
+    return max_tokens
+
+
+def _parse_thinking_block(body: dict) -> tuple[Optional[str], bool]:
+    """thinking 块 → (reasoning_effort, 档位是否被钉住)。
+
+    enabled/disabled 钉住档位：output_config.effort 不再覆盖（对齐
+    vertex-master：Go 版 thinking 块后处理、整写覆盖 thinkingConfig；
+    adaptive 是合并语义——effort 设的档保留，故 effort 仍生效）。
+    budget → 档位映射对齐 vertex-master thinkingLevelForBudget
+    （<=1024 → LOW，<=8192 → MEDIUM，其余 → HIGH）。
+    """
+    thinking = body.get("thinking")
+    if thinking is None:
+        return None, False
+    if not isinstance(thinking, dict):
+        raise ClaudeRequestError("thinking must be an object")
+    ttype = str(thinking.get("type") or "").strip().lower()
+    if ttype == "enabled":
+        budget = thinking.get("budget_tokens")
+        valid = (isinstance(budget, (int, float)) and not isinstance(budget, bool)
+                 and (not isinstance(budget, float) or budget.is_integer()))
+        if not valid or int(budget) < 1024:
+            raise ClaudeRequestError("thinking.budget_tokens must be an integer >= 1024")
+        budget = int(budget)
+        effort = "low" if budget <= 1024 else ("medium" if budget <= 8192 else "high")
+        # display 仅接受 summarized / omitted（对齐 vertex-master，其余 400）
+        display = thinking.get("display")
+        if display is not None:
+            if not isinstance(display, str) or display.strip().lower() not in ("summarized", "omitted"):
+                raise ClaudeRequestError(f"unsupported thinking.display {display!r}")
+        return effort, True
+    if ttype == "disabled":
+        return "off", True
+    if ttype == "adaptive":
+        return None, False  # 交给控制台 / 模型默认档位动态思考（effort 仍可生效）
+    raise ClaudeRequestError(f"unsupported thinking.type {ttype!r}")
+
+
+def _parse_output_config(body: dict) -> tuple[Optional[dict], Any]:
+    """output_config → (response_format, effort 意图)。
+
+    effort 返回 _EFFORT_UNSET 表示未提供；None 表示 auto/default（不钉档）；
+    校验始终执行（vertex-master 在 anthropicToChatRequest 里先行校验），
+    档位应用由调用方结合 thinking_pinned 决定（Go 版后写覆盖的反向还原）。
+    """
+    response_format = None
+    output_config = body.get("output_config")
+    if output_config is None:
+        return None, _EFFORT_UNSET
+    if not isinstance(output_config, dict):
+        raise ClaudeRequestError("output_config must be an object")
+    output_format = output_config.get("format")
+    if output_format is not None:
+        if not isinstance(output_format, dict) or output_format.get("type") != "json_schema":
+            raise ClaudeRequestError("output_config.format.type must be json_schema")
+        schema = output_format.get("schema")
+        try:
+            validate_json_schema(schema, label="output_config.format.schema")
+            sanitize_for_gemini(schema)
+        except SchemaValidationError as exc:
+            raise ClaudeRequestError(str(exc)) from None
+        response_format = {"type": "json_schema", "json_schema": {"name": "response", "schema": schema}}
+    effort = output_config.get("effort")
+    if effort is None:
+        return response_format, _EFFORT_UNSET
+    if not isinstance(effort, str) or not effort.strip():
+        raise ClaudeRequestError("output_config.effort must be a non-empty string")
+    normalized = effort.strip().lower()
+    if normalized in ("low", "medium", "high"):
+        return response_format, normalized
+    if normalized in ("xhigh", "max"):
+        return response_format, "high"  # 内部档位上限为 high
+    if normalized in ("auto", "default"):
+        return response_format, None  # 让模型/控制台自主决定思考强度
+    raise ClaudeRequestError(f"unsupported output_config.effort {normalized!r}")
+
+
 def anthropic_to_openai_request(body: dict, internal_model: str,
                                 require_max_tokens: bool = True) -> OpenAIRequest:
     """Anthropic Messages 请求体 → 内部 OpenAIRequest。
@@ -514,86 +610,18 @@ def anthropic_to_openai_request(body: dict, internal_model: str,
         raise ClaudeRequestError("request body must be a JSON object")
 
     # ---- max_tokens：类型校验（必填性在路由层）----
-    max_tokens = body.get("max_tokens")
-    if max_tokens is not None:
-        if isinstance(max_tokens, bool) or not isinstance(max_tokens, (int, float)) \
-                or (isinstance(max_tokens, float) and not float(max_tokens).is_integer()):
-            raise ClaudeRequestError("max_tokens must be an integer >= 1")
-        max_tokens = int(max_tokens)
-        if max_tokens < 1:
-            raise ClaudeRequestError("max_tokens must be an integer >= 1")
-    elif require_max_tokens:
-        raise ClaudeRequestError("max_tokens is required")
+    max_tokens = _parse_max_tokens(body, require_max_tokens)
 
     # ---- thinking：budget_tokens → reasoning_effort ----
     extras: dict[str, Any] = {}
-    # thinking.enabled/disabled 钉住档位：output_config.effort 不再覆盖
-    # （对齐 vertex-master：Go 版 thinking 块后处理、整写覆盖 thinkingConfig；
-    # adaptive 是合并语义——effort 设的档保留，故 effort 仍生效）
-    thinking_pinned = False
-    thinking = body.get("thinking")
-    if thinking is not None:
-        if not isinstance(thinking, dict):
-            raise ClaudeRequestError("thinking must be an object")
-        ttype = str(thinking.get("type") or "").strip().lower()
-        if ttype == "enabled":
-            budget = thinking.get("budget_tokens")
-            valid = (isinstance(budget, (int, float)) and not isinstance(budget, bool)
-                     and (not isinstance(budget, float) or budget.is_integer()))
-            if not valid or int(budget) < 1024:
-                raise ClaudeRequestError("thinking.budget_tokens must be an integer >= 1024")
-            budget = int(budget)
-            # Gemini 3.x 走 thinking_level：档位映射对齐 vertex-master
-            # thinkingLevelForBudget（<=1024 → LOW，<=8192 → MEDIUM，其余 → HIGH）
-            extras["reasoning_effort"] = "low" if budget <= 1024 else ("medium" if budget <= 8192 else "high")
-            thinking_pinned = True
-            # display 仅接受 summarized / omitted（对齐 vertex-master，其余 400）
-            display = thinking.get("display")
-            if display is not None:
-                if not isinstance(display, str) or display.strip().lower() not in ("summarized", "omitted"):
-                    raise ClaudeRequestError(f"unsupported thinking.display {display!r}")
-        elif ttype == "disabled":
-            extras["reasoning_effort"] = "off"
-            thinking_pinned = True
-        elif ttype == "adaptive":
-            pass  # 交给控制台 / 模型默认档位动态思考（effort 仍可生效）
-        else:
-            raise ClaudeRequestError(f"unsupported thinking.type {ttype!r}")
+    thinking_effort, thinking_pinned = _parse_thinking_block(body)
+    if thinking_effort is not None:
+        extras["reasoning_effort"] = thinking_effort
 
     # ---- output_config.effort → reasoning_effort（仅在 thinking 未钉住时生效，对齐 vertex-master）----
-    # 校验始终执行（vertex-master 在 anthropicToChatRequest 里先行校验），
-    # 但 thinking.enabled/disabled 钉住档位后不再覆盖（Go 版后写覆盖的反向还原）。
-    response_format = None
-    output_config = body.get("output_config")
-    if output_config is not None:
-        if not isinstance(output_config, dict):
-            raise ClaudeRequestError("output_config must be an object")
-        output_format = output_config.get("format")
-        if output_format is not None:
-            if not isinstance(output_format, dict) or output_format.get("type") != "json_schema":
-                raise ClaudeRequestError("output_config.format.type must be json_schema")
-            schema = output_format.get("schema")
-            try:
-                validate_json_schema(schema, label="output_config.format.schema")
-                sanitize_for_gemini(schema)
-            except SchemaValidationError as exc:
-                raise ClaudeRequestError(str(exc)) from None
-            response_format = {"type": "json_schema", "json_schema": {"name": "response", "schema": schema}}
-        effort = output_config.get("effort")
-        if effort is not None:
-            if not isinstance(effort, str) or not effort.strip():
-                raise ClaudeRequestError("output_config.effort must be a non-empty string")
-            normalized = effort.strip().lower()
-            if normalized in ("low", "medium", "high"):
-                effort_value: Optional[str] = normalized
-            elif normalized in ("xhigh", "max"):
-                effort_value = "high"  # 内部档位上限为 high
-            elif normalized in ("auto", "default"):
-                effort_value = None  # 让模型/控制台自主决定思考强度
-            else:
-                raise ClaudeRequestError(f"unsupported output_config.effort {normalized!r}")
-            if not thinking_pinned:
-                extras["reasoning_effort"] = effort_value
+    response_format, effort_intent = _parse_output_config(body)
+    if effort_intent is not _EFFORT_UNSET and not thinking_pinned:
+        extras["reasoning_effort"] = effort_intent
 
     # ---- 顶层 system ----
     openai_messages: list[OpenAIMessage] = []
@@ -774,28 +802,38 @@ def _ordered_completion_blocks(message, tools, omit_thinking):
     return result if len(seen) == len(blocks) + len(tools) else None
 
 
+def _count_value(value: Any) -> Optional[int]:
+    """usage 数值字段的统一清洗（REQ-P3-10 收敛）：
+
+    数值型且可有限转换为非负 int 则返回该值；其余（缺失 / 非数值 /
+    bool / 溢出 float 如 inf / NaN）一律返回 None，语义部「字段缺失」。
+    此前 pick 溢出换别名、detail 溢出归零、feed_usage 溢出跳过，
+    三处各自手写同一套 try/int/max，口径靠注释对齐——现在单一实现。
+    """
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return max(0, int(value))
+        except (ValueError, OverflowError):
+            return None
+    return None
+
+
 def _anthropic_usage(usage: Any) -> dict:
     usage = usage if isinstance(usage, dict) else {}
 
     def pick(*keys: str) -> int:
         for key in keys:
-            value = usage.get(key)
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                try:
-                    return max(0, int(value))
-                except (ValueError, OverflowError):
-                    continue
+            got = _count_value(usage.get(key))
+            if got is not None:
+                return got
         return 0
 
     def detail(field: str, key: str) -> int:
         block = usage.get(field)
         if isinstance(block, dict):
-            value = block.get(key)
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                try:
-                    return max(0, int(value))
-                except (ValueError, OverflowError):
-                    return 0
+            got = _count_value(block.get(key))
+            if got is not None:
+                return got
         return 0
 
     total_input = pick("prompt_tokens", "input_tokens")
@@ -1078,21 +1116,16 @@ class ClaudeStreamState:
         # Usage chunks are cumulative snapshots, but an update may contain
         # only output tokens. Missing input/cache counters must not become 0.
         for canonical, alias in (("prompt_tokens", "input_tokens"), ("completion_tokens", "output_tokens")):
-            value = usage.get(canonical, usage.get(alias))
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                try:
-                    self._usage_fields[canonical] = max(0, int(value))
-                except (ValueError, OverflowError):
-                    pass
+            got = _count_value(usage.get(canonical, usage.get(alias)))
+            if got is not None:
+                self._usage_fields[canonical] = got
         for field, key in (("prompt_tokens_details", "cached_tokens"),
                            ("completion_tokens_details", "reasoning_tokens")):
-            detail = usage.get(field)
-            value = detail.get(key) if isinstance(detail, dict) else None
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                try:
-                    self._usage_fields[field] = {key: max(0, int(value))}
-                except (ValueError, OverflowError):
-                    pass
+            detail_block = usage.get(field)
+            if isinstance(detail_block, dict):
+                got = _count_value(detail_block.get(key))
+                if got is not None:
+                    self._usage_fields[field] = {key: got}
         self.usage = _anthropic_usage(self._usage_fields)
 
     # ---- 收尾 ----
@@ -1152,15 +1185,23 @@ class ClaudeStreamState:
 # 的大上下文上要 300ms+（Claude Code 每轮都调 count_tokens），正则只需 ~10ms。
 # CJK 正则与 usage.estimate_token_count 共用同一份并集口径定义
 # （2026-11 审查收敛：此前两处平行正则区间不同，同一文本 token 估算分叉）。
-from usage import CJK_CHAR_RE as _CJK_RE  # noqa: E402
+# QUA-P2-4：估算公式同样收敛到 usage 单实现，本模块只做 count_tokens
+# 场景的下限包装。
+from usage import estimate_token_count as _estimate_token_count  # noqa: E402
+from datetime import UTC
 
 
 def estimate_text_tokens(text: str) -> int:
-    """CJK ≈ 1 token/字，其余 ≈ 4 字符/token 的启发式估算（正则批量计数）。"""
+    """CJK ≈ 1 token/字，其余 ≈ 4 字符/token 的启发式估算（正则批量计数）。
+
+    QUA-P2-4（2026-11 审查收敛）：估算公式统一走 usage.estimate_token_count
+    单实现（非 CJK 部分向上取整）；此前本函数自带一套银行家舍入 + 下限 1，
+    同名概念两个行为且测试互不知晓。count_tokens 场景「非空文本至少 1
+    token」的语义在本层包装。
+    """
     if not text:
         return 0
-    cjk = len(_CJK_RE.findall(text))
-    return max(1, round(cjk + (len(text) - cjk) / 4))
+    return max(1, _estimate_token_count(text))
 
 
 def estimate_request_tokens(body: dict) -> int:
@@ -1177,6 +1218,14 @@ def estimate_request_tokens(body: dict) -> int:
     def add(value: Any):
         if isinstance(value, str) and value:
             pieces.append(value)
+
+    def note_image(data: str) -> None:
+        # REQ-P3-3（2026-11 修正）：占位长度即数据长度（与旧「"x"*len(data)
+        # 进 join」口径一致），/4 折算统一在收尾做——此前这里提前 //4、
+        # 收尾再 /4 实际成了 len/16，与 docstring 承诺的 len/4 不符，
+        # Claude Code 依此裁剪上下文时每张图低估 4 倍。
+        nonlocal image_chars
+        image_chars += len(data)
 
     system = body.get("system")
     if isinstance(system, str):
@@ -1212,14 +1261,25 @@ def estimate_request_tokens(body: dict) -> int:
                     add(inner)
                 elif isinstance(inner, list):
                     for sub in inner:
-                        if isinstance(sub, dict) and sub.get("type") == "text":
+                        if not isinstance(sub, dict):
+                            continue
+                        stype = sub.get("type")
+                        if stype == "text":
                             add(sub.get("text"))
+                        elif stype == "image":
+                            # 工具结果内层图片（多模态 tool_result）同样计入：
+                            # 此前完全不计数，多截图请求的估算缺口更大。
+                            sdata = sub.get("source")
+                            if isinstance(sdata, dict):
+                                sdata = sdata.get("data")
+                            if isinstance(sdata, str) and sdata:
+                                note_image(sdata)
             elif btype == "image":
                 source = block.get("source") or {}
                 data = source.get("data") if isinstance(source, dict) else None
                 if isinstance(data, str) and data:
                     # 计数器直算，不再物化 "x" 占位串（O-10）。
-                    image_chars += len(data) // 4
+                    note_image(data)
 
     for tool in body.get("tools") or []:
         if not isinstance(tool, dict):
@@ -1252,9 +1312,9 @@ def anthropic_models_payload(available_models: list, catalog_variants: Optional[
     resolve_claude_model 对非 claude-* 名字原样透传，这些变体在 Claude
     协议下同样可用，目录应当如实反映。
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     entries: list[dict] = []
     seen: set[str] = set()
 

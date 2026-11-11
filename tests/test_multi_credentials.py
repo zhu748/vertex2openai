@@ -216,23 +216,23 @@ class ManagementTests(StateFixture, unittest.TestCase):
         saved = self.client.post("/api/cookie-accounts", json={"accounts": accounts})
         first_id, second_id = [record["id"] for record in saved.json()["accounts"]]
         revision = saved.json()["revision"]
-        response = self.client.post("/api/cookie-accounts/reveal", json={"id": first_id})
+        response = self.client.post("/api/cookie-accounts/reveal", json={"id": first_id, "password": "multi-console"})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"id": first_id, "cookie": accounts[0]["cookie"]})
         self.assertIn("no-store", response.headers["cache-control"])
         self.assertEqual(response.headers["pragma"], "no-cache")
         self.assertNotIn("reveal-two", response.text)
         self.assertEqual(self.client.get("/api/cookie-accounts").json()["revision"], revision)
-        disabled = self.client.post("/api/cookie-accounts/reveal", json={"id": second_id})
+        disabled = self.client.post("/api/cookie-accounts/reveal", json={"id": second_id, "password": "multi-console"})
         self.assertEqual(disabled.json()["cookie"], accounts[1]["cookie"])
         updated = app_state.get_cookie_accounts()
         updated[0]["cookie"] = "SAPISID=refreshed-one"
         app_state.set_cookie_accounts(updated)
-        self.assertEqual(self.client.post("/api/cookie-accounts/reveal", json={"id": first_id}).json()["cookie"],
+        self.assertEqual(self.client.post("/api/cookie-accounts/reveal", json={"id": first_id, "password": "multi-console"}).json()["cookie"],
                          "SAPISID=refreshed-one")
         self.assertNotIn("refreshed-one", self.client.get("/api/cookie-accounts").text)
         for account_id, code in (("", 400), ("missing", 404)):
-            response = self.client.post("/api/cookie-accounts/reveal", json={"id": account_id})
+            response = self.client.post("/api/cookie-accounts/reveal", json={"id": account_id, "password": "multi-console"})
             self.assertEqual(response.status_code, code)
             self.assertNotIn("SAPISID", response.text)
 

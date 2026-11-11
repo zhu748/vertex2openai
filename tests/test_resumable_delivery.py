@@ -1,6 +1,7 @@
 """Offline regressions for reconnects, delivery acknowledgments and eviction races."""
 import asyncio
 import json
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -16,6 +17,19 @@ from routes import chat_api
 
 def request(headers=None, query=None):
     return SimpleNamespace(headers=headers or {}, query_params=query or {})
+
+
+async def _wait_until(predicate, timeout=5.0):
+    """ENG-P2-4：事件驱动等待，取代「sleep 固定时长 < 宽限窗口」的墙钟假设。
+
+    旧写法在 CI 负载下事件循环停顿超过窗口即假失败（非确定性 flake）；
+    等待真实条件成立（计时器武装/撤销）不依赖任何时长假设。"""
+    import time as _time
+    deadline = _time.monotonic() + timeout
+    while not predicate():
+        if _time.monotonic() > deadline:
+            raise AssertionError("事件驱动等待超时：条件未满足")
+        await asyncio.sleep(0)
 
 
 async def send_response(response, fail=False):
@@ -234,6 +248,33 @@ class BufferLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.store = resumable.ResumableStore()
         self.addAsyncCleanup(self.store.aclose)
 
+    async def test_delivered_buffers_without_idempotency_key_use_short_window(self):
+        """PRF-P2-6：完整交付 + 无幂等键的缓冲用短窗口（默认 120s），
+        显式幂等键（cid-）与未完整交付的缓冲仍按完整 TTL 保留。"""
+        with mock.patch.object(resumable, "ttl_seconds", return_value=1800.0), \
+                mock.patch.object(resumable, "delivered_ttl_seconds", return_value=120.0):
+            fingerprint_buf, _ = await self.store.create_if_absent("req-fingerprint", kind="stream")
+            await fingerprint_buf.finish("done")
+            fingerprint_buf.mark_delivered()
+
+            idempotent_buf, _ = await self.store.create_if_absent("cid-idempotent", kind="stream")
+            await idempotent_buf.finish("done")
+            idempotent_buf.mark_delivered()
+
+            undelivered_buf, _ = await self.store.create_if_absent("req-undelivered", kind="stream")
+            await undelivered_buf.finish("done")
+            # 未完整交付（客户端没读完）：续传价值本体，按完整 TTL 保留。
+
+            # 推进 5 分钟（> 短窗口 120s、< 完整 TTL 1800s）后清扫。
+            for buf in (fingerprint_buf, idempotent_buf, undelivered_buf):
+                buf.finished_at = time.time() - 300
+                buf.last_access = time.time() - 300
+            removed = await self.store.sweep()
+            self.assertEqual(removed, 1)
+            self.assertIsNone(await self.store.get_exact(fingerprint_buf.id))   # 短窗口已过：回收
+            self.assertIsNotNone(await self.store.get_exact(idempotent_buf.id))  # 幂等键：完整 TTL
+            self.assertIsNotNone(await self.store.get_exact(undelivered_buf.id))  # 未交付：完整 TTL
+
     async def test_evicted_json_cannot_be_overwritten_by_late_success(self):
         buf, _ = await self.store.create_if_absent("late-json", kind="json")
         started = asyncio.Event()
@@ -375,12 +416,14 @@ class GraceExpiryTests(unittest.IsolatedAsyncioTestCase):
         first = ClientConnection()
         buf.attach_client(first)
         task, cancelled = await self.immortal_worker(buf)
-        with mock.patch.object(resumable, "disconnect_grace_seconds", return_value=0.12):
+        with mock.patch.object(resumable, "disconnect_grace_seconds", return_value=5.0):
             first.finish(True)
-            await asyncio.sleep(0.03)
+            # ENG-P2-4：事件驱动确认计时器已真实武装（旧写法 sleep(0.03) 假设
+            # 在 0.12 秒窗口内完成，CI 负载下事件循环停顿即假失败）。
+            await _wait_until(lambda: buf._grace_task is not None)
             second = ClientConnection()
             buf.attach_client(second)      # 窗口内重连：撤销断开计时
-        await asyncio.sleep(0.15)           # 越过原窗口
+            self.assertIsNone(buf._grace_task)  # 计时器已撤销（直接断言，不再依赖墙钟）
         self.assertFalse(task.done())
         self.assertFalse(cancelled.is_set())
         self.assertIsNone(buf.last_disconnect_monotonic)
@@ -394,13 +437,18 @@ class GraceExpiryTests(unittest.IsolatedAsyncioTestCase):
         connection = ClientConnection()
         buf.attach_client(connection)
         task, cancelled = await self.immortal_worker(buf)
-        with mock.patch.object(resumable, "disconnect_grace_seconds", return_value=0.15):
-            connection.finish(True)          # 原窗口到 t≈0.15
-            await asyncio.sleep(0.06)
-            buf.note_client_activity(0.0)    # 轮询把窗口滑到 t≈0.21
-            await asyncio.sleep(0.10)        # t≈0.16：原窗口已过、滑动窗口未到
-        self.assertFalse(task.done())        # 轮询中的客户端不被误取消
-        await asyncio.wait_for(cancelled.wait(), 1)
+        with mock.patch.object(resumable, "disconnect_grace_seconds", return_value=1.0):
+            connection.finish(True)          # 原窗口 1.0 秒（宽裕边际，消除墙钟竞态）
+            await _wait_until(lambda: buf._grace_task is not None)
+            first_timer = buf._grace_task
+            original_deadline = buf.last_disconnect_monotonic
+            await asyncio.sleep(0.001)       # 保证 now > 断开时刻，滑动才会生效
+            buf.note_client_activity(0.0)    # 轮询把窗口滑动
+            self.assertGreater(buf.last_disconnect_monotonic, original_deadline)
+            await _wait_until(lambda: buf._grace_task is not None
+                              and buf._grace_task is not first_timer)  # 已重挂新计时器
+        self.assertFalse(task.done())        # 滑动窗口内不被误取消
+        await asyncio.wait_for(cancelled.wait(), 5)
         self.assertTrue(task.cancelled())
         self.assertEqual(buf.status_code, 410)
 

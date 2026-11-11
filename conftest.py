@@ -77,7 +77,14 @@ def _snapshot_obj(obj) -> dict:
     for key, value in list(obj.__dict__.items()):
         try:
             snap[key] = copy.deepcopy(value)
-        except Exception:
+        except Exception as exc:
+            # ENG-P2-3（2026-11 审查）：兜底触发必须显式可见——静默保留现场
+            # 对象会让「跨模块隔离」退化为 no-op，2026-11 修复前的 17 项
+            # 顺序依赖失败会以最难排查的方式回归。单例新增不可拷贝字段时，
+            # 应显式加入本函数的白名单处理，而不是依赖这里静默吞掉。
+            print(f"⚠️ [conftest] 单例字段快照失败：{obj.__class__.__name__}.{key} "
+                  f"保留现场对象（{type(exc).__name__}: {exc}）。"
+                  f"若该字段可安全重建，请在此显式处理，避免隔离静默失效。")
             snap[key] = _LIVE
     return snap
 
@@ -137,6 +144,11 @@ def _reset_shared_singletons() -> None:
         _APP_STATE._save_seq = 0
         _APP_STATE._persisted_seq = 0
         _APP_STATE._inflight = set()
+        # PRF-P1-3：每模型生效设置缓存随内存态一并回出厂——直写 _state
+        # 的复位不经过 mutator，不会触发修订号失效；不清会把上一模块的
+        # 生效设置泄漏给下一模块（跨模块隔离静默退化）。
+        _APP_STATE._effective_cache.clear()
+        _APP_STATE._settings_rev = 0
     _clean_state_files()
     # 凭证 / 轮询器 / 客户端池 / 统计：实例字段整体回出厂快照。
     for obj, snap in _SNAPSHOT_SINGLETONS:

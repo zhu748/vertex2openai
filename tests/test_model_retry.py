@@ -647,6 +647,55 @@ class KeyRotationTests(unittest.IsolatedAsyncioTestCase):
         self.records[0]["enabled"] = False
         self.assertIsNone(manager.get_express_record(exclude_key="key-1"))
 
+    async def test_revisited_key_skips_known_bad_pin_path(self):
+        """REQ-P1-1：换 Key 重选到「钉定路径已失败」的 Key 时直接用裸模型名。
+
+        旧实现每次重访都重打已知 404 的 projects/locations 路径再免费回退，
+        不消耗重试预算——多 Key 轮询下同一逻辑请求的上游调用量最坏放大
+        3 倍。修复后每把 Key 的钉定路径至多被真实调用一次。
+        """
+        for mode in ("json", "stream", "fake"):
+            with self.subTest(mode=mode):
+                self.settings.update(retry_max=5, fake_streaming=mode == "fake")
+                pinned_calls, bare_calls = [], []
+
+                def client_for(key, key_proxy=None):
+                    async def generate(**kwargs):
+                        model = kwargs["model"]
+                        if model.startswith("projects/"):
+                            pinned_calls.append(key)
+                            raise api_error(404, "Publisher model was not found")
+                        bare_calls.append(key)
+                        if len(bare_calls) <= 5:
+                            raise api_error(429)
+                        return text_response()
+
+                    async def stream(**kwargs):
+                        result = await generate(**kwargs)
+
+                        async def iterate():
+                            yield result
+                        return iterate()
+
+                    return SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(
+                        generate_content=generate, generate_content_stream=stream)))
+
+                obj = api_helpers.OpenAIRequest(model="gemini-3.6-flash", messages=[], stream=mode != "json")
+                request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(express_key_manager=ExpressKeyManager())),
+                                          is_disconnected=mock.AsyncMock(return_value=False))
+                with mock.patch.object(express_sdk, "get_pooled_express_client", side_effect=client_for):
+                    result = await express_sdk.ExpressSDKUpstream().chat_completions(obj, request)
+                    body = ("".join([chunk async for chunk in result.body_iterator])
+                            if hasattr(result, "body_iterator") else result.body.decode())
+                self.assertIn("answer", body)
+                # 每把 Key 的钉定路径只被真实调用一次；此后重访直接走裸模型名。
+                self.assertEqual(sorted(pinned_calls), ["key-1", "key-2"])
+                # 裸模型名调用共 6 次（两把 Key 首访免费回退 + 各 2 次重访），
+                # 第 6 次成功；随机调度下起始 Key 不定，按计数断言。
+                self.assertEqual(len(bare_calls), 6)
+                self.assertEqual(bare_calls.count("key-1"), 3)
+                self.assertEqual(bare_calls.count("key-2"), 3)
+
 
 class RetryPolicyTests(unittest.TestCase):
     def test_sparse_candidate_indices_keep_separate_tool_call_indices(self):

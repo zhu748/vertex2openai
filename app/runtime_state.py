@@ -10,12 +10,14 @@ from functools import lru_cache
 from typing import Optional
 
 import config as app_config
+from config import state_dir as _state_dir_env  # QUA-P2-7：STATE_DIR 单点定义
+import state_crypto
 from credential_config import parse_cookie_records
 from model_capabilities import _strip_known_suffixes
 from proxy_config import parse_proxy_list
 
 # S-3：允许把状态落到挂载卷，避免 docker compose 重建后设置与 Cookie 全部丢失。
-STATE_DIR = os.environ.get("STATE_DIR", ".")
+STATE_DIR = _state_dir_env()  # QUA-P2-7：默认值与解析口径收敛到 config.state_dir
 STATE_FILE = os.path.join(STATE_DIR, "web_state.json")
 
 
@@ -44,6 +46,289 @@ def _check_expected_settings(current, expected):
         present = key in current
         if present != snapshot["present"] or (present and current[key] != snapshot.get("value")):
             raise SettingsConflictError(key)
+
+
+class CredentialsRepository:
+    """Express Key 与 Cookie 账号的 CRUD（QUA-P2-6 自 AppState 拆出）。
+
+    存储与持久化仍归宿主 AppState：_state / _lock / _save / legacy 的
+    get_project_id 经宿主动态取用（reload 会整体替换 _state，不能快照
+    引用）；本类只承载凭证域的读取 / 归一 / 修订校验 / 写入编排。
+    AppState 以同名方法委托转发，36 个依赖方与测试 patch 面零改动。
+    """
+
+    def __init__(self, host: "AppState"):
+        self._host = host
+
+    # ---------- Express API Key（多账号，可热编辑） ----------
+
+    @staticmethod
+    def _account_proxy_fields(item) -> dict:
+        proxies = parse_proxy_list(item.get("proxies") if "proxies" in item else item.get("proxy", ""))
+        return {"proxies": proxies, "proxy": proxies[0] if proxies else "",
+                "proxy_fallback": bool(item.get("proxy_fallback", True))}
+
+
+    @staticmethod
+    def _normalize_express_record(item) -> dict:
+        if isinstance(item, str):
+            item = {"key": item}
+        if not isinstance(item, dict):
+            return {}
+        key = str(item.get("key", "") or "").strip()
+        if not key:
+            return {}
+        source = str(item.get("project_source", "") or "").strip().lower()
+        if source not in ("auto", "manual"):
+            source = ""
+        detected = item.get("detected_at", 0)
+        if (isinstance(detected, bool) or not isinstance(detected, (int, float))
+                or detected < 0 or (isinstance(detected, float) and not math.isfinite(detected))):
+            detected = 0
+        return {
+            "key": key,
+            "project_id": str(item.get("project_id", "") or "").strip(),
+            "project_source": source,
+            "detected_at": detected,
+            "note": str(item.get("note", "") or "").strip(),
+            "enabled": bool(item.get("enabled", True)),
+            # Key 级出站代理：支持 http/https/socks5/socks4/vless/vmess/trojan/ss/
+            # hysteria2/tuic 等 URI（见 proxy_resolver.py）；空 = 跟随全局，direct = 强制直连。
+            **CredentialsRepository._account_proxy_fields(item),
+        }
+
+
+    def get_express_keys(self) -> list:
+        with self._host._lock:
+            stored = self._host._state.get("express_keys")
+            if not isinstance(stored, list):
+                return []
+            out = []
+            for item in stored:
+                rec = self._normalize_express_record(item)
+                if rec:
+                    out.append(rec)
+            return out
+
+
+    def credential_snapshot(self, kind: str) -> tuple[list, str]:
+        """Read records and their content revision under the same state lock."""
+        with self._host._lock:
+            records = self.get_express_keys() if kind == "keys" else self.get_cookie_accounts()
+            revision_data = records
+            if kind == "cookies":
+                # Token rotation must not invalidate metadata drafts. Manual
+                # credential edits advance an epoch in the same persisted state;
+                # blank-cookie saves still preserve the latest token under lock.
+                revision_data = [{k: v for k, v in rec.items() if k != "cookie"} for rec in records]
+                revision_data = [self._host._state.get("cookie_accounts_revision", 0), revision_data]
+            revision = hashlib.sha256(json.dumps(revision_data, sort_keys=True, ensure_ascii=False,
+                                                 separators=(",", ":")).encode()).hexdigest()
+            return records, revision
+
+
+    def _check_credential_revision(self, kind: str, expected_revision: str | None) -> None:
+        # Called while the mutation lock is held; optional for legacy API clients.
+        if expected_revision is not None and self.credential_snapshot(kind)[1] != expected_revision:
+            raise CredentialRevisionConflictError("服务器凭证列表已更新，当前草稿已保留。请重新加载列表并合并修改后再保存。")
+
+
+    def set_express_keys(self, records: list, *, expected_revision: str | None = None) -> list:
+        """整表覆盖保存（控制台的增删改都走这里）。
+
+        同时打上 express_keys_initialized 标记：**用户保存空列表后，
+        启动时不得再从环境变量把 Key 导回来**（否则删不掉）。
+        """
+        clean = self._clean_express_records(records)
+        with self._host._lock:
+            self._check_credential_revision("keys", expected_revision)
+            self._host._state["express_keys"] = clean
+            self._host._state["express_keys_initialized"] = True
+        self._host._save()
+        print(f"🔑 [状态管理器] 已保存 {len(clean)} 个 Express API Key（明文存于 web_state.json，权限 0600）。")
+        return clean
+
+
+    @staticmethod
+    def _clean_express_records(records: list) -> list:
+        """批量归一化 Express Key 记录并按 key 去重（保持顺序，空记录丢弃）。"""
+        clean, seen = [], set()
+        for item in (records or []):
+            rec = CredentialsRepository._normalize_express_record(item)
+            if rec and rec["key"] not in seen:
+                seen.add(rec["key"])
+                clean.append(rec)
+        return clean
+
+
+    def update_express_key_project(self, key: str, project_id: str, source: str = "auto", *,
+                                   expected: dict | None = None) -> bool:
+        """写回某个 Key 的 Project ID（自动探测或人工覆盖）。"""
+        key = (key or "").strip()
+        if not key:
+            return False
+        with self._host._lock:
+            stored = self._host._state.get("express_keys")
+            if not isinstance(stored, list):
+                return False
+            changed = False
+            new_list = []
+            for item in stored:
+                rec = self._normalize_express_record(item)
+                if not rec:
+                    continue
+                if rec["key"] == key:
+                    if expected is not None and rec != expected:
+                        return False
+                    rec["project_id"] = (project_id or "").strip()
+                    rec["project_source"] = source if source in ("auto", "manual") else ""
+                    rec["detected_at"] = time.time()
+                    changed = True
+                new_list.append(rec)
+            if changed:
+                self._host._state["express_keys"] = new_list
+        if changed:
+            self._host._save()
+        return changed
+
+
+    def import_env_express_keys_once(self, env_keys: list) -> int:
+        """把环境变量 VERTEX_EXPRESS_API_KEY 做**一次性**初始导入。
+
+        只在从未保存过（没有 express_keys_initialized 标记）时执行，
+        因此用户在控制台把 Key 全删光并保存后，重启也不会被环境变量重新灌回来。
+        """
+        result = 0
+        with self._host._lock:
+            if self._host._state.get("express_keys_initialized"):
+                return 0
+            existing = self._host._state.get("express_keys")
+            if isinstance(existing, list) and existing:
+                self._host._state["express_keys_initialized"] = True
+                result = 0
+            else:
+                clean = self._clean_express_records(env_keys)
+                self._host._state["express_keys"] = clean
+                self._host._state["express_keys_initialized"] = True
+                result = len(clean)
+                if clean:
+                    print(f"📥 [状态管理器] 已从环境变量 VERTEX_EXPRESS_API_KEY 一次性导入 {len(clean)} 个 Key，"
+                          "此后以控制台保存的列表为准。")
+        self._host._save()
+        return result
+
+
+    @staticmethod
+    def _normalize_cookie_record(item) -> dict:
+        if isinstance(item, str):
+            item = {"cookie": item}
+        if not isinstance(item, dict):
+            return {}
+        cookie = str(item.get("cookie", "") or "").strip()
+        if not cookie:
+            return {}
+        record_id = str(item.get("id", "") or "").strip()
+        if not record_id:
+            record_id = _cookie_record_id(cookie)
+        return {"id": record_id, "cookie": cookie,
+                "project_id": str(item.get("project_id", "") or "").strip(),
+                "note": str(item.get("note", "") or "").strip(),
+                "enabled": bool(item.get("enabled", True)),
+                **CredentialsRepository._account_proxy_fields(item)}
+
+
+    def get_cookie_accounts(self) -> list:
+        with self._host._lock:
+            stored = self._host._state.get("cookie_accounts")
+            if not isinstance(stored, list):
+                if "google_cookie" in self._host._state:
+                    stored = [{"cookie": self._host._state["google_cookie"], "project_id": self._host.get_project_id()}]
+                elif app_config.GOOGLE_COOKIES is not None:
+                    stored = app_config.ENV_COOKIE_ACCOUNTS
+                elif app_config.GOOGLE_COOKIE:
+                    stored = parse_cookie_records(app_config.GOOGLE_COOKIE, self._host.get_project_id())
+                else:
+                    stored = app_config.ENV_COOKIE_ACCOUNTS
+            return [rec for item in stored if (rec := self._normalize_cookie_record(item))]
+
+
+    def set_cookie_accounts(self, records: list, *, preserve_cookie_ids: set[str] | None = None,
+                            expected_revision: str | None = None) -> list:
+        clean, ids, cookies = [], set(), set()
+        for item in records:
+            rec = self._normalize_cookie_record(item)
+            if not rec or rec["id"] in ids or rec["cookie"] in cookies:
+                continue
+            ids.add(rec["id"])
+            cookies.add(rec["cookie"])
+            clean.append(rec)
+        with self._host._lock:
+            self._check_credential_revision("cookies", expected_revision)
+            if preserve_cookie_ids:
+                current = {rec["id"]: rec for rec in self.get_cookie_accounts()}
+                for rec in clean:
+                    if rec["id"] in preserve_cookie_ids:
+                        if rec["id"] not in current:
+                            raise CookieAccountConflictError("Cookie 账号已被删除，请重新加载列表后再保存。")
+                        # Resolve blank-cookie preservation inside the commit
+                        # lock, after any rotation or manual replacement.
+                        rec["cookie"] = current[rec["id"]]["cookie"]
+                if len({rec["cookie"] for rec in clean}) != len(clean):
+                    raise CookieAccountConflictError("Cookie 凭证已更新并产生重复，请重新加载列表后再保存。")
+            self._host._state["cookie_accounts"] = clean
+            epoch = self._host._state.get("cookie_accounts_revision", 0)
+            self._host._state["cookie_accounts_revision"] = (epoch if isinstance(epoch, int) else 0) + 1
+            self._host._state["cookie_accounts_initialized"] = True
+            # Old credentials must not resurrect after deleting every account.
+            self._host._state.pop("google_cookie", None)
+        self._host._save()
+        return clean
+
+
+    def import_env_cookie_accounts_once(self) -> int:
+        with self._host._lock:
+            if self._host._state.get("cookie_accounts_initialized"):
+                return 0
+            records = self.get_cookie_accounts()
+        # set_cookie_accounts（含 _save 的磁盘 IO）在状态锁外调用。
+        self.set_cookie_accounts(records)
+        return len(records)
+
+
+    def update_cookie_account_cookie(self, account_id: str, new_cookie: str,
+                                    *, expected_cookie: str | None = None) -> bool:
+        """只更新某个 Cookie 账号的凭证字符串（短期令牌自动续期用）。
+
+        其余字段（project_id/代理/开关/备注）一律不动；其他字段一并改写
+        必须走控制台的整表保存接口。锁内完成内存替换，_save 落盘在锁外
+        （与既有方法口径一致）；账号不存在或与 expected_cookie 快照不符返回
+        False。比较与替换在同一把锁内，迟到的续期不得覆盖手动更换的新凭证。
+        """
+        new_cookie = str(new_cookie or "").strip()
+        if not account_id or not new_cookie:
+            return False
+        with self._host._lock:
+            records = self._host._state.get("cookie_accounts")
+            if not isinstance(records, list) or not records:
+                return False
+            hit = False
+            cleaned = []
+            for item in records:
+                rec = self._normalize_cookie_record(item)
+                if not rec:
+                    continue
+                if rec["id"] == account_id:
+                    if expected_cookie is not None and rec["cookie"] != expected_cookie:
+                        return False
+                    rec["cookie"] = new_cookie
+                    hit = True
+                cleaned.append(rec)
+            if not hit:
+                return False
+            self._host._state["cookie_accounts"] = cleaned
+            self._host._state["cookie_accounts_initialized"] = True
+        self._host._save()
+        return True
 
 
 class AppState:
@@ -75,6 +360,22 @@ class AppState:
         self._load_from_disk()
         self._clean_orphan_temp_files()
         self._committed = copy.deepcopy(self._state)
+        # PRF-P1-3：get_effective_settings 的修订号 + 每模型缓存。旧实现
+        # 在每个请求上被调 2-4 次，base 为空时每次都全量 deepcopy 含
+        # model_overrides 的整棵设置树（约 90µs，全部发生在 RLock 内，
+        # Cookie 路径还在媒体线程再次竞争同一把锁）。设置只在控制台保存
+        # 时变化：命中缓存直接返回浅拷贝，未命中才全量合成。
+        # 缓存键同时含修订号 / 存储字典身份 / 键数，覆盖全部已知的失效
+        # 路径（mutator、reload、测试直写 _state、原地 pop）。
+        self._settings_rev = 0
+        self._effective_cache: dict[tuple, dict] = {}
+        # QUA-P2-6：凭证 CRUD 委托给仓库（存储/持久化仍归本类）。
+        self._credentials = CredentialsRepository(self)
+
+    def _invalidate_effective_cache_locked(self) -> None:
+        """设置变更时作废每模型生效设置缓存（调用方需已持 self._lock）。"""
+        self._settings_rev += 1
+        self._effective_cache.clear()
 
     # ---------- 持久化 ----------
 
@@ -84,16 +385,29 @@ class AppState:
         文件缺失/损坏时**不改 _state**并返回 None：调用方（reload）需要
         区分「读到了什么」与「内存里还有什么」，不能拿内存态充当磁盘真相
         （2026-11 C-11）。
+        SEC-P2-2：支持可选静态加密——密文信封需 STATE_ENCRYPTION_KEY 才能读；
+        有信封而无密钥/密钥错误时拒绝启动（RuntimeError），不进损坏备份路径：
+        加密文件本身没坏，降级启动反而会把加密状态覆盖丢失。
         """
+        # 启动自检：已设密钥但缺 cryptography 时尽早失败，别等到第一次保存。
+        _crypto_error = state_crypto.self_check()
+        if _crypto_error is not None:
+            print(f"⛔ [状态管理器] {_crypto_error}")
+            raise RuntimeError(_crypto_error)
         if not os.path.exists(STATE_FILE):
             return None
+        migrated_from_plaintext = False
         try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
+            with open(STATE_FILE, encoding="utf-8") as f:
                 data = json.load(f)
             if not isinstance(data, dict):
                 # 顶层不是 JSON 对象（如被截断成数组/字符串）同样按损坏处理，
                 # 否则降级内存模式后的下一次 _save() 会把它静默覆盖掉。
                 raise ValueError("文件顶层不是 JSON 对象")
+            if state_crypto.is_encryption_envelope(data):
+                data = state_crypto.decrypt_state_json(data)
+            elif state_crypto.encryption_enabled():
+                migrated_from_plaintext = True
             self._state = data
             # 旧版本创建的文件可能是 0644（里面有完整 Google Cookie），
             # 加载后立即收紧；否则要等到下一次 _save 才被 chmod 修复。
@@ -101,7 +415,14 @@ class AppState:
                 os.chmod(STATE_FILE, 0o600)
             except OSError:
                 pass
+            if migrated_from_plaintext:
+                print("🔐 [状态管理器] 已设置 STATE_ENCRYPTION_KEY：本次保存起 "
+                      "web_state.json 将以密文落盘（旧明文文件会在首次保存时被替换）。")
             return data
+        except state_crypto.StateCryptoError as e:
+            # 拒绝启动：不备份、不降级（见 docstring）。
+            print(f"⛔ [状态管理器] {e}")
+            raise RuntimeError(str(e)) from e
         except Exception as e:
             # 损坏/不可读：先把原文件改名备份再降级为内存模式。不备份的话，
             # 用户在控制台改任何一项设置都会触发 _save() 用近空状态原子替换
@@ -181,10 +502,13 @@ class AppState:
                 try:
                     target_dir = os.path.dirname(STATE_FILE) or "."
                     os.makedirs(target_dir, exist_ok=True)
+                    # SEC-P2-2：已设 STATE_ENCRYPTION_KEY 时密文落盘；
+                    # 加密失败（依赖缺失等）走既有回滚路径，内存不会与磁盘分叉。
+                    disk_payload = state_crypto.encrypt_state_json(snapshot)
                     fd, tmp_path = tempfile.mkstemp(prefix=".web_state-", suffix=".tmp", dir=target_dir)
                     try:
                         with os.fdopen(fd, "w", encoding="utf-8") as f:
-                            json.dump(snapshot, f, ensure_ascii=False, indent=2)
+                            json.dump(disk_payload, f, ensure_ascii=False, indent=2)
                             f.flush()
                             os.fsync(f.fileno())
                         os.replace(tmp_path, STATE_FILE)
@@ -258,6 +582,8 @@ class AppState:
                 # 作废重载前已拍下、尚未落盘的快照，避免旧保存覆盖外部编辑。
                 self._save_seq += 1
                 self._persisted_seq = self._save_seq
+                # PRF-P1-3：磁盘重载可能换了整套设置，作废每模型缓存。
+                self._invalidate_effective_cache_locked()
 
     def set_cookie_credentials(self, cookie: str = "", project_id: str = "") -> None:
         """Commit both credential fields together, so partial updates cannot leak."""
@@ -343,270 +669,52 @@ class AppState:
         with self._lock:
             return self._state.get("google_project_id", app_config.GOOGLE_PROJECT_ID or "")
 
-    # ---------- Express API Key（多账号，可热编辑） ----------
-    # 记录形态：{"key":..., "project_id":..., "project_source":"auto|manual|", 
-    #            "detected_at": 时间戳, "note":..., "enabled": True,
-    #            "proxy": "该 Key 专属出站代理 URI（空=跟随全局，direct=强制直连）"}
-    # 一个 Key 对应一个谷歌账号/项目，所以 Project ID 必须**跟着 Key 走**，
-    # 不能共用 Cookie 通道那份全局 Project ID（见 express_sdk.resolve_express_model_path）。
-    # proxy 同理：多账号常来自不同网络环境，各自挂各自的出口。
-
-    @staticmethod
-    def _account_proxy_fields(item) -> dict:
-        proxies = parse_proxy_list(item.get("proxies") if "proxies" in item else item.get("proxy", ""))
-        return {"proxies": proxies, "proxy": proxies[0] if proxies else "",
-                "proxy_fallback": bool(item.get("proxy_fallback", True))}
-
-    @staticmethod
-    def _normalize_express_record(item) -> dict:
-        if isinstance(item, str):
-            item = {"key": item}
-        if not isinstance(item, dict):
-            return {}
-        key = str(item.get("key", "") or "").strip()
-        if not key:
-            return {}
-        source = str(item.get("project_source", "") or "").strip().lower()
-        if source not in ("auto", "manual"):
-            source = ""
-        detected = item.get("detected_at", 0)
-        if (isinstance(detected, bool) or not isinstance(detected, (int, float))
-                or detected < 0 or (isinstance(detected, float) and not math.isfinite(detected))):
-            detected = 0
-        return {
-            "key": key,
-            "project_id": str(item.get("project_id", "") or "").strip(),
-            "project_source": source,
-            "detected_at": detected,
-            "note": str(item.get("note", "") or "").strip(),
-            "enabled": bool(item.get("enabled", True)),
-            # Key 级出站代理：支持 http/https/socks5/socks4/vless/vmess/trojan/ss/
-            # hysteria2/tuic 等 URI（见 proxy_resolver.py）；空 = 跟随全局，direct = 强制直连。
-            **AppState._account_proxy_fields(item),
-        }
+    # ---------- 凭证 CRUD（QUA-P2-6：实现拆至 CredentialsRepository，此处委托转发） ----------
 
     def get_express_keys(self) -> list:
-        with self._lock:
-            stored = self._state.get("express_keys")
-            if not isinstance(stored, list):
-                return []
-            out = []
-            for item in stored:
-                rec = self._normalize_express_record(item)
-                if rec:
-                    out.append(rec)
-            return out
+        return self._credentials.get_express_keys()
 
     def credential_snapshot(self, kind: str) -> tuple[list, str]:
-        """Read records and their content revision under the same state lock."""
-        with self._lock:
-            records = self.get_express_keys() if kind == "keys" else self.get_cookie_accounts()
-            revision_data = records
-            if kind == "cookies":
-                # Token rotation must not invalidate metadata drafts. Manual
-                # credential edits advance an epoch in the same persisted state;
-                # blank-cookie saves still preserve the latest token under lock.
-                revision_data = [{k: v for k, v in rec.items() if k != "cookie"} for rec in records]
-                revision_data = [self._state.get("cookie_accounts_revision", 0), revision_data]
-            revision = hashlib.sha256(json.dumps(revision_data, sort_keys=True, ensure_ascii=False,
-                                                 separators=(",", ":")).encode()).hexdigest()
-            return records, revision
-
-    def _check_credential_revision(self, kind: str, expected_revision: str | None) -> None:
-        # Called while the mutation lock is held; optional for legacy API clients.
-        if expected_revision is not None and self.credential_snapshot(kind)[1] != expected_revision:
-            raise CredentialRevisionConflictError("服务器凭证列表已更新，当前草稿已保留。请重新加载列表并合并修改后再保存。")
+        return self._credentials.credential_snapshot(kind)
 
     def set_express_keys(self, records: list, *, expected_revision: str | None = None) -> list:
-        """整表覆盖保存（控制台的增删改都走这里）。
-
-        同时打上 express_keys_initialized 标记：**用户保存空列表后，
-        启动时不得再从环境变量把 Key 导回来**（否则删不掉）。
-        """
-        clean = self._clean_express_records(records)
-        with self._lock:
-            self._check_credential_revision("keys", expected_revision)
-            self._state["express_keys"] = clean
-            self._state["express_keys_initialized"] = True
-        self._save()
-        print(f"🔑 [状态管理器] 已保存 {len(clean)} 个 Express API Key（明文存于 web_state.json，权限 0600）。")
-        return clean
-
-    @staticmethod
-    def _clean_express_records(records: list) -> list:
-        """批量归一化 Express Key 记录并按 key 去重（保持顺序，空记录丢弃）。"""
-        clean, seen = [], set()
-        for item in (records or []):
-            rec = AppState._normalize_express_record(item)
-            if rec and rec["key"] not in seen:
-                seen.add(rec["key"])
-                clean.append(rec)
-        return clean
+        return self._credentials.set_express_keys(records, expected_revision=expected_revision)
 
     def update_express_key_project(self, key: str, project_id: str, source: str = "auto", *,
                                    expected: dict | None = None) -> bool:
-        """写回某个 Key 的 Project ID（自动探测或人工覆盖）。"""
-        key = (key or "").strip()
-        if not key:
-            return False
-        with self._lock:
-            stored = self._state.get("express_keys")
-            if not isinstance(stored, list):
-                return False
-            changed = False
-            new_list = []
-            for item in stored:
-                rec = self._normalize_express_record(item)
-                if not rec:
-                    continue
-                if rec["key"] == key:
-                    if expected is not None and rec != expected:
-                        return False
-                    rec["project_id"] = (project_id or "").strip()
-                    rec["project_source"] = source if source in ("auto", "manual") else ""
-                    rec["detected_at"] = time.time()
-                    changed = True
-                new_list.append(rec)
-            if changed:
-                self._state["express_keys"] = new_list
-        if changed:
-            self._save()
-        return changed
+        return self._credentials.update_express_key_project(
+            key, project_id, source, expected=expected)
 
     def import_env_express_keys_once(self, env_keys: list) -> int:
-        """把环境变量 VERTEX_EXPRESS_API_KEY 做**一次性**初始导入。
-
-        只在从未保存过（没有 express_keys_initialized 标记）时执行，
-        因此用户在控制台把 Key 全删光并保存后，重启也不会被环境变量重新灌回来。
-        """
-        result = 0
-        with self._lock:
-            if self._state.get("express_keys_initialized"):
-                return 0
-            existing = self._state.get("express_keys")
-            if isinstance(existing, list) and existing:
-                self._state["express_keys_initialized"] = True
-                result = 0
-            else:
-                clean = self._clean_express_records(env_keys)
-                self._state["express_keys"] = clean
-                self._state["express_keys_initialized"] = True
-                result = len(clean)
-                if clean:
-                    print(f"📥 [状态管理器] 已从环境变量 VERTEX_EXPRESS_API_KEY 一次性导入 {len(clean)} 个 Key，"
-                          "此后以控制台保存的列表为准。")
-        self._save()
-        return result
-
-    # ---------- Cookie accounts (legacy singleton credentials are migrated once) ----------
-
-    @staticmethod
-    def _normalize_cookie_record(item) -> dict:
-        if isinstance(item, str):
-            item = {"cookie": item}
-        if not isinstance(item, dict):
-            return {}
-        cookie = str(item.get("cookie", "") or "").strip()
-        if not cookie:
-            return {}
-        record_id = str(item.get("id", "") or "").strip()
-        if not record_id:
-            record_id = _cookie_record_id(cookie)
-        return {"id": record_id, "cookie": cookie,
-                "project_id": str(item.get("project_id", "") or "").strip(),
-                "note": str(item.get("note", "") or "").strip(),
-                "enabled": bool(item.get("enabled", True)),
-                **AppState._account_proxy_fields(item)}
+        return self._credentials.import_env_express_keys_once(env_keys)
 
     def get_cookie_accounts(self) -> list:
-        with self._lock:
-            stored = self._state.get("cookie_accounts")
-            if not isinstance(stored, list):
-                if "google_cookie" in self._state:
-                    stored = [{"cookie": self._state["google_cookie"], "project_id": self.get_project_id()}]
-                elif app_config.GOOGLE_COOKIES is not None:
-                    stored = app_config.ENV_COOKIE_ACCOUNTS
-                elif app_config.GOOGLE_COOKIE:
-                    stored = parse_cookie_records(app_config.GOOGLE_COOKIE, self.get_project_id())
-                else:
-                    stored = app_config.ENV_COOKIE_ACCOUNTS
-            return [rec for item in stored if (rec := self._normalize_cookie_record(item))]
+        return self._credentials.get_cookie_accounts()
 
     def set_cookie_accounts(self, records: list, *, preserve_cookie_ids: set[str] | None = None,
                             expected_revision: str | None = None) -> list:
-        clean, ids, cookies = [], set(), set()
-        for item in records:
-            rec = self._normalize_cookie_record(item)
-            if not rec or rec["id"] in ids or rec["cookie"] in cookies:
-                continue
-            ids.add(rec["id"])
-            cookies.add(rec["cookie"])
-            clean.append(rec)
-        with self._lock:
-            self._check_credential_revision("cookies", expected_revision)
-            if preserve_cookie_ids:
-                current = {rec["id"]: rec for rec in self.get_cookie_accounts()}
-                for rec in clean:
-                    if rec["id"] in preserve_cookie_ids:
-                        if rec["id"] not in current:
-                            raise CookieAccountConflictError("Cookie 账号已被删除，请重新加载列表后再保存。")
-                        # Resolve blank-cookie preservation inside the commit
-                        # lock, after any rotation or manual replacement.
-                        rec["cookie"] = current[rec["id"]]["cookie"]
-                if len({rec["cookie"] for rec in clean}) != len(clean):
-                    raise CookieAccountConflictError("Cookie 凭证已更新并产生重复，请重新加载列表后再保存。")
-            self._state["cookie_accounts"] = clean
-            epoch = self._state.get("cookie_accounts_revision", 0)
-            self._state["cookie_accounts_revision"] = (epoch if isinstance(epoch, int) else 0) + 1
-            self._state["cookie_accounts_initialized"] = True
-            # Old credentials must not resurrect after deleting every account.
-            self._state.pop("google_cookie", None)
-        self._save()
-        return clean
+        return self._credentials.set_cookie_accounts(
+            records, preserve_cookie_ids=preserve_cookie_ids,
+            expected_revision=expected_revision)
 
     def import_env_cookie_accounts_once(self) -> int:
-        with self._lock:
-            if self._state.get("cookie_accounts_initialized"):
-                return 0
-            records = self.get_cookie_accounts()
-        # set_cookie_accounts（含 _save 的磁盘 IO）在状态锁外调用。
-        self.set_cookie_accounts(records)
-        return len(records)
+        return self._credentials.import_env_cookie_accounts_once()
 
     def update_cookie_account_cookie(self, account_id: str, new_cookie: str,
-                                    *, expected_cookie: str | None = None) -> bool:
-        """只更新某个 Cookie 账号的凭证字符串（短期令牌自动续期用）。
+                                     *, expected_cookie: str | None = None) -> bool:
+        return self._credentials.update_cookie_account_cookie(
+            account_id, new_cookie, expected_cookie=expected_cookie)
 
-        其余字段（project_id/代理/开关/备注）一律不动；其他字段一并改写
-        必须走控制台的整表保存接口。锁内完成内存替换，_save 落盘在锁外
-        （与既有方法口径一致）；账号不存在或与 expected_cookie 快照不符返回
-        False。比较与替换在同一把锁内，迟到的续期不得覆盖手动更换的新凭证。
-        """
-        new_cookie = str(new_cookie or "").strip()
-        if not account_id or not new_cookie:
-            return False
-        with self._lock:
-            records = self._state.get("cookie_accounts")
-            if not isinstance(records, list) or not records:
-                return False
-            hit = False
-            cleaned = []
-            for item in records:
-                rec = self._normalize_cookie_record(item)
-                if not rec:
-                    continue
-                if rec["id"] == account_id:
-                    if expected_cookie is not None and rec["cookie"] != expected_cookie:
-                        return False
-                    rec["cookie"] = new_cookie
-                    hit = True
-                cleaned.append(rec)
-            if not hit:
-                return False
-            self._state["cookie_accounts"] = cleaned
-            self._state["cookie_accounts_initialized"] = True
-        self._save()
-        return True
+    @staticmethod
+    def _normalize_express_record(item) -> dict:
+        # 类级静态别名：tests/test_wire_and_startup_audit 直接经
+        # AppState._normalize_express_record 调用（QUA-P2-6 拆分保兼容）。
+        return CredentialsRepository._normalize_express_record(item)
+
+    @staticmethod
+    def _normalize_cookie_record(item) -> dict:
+        # set_cookie_credentials（通道域，留在 AppState）仍需归一化。
+        return CredentialsRepository._normalize_cookie_record(item)
 
     # ---------- 控制台可调设置 ----------
 
@@ -692,6 +800,7 @@ class AppState:
                 current["proxy_urls"] = proxies
                 current["proxy_url"] = proxies[0] if proxies else ""
             self._state["settings"] = current
+            self._invalidate_effective_cache_locked()
         self._save()
         print(f"🔧 [状态管理器] 已更新 {accepted} 项运行时设置。")
         return self.get_settings()
@@ -731,6 +840,7 @@ class AppState:
                 overrides.pop(model_name, None)
             settings["model_overrides"] = overrides
             self._state["settings"] = settings
+            self._invalidate_effective_cache_locked()
         self._save()
         print(f"🔧 [状态管理器] 已保存模型 {model_name} 的专属参数（{len(clean)} 项）。")
         return self.get_model_overrides().get(model_name, {})
@@ -747,6 +857,8 @@ class AppState:
             overrides.pop(model_name, None)
             settings["model_overrides"] = overrides
             self._state["settings"] = settings
+            # 原地 pop 不改变存储字典身份/键数，必须显式作废缓存。
+            self._invalidate_effective_cache_locked()
         self._save()
         print(f"🔧 [状态管理器] 已清除模型 {model_name} 的专属参数。")
         return True
@@ -759,6 +871,11 @@ class AppState:
         每个模型都 deepcopy 一次完整设置树（含全部 model_overrides）。
         本方法只做**顶层标量**赋值，浅拷贝入参即安全，不会改到调用方的基础。
 
+        若不传 base，则命中「设置修订号 + 每模型」缓存（PRF-P1-3）：设置
+        只在控制台保存时变化，命中直接返回浅拷贝，未命中才做一次全量
+        deepcopy 合成。缓存键含修订号 / 存储字典身份 / 键数三重指纹，
+        覆盖 mutator、reload、测试直写 _state 与原地 pop 全部失效路径。
+
         覆盖键查找做后缀归一：控制台按基础名（如 gemini-3.6-flash）保存的
         专属参数，在 -search 等别名后缀的请求下也要生效——旧实现拿原始
         请求名做精确查表，gemini-3.6-flash-search 匹配不到按基础名存的
@@ -768,8 +885,19 @@ class AppState:
         再退回剥掉已知别名后缀（-search / -1k/-2k/-4k/-512 / -think-*）
         的基础名。
         """
+        cache_store = None
         if base is None:
+            model_key = (model_name or "").strip()
+            with self._lock:
+                stored = self._state.get("settings")
+                stored = stored if isinstance(stored, dict) else None
+                cache_key = (self._settings_rev, id(stored),
+                             len(stored) if stored is not None else -1, model_key)
+                cached = self._effective_cache.get(cache_key)
+            if cached is not None:
+                return dict(cached)  # 浅拷贝：调用方只读，不互相污染
             base = self.get_settings()
+            cache_store = cache_key
         else:
             base = dict(base)
         # Legacy global transport defaults must not publish every model's
@@ -788,6 +916,12 @@ class AppState:
             for k in app_config.PER_MODEL_KEYS:
                 if k in ov:
                     base[k] = ov[k]
+        if cache_store is not None:
+            # 有界缓存：模型目录规模有限（数百），超限淘汰最旧条目。
+            with self._lock:
+                if len(self._effective_cache) >= 512:
+                    self._effective_cache.pop(next(iter(self._effective_cache)), None)
+                self._effective_cache[cache_store] = base
         return base
 
 

@@ -128,8 +128,6 @@ def _sse_frame_kind(frame: str) -> tuple[str, Optional[int]]:
         return ("done", None)
     if _CONTENT_FRAME_RE.search(payload_text):
         return ("content", None)
-    if '"chatcmpl-keepalive"' in payload_text:
-        return ("keepalive", None)
     if '"error"' not in payload_text and '"choices"' not in payload_text:
         # 无错误负载也无 choices 结构（如纯 usage 帧）：不可能是
         # error/content/finish，直接归 other，省一次完整反序列化。
@@ -140,8 +138,6 @@ def _sse_frame_kind(frame: str) -> tuple[str, Optional[int]]:
         return ("other", None)
     if not isinstance(payload, dict):
         return ("other", None)
-    if payload.get("id") == "chatcmpl-keepalive":
-        return ("keepalive", None)
     err = payload.get("error")
     if isinstance(err, dict):
         code = err.get("code")
@@ -214,7 +210,13 @@ async def _stream_with_fallback_frames(
     try:
         async for frame in iterator:
             kind, code = _sse_frame_kind(frame)
-            if kind == "content":
+            if kind == "content" and not fallback_started:
+                # REQ-P2-7（2026-11 收敛）：主通道 error 帧之后迟到的
+                # content 帧属于已被判死的尝试（错误帧已吞、内容不会
+                # 下发），不再计入 saw_content——否则流既不切备用通道、
+                # 又因错误帧被吞而无 [DONE] 终止语义，客户端只能靠
+                # 自身超时判死。修正后 saw_content 与 fallback_started
+                # 互斥（内容先于错误则错误分支不触发）。
                 saw_content = True
             elif (kind == "error" and not saw_content and not fallback_started
                     and _fallback_eligible_code(code if code is not None else 502)):
@@ -224,7 +226,7 @@ async def _stream_with_fallback_frames(
                 pending_error_code = code if code is not None else 502
                 continue
             if fallback_started:
-                # 主通道错误后的收尾帧（[DONE] / 尾随心跳）不再下发
+                # 主通道错误后的收尾帧（[DONE] / 尾随心跳 / 迟到内容）不再下发
                 continue
             yield frame
     finally:
@@ -233,7 +235,9 @@ async def _stream_with_fallback_frames(
             with suppress(Exception):
                 await close()
 
-    if not fallback_started or saw_content:
+    # 互斥不变量：fallback_started=True 蕴含 saw_content=False（上方守卫）。
+    # 未触发兜底时主通道全部帧已原样转发（含自身的 [DONE]），直接结束。
+    if not fallback_started:
         return
 
     alt = await _try_channel_fallback(

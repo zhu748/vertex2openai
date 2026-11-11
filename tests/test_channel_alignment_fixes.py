@@ -182,7 +182,7 @@ class ProxyShareLinkHardeningTests(unittest.TestCase):
 class ConsoleScriptSyntaxTests(unittest.TestCase):
     """控制台前端脚本语法完整性（本轮新增 testCookieAccount 等函数）。"""
 
-    SCRIPTS = ["channel-config.js", "dashboard.js", "console-forms.js"]
+    SCRIPTS = ["channel-config.js", "proxy-editor.js", "dashboard.js", "console-forms.js"]
 
     def test_scripts_parse(self):
         node = shutil.which("node")

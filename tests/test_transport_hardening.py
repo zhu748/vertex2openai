@@ -13,6 +13,7 @@ import httpx
 from fastapi.testclient import TestClient
 from google import genai
 from google.genai import types
+from google.genai.errors import ServerError  # B017 断言收窄用
 
 import upstreams.express_pipeline as api_helpers
 import client_pool
@@ -65,7 +66,8 @@ class SDKTests(unittest.IsolatedAsyncioTestCase):
         options.async_client_args = dict(options.async_client_args, transport=httpx.MockTransport(handle))
         client = genai.Client(vertexai=True, api_key="offline", http_options=options)
         try:
-            with self.assertRaises(Exception):
+            # B017：断言收窄到 SDK 实际抛出的 503 ServerError（重试耗尽后向上冒泡）
+            with self.assertRaises(ServerError):
                 await client.aio.models.generate_content(model="gemini-3.6-flash", contents="hi")
         finally:
             client.close()
@@ -224,6 +226,11 @@ class BrowserWireTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ImageTests(unittest.TestCase):
+    def setUp(self):
+        # PRF-P2-3：共享图片客户端池必须逐测试重置，避免上个测试注入的
+        # mock 客户端（按代理签名缓存）泄漏到本测试。
+        image_processing.reset_image_clients()
+
     def test_proxy_does_not_disable_private_address_checks(self):
         with mock.patch.object(image_processing, "get_effective_proxy_url", return_value="http://proxy:8080"), \
              mock.patch.object(proxy_resolver, "resolve_proxy_uri", return_value="http://proxy:8080"), \

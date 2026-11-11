@@ -31,7 +31,7 @@ from runtime_state import app_state
 from schema_validation import SchemaValidationError
 from upstream_errors import extract_upstream_error
 from upstreams import cookie_native, cookie_proxy, cookie_request, cookie_transport
-from routes import gemini_native
+from upstreams import native_passthrough
 
 
 MODEL = "gemini-3.8-flash"
@@ -326,7 +326,7 @@ class ResponseBudgetTests(unittest.IsolatedAsyncioTestCase):
                 lambda request: httpx.Response(200, stream=body))) as client:
             with mock.patch.object(http_io, "MAX_UPSTREAM_RESPONSE_BYTES", 15):
                 with self.assertRaises(IncompleteResponseError):
-                    await gemini_native._passthrough_once(client, "key", MODEL, "generateContent", "", b"{}", stream=False)
+                    await native_passthrough._passthrough_once(client, "key", MODEL, "generateContent", "", b"{}", stream=False)
         self.assertTrue(body.closed)
         self.assertEqual(body.reads, 2)
 

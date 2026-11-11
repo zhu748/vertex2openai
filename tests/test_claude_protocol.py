@@ -977,7 +977,7 @@ class StreamBufferTests(unittest.TestCase):
     def test_tool_arguments_accumulated_via_list_join(self):
         state = ClaudeStreamState("m")
         fragments = ['{"co', 'ntent": ', '"写入这段', '很长的文件内容', '"}']
-        for i, frag in enumerate(fragments):
+        for frag in fragments:  # B007：序号未用，去掉 enumerate
             state.feed_openai_chunk({"choices": [{"delta": {"tool_calls": [
                 {"index": 0, "id": "t1", "function": {"name": "write", "arguments": frag}}]}}]})
         events = stream_events(state.finish_events())

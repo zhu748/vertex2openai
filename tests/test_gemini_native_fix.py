@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """vertex2openai Gemini 原生透传 404 修复的回归测试。
 
 背景（根因）：
@@ -27,6 +26,7 @@ import httpx
 import unittest.mock as mock
 
 from routes import gemini_native
+from upstreams import native_passthrough
 
 PROJECT = "141662177969"
 MODEL = "gemini-4-argon"
@@ -133,7 +133,7 @@ def run_passthrough(model, action, query, payload, records, responder, settings)
     req = StubRequest(StubManager(records))
 
     async def _run():
-        with mock.patch.object(gemini_native, "passthrough_client_pool", slot), \
+        with mock.patch.object(native_passthrough, "passthrough_client_pool", slot), \
              mock.patch.object(gemini_native.app_state, "get_settings",
                                return_value=dict(settings)):
             resp = await gemini_native._passthrough_request(
