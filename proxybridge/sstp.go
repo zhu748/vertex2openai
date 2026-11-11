@@ -160,6 +160,15 @@ func (p *sstpPackets) await() (*wireguard.LightweightNetTun, error) {
 	case <-p.closed:
 		return nil, io.ErrClosedPipe
 	case <-p.ready:
+		// ready 与 closed 同时就绪时，select 在就绪分支间伪随机选择，
+		// 约一半概率把已 Close 的 tun 当可用返回（go1.27.4 的调度
+		// 时序在 CI 上稳定踩中）。命中 ready 后必须复检 closed，
+		// 「已关闭必错」的语义不得依赖调度时序。
+		select {
+		case <-p.closed:
+			return nil, io.ErrClosedPipe
+		default:
+		}
 		return p.network.Load(), nil
 	}
 }
