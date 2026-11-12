@@ -84,11 +84,13 @@ class FirstReplyTimeout(TimeoutError):
 
 
 def timeout_seconds(model: str) -> float:
+    # 兜底口径与 DEFAULT_SETTINGS 一致（0=关闭，2026-11-12 用户决策）：
+    # 缺键、非有限数或类型错误的存量损坏值一律回落关闭，不再复活旧的 15 秒默认。
     try:
-        value = float(app_state.get_effective_settings(model).get("first_reply_timeout_seconds", 15))
-        return max(0.0, min(app_config.MAX_TIMEOUT_SECONDS, value)) if math.isfinite(value) else 15.0
+        value = float(app_state.get_effective_settings(model).get("first_reply_timeout_seconds", 0))
+        return max(0.0, min(app_config.MAX_TIMEOUT_SECONDS, value)) if math.isfinite(value) else 0.0
     except (TypeError, ValueError, OverflowError):
-        return 15.0
+        return 0.0
 
 
 class FirstReplyGuard:

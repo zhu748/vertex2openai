@@ -204,12 +204,12 @@ class SettingsTests(unittest.TestCase):
 
     def test_partial_model_patch_preserves_explicit_antitruncation_preference(self):
         state = self.state()
-        state.set_model_override("gemini-4-argon", {"anti_truncation_mode": "off"})
-        saved = state.set_model_override("gemini-4-argon", {"thinking_g3_level": "low"})
+        state.set_model_override("gemini-3.5-flash-lite", {"anti_truncation_mode": "off"})
+        saved = state.set_model_override("gemini-3.5-flash-lite", {"thinking_g3_level": "low"})
         self.assertEqual(saved["anti_truncation_mode"], "off")
-        self.assertEqual(state.get_effective_settings("gemini-4-argon")["anti_truncation_mode"], "off")
-        state.clear_model_override("gemini-4-argon")
-        self.assertEqual(state.get_effective_settings("gemini-4-argon")["anti_truncation_mode"], "both")
+        self.assertEqual(state.get_effective_settings("gemini-3.5-flash-lite")["anti_truncation_mode"], "off")
+        state.clear_model_override("gemini-3.5-flash-lite")
+        self.assertEqual(state.get_effective_settings("gemini-3.5-flash-lite")["anti_truncation_mode"], "both")
 
     def test_keep_turn_can_be_saved_from_dashboard(self):
         main.app.dependency_overrides[console_auth.require_auth] = lambda: True

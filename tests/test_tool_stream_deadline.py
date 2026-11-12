@@ -173,7 +173,7 @@ class DeadlineTests(unittest.IsolatedAsyncioTestCase):
         return "".join([frame async for frame in result.body_iterator])
 
     async def test_slow_tool_generation_passes_without_extending_first_reply_deadline(self):
-        for model in ("gemini-3.5-flash-lite", "gemini-4-argon-antitruncation-stream"):
+        for model in ("gemini-3.5-flash-lite", "gemini-3.5-flash-lite-antitruncation-stream"):
             with self.subTest(model=model):
                 seen = []
                 async def generate(**kwargs):

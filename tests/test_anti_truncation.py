@@ -75,7 +75,7 @@ class PrepareTests(unittest.TestCase):
     def test_builtin_anti_truncation_models_publish_aliases_and_plain_ids_never_enable(self):
         state = self.isolated_state()
         models = json.loads((Path(__file__).resolve().parents[1] / "vertexModels.json").read_text())["models"]
-        enabled = {"gemini-4-argon", "gemini-4-carbon", "gemini-3.8-flash"}
+        enabled = {"gemini-3.5-flash-lite"}
         self.assertTrue(enabled <= set(models))
         for model in models:
             req = request(stream=True).model_copy(update={"model": model})
@@ -89,22 +89,22 @@ class PrepareTests(unittest.TestCase):
 
     def test_model_defaults_survive_legacy_maps_and_partial_saved_parameters(self):
         state = self.isolated_state({"anti_truncation_mode": "off", "model_overrides": {
-            "gemini-4-argon": {"thinking_g3_level": "low"},
+            "gemini-3.5-flash-lite": {"thinking_g3_level": "low"},
             MODEL: {"default_max_tokens": 500},
         }})
-        for model in ("gemini-4-argon", "gemini-3.8-flash"):
+        for model in ("gemini-3.5-flash-lite",):
             self.assertEqual(state.get_effective_settings(model)["anti_truncation_mode"], "both")
         self.assertEqual(state.get_effective_settings(MODEL)["anti_truncation_mode"], "off")
-        saved = state.set_model_override("gemini-4-argon", {"thinking_g3_level": "medium"})
+        saved = state.set_model_override("gemini-3.5-flash-lite", {"thinking_g3_level": "medium"})
         self.assertEqual(saved, {"thinking_g3_level": "medium", "anti_truncation_mode": "both"})
         copy = state.get_model_overrides()
-        copy["gemini-4-argon"]["anti_truncation_mode"] = "off"
-        self.assertEqual(state.get_effective_settings("gemini-4-argon")["anti_truncation_mode"], "both")
-        self.assertEqual(config.DEFAULT_SETTINGS["model_overrides"]["gemini-4-argon"]["anti_truncation_mode"], "both")
+        copy["gemini-3.5-flash-lite"]["anti_truncation_mode"] = "off"
+        self.assertEqual(state.get_effective_settings("gemini-3.5-flash-lite")["anti_truncation_mode"], "both")
+        self.assertEqual(config.DEFAULT_SETTINGS["model_overrides"]["gemini-3.5-flash-lite"]["anti_truncation_mode"], "both")
 
     def test_defaults_can_be_disabled_and_restored_without_affecting_other_models(self):
         state = self.isolated_state()
-        for model in ("gemini-4-argon", "gemini-3.8-flash"):
+        for model in ("gemini-3.5-flash-lite",):
             state.set_model_override(model, {"anti_truncation_mode": "off"})
             self.assertEqual(state.get_effective_settings(model)["anti_truncation_mode"], "off")
             state.clear_model_override(model)
@@ -112,14 +112,14 @@ class PrepareTests(unittest.TestCase):
         state.set_model_override(MODEL, {"anti_truncation_mode": "stream"})
         state.clear_model_override(MODEL)
         self.assertEqual(state.get_effective_settings(MODEL)["anti_truncation_mode"], "off")
-        req = request(stream=True, anti_truncation_mode="off").model_copy(update={"model": "gemini-4-argon"})
+        req = request(stream=True, anti_truncation_mode="off").model_copy(update={"model": "gemini-3.5-flash-lite"})
         self.assertIsNone(at.prepare_transport(req, req.model, state.get_effective_settings(req.model))[1])
 
     def test_model_reset_api_reports_builtin_fallback_for_dashboard(self):
         state = self.isolated_state()
-        state.set_model_override("gemini-4-argon", {"anti_truncation_mode": "off"})
+        state.set_model_override("gemini-3.5-flash-lite", {"anti_truncation_mode": "off"})
         with mock.patch.object(settings_api, "app_state", state):
-            result = asyncio.run(settings_api.delete_model_override("gemini-4-argon", True))
+            result = asyncio.run(settings_api.delete_model_override("gemini-3.5-flash-lite", True))
         payload = json.loads(result.body)
         self.assertEqual(payload["override"], {"anti_truncation_mode": "both"})
 
@@ -215,7 +215,7 @@ class CatalogHTTPTests(unittest.IsolatedAsyncioTestCase):
         self.state = AppState()
         # Reproduce an old persisted global value; it must not publish aliases.
         self.state._state = {"settings": {"anti_truncation_mode": "stream"}}
-        self.raw = ["gemini-3.8-flash", "gemini-4-argon", MODEL, "gemini-3.1-pro-preview",
+        self.raw = ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-4-argon", MODEL, "gemini-3.1-pro-preview",
                     "gemini-3.1-flash-image", "gemini-live", "text-embedding-005",
                     MODEL + "-antitruncation-stream"]
         for patch in (
@@ -240,7 +240,7 @@ class CatalogHTTPTests(unittest.IsolatedAsyncioTestCase):
         return {model["id"] for model in result.json()["data"]}
 
     async def test_default_catalog_and_model_setting_changes_take_effect_immediately(self):
-        defaults = {model + suffix for model in ("gemini-3.8-flash", "gemini-4-argon")
+        defaults = {model + suffix for model in ("gemini-3.5-flash-lite",)
                     for suffix in ("-antitruncation-stream", "-antitruncation-nonstream")}
         self.assertEqual({name for name in await self.ids() if "antitruncation" in name}, defaults)
         for selected, visible in (("both", {"stream", "nonstream"}), ("stream", {"stream"}),
@@ -260,7 +260,7 @@ class CatalogHTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({name for name in await self.ids() if "antitruncation" in name}, defaults)
 
     async def test_hiding_and_resetting_builtins_and_custom_aliases(self):
-        for model in ("gemini-3.8-flash", "gemini-4-argon", MODEL):
+        for model in ("gemini-3.5-flash-lite", MODEL):
             initial = "off" if model != MODEL else "both"
             result = await self.client.post("/api/model-overrides/" + model,
                                             json={"anti_truncation_mode": initial})

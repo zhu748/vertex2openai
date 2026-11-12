@@ -137,7 +137,7 @@ DEFAULT_SETTINGS = {
     # 遇 429/401/403/5xx 失败时，切换另一通道（Express ↔ Cookie）接力。
     # 默认关闭，保存另一类凭证不应改变单一模式的默认行为；可显式开启。
     "cross_channel_fallback": False,
-    "first_reply_timeout_seconds": 15.0,  # 每次上游尝试等待模型首回复；0=关闭，可按模型覆盖
+    "first_reply_timeout_seconds": 0.0,  # 每次上游尝试等待模型首回复；0=关闭（默认关闭，永不因首回复超时断开），可按模型覆盖
     # 开关（初始值取环境变量）
     "fake_streaming": FAKE_STREAMING_ENABLED,
     "fake_streaming_interval": FAKE_STREAMING_INTERVAL_SECONDS,
@@ -304,14 +304,13 @@ DEFAULT_SETTINGS = {
     "proxy_test_allow_private": False,
     # 按模型单独保存的参数覆盖：{ "模型ID": { 键: 值, ... } }
     # 仅覆盖“与模型相关”的参数（见 PER_MODEL_KEYS）；优先级 请求 > 模型专属 > 全局 > 内置。
-    # 下面三个是**内置模型默认**（非演示条目）：这几款模型官方流式实现会
-    # 截断长文本，抗截断默认开启；有专门测试断言该行为（test_anti_truncation）
-    # 与控制台“重置回内置默认”的回退语义（用户可按模型覆盖为 off，清空
-    # 保存值后回落到这里的内置默认，属预期设计）。
+    # 内置模型默认（非演示条目，用户决策 2026-11-12）：默认仅 gemini-3.5-flash-lite
+    # 开启抗截断（both），其余模型一律默认 off，可在控制台按模型逐个开启；
+    # 用户可按模型覆盖为 off，清空保存值后回落到这里的内置默认，属预期设计
+    # （控制台“重置回内置默认”的回退语义同样指向此处；test_anti_truncation
+    # 断言该默认集合）。
     "model_overrides": {
-        "gemini-4-argon": {"anti_truncation_mode": "both"},
-        "gemini-4-carbon": {"anti_truncation_mode": "both"},
-        "gemini-3.8-flash": {"anti_truncation_mode": "both"},
+        "gemini-3.5-flash-lite": {"anti_truncation_mode": "both"},
     },
 }
 

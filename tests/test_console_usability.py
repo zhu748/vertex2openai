@@ -18,6 +18,7 @@ class ConsoleUsabilityTests(unittest.TestCase):
         self.state = AppState()
         self.state.clear_model_override('audit-model')
         self.state.clear_model_override('gemini-4-argon')
+        self.state.clear_model_override('gemini-3.5-flash-lite')
         self.client = TestClient(main.app)
         self.addCleanup(self.client.close)
         self.client.cookies.set(console_auth.AUTH_COOKIE, console_auth.issue_session())
@@ -45,14 +46,14 @@ class ConsoleUsabilityTests(unittest.TestCase):
         self.assertNotIn('audit-model', self.state.get_model_overrides())
 
     def test_reset_builtin_field_restores_builtin_without_saving_a_copy(self):
-        path = '/api/model-overrides/gemini-4-argon'
+        path = '/api/model-overrides/gemini-3.5-flash-lite'
         self.client.post(path, json={'anti_truncation_mode': 'off', 'first_reply_timeout_seconds': 21})
         response = self.client.post(path, json={'_inherit': ['anti_truncation_mode']})
         self.assertEqual(response.json()['override']['anti_truncation_mode'], 'both')
-        self.assertEqual(self.state.get_saved_model_overrides()['gemini-4-argon'], {'first_reply_timeout_seconds': 21})
-        with mock.patch.object(settings_api, 'get_express_models', mock.AsyncMock(return_value=['gemini-4-argon'])):
+        self.assertEqual(self.state.get_saved_model_overrides()['gemini-3.5-flash-lite'], {'first_reply_timeout_seconds': 21})
+        with mock.patch.object(settings_api, 'get_express_models', mock.AsyncMock(return_value=['gemini-3.5-flash-lite'])):
             result = self.client.get('/api/capabilities').json()
-        self.assertEqual(result['saved_overrides']['gemini-4-argon'], {'first_reply_timeout_seconds': 21})
+        self.assertEqual(result['saved_overrides']['gemini-3.5-flash-lite'], {'first_reply_timeout_seconds': 21})
         self.assertEqual(result['builtin_overrides'], config.DEFAULT_SETTINGS['model_overrides'])
 
     def test_invalid_inheritance_is_atomic(self):

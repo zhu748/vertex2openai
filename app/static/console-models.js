@@ -343,7 +343,7 @@ async function saveModelOverride() {
   const m = $('model-sel').value;
   if (!m) return;
   let patch = {
-    first_reply_timeout_seconds: numOr('first_reply_timeout_seconds', 15),
+    first_reply_timeout_seconds: numOr('first_reply_timeout_seconds', 0),
     anti_truncation_mode: $('anti_truncation_mode').value,
     native_thinking_mode: $('native_thinking_mode').value,
     thinking_g3_level: $('thinking_g3_level').value,

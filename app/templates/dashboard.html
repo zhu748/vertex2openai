@@ -801,10 +801,10 @@
          <input class="inp" id="first_reply_timeout_seconds" max="7200" min="0" type="number" step="any"/>
          <details class="field-help">
           <summary>首回复如何计时？假流式和非流式为什么不受影响？</summary>
-          <p class="text-xs text-neutral-500 mt-2 leading-relaxed">默认 15 秒，每次上游尝试独立计时。思考、正文、工具调用、图片均算首回复；心跳、纯用量和签名不算。超时沿用下方重试预算。本窗口仅约束真流式请求；假流式与非流式为整取路径，不参与首回复计时（无首回复超时），上游挂起由传输层读超时（Express 600 秒 / Cookie 180 秒）与整轮期限兜底，无需为它们调大或关闭本值。</p>
+          <p class="text-xs text-neutral-500 mt-2 leading-relaxed">默认 0（关闭，不再因首回复超时断开）；设置秒数后每次上游尝试独立计时。思考、正文、工具调用、图片均算首回复；心跳、纯用量和签名不算。超时沿用下方重试预算。本窗口仅约束真流式请求；假流式与非流式为整取路径，不参与首回复计时（无首回复超时），上游挂起由传输层读超时（Express 600 秒 / Cookie 180 秒）与整轮期限兜底，无需为它们调大或关闭本值。</p>
          </details>
         </div>
-        <p class="text-xs text-neutral-500 mt-2" id="anti-truncation-note">默认仅 4 Argon / 3.8 Flash 提供抗截断后缀；普通无后缀名称始终不启用。</p>
+        <p class="text-xs text-neutral-500 mt-2" id="anti-truncation-note">默认仅 3.5 Flash-Lite 提供抗截断后缀；普通无后缀名称始终不启用。</p>
         <div class="helpbox" id="h_at">
          将正文放入临时函数的
          <code>

@@ -2,6 +2,14 @@
 
 基于原版 `vertex2openai-main`（2026-09-01），持续完善兼容性、可靠性和代码组织。
 
+## 2026-11-12（第二十轮）：收录 gemini-4-hydrogen；抗截断默认收敛到 3.5 Flash-Lite；首回复超时默认关闭
+
+- 新模型：`vertexModels.json` 收录 `gemini-4-hydrogen`（用户确认 2026-11-12 已发布）。能力档案经 `gemini-(\d+)` 家族识别自动归入 4 系规则（思考档 low/medium/high、默认 medium、剥离 temperature/top_p/top_k），目录自动展开 `-search` 变体；按用户决策默认不开抗截断，如上游实际 API ID 与此不同只需改该文件一行。
+- 抗截断默认集合收敛（用户决策 2026-11-12）：内置 `model_overrides` 仅保留 `gemini-3.5-flash-lite: both`，移除 `gemini-4-argon` / `gemini-4-carbon` / `gemini-3.8-flash` 三个内置条目——目录默认只发布 3.5 Flash-Lite 的 `-antitruncation-stream` / `-antitruncation-nonstream` 两个后缀，其余模型（含 4 Hydrogen）默认仅普通名称与搜索别名，可在控制台逐个开启；裸模型名永不启用抗截断、未开启的后缀返回 400 的语义不变。
+- 首回复超时默认 15.0 → 0.0（关闭）：`DEFAULT_SETTINGS.first_reply_timeout_seconds` 归零，`first_reply.timeout_seconds()` 三处兜底（缺键 / 非有限数 / 类型错误）与控制台模型参数表单空值回退同步从 15 改 0——真流式请求不再因首回复超时被断开，需要时仍可在「模型参数」设置全局或模型专属秒数（0–7200）；假流式/非流式/整块生图整取路径不参与首回复计时的既有语义不变，启用后超时仍沿用现有重试预算。
+- 文案与文档同步：README（能力清单、抗截断模型选项、重试与超时章节）、docs/architecture.md、dashboard「模型参数」帮助文本与抗截断默认提示全部改为新默认口径。
+- 测试同步：test_anti_truncation 内置默认集合断言收敛到 3.5 Flash-Lite（含目录 HTTP 展开与回退语义），test_console_usability / test_streaming_optimizations / test_tool_stream_deadline 的沿用模型从 4 Argon 换为 3.5 Flash-Lite。
+
 ## 2026-11-11（第十九轮）：首推 GitHub 后 CI 红构建修复（pytest 缺失 + Go 1.27.4）
 
 - 背景：第十八轮收尾推送 GitHub 后 "Build & Publish Docker Image" 首跑双红。test 矩阵挂在 check_project「单元测试」组：`No module named pytest`——P2-8 把单测切到 `python -m pytest` 单进程模式时 pytest 未进 requirements-dev.txt，本地沙箱常驻 pytest 掩盖了缺口，CI 干净环境当场暴露（pip-audit 与其余 8 组检查均通过，publish 因 test / proxy-bridge 未过而跳过，amd64 / arm64 双架构镜像构建本身成功）。proxy-bridge 挂在 govulncheck：GO-2026-6859（net/http MaxBytesReader 头部竞态导致 HTTP/1 server crash），go1.27.3 受影响、1.27.4 修复，SSTP 侧 `init → http.HandleFunc` 等三条符号路径实测可达。同批 Dependabot 自动开的 5 个 PR（actions 升级 ×4 + pion）基于修复前 main，同因红，待本轮合入后重定基。

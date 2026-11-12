@@ -250,7 +250,7 @@ async def _passthrough_request_impl(fastapi_request: Request, model: str, action
     #（与 cookie_proxy/api_helpers 的 fr_seconds 预读模式对齐，2026-10 优化）。
     # 注意经模块属性调用：测试用 mock.patch.object(first_reply, "timeout_seconds")
     # 替换模块属性，直接 from-import 的函数绑定会绕过 patch，把窗口变成
-    # 真实默认 15 秒（本路由的外层限时较短，回归会直接暴露）。
+    # 真实默认 0（关闭；回归会直接暴露）。
     fr_seconds = first_reply_module.timeout_seconds(model)
     record = None
     previous_key = None
