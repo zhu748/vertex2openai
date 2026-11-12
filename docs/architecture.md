@@ -14,6 +14,7 @@ Gemini 原生请求通过 Express REST 透传，或经 Cookie 原生桥接交付
 | `app/routes/claude_api.py`、`app/claude_protocol.py` | Anthropic 路由、消息/事件转换与 count_tokens 请求准备 |
 | `app/routes/gemini_native.py` | Gemini 原生鉴权与路由装配；透传编排在 `upstreams/native_passthrough.py`，目录/变体/URL 在 `upstreams/native_catalog.py`（QUA-P2-9 拆分） |
 | `app/routes/models_api.py` | OpenAI 模型清单 |
+| `app/model_catalog.py` | 三种协议共用的模型目录规则：搜索、生图分辨率与抗截断后缀；不读取运行状态，不依赖传输实现 |
 | `app/routes/console.py` | 页面、登录退出、统计和日志流 |
 | `app/routes/settings_api.py` | 全局设置、模型设置和能力摘要 |
 | `app/routes/credentials_api.py` | Express Key、项目探测和 Cookie 凭证 |
@@ -57,6 +58,7 @@ Gemini 原生请求通过 Express REST 透传，或经 Cookie 原生桥接交付
 | `app/first_reply.py` | 每次尝试的首回复期限、有效输出识别、可重试超时及原生流预读 |
 | `app/request_connection.py` | 请求体结束后独占 ASGI receive，及时广播实际断连 |
 | `app/request_tracking.py` | 请求生命周期、分离连接/生成计数、首字时序、输出诊断与有界历史 |
+| `app/log_stream.py`、`app/logger.py` | 分别负责有界跨线程日志投递，以及日志脱敏、stdout 写入和统计；历史 `logger.SSELogger` 导入保持可用 |
 | `app/static/request-monitor.js` | 请求监控列表、筛选、分页、详情和关联日志交互 |
 | `app/usage.py` | SDK / REST 用量映射、用量开关与 OpenAI 用量尾块 |
 | `app/keepalive.py` | 出站保活：定期 GET 配置的 URL，配置校验、任务启停与热重启 |
@@ -90,8 +92,11 @@ re-export**，计划在 2026-12 的清理轮移除——届时测试 patch 落�
 `upstreams.express_pipeline` 等实际归属模块（新增测试禁止再 patch 兼容层私有名，
 存量 26 处随触及逐步迁移）。公共名（`SDKGeneration` / `execute_gemini_call` 等）
 是稳定 API，不在移除范围。
-`scripts/check_architecture.py` 静态检查三处模块的反向依赖（含函数内导入），
+`scripts/check_architecture.py` 静态检查协议响应、Cookie 传输、模型目录与日志投递模块的反向依赖（含函数内导入），
 并检查应用模块加载时的导入环；动态导入和运行时调用关系仍需人工复查。
+目录规则从 `model_catalog.py` 引入；`anti_truncation.py` 负责可选传输与解码，
+保留旧目录函数的导出供现有调用者迁移。日志订阅从 `log_stream.py` 引入，
+该模块不依赖全局 print 钩子、请求跟踪或路由。
 
 ## 控制台脚本职责
 
@@ -190,8 +195,20 @@ Cookie 执行器只编排认证、重试、协议降级与交付，不再承担�
 请求诊断按 SSE 事件限制检查大小，大网络块中的多个小事件分别处理。
 超限事件只保留三个字节用于识别跨块分隔符，后面的正常事件仍继续检查；
 缓冲区按至多 64 KiB 的输入片段处理，每片段只压实一次。
+关闭 `request_diagnostics` 时，非流式观察器只累计字节数，不保留 JSON 正文副本。
 stdout 后台队列同时限制条目数和单条文本长度（16 Ki 字符），超长条目
 附原始长度提示；代理日志尾部仅从文件末尾有界读取。
+控制台日志的每个订阅者同时有有界的线程交接缓冲和 asyncio 队列，默认各 500 条，
+最多保留一个待执行投递回调；满载时保留最新消息，序号单调递增。
+
+文本准备与媒体处理使用独立的 8 线程执行器，各自最多接受 32 个运行/排队任务，
+两个执行器合计上界为 64；入口的请求数、正文总字节和结构复杂度预算仍另外生效。
+取消等待者不立即归还执行器名额，实际工作线程退出后才释放，避免取消绕过准入。
+
+续传整包 JSON 使用 `json_encoding.json_size_offloop()` 计算精确 UTF-8 字节数，
+与既有 `json.dumps(ensure_ascii=False)` 的空白、转义和键序列化语义一致。
+计数只保留有界编码片段，估算超过 1 MiB 后移到线程执行，不创建整包 JSON 副本。
+完整 JSON 响应仍遵循现有 `.body` 契约；大响应交付还需要最终响应体缓冲。
 
 curl 流式上下文必须由 `_CurlClientShim` 关闭。锁定版本的原始
 `Response.aclose()` 只等待下载任务，提前退出时不会主动终止下载。
@@ -251,7 +268,9 @@ Pydantic 校验错误保留最多 50 个字段位置与说明，不返回原始 
 
 安装 `requirements-dev.txt` 后，运行 `python scripts/check_project.py`。
 检查会执行语法、静态分析、工作流校验、模块边界、全部 `tests/test_*.py` 和 SDK 档案探针。
-每个测试文件单独启动 Python 进程，隔离模块级状态和事件循环资源。
+测试在单个 pytest 进程中执行；根目录 `conftest.py` 在导入前设置规范环境，
+并在测试模块之间复位共享状态。测试分组和定向命令见 `tests/README.md`。
+日志积压的本地微基准可运行 `python scripts/benchmark_log_delivery.py`。
 
 单组测试可以直接运行，例如 `python tests/test_console_routes.py`。
 `verify_singbox_e2e.py` 与 `verify_proxy_bridge_sstp.py` 属于手动网络诊断，不属于离线回归。

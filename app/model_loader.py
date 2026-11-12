@@ -17,9 +17,9 @@ _next_refresh_allowed = 0.0
 _refresh_task: Optional[asyncio.Task] = None
 MAX_MODELS_CONFIG_BYTES = 1024 * 1024
 MODELS_FETCH_TIMEOUT_SECONDS = 20.0
-DEFAULT_MODELS_CONFIG_URL = "https://raw.githubusercontent.com/bad-woman/vertex2openai/main/vertexModels.json"
+DEFAULT_MODELS_CONFIG_URL = "https://raw.githubusercontent.com/zhu748/vertex2openai/main/vertexModels.json"
 FALLBACK_MODELS_CONFIG_URLS = [
-    "https://cdn.jsdelivr.net/gh/bad-woman/vertex2openai@main/vertexModels.json",
+    "https://cdn.jsdelivr.net/gh/zhu748/vertex2openai@main/vertexModels.json",
 ]
 
 _LOCAL_MODEL_FILE_CANDIDATES = [

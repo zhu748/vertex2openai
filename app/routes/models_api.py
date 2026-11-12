@@ -5,7 +5,8 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from auth import extract_candidate_key, validate_api_key
 from model_loader import get_express_models
 from runtime_state import app_state
-from anti_truncation import catalog_variant_ids, split_model_alias
+from model_catalog import catalog_variant_ids
+from model_capabilities import split_model_alias
 from routes import claude_api
 
 router = APIRouter()
@@ -101,7 +102,7 @@ async def openai_model_entries(express_key_manager_instance) -> List[Dict[str, A
     current_time = int(time.time())
 
     def add_model(base_id: str):
-        # 展开口径单一事实源：anti_truncation.catalog_variant_ids（OpenAI /
+        # 展开口径单一事实源：model_catalog.catalog_variant_ids（OpenAI /
         # Anthropic / Gemini 原生三套目录共用，变体集合保持一致）。
         plain_id, _ = split_model_alias(base_id)
         effective = app_state.get_effective_settings(plain_id, base=settings_base)

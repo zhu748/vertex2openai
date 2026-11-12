@@ -18,6 +18,15 @@ def check_sources(sources, packages=frozenset()):
 
 
 class ArchitectureTests(unittest.TestCase):
+    def test_catalog_and_log_delivery_cannot_depend_on_runtime_adapters(self):
+        for module, target in (("model_catalog", "anti_truncation"),
+                               ("model_catalog", "runtime_state"),
+                               ("log_stream", "logger"),
+                               ("log_stream", "routes.console")):
+            with self.subTest(module=module, target=target):
+                errors = check_sources({module: f"def call():\n    import {target}"})
+                self.assertTrue(any(f"imports upper-layer {target}" in error for error in errors))
+
     def test_adapters_can_use_leaf_modules(self):
         self.assertEqual(
             check_sources(

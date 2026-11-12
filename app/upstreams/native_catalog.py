@@ -12,6 +12,8 @@ from typing import Optional
 import config as app_config
 from express_endpoint import resolve_express_model_path
 from runtime_state import app_state
+from model_catalog import native_catalog_ids as _native_catalog_ids  # noqa: F401
+from model_catalog import search_variant_available
 
 EXPRESS_BASE = app_config.VERTEX_BASE_URL or "https://aiplatform.googleapis.com"
 
@@ -38,34 +40,6 @@ def _native_model_entry(model_id: str) -> dict:
         "outputTokenLimit": 65536,
         "supportedGenerationMethods": ["generateContent", "streamGenerateContent", "countTokens"],
     }
-
-
-def _native_catalog_ids(raw_models: list) -> list[str]:
-    """原生目录 ID 列表：裸模型 + -search 变体 + 生图分辨率变体
-    （与 OpenAI / Anthropic 目录同源，规则来自 anti_truncation.
-    search_variant_available 与 model_capabilities.image_size_variant_ids）。
-
-    抗截断后缀不列入：其解码/重建语义只在 OpenAI 兼容端点的统一管线里
-    实现，原生透传无法承载（保持「透明目录」的老约束，测试也断言这一点）。
-    分辨率变体可列：透传侧 _strip_image_size_variant 做剥后缀 + 注入
-    imageConfig.imageSize 的最小改写（与 -search 同模式）。
-    """
-    from anti_truncation import search_variant_available
-    from model_capabilities import image_size_variant_ids
-
-    ids: list[str] = []
-    seen: set[str] = set()
-    for model_id in sorted(raw_models):
-        extra: list[str] = []
-        if search_variant_available(model_id):
-            extra.append(f"{model_id}-search")
-        # 生图模型无 -search 变体，两类后缀互斥，不会叠出 -4k-search。
-        extra.extend(f"{model_id}{suffix}" for suffix in image_size_variant_ids(model_id))
-        for candidate in (model_id, *extra):
-            if candidate not in seen:
-                seen.add(candidate)
-                ids.append(candidate)
-    return ids
 
 
 def _split_model_action(model_action: str) -> tuple[str, str]:
@@ -98,8 +72,6 @@ def _strip_search_variant(model: str, action: str, parsed: dict) -> tuple[str, O
     - countTokens / embedContent：只剥后缀（body 与模型无关，无需重组）。
     body 为 None 表示未做任何改写，调用方继续用原始字节。
     """
-    from anti_truncation import search_variant_available
-
     lowered = (model or "").lower()
     if not lowered.endswith("-search") or len(lowered) <= len("-search"):
         return model, None

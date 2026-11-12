@@ -14,6 +14,8 @@ ADAPTERS = (
     "upstreams.express_sdk",
 )
 LEAF_BOUNDARIES = {
+    "log_stream": ("logger", "runtime_state", "request_tracking", *ADAPTERS),
+    "model_catalog": ("anti_truncation", "runtime_state", "model_loader", *ADAPTERS),
     "proxies.protocols": ("proxy_resolver", "proxy_failover", *ADAPTERS),
     "upstreams.cookie_transport": ADAPTERS,
     "upstreams.express_response": ADAPTERS,

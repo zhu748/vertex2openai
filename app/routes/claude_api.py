@@ -633,12 +633,13 @@ def is_anthropic_client(fastapi_request: Request) -> bool:
 async def anthropic_models_data() -> dict:
     """Anthropic 模型目录数据体（列表 /v1/models 与单模型检索共用）。
 
-    变体目录与 OpenAI /v1/models 同源展开（anti_truncation.catalog_variant_ids
+    变体目录与 OpenAI /v1/models 同源展开（model_catalog.catalog_variant_ids
     单一事实源）：-search 变体与按模型设置开启的抗截断后缀一并列出——
     请求侧 resolve_claude_model 对非 claude-* 名字原样透传，Claude 客户端
     可直接使用这些变体，目录应与实际能力一致。
     """
-    from anti_truncation import catalog_variant_ids, split_model_alias
+    from model_catalog import catalog_variant_ids
+    from model_capabilities import split_model_alias
 
     available = await _available_models()
     settings_base = app_state.get_settings()

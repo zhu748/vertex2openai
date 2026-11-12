@@ -29,6 +29,19 @@ def frame(text="answer", reasoning=None, finish=None):
 
 
 class DiagnosticTests(unittest.TestCase):
+    def test_disabled_nonstream_inspection_counts_bytes_without_retaining_body(self):
+        for sent in (False, True):
+            with self.subTest(sent=sent):
+                trace = tracking.RequestTrace("/v1/chat/completions")
+                observer = tracking.PayloadObserver(trace, sse=False, sent=sent, inspect=False)
+                chunk = b"x" * (1024 * 1024)
+                for _ in range(8):
+                    observer.feed(chunk)
+                    self.assertFalse(observer.buffer)
+                observer.feed(b"", final=True)
+                self.assertEqual(trace.data["sent_bytes" if sent else "generated_bytes"], 8 * len(chunk))
+                self.assertNotIn("first_reply", trace.timings)
+
     def test_split_utf8_and_heartbeats_do_not_produce_false_first_text(self):
         trace = tracking.RequestTrace("/v1/chat/completions")
         observer = tracking.PayloadObserver(trace)

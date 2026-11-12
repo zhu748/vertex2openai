@@ -107,36 +107,35 @@ class LogOrderingTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(logger._subscribers)
 
     def test_threaded_publishers_schedule_events_in_sequence_order(self):
-        first_entered, release_first, second_submitted = (threading.Event() for _ in range(3))
+        first_entered, release_first = (threading.Event() for _ in range(2))
         scheduled = []
 
         class Loop:
             def is_closed(self):
                 return False
 
-            def call_soon_threadsafe(self, callback, queue, item):
-                if item[0] == 1:
-                    first_entered.set()
-                    release_first.wait(1)
-                scheduled.append(item[0])
-                if item[0] == 2:
-                    second_submitted.set()
+            def call_soon_threadsafe(self, callback, *args):
+                first_entered.set()
+                release_first.wait(1)
+                scheduled.append((callback, args))
 
         logger = SSELogger()
-        logger.subscribe(Loop())
+        queue = logger.subscribe(Loop())
         first = threading.Thread(target=logger.push, args=("first",))
         second = threading.Thread(target=logger.push, args=("second",))
         first.start()
         try:
             self.assertTrue(first_entered.wait(1))
             second.start()
-            second_submitted.wait(0.05)
         finally:
             release_first.set()
             first.join(1)
             second.join(1)
         self.assertFalse(first.is_alive() or second.is_alive())
-        self.assertEqual(scheduled, [1, 2])
+        self.assertEqual(len(scheduled), 1)
+        callback, args = scheduled.pop()
+        callback(*args)
+        self.assertEqual([queue.get_nowait()[0], queue.get_nowait()[0]], [1, 2])
 
 
 class RequestBoundaryTests(unittest.IsolatedAsyncioTestCase):

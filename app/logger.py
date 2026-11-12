@@ -4,12 +4,11 @@ import io
 import queue
 import sys
 import time
-import asyncio
 import re
 import threading
-from collections import deque
-from typing import List, Optional
+from typing import Optional
 from request_tracking import current_trace, redact
+from log_stream import SSELogger
 
 original_print = builtins.print
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
@@ -67,93 +66,10 @@ class ProxyStats:
 stats = ProxyStats()
 
 
-class SSELogger:
-    """把运行日志推给控制台的 SSE 订阅者。
-
-    P1-5 修复的三个隐患：
-      - `asyncio.Queue.put_nowait` 不是线程安全的，而 push() 可能从任意线程被调用
-        （图片压缩线程、to_thread 里的消息转换等）。改为 loop.call_soon_threadsafe。
-      - 订阅者列表与事件序号用同一把锁，增删订阅和多线程发布保持有序。
-      - 队列原本无界，慢客户端会把内存撑爆。改为有界 + 满则丢最旧。
-    """
-
-    def __init__(self, max_history: int = 100, queue_size: int = 500):
-        self.max_history = max_history
-        self.queue_size = queue_size
-        # PRF-P3-3：deque(maxlen) 自动淘汰——旧实现在锁内 list.pop(0)，
-        # 每条日志一次 O(n) 整体前移（异常风暴时高频路径）。
-        self.history: deque = deque(maxlen=max_history)  # [(seq, formatted_msg)]，seq 全局递增
-        self._seq = 0
-        self._subscribers: List[tuple] = []       # [(queue, loop)]
-        self._lock = threading.Lock()
-
-    # ---- 订阅管理 ----
-
-    def subscribe(self, loop: Optional[asyncio.AbstractEventLoop] = None) -> asyncio.Queue:
-        q: asyncio.Queue = asyncio.Queue(maxsize=self.queue_size)
-        loop = loop or asyncio.get_running_loop()
-        with self._lock:
-            self._subscribers.append((q, loop))
-        return q
-
-    def unsubscribe(self, q: asyncio.Queue) -> None:
-        with self._lock:
-            self._subscribers = [(sq, sl) for (sq, sl) in self._subscribers if sq is not q]
-
-    def snapshot_history(self) -> List[tuple]:
-        """返回 [(seq, msg)]；seq 供 SSE id 字段与 Last-Event-ID 增量重放使用。"""
-        with self._lock:
-            return list(self.history)
-
-    # ---- 推送 ----
-
-    @staticmethod
-    def _offer(q: asyncio.Queue, msg: tuple) -> None:
-        """在事件循环线程里执行：队列满时丢最旧的一条，保证新日志能进来。"""
-        try:
-            q.put_nowait(msg)
-        except asyncio.QueueFull:
-            try:
-                q.get_nowait()
-                q.put_nowait(msg)
-            except Exception:
-                pass
-
-    def push(self, plain_text: str) -> None:
-        # 超长打印截断后再推流：控制台日志面板不需要完整巨型文本，
-        # 保留原长度提示便于在 Docker stdout 侧定位完整内容。
-        if len(plain_text) > _MAX_PUSH_CHARS:
-            plain_text = plain_text[:_MAX_PUSH_CHARS] + f"…（已截断，原长度 {len(plain_text)} 字符）"
-        timestamp = time.strftime("%H:%M:%S")
-        formatted_msg = f"[{timestamp}] {plain_text}"
-
-        with self._lock:
-            # 每条日志带全局递增 seq：SSE 下发 id 字段后，浏览器断线重连会
-            # 自动回传 Last-Event-ID，服务端据此只重放缺失部分（旧实现重连
-            # 后全量重放 100 条历史，前端无条件 append 导致日志成片重复）。
-            self._seq += 1
-            seq = self._seq
-            self.history.append((seq, formatted_msg))  # deque(maxlen) 自动淘汰最旧
-            # Schedule under the sequence lock: concurrent worker threads must
-            # not enqueue seq N+1 before N, or reconnect deduplication loses N.
-            for q, loop in self._subscribers:
-                try:
-                    if not loop.is_closed():
-                        loop.call_soon_threadsafe(self._offer, q, (seq, formatted_msg))
-                except RuntimeError:
-                    pass  # Event loop stopped while publishing.
-
-
 rt_logger = SSELogger()
 
 # 防止 print 钩子内部再触发 print 导致递归
 _in_hook = threading.local()
-
-# 推入 SSE 日志流的单条消息长度上限：trace.log 有 2000 字符截断，但
-# rt_logger.push 没有——一条带完整响应体/traceback 的巨型打印会同时驻留
-# history（100 条）与每个订阅者队列（500 槽），内存按订阅者数放大。
-_MAX_PUSH_CHARS = 8 * 1024
-
 
 # ---------------- stdout 后台写线程 ----------------
 # 为什么：Docker/journald 场景下 stdout 是管道（64KB 缓冲）；当读端

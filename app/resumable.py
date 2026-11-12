@@ -30,6 +30,7 @@ from runtime_state import app_state
 from streaming import with_heartbeats, HEARTBEAT, HEARTBEAT_FRAME
 from streaming import DONE_FRAME, MAX_ERROR_MESSAGE_CHARS
 from request_tracking import current_trace
+from json_encoding import json_size_offloop
 from upstream_errors import google_status_detail
 
 # 终止帧：与 OpenAI 流一致，客户端见到它即可判定「本轮完整结束」
@@ -342,10 +343,12 @@ class ResumableBuffer:
         async with self._cond:
             if self.done:
                 return
+            # Finish accounting before publishing terminal state: cancellation
+            # during a large count must still allow fail() to settle the buffer.
+            size = await json_size_offloop(payload) if payload is not None else 0
             self.status = status
             self.error = error
             if payload is not None:
-                size = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
                 fits = self.bytes_stored + size <= self.max_buffer_bytes
                 if fits and self._account_bytes:
                     fits = self._account_bytes(size, False)

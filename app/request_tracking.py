@@ -287,6 +287,10 @@ class PayloadObserver:
         raw = chunk.encode("utf-8") if isinstance(chunk, str) else bytes(chunk)
         with self.trace._lock:
             self.trace.data["sent_bytes" if self.sent else "generated_bytes"] += len(raw)
+        if not self.sse and not self._inspect:
+            # Byte accounting needs no copy of a non-streaming response when
+            # payload inspection is disabled (up to 2 MiB per observer).
+            return
         if not self.sse:
             if self.skipping or len(self.buffer) + len(raw) > MAX_INSPECTION_BYTES:
                 self._skipped(len(raw) + len(self.buffer))

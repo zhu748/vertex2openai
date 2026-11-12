@@ -286,7 +286,7 @@ class CancellationTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 finished.set()
 
-        with patch.object(media_tasks, "_slots", threading.BoundedSemaphore(1)):
+        with patch.object(media_tasks, "_media_slots", threading.BoundedSemaphore(1)):
             task = asyncio.create_task(media_tasks.run_media_task(work))
             try:
                 self.assertTrue(await asyncio.to_thread(started.wait, 1))

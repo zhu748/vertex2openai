@@ -23,7 +23,7 @@ def estimate_json_chars(value) -> int:
     if isinstance(value, str):
         return len(value) + 2
     if isinstance(value, dict):
-        return sum(len(k) + 4 + estimate_json_chars(v) for k, v in value.items()) + 2
+        return sum(estimate_json_chars(k) + 2 + estimate_json_chars(v) for k, v in value.items()) + 2
     if isinstance(value, (list, tuple)):
         return sum(estimate_json_chars(v) + 1 for v in value) + 2
     return 8
@@ -99,6 +99,18 @@ def iter_json_bytes(value, *, compact=False, allow_nan=True):
             yield json.dumps(node, ensure_ascii=False, allow_nan=allow_nan).encode("utf-8")
 
     yield from encode(value)
+
+
+def encoded_json_size(value) -> int:
+    """Exact json.dumps(ensure_ascii=False) byte size without a whole-body copy."""
+    return sum(len(chunk) for chunk in iter_json_bytes(value))
+
+
+async def json_size_offloop(value) -> int:
+    """Keep large reply accounting out of the event loop and bound temporaries."""
+    if estimate_json_chars(value) <= LARGE_RESPONSE_CHARS:
+        return encoded_json_size(value)
+    return await asyncio.to_thread(encoded_json_size, value)
 
 
 class LargeJSONResponse(JSONResponse):

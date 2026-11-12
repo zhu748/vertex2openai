@@ -20,7 +20,8 @@ from request_ingress import current_ingress
 #               远程图片抓取与压缩，本质上就是媒体工作）。
 _prep_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="prep")
 _media_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="media")
-_slots = threading.BoundedSemaphore(32)
+_prep_slots = threading.BoundedSemaphore(32)
+_media_slots = threading.BoundedSemaphore(32)
 _budget = contextvars.ContextVar("media_budget", default=None)
 PREPARATION_TIMEOUT_SECONDS = 30.0
 
@@ -43,9 +44,11 @@ async def run_media_task(function, *args, heavy=True, **kwargs):
     # Hold admission until the real thread finishes, even after its awaiting
     # request is cancelled. ThreadPoolExecutor's otherwise unbounded queue can
     # therefore never accumulate abandoned requests without limit.
-    if not _slots.acquire(blocking=False):
+    # Admission follows the executor too: a full media queue must not reject
+    # text work while the independent preparation executor is available.
+    slots = _media_slots if heavy else _prep_slots
+    if not slots.acquire(blocking=False):
         raise GenerationCapacityError("图片/提示词处理并发已满，请稍后重试。")
-    slots = _slots
     cancelled = threading.Event()
     token = _budget.set((time.monotonic() + PREPARATION_TIMEOUT_SECONDS, cancelled))
     context = contextvars.copy_context()

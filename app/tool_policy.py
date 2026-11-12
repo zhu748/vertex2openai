@@ -1,6 +1,6 @@
 """Shared search-tool recognition and explicit model-alias selection."""
 
-from anti_truncation import split_model_alias
+from model_capabilities import split_model_alias
 
 
 BUILTIN_SEARCH_NAMES = frozenset({

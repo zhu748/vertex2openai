@@ -415,7 +415,7 @@ TCP+TLS 握手（每次约省 100~300ms 与相应 CPU）；429 重试场景收�
 | `IMAGE_OUTPUT_MODE` | 否 | `url` | OpenAI 聊天接口的图片默认保存为文件、返回短链接；设为 `inline` 恢复 Base64 data URL（大图可能使客户端内存不足）。Express / Cookie、流式 / 非流式均生效。Gemini 原生接口不变。 |
 | `IMAGE_PUBLIC_BASE_URL` | 否 | 自动 | 对外服务根地址，例如 `https://example.onrender.com`，不要加 `/v1`。未设置时优先用 Render 的 `RENDER_EXTERNAL_URL`，否则从请求地址推导；反代子路径部署应显式指定含前缀的地址。 |
 | `FAKE_STREAMING_INTERVAL` | 否 | `1.0` | 假流式等待期间 keep-alive 间隔秒数。可在控制台热改。 |
-| `MODELS_CONFIG_URL` | 否 | 仓库 `vertexModels.json` | 远程模型列表地址；改远程文件即可刷新，无需重部署。 |
+| `MODELS_CONFIG_URL` | 否 | `zhu748/vertex2openai` 的 `main` 分支 `vertexModels.json` | 远程模型列表地址；改远程文件即可刷新，无需重部署。已有环境变量会覆盖内置默认地址。 |
 | `SAFETY_SCORE` | 否 | `false` | 是否把 Gemini safety ratings 附加到输出。可在控制台热改。 |
 | `PROXY_URL` | 否 | 空 | 全局出站代理（仅作初始值，控制台保存后以控制台为准）。支持 HTTP / SOCKS 原生代理、sing-box 分享链接，以及 `turn://` / `turns://` / `sstp://` 节点；镜像内置两种转换组件。保存时自动校验格式。 |
 | `PROXY_URLS` | 否 | 空 | 有序全局代理列表，JSON 字符串数组或每行一条；优先于 `PROXY_URL`。每次请求先尝试第一条，失败再尝试后续条目。 |
@@ -788,11 +788,14 @@ Express 文本通道保留普通 `type: "function"` 声明的自定义函数语�
 ## 模型列表配置
 
 > 模型列表启动时先读取镜像内的本地 `vertexModels.json`，后台再从
-> `https://raw.githubusercontent.com/bad-woman/vertex2openai/main/vertexModels.json` 更新。
+> `https://raw.githubusercontent.com/zhu748/vertex2openai/main/vertexModels.json` 更新，备用 CDN 也指向同一仓库。
 > 网络失败或远程空列表不会清掉当前缓存，也不会阻塞启动和模型列表请求。
 > 后台更新成功后以远程列表为准；要持续提供自己的模型清单，可以二选一：
-> 1. 把更新后的 `vertexModels.json` 推到 GitHub `main`（推荐，改远程即可全部部署生效、无需重部署）；
+> 1. 把更新后的 `vertexModels.json` 推到 `zhu748/vertex2openai` 的 `main` 分支（推荐，后台刷新后部署即可生效，成功刷新间隔为 1 小时）；
 > 2. 或设环境变量 `MODELS_CONFIG_URL` 指向你自己维护的地址。
+>
+> 如果新增模型在部署后消失，请检查 `MODELS_CONFIG_URL` 是否仍指向其它仓库的旧清单。
+> 现有部署可将其设为上面的地址并重启服务；自定义环境变量优先于镜像内置默认地址。
 
 默认模型列表在远程 `MODELS_CONFIG_URL` 或本地 `vertexModels.json`：
 

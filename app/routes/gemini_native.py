@@ -191,7 +191,7 @@ def _passthrough_endpoint():
         # 剥后缀 + 注入 google_search 工具。监控按客户端原始请求名记录。
         requested_model = model
         if model.lower().endswith("-search"):
-            from anti_truncation import search_variant_available
+            from model_catalog import search_variant_available
             base_probe = model[: -len("-search")]
             if not search_variant_available(base_probe):
                 return _native_error(
