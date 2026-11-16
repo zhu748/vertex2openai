@@ -34,6 +34,7 @@ from thought_signatures import (
     resolve_tool_call_signature,
     signature_bytes,
     signature_from_extra,
+    sdk_thought_signature_field,
     thought_signature_extra,
 )
 from usage import map_usage
@@ -395,7 +396,10 @@ def _assistant_tool_parts(
         try:
             part_kwargs = {"function_call": types.FunctionCall(**fc_kwargs)}
             if thought_sig_bytes:
-                part_kwargs["thought_signature"] = thought_sig_bytes
+                # 哨兵必须以 str 字面量出站：SDK 会把 bytes 哨兵 base64 编码，
+                # 破坏官方要求的 skip_thought_signature_validator 字面量
+                #（见 thought_signatures.sdk_thought_signature_field）。
+                part_kwargs["thought_signature"] = sdk_thought_signature_field(thought_sig_bytes)
             fc_part = types.Part(**part_kwargs)
         except Exception as e:
             print(f"⚠️ [工具调用] 构造 FunctionCall 失败，将回退为基础形式：{e}")
@@ -644,10 +648,10 @@ def _attach_message_signature(parts: list, message_sig: Optional[str], signature
     if target is None and signature_kind != "signature_only":
         target = parts[-1] if parts else None
     if target is None:
-        parts.append(types.Part(text="", thought_signature=message_sig))
+        parts.append(types.Part(text="", thought_signature=sdk_thought_signature_field(message_sig)))
         return
     parts[_rindex_by_identity(parts, target)] = target.model_copy(
-        update={"thought_signature": message_sig}
+        update={"thought_signature": sdk_thought_signature_field(message_sig)}
     )
 
 

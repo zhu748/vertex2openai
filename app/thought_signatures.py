@@ -8,6 +8,7 @@ import model_capabilities as mc
 from google.genai import types
 from signature_store import (
     SKIP_VALIDATOR_SENTINEL,
+    SKIP_VALIDATOR_SENTINELS,
     SignatureState,
     signature_store,
 )
@@ -38,6 +39,33 @@ def encode_thought_signature(signature: Optional[bytes]) -> Optional[str]:
     if not signature:
         return None
     return base64.b64encode(signature).decode("ascii")
+
+
+def sdk_thought_signature_field(signature: Optional[bytes]):
+    """把内部签名字节转换成 ``types.Part.thought_signature`` 的出站值（Express/REST）。
+
+    Google 要求官方哨兵以 JSON **字面量字符串**抵达 REST 上游
+    （thought-signatures FAQ：``skip_thought_signature_validator`` /
+    ``context_engineering_is_the_way_to_go``；langchain-google#1570 实证
+    base64 形态会被 Vertex 拒绝）。而 google-genai SDK 对一切 ``bytes`` 值做
+    base64 序列化（``BaseModel`` 的 ``ser_json_bytes='base64'`` 与出站管线
+    ``encode_unserializable_types`` 的 urlsafe 编码），直接把
+    ``b"skip_thought_signature_validator"`` 交给 ``types.Part`` 会在 wire 上
+    变成 ``"c2tpcF90aG91..."``，上游据此拒绝跳过校验。
+
+    因此哨兵改用 ``str`` 传入 ``types.Part``：pydantic 宽松验证把哨兵按
+    base64 解码回字节，SDK 出站序列化时 urlsafe 重编码恰好还原字面量
+    （哨兵本身被 Google 设计为 32 个 urlsafe-base64 字符，可无损往返）。
+    真实签名保持 ``bytes`` 走正常 base64 路径。
+
+    注意：**只适用于 Express/REST 出站**。Cookie batchGraphql 的
+    thoughtSignature 是 GraphQL Bytes 标量，哨兵在那里必须 base64 编码
+    （字面量会被校验层拒绝，2026-11-16 真机验证），详见 signature_store
+    的通道差异说明。
+    """
+    if signature in SKIP_VALIDATOR_SENTINELS:
+        return signature.decode("ascii")
+    return signature
 
 
 def thought_signature_extra(signature: Optional[bytes], part_kind: Optional[str] = None) -> Optional[dict]:
@@ -134,7 +162,9 @@ def ordinary_parts_from_extra(value: Any, image_loader=None) -> Optional[List[ty
             index = image_indices[thought]
             if index < len(images[thought]):
                 part = images[thought][index].model_copy(deep=True)
-                part.thought_signature = signature
+                # 哨兵以 str 赋值：SDK 出站时 str 原样落 JSON，保持官方字面量
+                #（属性赋值不经 pydantic 验证，bytes 哨兵会被 base64 破坏）。
+                part.thought_signature = sdk_thought_signature_field(signature)
                 part.thought = True if thought else None
                 parts.append(part)
                 image_indices[thought] += 1
@@ -145,7 +175,7 @@ def ordinary_parts_from_extra(value: Any, image_loader=None) -> Optional[List[ty
             types.Part(
                 text=text,
                 thought=(True if kind == "thought" else None),
-                thought_signature=signature,
+                thought_signature=sdk_thought_signature_field(signature),
             )
         )
     return parts

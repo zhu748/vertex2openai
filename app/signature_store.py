@@ -20,6 +20,23 @@ from typing import Optional
 
 SKIP_VALIDATOR_SENTINEL = b"skip_thought_signature_validator"
 
+# Google thought-signatures 文档 FAQ：无法恢复签名时，可在 thoughtSignature
+# 字段填充官方 dummy 值跳过校验，documented 的合法字面量有两个：
+#   "skip_thought_signature_validator" 与 "context_engineering_is_the_way_to_go"
+#
+# ⚠️ 两条出站通道对哨兵的 wire 编码不同（2026-11-16 真机验证，勿“顺手统一”）：
+#   * Express / REST（aiplatform JSON，string 字段）——必须发送字面量字符串
+#     （官方 FAQ；langchain-google#1570 实证 base64 会被拒绝），见
+#     thought_signatures.sdk_thought_signature_field；
+#   * Cookie / batchGraphql（GraphQL Bytes 标量）——必须 base64 编码，字面量中的
+#     "_" 不是合法 base64 字符，会被校验层拒绝（"Invalid value for variable
+#     $contents ... invalid value for type Bytes"，真机对比实测），走原有的
+#     encode_thought_signature 即可。
+SKIP_VALIDATOR_SENTINELS = (
+    b"skip_thought_signature_validator",
+    b"context_engineering_is_the_way_to_go",
+)
+
 DEFAULT_TTL_SECONDS = 2 * 60 * 60
 DEFAULT_MAX_ENTRIES = 5000
 

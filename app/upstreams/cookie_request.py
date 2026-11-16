@@ -367,6 +367,8 @@ def _ordinary_wire_parts_from_extra(message: Any) -> Optional[list[dict]]:
 
 def _attach_message_signature(parts: list[dict], message: Any) -> None:
     signature, kind = signature_from_extra(message)
+    # thoughtSignature 是 GraphQL Bytes 标量：哨兵与真实签名一样 base64 编码
+    #（字面量会被校验层拒绝，2026-11-16 真机验证，见 signature_store 说明）。
     encoded = encode_thought_signature(signature)
     if not encoded:
         return
@@ -483,6 +485,9 @@ def _convert_messages_to_contents(messages: list, model_name: str = "", native_t
                 }
                 if call_id:
                     part["functionCall"]["id"] = call_id
+                # thoughtSignature 是 GraphQL Bytes 标量：哨兵与真实签名一样
+                # base64 编码——字面量会被校验层拒绝（"invalid value for type
+                # Bytes"，2026-11-16 真机对比实测，见 signature_store 说明）。
                 encoded = encode_thought_signature(signature)
                 if encoded:
                     part["thoughtSignature"] = encoded
