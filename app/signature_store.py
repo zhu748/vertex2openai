@@ -25,13 +25,22 @@ SKIP_VALIDATOR_SENTINEL = b"skip_thought_signature_validator"
 #   "skip_thought_signature_validator" 与 "context_engineering_is_the_way_to_go"
 #
 # ⚠️ 两条出站通道对哨兵的 wire 编码不同（2026-11-16 真机验证，勿“顺手统一”）：
-#   * Express / REST（aiplatform JSON，string 字段）——必须发送字面量字符串
-#     （官方 FAQ；langchain-google#1570 实证 base64 会被拒绝），见
+#   * Express / REST（aiplatform JSON，string 字段）——发送官方字面量字符串
+#     （唯一 documented 形态；langchain-google#1570 实证 Vertex 端点拒绝
+#     base64 形态，其官方修复 #1972 亦改为发字面量），见
 #     thought_signatures.sdk_thought_signature_field；
 #   * Cookie / batchGraphql（GraphQL Bytes 标量）——必须 base64 编码，字面量中的
 #     "_" 不是合法 base64 字符，会被校验层拒绝（"Invalid value for variable
 #     $contents ... invalid value for type Bytes"，真机对比实测），走原有的
 #     encode_thought_signature 即可。
+#
+# 2026-11-17 Express 真机 A/B（Express Key + socks5 出站 + gemini-3.5-flash-lite）：
+#   修复前后全链路各 3 次伪造无签名工具调用均 200，模型均基于工具结果作答；
+#   四形态同位探针——字面量哨兵 200、base64 哨兵 200（该 Express 端点当日
+#   宽容）、随机 48 字节伪签名 400 "Invalid thought signature."、缺失签名
+#   400 "Function call is missing a thought_signature"。验签确实在跑，
+#   哨兵兜底必需；但 base64 形态的通过属未文档化宽容行为（仅本端点当日
+#   如此，langchain 实测的 Vertex 端点拒绝该形态），故字面量出站不变。
 SKIP_VALIDATOR_SENTINELS = (
     b"skip_thought_signature_validator",
     b"context_engineering_is_the_way_to_go",

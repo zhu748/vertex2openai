@@ -47,11 +47,13 @@ def sdk_thought_signature_field(signature: Optional[bytes]):
     Google 要求官方哨兵以 JSON **字面量字符串**抵达 REST 上游
     （thought-signatures FAQ：``skip_thought_signature_validator`` /
     ``context_engineering_is_the_way_to_go``；langchain-google#1570 实证
-    base64 形态会被 Vertex 拒绝）。而 google-genai SDK 对一切 ``bytes`` 值做
+    base64 形态会被 Vertex 拒绝。2026-11-17 真机 A/B：Express 端点当日对
+    base64 哨兵亦放行——属未文档化宽容，字面量仍是唯一 documented 形态）。
+    而 google-genai SDK 对一切 ``bytes`` 值做
     base64 序列化（``BaseModel`` 的 ``ser_json_bytes='base64'`` 与出站管线
     ``encode_unserializable_types`` 的 urlsafe 编码），直接把
     ``b"skip_thought_signature_validator"`` 交给 ``types.Part`` 会在 wire 上
-    变成 ``"c2tpcF90aG91..."``，上游据此拒绝跳过校验。
+    变成 ``"c2tpcF90aG91..."``——严格比对字面量的端点据此拒绝跳过校验。
 
     因此哨兵改用 ``str`` 传入 ``types.Part``：pydantic 宽松验证把哨兵按
     base64 解码回字节，SDK 出站序列化时 urlsafe 重编码恰好还原字面量

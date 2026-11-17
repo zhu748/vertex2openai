@@ -6,7 +6,9 @@
 
 * Express（google-genai SDK → Vertex REST，thoughtSignature 是 JSON string）
   ——必须发送官方**字面量** ``"skip_thought_signature_validator"``
-  （官方 thought-signatures FAQ；langchain-google#1570 实证 base64 会被拒）。
+  （官方 thought-signatures FAQ；langchain-google#1570 实证 base64 会被拒。
+  2026-11-17 真机 A/B：Express 端点当日对 base64 哨兵亦放行，宽容未文档化，
+  字面量仍为唯一 documented 形态——测试继续锁定字面量）。
   旧实现把哨兵 bytes 直接交给 ``types.Part``，SDK 对 bytes 统一 base64 序列化
   （``ser_json_bytes='base64'`` / ``encode_unserializable_types``），wire 上变成
   ``"c2tpcF90aG91..."``，上游拒绝跳过校验。修复：哨兵以 str 传给 Part，

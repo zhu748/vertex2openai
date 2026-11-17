@@ -2,6 +2,13 @@
 
 基于原版 `vertex2openai-main`（2026-09-01），持续完善兼容性、可靠性和代码组织。
 
+## 2026-11-17：Express 哨兵字面量修复 + 真机 A/B 验证
+
+- 修复：Express 通道缺失签名的 SKIP 兜底哨兵此前以 bytes 交给 `types.Part(thought_signature=...)`，google-genai SDK 对 bytes 统一 base64 序列化（`ser_json_bytes='base64'` + `encode_unserializable_types`），wire 上变成 `c2tpcF90aG91...` 而非官方字面量。`sdk_thought_signature_field()` 改为哨兵以 str 传入（pydantic 宽松解码 + SDK urlsafe 重编码无损还原字面量），覆盖工具调用 / 消息级签名 / ordinary-parts 复原，并识别第二个官方哨兵 `context_engineering_is_the_way_to_go`；真实签名仍走 bytes。Cookie 通道保持 base64 不变（GraphQL Bytes 标量要求，2026-11-16 真机实测字面量被拒）。
+- 真机 A/B（Express Key + socks5 出站 + gemini-3.5-flash-lite）：修复前后各起完整服务跑对照组与 3 次伪造无签名工具调用——两组 3/3 全部 200、模型均基于工具结果作答；离线序列化捕获证实改动前 wire 为 base64、改动后为官方字面量（服务日志各触发 3 次哨兵兜底）。
+- 四形态同位探针（同 Key 同代理同模型直发 SDK）：字面量哨兵 200；base64 哨兵 200（该 Express 端点当日宽容，属未文档化行为）；随机 48 字节伪签名 400 `Invalid thought signature.`；缺失签名 400 `Function call is missing a thought_signature`——验签确实在跑、哨兵兜底必需。
+- 结论：本 Express 端点当日对两种哨兵形态均放行，修复的实际收益是出站形态对齐唯一 documented 形态、消除对未文档化宽容行为的依赖（langchain-google#1570 实证 Vertex 端点拒绝 base64 形态，其官方修复 #1972 亦改为发字面量；Google 收紧校验时 base64 形态即失效）。新增 `tests/test_thought_signature_sentinel_wire.py` 11 项 wire 级测试锁定两通道形态；全量 1454 项测试 + 1103 子测试通过（2 跳过）。
+
 ## 2026-11-13：性能与可维护性复审
 
 - 日志投递从 `logger.py` 分离到 `log_stream.py`；线程到事件循环的交接缓冲同样有界，每订阅者最多一个待执行回调，避免日志风暴在 asyncio 回调队列中持续积压。
