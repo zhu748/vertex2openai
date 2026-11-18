@@ -8,14 +8,16 @@ replace (
 )
 
 require (
+	codeberg.org/miekg/dns v0.6.118
 	github.com/Asutorufa/yuhaiin v0.4.0-beta.3.0.20261020114746-c3ac7d8eb930
 	github.com/pion/logging v0.2.4
-	github.com/pion/transport/v5 v5.0.0
-	github.com/pion/turn/v5 v5.1.2
+	github.com/pion/stun/v4 v4.0.1
+	github.com/pion/transport/v5 v5.1.5
+	github.com/pion/turn/v5 v5.1.3
+	golang.org/x/net v0.61.0
 )
 
 require (
-	codeberg.org/miekg/dns v0.6.118 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
@@ -25,7 +27,6 @@ require (
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/pion/dtls/v3 v3.1.9 // indirect
 	github.com/pion/randutil v0.1.0 // indirect
-	github.com/pion/stun/v4 v4.0.1 // indirect
 	github.com/prometheus/client_golang v1.25.0 // indirect
 	github.com/prometheus/client_model v0.6.3 // indirect
 	github.com/prometheus/common v0.72.0 // indirect
@@ -36,7 +37,6 @@ require (
 	github.com/wlynxg/anet v0.0.5 // indirect
 	golang.org/x/crypto v0.58.0 // indirect
 	golang.org/x/exp v0.0.0-20261014143641-f0251eb4aa3e // indirect
-	golang.org/x/net v0.61.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect
 	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/time v0.16.0 // indirect
