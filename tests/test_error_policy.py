@@ -63,8 +63,17 @@ class RetrySettingsTests(unittest.TestCase):
             app_state, "get_effective_settings", return_value=dict(config.DEFAULT_SETTINGS)
         ):
             result = _build_thinking_config(obj.model, obj)
-        self.assertEqual(result["thinking_level"], "high")
+        # Express 线格式为大写枚举名；合法值 SDK 归一后 wire 输出不变
+        self.assertEqual(result["thinking_level"], "HIGH")
         self.assertIsNotNone(types.ThinkingConfig(**result).thinking_level)
+        # XHIGH（4 Neon / Hydrogen 第四档）：锁定的 SDK 枚举表还没有它，
+        # 大写裸透传到 wire（小写会有服务端枚举校验 400 风险）
+        obj_x = OpenAIRequest(model="gemini-4-neon", messages=[], reasoning_effort="xhigh")
+        with mock.patch.object(
+            app_state, "get_effective_settings", return_value=dict(config.DEFAULT_SETTINGS)
+        ):
+            result_x = _build_thinking_config(obj_x.model, obj_x)
+        self.assertEqual(result_x["thinking_level"], "XHIGH")
 
 
 class BlockedResponseTests(unittest.IsolatedAsyncioTestCase):

@@ -2,6 +2,16 @@
 
 基于原版 `vertex2openai-main`（2026-09-01），持续完善兼容性、可靠性和代码组织。
 
+## 2026-11-19：收录 gemini-4-neon；思考档位对齐官方 xhigh 第四档（修正 4 Hydrogen 档案）
+
+- 新模型：`vertexModels.json` 收录 `gemini-4-neon`（官方 2026-11 发布，Agent Platform "Google Frontier Model"，1M 统一上下文 / 64K 默认 1M 长解码输出）。按官方档位表适配，不走 4 系默认档案。
+- **修正 `gemini-4-hydrogen` 档案错误**：官方 thinking 文档（核对于 2026-11-19，aistudio.google.com/docs/thinking）明确 4 Neon / 4 Hydrogen 为**四档 `low`/`medium`/`high`(默认)/`xhigh`** 且**默认 `high`**——旧档案按 4 系家族规则给的是三档 `low`/`medium`/`high`、默认 `medium`：`xhigh` 选不到（`reasoning_effort=xhigh`/`max` 一律折成 `high`）、默认档也偏低。
+- `model_capabilities.py`：档位阶梯新增 `xhigh`（`_LEVEL_ORDER` 尾部）；新增 `_XHIGH_MODELS` 型号名单（仅 4-neon / 4-hydrogen，`xhigh` 无法按版本号推导——同为 4 系的 Argon / Carbon 官方最高 `high`）；`_EFFORT_ALIASES` 中 `xhigh`/`x-high`/`very_high`/`max` 保留为 `xhigh` 原样透传，不支持的模型由 `_collapse_level` 就近向下压到 `high`（P0-1 方向性不变：选最高档=拿到该模型最高合法档）。其余模型经与官方表逐型号核对全部一致（argon/carbon/3.8-flash=low·medium(默认)·high；3.6-flash/3.5-flash-lite/3.1-flash-lite 含 minimal；3.1-pro-preview 默认 high；3-pro-preview 仅 low·high；4 系与 3.8-flash 无 minimal——官方明文），3.7-flash/3.5-flash/3-flash-preview 官方表未列出，沿用既有家族判定不变。
+- `claude_protocol.py`：`output_config.effort` 的 `xhigh`/`max` 不再提前折成 `high`，原样透传交给按模型的档位收敛（两档模型 / 无第四档模型最终仍是 `high`，行为对它们不变）。
+- Express 线格式：`express_sdk._build_thinking_config` 档位统一转**大写枚举名**再入 SDK。合法值（LOW/MEDIUM/HIGH/MINIMAL）SDK 归一后 wire 输出与原先小写**完全一致**；`XHIGH` 在锁定的 google-genai 2.31.0 枚举表里还没有（该版本早于 4 Hydrogen 发布）——小写会原样透传成 `"xhigh"`，服务端大写枚举校验有 400 风险（REST 参考/promptfoo Vertex 示例均为 `thinkingLevel: XHIGH`；Cookie 通道真机回归同样证明该枚举族只收大写），故统一大写（XHIGH 裸透传，SDK 发一次无害 UserWarning，升级依赖后自动归一）。离线验证：`GenerateContentConfig` 序列化 `XHIGH` → wire `"XHIGH"`。
+- 控制台：`thinking_g3_level` 白名单（`settings_validation.py`）与下拉（dashboard）新增 `xhigh` 选项（标注仅 4 Neon / Hydrogen），标签改为「思考档位」；`config.py` 默认值注释同步。Cookie 通道 XHIGH 大写枚举与 Express 通道大写 `thinking_level` 均按各自线格式序列化——**XHIGH 的两通道线格式均尚未真机验证**，如遇 400 请反馈。
+- 测试：新增 `tests/test_model_capabilities_levels.py`（官方档位矩阵逐型号回归 + xhigh 透传/压制/收敛）；`test_claude_protocol.py` effort 归一化与最高档映射更新为 xhigh 语义。
+
 ## 2026-11-17：Express 哨兵字面量修复 + 真机 A/B 验证
 
 - 修复：Express 通道缺失签名的 SKIP 兜底哨兵此前以 bytes 交给 `types.Part(thought_signature=...)`，google-genai SDK 对 bytes 统一 base64 序列化（`ser_json_bytes='base64'` + `encode_unserializable_types`），wire 上变成 `c2tpcF90aG91...` 而非官方字面量。`sdk_thought_signature_field()` 改为哨兵以 str 传入（pydantic 宽松解码 + SDK urlsafe 重编码无损还原字面量），覆盖工具调用 / 消息级签名 / ordinary-parts 复原，并识别第二个官方哨兵 `context_engineering_is_the_way_to_go`；真实签名仍走 bytes。Cookie 通道保持 base64 不变（GraphQL Bytes 标量要求，2026-11-16 真机实测字面量被拒）。

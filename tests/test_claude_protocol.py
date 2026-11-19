@@ -626,7 +626,7 @@ class EffortAndDisplayTests(unittest.TestCase):
 
     def test_output_config_effort_normalization(self):
         cases = {"LOW": "low", "Medium": "medium", "high": "high",
-                 "xhigh": "high", "max": "high"}
+                 "xhigh": "xhigh", "max": "xhigh"}
         for raw, expected in cases.items():
             req = anthropic_to_openai_request(base_body(output_config={"effort": raw}), "m")
             self.assertEqual(req.reasoning_effort, expected, raw)
@@ -773,7 +773,8 @@ class EffortChainTests(unittest.TestCase):
             self.assertEqual(self._level(body, model), expected, f"{body} @ {model}")
 
     def test_claude_code_efforts_map_to_highest_tier(self):
-        """Claude Code 思考强度 high/xhigh/max → 模型最高合法档 high；
+        """Claude Code 思考强度 high/xhigh/max → 模型最高合法档；
+        4 Neon / Hydrogen 最高合法档为官方第四档 xhigh，其余模型压到 high；
         medium/low 在模型支持时原样、不支持时按官方档位表折叠。"""
         for eff in ("high", "xhigh", "max"):
             for model in ("gemini-3-pro", "gemini-3.8-flash", "gemini-3.6-flash",
@@ -781,6 +782,18 @@ class EffortChainTests(unittest.TestCase):
                 self.assertEqual(
                     self._level({"output_config": {"effort": eff}}, model), "high",
                     f"effort={eff} @ {model}")
+        # xhigh / max：仅 4 Neon / Hydrogen 原生保留第四档（官方档位表）
+        for eff in ("high", "xhigh", "max"):
+            expected = "xhigh" if eff != "high" else "high"
+            for model in ("gemini-4-neon", "gemini-4-hydrogen"):
+                self.assertEqual(
+                    self._level({"output_config": {"effort": eff}}, model), expected,
+                    f"effort={eff} @ {model}")
+        # xhigh：无第四档的 4 系（Argon / Carbon）就近压到 high
+        for model in ("gemini-4-argon", "gemini-4-carbon"):
+            self.assertEqual(
+                self._level({"output_config": {"effort": "xhigh"}}, model), "high",
+                f"model={model}")
         # medium：支持的模型原样保留
         self.assertEqual(self._level({"output_config": {"effort": "medium"}},
                                      "gemini-3.8-flash"), "medium")

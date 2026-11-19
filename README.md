@@ -574,8 +574,9 @@ PROXY_URLS='["socks5://global-first:1080","http://global-second:8080"]'
 
 - **采样参数弃用**：自 **Gemini 3.6 Flash / 3.5 Flash-Lite 起（及所有更新/未来模型）**，`temperature`/`top_p`/`top_k` 已废弃（现被忽略、未来返回 400），代理会**自动移除**；更早的 3.x（如 3.0–3.5 非 lite）仍可用，但官方建议保持默认。
 - **`candidate_count`**：所有 Gemini 3.x 不支持，自动移除。
-- **思考**：Gemini 3.x 用 `thinking_level`（`minimal`/`low`/`medium`/`high`，不可完全关闭；各模型默认不同，如 3.6-flash=medium、pro=high、flash-lite=minimal）；
-  - **`gemini-3.7-flash`（2026-08 新增）**：官方默认档位 **`medium`**（取代旧 3.x 的 `high`），档位表只提供 **`low`/`medium`/`high`——没有 `minimal`**（出处：`intro_gemini_3_7_flash.ipynb`）。因此在 3.7 上选「关闭原生思考」会压到 `low`（就近合法档），而不是发一个不支持的枚举去冒 400 风险。同理，**3.7 及更新/未知型号一律不提供 `minimal`**，等真机验证后再逐个放开；`thinking_level` 与旧的 `thinking_budget` **不可同时出现**（官方明确会 400），本代理只会二选一。Gemini 2.5 用 `thinking_budget`（`-1` 动态；2.5-flash 可设 `0` 关闭，2.5-pro 最低 128）。
+- **思考**：Gemini 3.x 用 `thinking_level`（`minimal`/`low`/`medium`/`high`/`xhigh`，不可完全关闭；各模型默认不同，如 3.6-flash=medium、pro=high、flash-lite=minimal、4-neon/4-hydrogen=high）；
+  - **`gemini-4-neon` / `gemini-4-hydrogen`（2026-11 官方档位表）**：官方**四档 `low`/`medium`/`high`(默认)/`xhigh`**——`xhigh` 是这两型专有的第四档（其余 Gemini 4 与 3.8-flash 最高 `high`）；两者默认档为 **`high`**（不是其它非 Pro 型号的 `medium`）。前端发 `reasoning_effort=xhigh`（SillyTavern 常见）在这两型上会真正下发 XHIGH；在不支持的模型上自动就近压到 `high`。官方建议 `xhigh` 只用于 `high` 不够用的难任务（消耗 token 最多，简单任务上可能过度思考或耗尽 `max_output_tokens`）。
+  - **`gemini-3.7-flash`（2026-08 新增）**：官方默认档位 **`medium`**（取代旧 3.x 的 `high`），档位表只提供 **`low`/`medium`/`high`——没有 `minimal`**（出处：`intro_gemini_3_7_flash.ipynb`）。因此在 3.7 上选「关闭原生思考」会压到 `low`（就近合法档），而不是发一个不支持的枚举去冒 400 风险。同理，**3.7 及更新/未知型号一律不提供 `minimal`**（官方已明确 Gemini 4 全系与 3.8-flash 不支持），等真机验证后再逐个放开；`thinking_level` 与旧的 `thinking_budget` **不可同时出现**（官方明确会 400），本代理只会二选一。Gemini 2.5 用 `thinking_budget`（`-1` 动态；2.5-flash 可设 `0` 关闭，2.5-pro 最低 128）。
   - **原生思考控制（`native_thinking_mode`）**——控制台"思考强度"卡片的下拉，支持"保存为该模型专属"：
     - **跟随请求（默认）**：用前端发来的 `reasoning_effort`。⚠️ SillyTavern 等前端常在**每次请求都发 `reasoning_effort`（如 `xhigh`）**，会覆盖你在控制台设的档位。
     - **关闭原生思考（角色扮演推荐）**：忽略前端 effort，把档位压到该模型最低（3.x=`minimal`、2.5-flash 预算 `0`、2.5-pro `128`），并**不返回思考**。
@@ -802,6 +803,11 @@ Express 文本通道保留普通 `type: "function"` 声明的自定义函数语�
 ```json
 {
   "models": [
+    "gemini-4-argon",
+    "gemini-4-carbon",
+    "gemini-4-hydrogen",
+    "gemini-4-neon",
+    "gemini-3.8-flash",
     "gemini-3.7-flash",
     "gemini-3.6-flash",
     "gemini-3.5-flash",
@@ -809,9 +815,9 @@ Express 文本通道保留普通 `type: "function"` 声明的自定义函数语�
     "gemini-3.1-pro-preview",
     "gemini-3.1-flash-lite",
     "gemini-3.1-flash-image",
+    "gemini-nano-banana-2.1",
     "gemini-3-pro-image",
-    "gemini-2.5-pro",
-    "gemini-2.5-flash"
+    "gemini-3-flash-preview"
   ]
 }
 ```
@@ -827,7 +833,7 @@ Express 文本通道保留普通 `type: "function"` 声明的自定义函数语�
 
 ## 抗截断模型选项
 
-默认仅 **`gemini-3.5-flash-lite`（3.5 Flash-Lite）** 在 `/v1/models` 中显示流式与非流式抗截断后缀。其它模型（含 3.8 Flash、4a / Argon、4 / Carbon、4 Hydrogen）默认仅提供普通名称和原有搜索别名，不添加抗截断后缀。
+默认仅 **`gemini-3.5-flash-lite`（3.5 Flash-Lite）** 在 `/v1/models` 中显示流式与非流式抗截断后缀。其它模型（含 3.8 Flash、4a / Argon、4 / Carbon、4 Hydrogen、4 Neon）默认仅提供普通名称和原有搜索别名，不添加抗截断后缀。
 
 **普通无后缀名称始终不启用抗截断，包括 3.5 Flash-Lite。** 只有选择已开启的抗截断后缀才会使用该传输方式，无需额外运行 Node.js/Go 网关或配置客户端正则。
 

@@ -552,13 +552,14 @@
        <div class="card settings-card" id="model-thinking">
         <h3 class="settings-card-title">思考强度</h3>
         <div class="mb-3" id="wrap-g3level">
-         <label class="lbl mb-1" for="thinking_g3_level">Gemini 3.x 思考档位（thinking_level）</label>
+         <label class="lbl mb-1" for="thinking_g3_level">思考档位（thinking_level）</label>
          <select class="inp" id="thinking_g3_level">
           <option value="">自动（按模型默认）</option>
           <option value="minimal">minimal</option>
           <option value="low">low</option>
           <option value="medium">medium</option>
           <option value="high">high</option>
+          <option value="xhigh">xhigh（仅 4 Neon / Hydrogen）</option>
          </select>
         </div>
         <p class="text-xs text-neutral-500 mt-2" id="think-note">
@@ -592,7 +593,7 @@
            <code>
             xhigh
            </code>
-           → 高强度原生思考。
+           → 4 Neon / Hydrogen 走原生 xhigh，其余模型压到该模型最高档 high。
            <br/>
            •
            <b>

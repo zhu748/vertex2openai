@@ -115,7 +115,8 @@ def _build_thinking_config(
 ) -> Optional[dict]:
     """
     按模型能力档案 + 控制台设置 + 单次请求构建 thinkingConfig：
-    - Gemini 3 及以上（含生图模型）：thinkingLevel（MINIMAL/LOW/MEDIUM/HIGH，生图默认 HIGH）
+    - Gemini 3 及以上（含生图模型）：thinkingLevel
+      （MINIMAL/LOW/MEDIUM/HIGH，4 Neon/Hydrogen 另有 XHIGH；生图默认 HIGH）
     - 其它：None
     prefill_active=True 时按控制台开关压制思考（见 mc.resolve_thinking）。
     """

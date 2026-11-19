@@ -593,7 +593,9 @@ def _parse_output_config(body: dict) -> tuple[Optional[dict], Any]:
     if normalized in ("low", "medium", "high"):
         return response_format, normalized
     if normalized in ("xhigh", "max"):
-        return response_format, "high"  # 内部档位上限为 high
+        # xhigh 是真实档位（Gemini 4 Neon / Hydrogen 官方四档的第四档），
+        # 原样透传；不支持的模型在 resolve_thinking 按官方档位表就近压到 high。
+        return response_format, "xhigh"
     if normalized in ("auto", "default"):
         return response_format, None  # 让模型/控制台自主决定思考强度
     raise ClaudeRequestError(f"unsupported output_config.effort {normalized!r}")

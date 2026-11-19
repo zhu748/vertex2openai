@@ -16,6 +16,9 @@
 - 生图: ai.google.dev/gemini-api/docs/image-generation ；Agent Platform 3-pro-image / 3-1-flash-image
 - per-model 官方档位表与档位收敛：vertex-master internal/transform/thinking.go
   （thinkingKindForModel / supportedThinkingLevel / thinkingLevelForBudget，核对于 2026-10-22）
+- 全量档位重核（aistudio.google.com/docs/thinking + /docs/latest-model，2026-11-19）：
+  XHIGH 仅 Gemini 4 Neon / 4 Hydrogen 支持（两者默认 high，四档 low/medium/high/xhigh）；
+  minimal 官方明确「Gemini 4 与 3.8-flash 不支持」；4 Argon / Carbon / 3.8-flash 默认 medium。
 """
 
 import re
@@ -69,7 +72,10 @@ _SIZE_AR_MAP = {
 #   gemini-3-pro(-preview) 官方仅 LOW/HIGH 两档，MEDIUM 会 400 → 折叠到 HIGH；
 #   3.7/3.8 Flash 与 Gemini 4（Argon / Carbon）仅 LOW/MEDIUM/HIGH；
 #   3.1-flash-image(-lite) 仅 MINIMAL/HIGH。
-_LEVEL_ORDER = ["minimal", "low", "medium", "high"]
+# 全量重核（aistudio thinking 文档，2026-11-19）：
+#   XHIGH 仅 Gemini 4 Neon / 4 Hydrogen 有（两者默认 HIGH）；
+#   minimal 官方明确 Gemini 4 全系与 3.8-flash 不支持。
+_LEVEL_ORDER = ["minimal", "low", "medium", "high", "xhigh"]
 
 # MINIMAL 的可用性上界（含）：3.6 及更早的非 Pro 机型实测/文档支持 MINIMAL
 # （3.6-flash 已真机验证 MINIMAL 生效、思考归零）。
@@ -86,6 +92,18 @@ def _supports_minimal(major: int, minor: int, is_pro: bool) -> bool:
     if is_pro:
         return False                                  # Pro 系最低 LOW（官方）
     return (major, minor) <= _MINIMAL_MAX_VERSION
+
+
+# 官方支持 XHIGH 的型号名单（aistudio thinking 文档，核对于 2026-11-19）：
+# 仅 Gemini 4 Neon / 4 Hydrogen——两者四档 low/medium/high(默认)/xhigh。
+# XHIGH 不能按版本号推导（同为 4 系的 Argon / Carbon 就没有），只能按名单维护；
+# 新型号发布后查官方档位表再增补。
+_XHIGH_MODELS = ("gemini-4-neon", "gemini-4-hydrogen")
+
+
+def _supports_xhigh(name: str) -> bool:
+    """该型号是否提供 XHIGH 思考档位（按官方型号名单，非版本推导）。"""
+    return any(marker in name for marker in _XHIGH_MODELS)
 
 
 def _clamp_level(level: str, levels: set) -> str:
@@ -127,6 +145,9 @@ def _collapse_level(level: str, levels: set) -> str:
     - LevelsNoMinimal（3.1-pro / 3.7/3.8-flash / 4-argon / 4-carbon）：NONE/MINIMAL→LOW
     - LevelsMinimalHigh（3.1-flash-image）：NONE/MINIMAL/LOW→MINIMAL，MEDIUM→HIGH
     - LevelsAll（3.6- Flash）：NONE→MINIMAL
+
+    XHIGH（4 Neon / Hydrogen 专有）：其余模型就近向下压到 HIGH
+    （XHIGH→HIGH），保住“选最高档=拿到该模型最高合法档”的方向性。
     """
     if not levels:
         return "low"
@@ -290,13 +311,19 @@ def _compute_profile(name: str) -> Dict[str, Any]:
             levels = {"low", "high"}
         elif _supports_minimal(major, minor, is_pro):
             levels = levels | {"minimal"}
+        if _supports_xhigh(name):
+            # Gemini 4 Neon / Hydrogen：官方四档（low/medium/high/xhigh）
+            # （aistudio thinking 文档，核对于 2026-11-19）
+            levels = levels | {"xhigh"}
         if "flash-lite" in name and "minimal" in levels:
             default_level = "minimal"
-        elif is_pro:
+        elif is_pro or _supports_xhigh(name):
+            # Pro 与 4 Neon / Hydrogen 官方默认 high
+            # （Neon/Hydrogen 档位表 "low, medium, high (default), xhigh"）
             default_level = "high"
         else:
-            # 非 Pro 的 3.x 默认 medium。3.7 Flash 官方明确默认 medium
-            # （取代旧 3.x 的 high），与这里一致。
+            # 非 Pro 的 3.x 与 4 Argon / Carbon 默认 medium。3.7 Flash 官方
+            # 明确默认 medium（取代旧 3.x 的 high），与这里一致。
             default_level = "medium"
         allowed = set(SAMPLING_KEYS)
         allowed.discard("candidate_count")  # 所有 Gemini 3.x 不支持 candidate_count
@@ -327,11 +354,15 @@ def _compute_profile(name: str) -> Dict[str, Any]:
     }
 
 
-# 客户端 reasoning_effort 归一化（SillyTavern 等会发 min/minimal/max/xhigh/auto 等）
+# 客户端 reasoning_effort 归一化（SillyTavern 等会发 min/minimal/max/xhigh/auto 等）。
+# xhigh / x-high / very_high / max 保留为 xhigh：这是 4 Neon / Hydrogen 的真实档位
+# （官方四档 low/medium/high/xhigh）；不支持的模型由 _collapse_level 就近压到 high
+# （方向性与 P0-1 一致：选最高档拿到该模型最高合法档）。旧实现把 xhigh 一律折成
+# high，Neon/Hydrogen 上永远选不到官方最高档 xhigh（2026-11-19 修正）。
 _EFFORT_ALIASES = {
     "min": "minimal", "minimal": "minimal",
     "low": "low", "medium": "medium", "med": "medium",
-    "high": "high", "max": "high", "xhigh": "high", "x-high": "high", "very_high": "high",
+    "high": "high", "xhigh": "xhigh", "x-high": "xhigh", "very_high": "xhigh", "max": "xhigh",
     "none": "off", "off": "off", "disabled": "off",
 }
 

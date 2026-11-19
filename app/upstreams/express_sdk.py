@@ -96,7 +96,13 @@ def _build_thinking_config(
     thinking_config = {"include_thoughts": t.get("include_thoughts", True)}
 
     if t["mode"] == "level":
-        thinking_config["thinking_level"] = t["level"]
+        # REST 线格式 thinkingLevel 是大写枚举名（LOW/MEDIUM/HIGH/…）。
+        # 合法枚举名 SDK 会归一成枚举值，wire 输出与原先小写完全一致；
+        # XHIGH（4 Neon / Hydrogen 第四档，2026-11 官方新增）在锁定的
+        # google-genai 2.31.0 枚举表里还没有——小写会被原样透传成 "xhigh"，
+        # 服务端大写枚举校验有 400 风险，故统一转大写（XHIGH 裸透传，
+        # SDK 仅发一次无害 UserWarning，升级依赖后自动归一）。
+        thinking_config["thinking_level"] = t["level"].upper()
 
     if app_state.get_setting("debug_outbound", False):
         print(f"🔎 [出站调试] Express 通道 模型={base_model_name} thinkingConfig={thinking_config}")

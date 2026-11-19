@@ -106,7 +106,7 @@ DEFAULT_SETTINGS = {
     # 仅模型专属有效：控制发布哪些抗截断后缀；普通名称始终不启用。
     "anti_truncation_mode": "off",        # off | nonstream | stream | both
     # 思考
-    "thinking_g3_level": "",              # 空=按模型各自默认(3.6-flash=medium/pro=high/flash-lite=minimal)；也可强制 minimal|low|medium|high
+    "thinking_g3_level": "",              # 空=按模型各自默认(3.6-flash=medium/pro=high/flash-lite=minimal/4-neon·4-hydrogen=high)；也可强制 minimal|low|medium|high|xhigh（xhigh 仅 4 Neon/Hydrogen，其余模型就近压到 high）
     # 生图
     "image_size": "4K",                   # 默认分辨率: 512|1K|2K|4K（按模型白名单校验）
     "image_aspect_ratio": "",             # 默认宽高比, ""=自动

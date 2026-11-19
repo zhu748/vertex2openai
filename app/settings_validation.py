@@ -13,7 +13,7 @@ _SETTING_ENUMS = {
     "prefill_mode": ("smart", "keep_turn", "minimal", "off"),
     "native_thinking_mode": ("request", "off", "console"),
     "sampling_policy": ("auto", "deprecated", "allowed"),
-    "thinking_g3_level": ("", "minimal", "low", "medium", "high"),
+    "thinking_g3_level": ("", "minimal", "low", "medium", "high", "xhigh"),
     "image_size": ("", "512", "1K", "2K", "4K"),
     "cookie_impersonate": ("off", "chrome", "edge", "safari", "firefox", "safari_ios"),
     "retry_backoff_mode": ("fixed", "exponential"),
