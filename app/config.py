@@ -22,7 +22,7 @@ class AppSettings(BaseSettings):
     # 留空 = 回退用 API_KEY 登录控制台（过渡期兼容旧部署）。
     ADMIN_PASSWORD: Optional[str] = None
     VERTEX_EXPRESS_API_KEY: Optional[str] = None
-    VERTEX_EXPRESS_API_KEYS: Optional[str] = None  # JSON records or comma/newline-separated keys
+    VERTEX_EXPRESS_API_KEYS: Optional[str] = None  # JSON records or comma/newline-separated "key" / "key,proxy" entries
     UPSTREAM_MODE: Optional[str] = None  # api_key | web_proxy | mixed; inferred on first boot
     FAKE_STREAMING: bool = False
     FAKE_STREAMING_INTERVAL: float = 1.0
@@ -49,8 +49,8 @@ class AppSettings(BaseSettings):
     VERTEX_BASE_URL: Optional[str] = None
 
     # Cookie direct mode settings (Recommended for cloud deployments like Render)
-    GOOGLE_COOKIE: Optional[str] = None         # Google Cookie string
-    GOOGLE_COOKIES: Optional[str] = None        # JSON records: cookie + project_id + proxies
+    GOOGLE_COOKIE: Optional[str] = None         # Google Cookie string; one account per line, each optionally "cookie,proxy"
+    GOOGLE_COOKIES: Optional[str] = None        # JSON records (cookie + project_id + proxies) or per-line "cookie" / "cookie,proxy"
     GOOGLE_PROJECT_ID: Optional[str] = None     # Google Cloud Project ID
     GOOGLE_PROJECT_IDS: Optional[str] = None    # optional positional projects for Cookie strings
     EXPERIMENT_FLAGS: Optional[str] = None      # experimentFlagsBinary (optional; paste from a console request if needed)

@@ -29,6 +29,10 @@ services:
       # - UPSTREAM_MODE=mixed
       # - 'VERTEX_EXPRESS_API_KEYS=[{"key":"key-a","project_id":"project-a"},{"key":"key-b","project_id":"project-b"}]'
       # - 'GOOGLE_COOKIES=[{"cookie":"SAPISID=cookie-a; SID=sid-a","project_id":"project-a"},{"cookie":"SAPISID=cookie-b; SID=sid-b" ,"project_id":"project-b"}]'
+      # 简写：key / cookie 后用逗号直接跟专属代理（支持全部代理协议与 direct
+      # 直连哨兵，多个代理依次往后写）；明细见 README「出站代理与多协议支持」。
+      # - VERTEX_EXPRESS_API_KEY=key-a,socks5://user:pass@proxy-a:1080
+      # - GOOGLE_COOKIES=SAPISID=cookie-a; SID=sid-a,socks5://proxy-b:1080
       # Optional: set true to rotate all enabled accounts in order instead of random selection.
       - ROUNDROBIN=false
       # Optional: fake streaming keeps client connections alive while waiting for non-streaming Gemini responses.

@@ -28,7 +28,7 @@ import main
 from models import OpenAIRequest
 from routes import chat_api, gemini_native, models_api
 import runtime_state
-from runtime_state import AppState, app_state, get_effective_proxy_uris_for_account
+from runtime_state import AppState, app_state, get_effective_proxy_uri_for_key, get_effective_proxy_uris_for_account
 from upstreams import cookie_delivery, cookie_proxy
 
 
@@ -84,6 +84,48 @@ class EnvironmentTests(StateFixture, unittest.TestCase):
                 with self.subTest(field=field, encoded=isinstance(value, str)):
                     self.assertEqual(parse_cookie_records(value, project_ids="p"),
                                      [{"cookie": "SAPISID=one; SID=two", "project_id": "p"}])
+
+    def test_inline_proxy_suffix_in_environment_credentials(self):
+        """key,代理 / cookie,代理 简写：代理直接跟在凭证后面（逗号分隔）。"""
+        # 代理归属前一条 Key；direct 哨兵表示强制直连；普通 Key 不受影响。
+        records = parse_key_records("k1,socks5://p1:1080,direct,k2\nk3")
+        self.assertEqual(records, [{"key": "k1", "proxies": ["socks5://p1:1080", "direct"]},
+                                   {"key": "k2"}, {"key": "k3"}])
+        # JSON 数组：对象原样保留，字符串项同样支持 k,代理，已有 proxies 字段则追加。
+        records = parse_key_records(json.dumps([{"key": "a", "proxies": ["host:1080:u:p"]}, "k1,http://p:80"]))
+        self.assertEqual(records, [{"key": "a", "proxies": ["host:1080:u:p"]},
+                                   {"key": "k1", "proxies": ["http://p:80"]}])
+        # 旧占位写法（none/off）保持原样；无主且带 scheme 的代理串直接报错指明写法。
+        self.assertEqual(parse_key_records("none"), [{"key": "none"}])
+        with self.assertRaises(ValueError):
+            parse_key_records("socks5://p:1080,k1")
+        # Cookie 行尾随代理：Cookie 值里的普通逗号不受影响，位置序号照常对齐。
+        cookies = parse_cookie_records(
+            "SAPISID=a,b; SID=c\nSAPISID=one; SID=x,http://p1:80,socks5://p2:1080\nSAPISID=two,direct",
+            project_ids="p1,p2,p3")
+        self.assertEqual(cookies[0], {"cookie": "SAPISID=a,b; SID=c", "project_id": "p1"})
+        self.assertEqual(cookies[1]["cookie"], "SAPISID=one; SID=x")
+        self.assertEqual(cookies[1]["proxies"], ["http://p1:80", "socks5://p2:1080"])
+        self.assertEqual(cookies[2]["proxies"], ["direct"])
+        # 记录已显式给出 proxies 字段时以内联字段为准，Cookie 文本仍被清理。
+        record = {"cookie": "SAPISID=x,socks5://inline:1080", "proxies": ["http://explicit:80"], "project_id": "p"}
+        cookies = parse_cookie_records(json.dumps([record]))
+        self.assertEqual(cookies[0]["cookie"], "SAPISID=x")
+        self.assertEqual(cookies[0]["proxies"], ["http://explicit:80"])
+        # 端到端：环境导入后按账号代理生效（账号优先、全局兜底，direct 强制直连）。
+        with mock.patch.object(config, "ENV_COOKIE_ACCOUNTS",
+                               parse_cookie_records("SAPISID=env-one; SID=s1,http://one:80\nSAPISID=env-two; SID=s2")):
+            self.assertEqual(app_state.import_env_cookie_accounts_once(), 2)
+        accounts = app_state.get_cookie_accounts()
+        self.assertEqual(accounts[0]["proxies"], ["http://one:80"])
+        app_state.update_settings({"proxy_urls": ["http://global:80"]})
+        self.assertEqual(get_effective_proxy_uris_for_account(accounts[0]), ["http://one:80", "http://global:80"])
+        self.assertEqual(get_effective_proxy_uris_for_account(accounts[1]), ["http://global:80"])
+        with mock.patch.object(config, "ENV_EXPRESS_KEYS", parse_key_records("k1,socks5://p1:1080,direct")):
+            self.assertEqual(app_state.import_env_express_keys_once(config.ENV_EXPRESS_KEYS), 1)
+        key_record = app_state.get_express_keys()[0]
+        self.assertEqual(key_record["proxies"], ["socks5://p1:1080", "direct"])
+        self.assertEqual(get_effective_proxy_uri_for_key(key_record), "socks5://p1:1080")
 
     def test_real_settings_load_plural_environment_and_infer_mixed_mode(self):
         environment = dict(os.environ, PYTHONPATH=str(ROOT / "app"),

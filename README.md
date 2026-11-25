@@ -407,8 +407,8 @@ TCP+TLS 握手（每次约省 100~300ms 与相应 CPU）；429 重试场景收�
 | `ALLOWED_ORIGINS` | 否 | 空（同源） | 默认不安装 CORS（仅同源可读，对 SDK/服务端调用零影响）。需要浏览器跨源直连 API 时填逗号分隔来源（如 `https://a.com,https://b.com`），或 `*` 恢复旧的任意来源行为。 |
 | `IMAGE_URL_TTL_SECONDS` | 否 | `86400` | 生图下载 URL 有效期（秒），默认 24 小时，可调 60 – 604800（7 天上限）。链接不绑定请求者，缩短可降低转发泄漏窗口。 |
 | `DISABLE_PROXY_TEST` | 否 | 空 | 设 `true` 禁用控制台的代理连通性测试端点（多租户/共享运维场景建议开启）。 |
-| `VERTEX_EXPRESS_API_KEY` | 否 | 空 | Gemini Express Key，支持逗号 / 换行分隔或 JSON 数组。首次启动导入，之后以控制台列表为准。 |
-| `VERTEX_EXPRESS_API_KEYS` | 否 | 空 | 多 Key 配置，优先于单数变量。支持字符串数组，或带 `key`、`project_id`、`proxies`、`proxy_fallback`、`enabled`、`note` 的对象数组。 |
+| `VERTEX_EXPRESS_API_KEY` | 否 | 空 | Gemini Express Key，支持逗号 / 换行分隔或 JSON 数组；也支持 `key,代理` 简写为单个 Key 指定专属代理（见「出站代理与多协议支持」）。首次启动导入，之后以控制台列表为准。 |
+| `VERTEX_EXPRESS_API_KEYS` | 否 | 空 | 多 Key 配置，优先于单数变量。支持字符串数组，或带 `key`、`project_id`、`proxies`、`proxy_fallback`、`enabled`、`note` 的对象数组；字符串项（含逗号 / 换行分隔形态）同样支持 `key,代理` 简写。 |
 | `UPSTREAM_MODE` | 否 | 自动 | `api_key`（仅 Key）、`web_proxy`（仅 Cookie）、`mixed`（混合）。首次启动同时配置两类凭证时自动使用混合模式；已有控制台通道选择继续保留。 |
 | `ROUNDROBIN` | 否 | `false` | Key / Cookie 账号轮询(`true`)或随机(`false`)；混合模式下两类账号共同参与。可在控制台热改。 |
 | `FAKE_STREAMING` | 否 | `false` | 先非流式取回再模拟流式；生图模型始终强制启用。可在控制台热改。 |
@@ -424,7 +424,7 @@ TCP+TLS 握手（每次约省 100~300ms 与相应 CPU）；429 重试场景收�
 | `SSL_CERT_FILE` | 否 | 空 | 自定义证书路径。 |
 | `VERTEX_BASE_URL` | 否 | 空 | **高级**：覆盖标准模式的上游 `base_url`，正常无需设置。要钉定区域请用控制台的「标准模式 location」（详见下方「标准模式的 location」）。 |
 | `GOOGLE_COOKIE` | 否 | 空 | 一个完整 Cookie 头，或每行一个账号的完整 Cookie；分号属于 Cookie 字段分隔符，不用于拆账号。兼容 Cookie-Editor JSON。 |
-| `GOOGLE_COOKIES` | 否 | 空 | 优先于单数变量。JSON 字符串数组或带 `cookie`、`project_id`、`proxies`、`proxy_fallback`、`enabled`、`note` 的对象数组；也支持每行一个完整 Cookie。首次导入后以面板列表为准。 |
+| `GOOGLE_COOKIES` | 否 | 空 | 优先于单数变量。JSON 字符串数组或带 `cookie`、`project_id`、`proxies`、`proxy_fallback`、`enabled`、`note` 的对象数组；也支持每行一个完整 Cookie，行尾可用 `cookie,代理` 简写为该账号指定专属代理。首次导入后以面板列表为准。 |
 | `GOOGLE_PROJECT_IDS` | 否 | 空 | Cookie 使用字符串列表时，可按相同顺序填写项目列表（JSON 数组或逗号 / 换行分隔），数量须一致。对象内的 `project_id` 优先；未填时使用 `GOOGLE_PROJECT_ID`。 |
 | `GOOGLE_PROJECT_ID` | 否 | 空 | Cookie 直连模式的 Project ID（初始值，后续可在控制台更新）。 |
 | `EXPERIMENT_FLAGS` | 否 | 空 | 可选：batchGraphql 的 `experimentFlagsBinary`，一般无需设置。 |
@@ -492,11 +492,21 @@ PROXY_URLS='["socks5://global-first:1080","http://global-second:8080"]'
 
 简单配置也可以使用 `VERTEX_EXPRESS_API_KEY=key-a,key-b`；多个 Cookie 可在 `GOOGLE_COOKIES` 中填写字符串 JSON 数组，并通过 `GOOGLE_PROJECT_IDS` 指定对应项目。
 
+不需要完整 JSON 时，还可以用 **`key,代理` / `cookie,代理` 的内联简写**直接给单个凭证指定专属代理：逗号后跟代理地址（支持上文全部协议与 `direct` 直连哨兵），多个代理依次往后写，即等价于给该账号填了专属代理列表。例如：
+
+```dotenv
+VERTEX_EXPRESS_API_KEY=key-a,socks5://user:pass@proxy-a:1080,http://backup-a:8080
+GOOGLE_COOKIES=SAPISID=cookie-a; SID=sid-a,socks5://proxy-b:1080,direct
+SAPISID=cookie-b; SID=sid-b
+```
+
+识别规则：只有带受支持协议前缀（`http://`、`socks5://`、`vless://` 等）的片段或 `direct` 哨兵会被当作代理，其余片段仍按普通 Key / 账号拆分，因此 Cookie 值里的普通逗号不受影响；`GOOGLE_PROJECT_IDS` 的按序对齐也不变。无协议的 `host:port:user:pass` 形式无法与凭证本身区分，请改用 JSON 对象的 `proxies` 字段。
+
 旧的单 Cookie、单代理和通道选择会自动兼容。账号列表首次导入并保存后，以面板中的持久化记录为准；清空列表后重启不会重新导入环境变量。Cookie 默认只显示配置状态；展开已保存账号后，可点击“显示 Cookie / 隐藏 Cookie”查看，或点击“复制 Cookie”复制最新保存值。查看框只读，不会生成编辑草稿；编辑框留空即可保留原 Cookie。普通 HTTP 页面无法自动复制时，会选中文本供手动复制。
 
 ### 出站代理与多协议支持
 
-代理列表按保存顺序尝试，每次新请求从第一条开始。账号有专属代理时，顺序为 **账号代理 1 → 账号代理 2 → 全局代理 1 → 全局代理 2**；取消该账号的「专属代理全部失效后，使用全局代理」，则在专属列表耗尽后返回错误。账号未设置专属列表时直接继承全局列表。
+代理列表按保存顺序尝试，每次新请求从第一条开始。账号有专属代理时，顺序为 **账号代理 1 → 账号代理 2 → 全局代理 1 → 全局代理 2**；取消该账号的「专属代理全部失效后，使用全局代理」，则在专属列表耗尽后返回错误。账号未设置专属列表时直接继承全局列表。环境变量里也可以用 **`key,代理` / `cookie,代理`** 的内联简写直接为单个凭证指定专属代理列表（写法见上方 `.env` 示例），等价于在面板里给该账号填专属代理；控制台保存过列表后仍以控制台为准。
 
 - 连接异常、网络超时、代理协议转换失败，以及 HTTP 407 / 502 / 503 / 504 会触发下一条代理；400 / 401 / 403 / 404 / 429 等参数、鉴权和配额问题沿用模型重试策略。代理切换独立于 `retry_max`，即使模型重试设为 0 也会尝试后续代理。
 - 模型首回复期限按代理尝试分别计时，整轮请求仍受 `request_timeout_seconds` 限制。已经交付流式内容后不会通过切换代理重发同一段内容。
