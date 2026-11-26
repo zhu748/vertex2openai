@@ -11,6 +11,7 @@ import thought_signatures
 from claude_protocol import ClaudeStreamState
 from claude_signature_projection import OmittedClaudeProjection
 from fastapi.responses import StreamingResponse
+from starlette.requests import ClientDisconnect
 from routes.claude_api import _claude_stream_response
 from signature_store import SignatureState, SignatureStore
 from test_claude_buffered_tool_order import read_events, reconstruct
@@ -168,8 +169,35 @@ class ClaudeOmittedSignatureRoutes(SchemaRouteHarness):
 
 
 class ClaudeProjectionTerminals(unittest.IsolatedAsyncioTestCase):
+    async def asgi_events(self, response, cache, fault):
+        records = []
+
+        async def receive():
+            raise AssertionError("ASGI 2.4 must not start a second receiver")
+
+        async def send(message):
+            if message["type"] == "http.response.body" and message.get("body"):
+                records.extend(read_events(message["body"].decode()))
+                if fault == "cancel" and records[-1]["type"] == "message_stop":
+                    self.assertFalse(cache._data)
+                    raise OSError("connection closed during the public stop event")
+
+        if fault == "read-only":
+            async for event in response.body_iterator:
+                records.extend(read_events(event))
+            self.assertFalse(cache._data)
+            await response.aclose()
+            return records
+        scope = {"type": "http", "asgi": {"spec_version": "2.4"}}
+        if fault == "cancel":
+            with self.assertRaises(ClientDisconnect):
+                await response(scope, receive, send)
+        else:
+            await response(scope, receive, send)
+        return records
+
     async def test_failed_incomplete_and_cancelled_streams_never_publish(self):
-        for fault in ("error", "no-done", "cancel", None):
+        for fault in ("error", "no-done", "cancel", "read-only", None):
             with self.subTest(fault=fault), ExitStack() as stack:
                 cache = new_cache(stack)
                 projection = OmittedClaudeProjection(b"already scoped prefix", {})
@@ -195,26 +223,22 @@ class ClaudeProjectionTerminals(unittest.IsolatedAsyncioTestCase):
 
                 response = _claude_stream_response(
                     StreamingResponse(source()), "display", omit_thinking=True, state=state)
-                events = []
-                async for event in response.body_iterator:
-                    events.extend(read_events(event))
-                    if fault == "cancel" and events[-1]["type"] == "message_stop":
-                        await response.body_iterator.aclose()
-                        break
+                events = await self.asgi_events(response, cache, fault)
                 self.assertEqual(events[-1]["type"], "error" if fault == "error" else "message_stop")
                 self.assertEqual(len(cache._data), 1 if fault is None else 0)
                 self.assertFalse(projection.ready)
 
     async def test_non_success_fence_only_after_the_complete_public_message(self):
         for omitted in (False, True):
-            for fault in (None, "no-done", "error", "cancel", "trailing", "different-source", "malformed", "blank"):
+            for fault in (None, "no-done", "error", "cancel", "read-only",
+                          "trailing", "different-source", "malformed", "blank"):
                 with self.subTest(omitted=omitted, fault=fault), ExitStack() as stack:
                     cache = new_cache(stack)
                     prefix = b"already scoped prefix"
                     projection = OmittedClaudeProjection(prefix, {}) if omitted else None
-                    fence = None if omitted else signature_origin.TerminalOriginFence()
+                    fence = None if omitted else signature_origin.DeliveredOrigin()
                     state = ClaudeStreamState("display", omit_thinking=omitted,
-                                              projection=projection, terminal_fence=fence)
+                                              projection=projection, delivered_origin=fence)
                     arguments = {"malformed": "{", "blank": ""}.get(fault, "{}")
                     call = {"index": 0, "id": "fixture-slot", "type": "function",
                             "function": {"name": "weather", "arguments": arguments},
@@ -233,7 +257,7 @@ class ClaudeProjectionTerminals(unittest.IsolatedAsyncioTestCase):
                             # Read-ahead alone does not confirm the public reply.
                             signature_origin.publish_completed_origins(prefix, [
                                 {"finish_reason": "length", "message": {"tool_calls": [call]}},
-                            ], stage_terminal=fence.stage)
+                            ], stage_origin=fence.stage)
                         if fault == "error":
                             yield 'data: {"error":{"code":502,"message":"simulated upstream fail"}}\n\n'
                         if fault != "no-done":
@@ -241,13 +265,7 @@ class ClaudeProjectionTerminals(unittest.IsolatedAsyncioTestCase):
 
                     result = _claude_stream_response(StreamingResponse(source()), "display",
                                                      omit_thinking=omitted, state=state)
-                    records = []
-                    async for event in result.body_iterator:
-                        records.extend(read_events(event))
-                        if fault == "cancel" and records[-1]["type"] == "message_stop":
-                            self.assertEqual(len(cache._data), 0)
-                            await result.body_iterator.aclose()
-                            break
+                    records = await self.asgi_events(result, cache, fault)
                     self.assertEqual(records[-1]["type"], "error" if fault == "error" else "message_stop")
                     self.assertEqual([record.state for _, record in cache._data.values()],
                                      [SignatureState.AMBIGUOUS] if fault is None else [])

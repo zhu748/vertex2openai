@@ -8,11 +8,13 @@ import httpx
 from starlette.requests import ClientDisconnect
 
 import admission
+import channel_dispatch
 import streaming
 from models import OpenAIRequest
 from routes import chat_api
 from proxy_resolver import current_proxy_usage
 from request_tracking import RequestTrace, current_trace
+from test_replay_http_delivery import Peer
 from upstreams.native_passthrough import _passthrough_once, _relay_stream
 
 
@@ -228,6 +230,62 @@ class ResponseCleanupAdmissionTests(unittest.IsolatedAsyncioTestCase):
             let_setup_return.set()
             self.release.set()
             await asyncio.wait_for(closer, 1)
+        self.assert_settled("cancelled")
+
+    async def test_fast_setup_route_cancellation_holds_both_slots_until_late_response_closes(self):
+        entered, cancelled, let_setup_return = (asyncio.Event() for _ in range(3))
+
+        async def frames():
+            self.fail("cancelled setup must never expose its stream")
+            yield b""
+
+        async def upstream(*_args):
+            self.usage = current_proxy_usage.get()
+            self.trace = current_trace.get()
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                await let_setup_return.wait()
+            return admission.ManagedStreamingResponse(frames(), cleanup=self.close_transport)
+
+        def peer():
+            return Peer("/v1/chat/completions", headers=[(b"x-resumable", b"false")],
+                        payload={"model": "gemini-3.1-flash-image-4k", "stream": True, "messages": []})
+
+        call = self.enterContext(patch.object(chat_api.express_upstream, "chat_completions", side_effect=upstream))
+        self.enterContext(patch.object(chat_api.app_state, "get_channel_mode", return_value="api_key"))
+        self.enterContext(patch.object(chat_api.app_state, "is_web_proxy_enabled", return_value=False))
+        self.enterContext(patch.object(channel_dispatch, "SETUP_FAST_WINDOW_SECONDS", 1))
+        self.enterContext(patch.object(streaming, "SETUP_CLOSE_TIMEOUT_SECONDS", .01))
+        first = peer()
+        caller = asyncio.create_task(first.run())
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            caller.cancel()
+            await asyncio.wait_for(cancelled.wait(), 1)
+            done, _ = await asyncio.wait({caller}, timeout=.03)
+            self.assertFalse(done, "fast cancellation may not abandon a late live response")
+            self.assert_held()
+
+            other = peer()
+            await asyncio.wait_for(other.run(), 1)
+            self.assertEqual(other.messages[0]["status"], 503)
+            call.assert_awaited_once()
+
+            let_setup_return.set()
+            await asyncio.wait_for(self.closing.wait(), 1)
+            caller.cancel()
+            done, _ = await asyncio.wait({caller}, timeout=.03)
+            self.assertFalse(done, "a second cancellation may not abandon physical close")
+            self.assert_held()
+            self.assertFalse(first.messages)
+        finally:
+            let_setup_return.set()
+            self.release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(caller, 1)
         self.assert_settled("cancelled")
 
     async def test_failed_closer_does_not_leak_or_repeat_cleanup(self):

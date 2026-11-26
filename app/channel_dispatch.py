@@ -22,7 +22,7 @@ from starlette.requests import ClientDisconnect
 from admission import SETUP_FAST_WINDOW_SECONDS, ManagedStreamingResponse
 from channel_capabilities import cookie_feature_error
 from credential_manager import CookiePoolCoolingDown, credential_manager
-from logger import stats
+from logger import StreamCounts, discard_current_stream_attempt, stats
 from models import OpenAIRequest
 from retry_policy import (advisory_headers, bounded_sse_advisory, exception_retry_after, note_retry_deadline,
                           response_requests_delay, response_retry_after, retry_after_seconds)
@@ -217,9 +217,8 @@ async def _try_channel_fallback(
         if record_failure is not None:
             record_failure(exc)
         code, msg = extract_upstream_error(exc)
-        # 不在此 add_error（2026-11 C-3 修复）：主通道失败已计过一次错误，
-        # 兜底通道自身的流式/非流式路径也会按各自口径计数，这里再计会使
-        # 同一请求在大盘上出现 2 个错误（success + error 之和超过 total）。
+        # This is an attempt, not an additional request failure. The caller
+        # will surface either a standby outcome or the original failure.
         print(f"❌ [跨通道兜底] 备用通道[{_channel_label(fallback_channel)}]启动失败："
               f"HTTP {code} | {str(msg)[:200]}")
         return None
@@ -297,14 +296,12 @@ async def _stream_with_fallback_frames(
     if pending_error_frame is None:
         return
 
+    # The primary error has not escaped this iterator. Keep its accounting
+    # with the staged frame, never with the standby generation.
+    primary_failure = discard_current_stream_attempt()
     alt = await _try_channel_fallback(
         request_obj, fastapi_request, fallback_channel, primary_label,
         f"流式失败（HTTP {pending_error_code}）且尚未输出内容", deadline)
-    if alt is None:
-        # 备用通道不可用：回放主通道错误帧，如实告知失败原因
-        yield pending_error_frame
-        yield DONE_FRAME
-        return
     if isinstance(alt, StreamingResponse):
         try:
             async for frame in alt.body_iterator:
@@ -314,9 +311,12 @@ async def _stream_with_fallback_frames(
             # cancelled before the first token). Hold this generation until both close.
             await await_owned_close(close_stream_response(alt))
         return
-    # 备用通道返回了非流式响应（配置/鉴权错误等）：保留主通道错误，不误导排查方向
-    alt_code = getattr(alt, "status_code", 502)
-    print(f"ℹ️ [跨通道兜底] 备用通道[{fallback_label}]未返回流式响应（HTTP {alt_code}），回放主通道错误。")
+    # A standby that cannot start a stream keeps the primary error visible.
+    if alt is not None:
+        alt_code = getattr(alt, "status_code", 502)
+        print(f"ℹ️ [跨通道兜底] 备用通道[{fallback_label}]未返回流式响应（HTTP {alt_code}），回放主通道错误。")
+    if primary_failure is not None:
+        primary_failure.add_error()  # restores the proposal on this pull
     yield pending_error_frame
     yield DONE_FRAME
 
@@ -402,6 +402,22 @@ async def _apply_json_fallback(
 
 
 
+class _AccountedStream:
+    def __init__(self, source, counts: StreamCounts):
+        self.source = source.__aiter__()
+        self.counts = counts
+
+    def __aiter__(self):
+        return self
+
+    def __anext__(self):
+        return self.counts.pull(self.source)
+
+    async def aclose(self):
+        if close := getattr(self.source, "aclose", None):
+            await close()
+
+
 async def _dispatch_upstream(request_obj: OpenAIRequest, fastapi_request: Request):
     """Select an enabled upstream credential using the saved channel mode."""
     deadline = note_retry_deadline(fastapi_request, time.monotonic() + request_timeout_seconds())
@@ -453,7 +469,9 @@ async def _dispatch_upstream(request_obj: OpenAIRequest, fastapi_request: Reques
         try:
             done, _ = await asyncio.wait({setup}, timeout=SETUP_FAST_WINDOW_SECONDS)
         except BaseException:
-            await close_setup_task(setup)
+            # Both admission leases still belong to this setup. Its transport
+            # may finish unwinding after a late response or another cancellation.
+            await await_owned_close(close_setup_task(setup, join=True))
             raise
         primary = setup.result() if done else None
         if done and not _stream_fallback_candidate(
@@ -536,10 +554,15 @@ async def _dispatch_upstream(request_obj: OpenAIRequest, fastapi_request: Reques
         original = response.body_iterator
 
         async def relay():
-            stream = keepalive_sse(original, fastapi_request)
+            counts = StreamCounts()
+            stream = keepalive_sse(_AccountedStream(original, counts), fastapi_request)
             error = terminal = None
             try:
                 async for frame in reads_before_deadline(stream, deadline):
+                    # The pending pull can mark an error before keepalive
+                    # emits a comment. Comments never settle a generation.
+                    if counts.failure is not None and _sse_frame_kind(frame)[0] != "keepalive":
+                        counts.commit_error()
                     if frame == DONE_FRAME or frame == _DONE_FRAME_BYTES:
                         # Complete the producer's normal bookkeeping before handing
                         # off [DONE]: downstream adapters may stop reading there.
@@ -554,7 +577,7 @@ async def _dispatch_upstream(request_obj: OpenAIRequest, fastapi_request: Reques
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                stats.add_error()
+                counts.commit_error(stats)
                 code, message = extract_upstream_error(exc)
                 # 裸 TimeoutError 的 str() 是空串，客户端会收到不可排障的空
                 # message 错误帧；对齐 resumable 路径的固定文案。
@@ -568,6 +591,8 @@ async def _dispatch_upstream(request_obj: OpenAIRequest, fastapi_request: Reques
             if error is not None:
                 yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
             if terminal is not None:
+                if error is None:
+                    counts.commit_terminal()
                 yield terminal
         headers = dict(response.headers)
         headers.pop("content-length", None)

@@ -5,6 +5,7 @@ pipeline. It does not implement server-side conversation state or storage.
 """
 
 from dataclasses import dataclass
+from itertools import chain
 import json
 import re
 import time
@@ -25,6 +26,7 @@ from tool_policy import has_search_suffix
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 _MAX_HISTORY_ITEMS = 4096
 _MAX_TOOLS = 128
+_MAX_TOOL_OUTPUT_PARTS = 128
 _MAX_ID = 16 * 1024
 _MAX_SIGNATURE = 350_000  # Covers a 256 KiB original signature in Base64.
 _FUNCTION_NAME = re.compile(r"[a-zA-Z0-9_-]{1,64}\Z")
@@ -207,6 +209,24 @@ def _message_content(value, role, param):
     return parts
 
 
+def _function_output(value, param):
+    if isinstance(value, str):
+        return _text(value, param)
+    if not isinstance(value, list) or len(value) > _MAX_TOOL_OUTPUT_PARTS:
+        _field_error(param, f"must be a string or an array of at most {_MAX_TOOL_OUTPUT_PARTS} input_text parts")
+    parts = []
+    for index, part in enumerate(value):
+        path = f"{param}[{index}]"
+        _fields(part, {"type", "text"}, path)
+        if part.get("type") != "input_text":
+            _field_error(path, "only input_text is supported in a function output")
+        # The native adapters retain each text block as ordered data in
+        # FunctionResponse.response. Unlike assistant text, tool text is
+        # not parsed for Markdown image attachments.
+        parts.append({"type": "text", "text": _text(part.get("text"), f"{path}.text")})
+    return parts
+
+
 class _History:
     def __init__(self, instructions):
         self.messages = ([OpenAIMessage(role="developer", content=instructions)] if instructions else [])
@@ -255,7 +275,7 @@ class _History:
                 _field_error(f"{param}.call_id", "does not match an unanswered call in the immediately preceding batch")
             if item.get("status") not in (None, "completed"):
                 _field_error(f"{param}.status", "function outputs must be complete")
-            output = _text(item.get("output"), f"{param}.output")
+            output = _function_output(item.get("output"), f"{param}.output")
             self._flush()
             self.pending.remove(call_id)
             self.in_results = True
@@ -475,12 +495,21 @@ def _usage(value):
     prompt, completion = count(value, "prompt_tokens", None), count(value, "completion_tokens", None)
     if prompt is None or completion is None:
         return None
-    return {
+    details = value.get("prompt_tokens_details")
+    usage = {
         "input_tokens": prompt, "output_tokens": completion,
         "total_tokens": count(value, "total_tokens", prompt + completion),
-        "input_tokens_details": {"cached_tokens": count(value.get("prompt_tokens_details"), "cached_tokens", 0)},
+        "input_tokens_details": {
+            "cached_tokens": count(details, "cached_tokens", 0),
+            # The Responses schema requires an integer. Zero means the
+            # gateway has no writes to report, not a Gemini billing claim.
+            "cache_write_tokens": count(details, "cache_write_tokens", 0),
+        },
         "output_tokens_details": {"reasoning_tokens": count(value.get("completion_tokens_details"), "reasoning_tokens", 0)},
     }
+    if value.get("estimated") is True:
+        usage["estimated"] = True
+    return usage
 
 
 def _completion_message(message):
@@ -598,6 +627,24 @@ def completion_to_response(completion, base):
 _SSE_SLICE = 16 * 1024
 
 
+def _sse_fragments(prefix, payload):
+    # The bounded JSON encoder yields punctuation, keys and numbers as
+    # independent fragments. Pack tiny fragments into ASGI writes without
+    # copying a large encoded string or combining independent SSE events.
+    pending = bytearray(prefix)
+    for fragment in chain(iter_json_bytes(payload, compact=True, allow_nan=False), (b"\n\n",)):
+        if len(pending) + len(fragment) > _SSE_SLICE:
+            if pending:
+                yield bytes(pending)
+                pending.clear()
+            if len(fragment) >= _SSE_SLICE:
+                yield fragment
+                continue
+        pending.extend(fragment)
+    if pending:
+        yield bytes(pending)
+
+
 class ResponsesEvents:
     """Serialize checked state without collecting frames or giant SSE byte strings."""
 
@@ -612,9 +659,7 @@ class ResponsesEvents:
             yield prefix + json.dumps(payload, ensure_ascii=False, separators=(",", ":"),
                                       allow_nan=False).encode("utf-8") + b"\n\n"
         else:
-            yield prefix
-            yield from iter_json_bytes(payload, compact=True, allow_nan=False)
-            yield b"\n\n"
+            yield from _sse_fragments(prefix, payload)
 
     def _deltas(self, kind, text, fields, **extra):
         for start in range(0, len(text), _SSE_SLICE):
@@ -641,12 +686,10 @@ class ResponsesEvents:
                     part_kind = part["type"]
                     key = "refusal" if part_kind == "refusal" else "text"
                     text = part[key]
-                    if kind == "message":
-                        yield from self.event("response.content_part.added", part={**part, key: ""}, **fields)
+                    yield from self.event("response.content_part.added", part={**part, key: ""}, **fields)
                     extra = {"logprobs": []} if part_kind == "output_text" else {}
                     yield from self._deltas(f"response.{part_kind}.delta", text, fields, **extra)
                     yield from self.event(f"response.{part_kind}.done", **{key: text}, **fields, **extra)
-                    if kind == "message":
-                        yield from self.event("response.content_part.done", part=part, **fields)
+                    yield from self.event("response.content_part.done", part=part, **fields)
             yield from self.event("response.output_item.done", output_index=index, item=item)
         yield from self.event(f"response.{response['status']}", response=response)

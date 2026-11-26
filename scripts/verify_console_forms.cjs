@@ -622,6 +622,127 @@ async function main(){
   assert.equal(el('retry_max').value,String(settings.retry_max+2));w.consoleForms.discard('runtime');
   check('Typing while a reload is in flight does not drop the draft');
 
+  // Hold completed writes at the transport boundary to exercise draft changes and
+  // reload ordering independently of the normal busy-fieldset interaction lock.
+  function deferWrite(endpoint, method='POST', receipt=null){
+   let release,body;
+   transport=(target,options)=>{if(target.pathname===endpoint&&options.method===method){
+    transport=null;body=JSON.parse(options.body);
+    let result, status=200;
+    if(receipt)({result,status=200}=receipt(body));
+    else if(endpoint==='/api/settings'){
+     Object.assign(settings,Object.fromEntries(Object.entries(body).filter(([key])=>key!=='_expected')));
+     result={...settings};
+    }else{
+     const model=endpoint.split('/').at(-1), own={...overrides[model]};
+     for(const key of body._inherit||[])delete own[key];
+     Object.assign(own,Object.fromEntries(Object.entries(body).filter(([key])=>!['_expected','_inherit'].includes(key))));
+     if(method==='DELETE')delete overrides[model];else overrides[model]=own;
+     result={override:{...builtins[model],...overrides[model]},saved_override:{...overrides[model]}};
+    }
+    const response=new Response(JSON.stringify(result),{status});
+    return new Promise(resolve=>{release=()=>resolve(response);});
+   }};
+   return {finish:()=>release(),submitted:()=>body};
+  }
+
+  w.switchTab('runtime');
+  const retryOld=settings.retry_max,keepaliveOld=settings.keepalive_interval;
+  edit('retry_max',String(retryOld+1));
+  let delayed=deferWrite('/api/settings'),saving=w.saveSettings();
+  assert.equal(delayed.submitted().retry_max,retryOld+1);
+  edit('retry_max',String(retryOld)); // an explicit late return to the pre-submit value
+  edit('keepalive_interval',String(keepaliveOld+9));
+  await w.loadParams(); // GET sees our saved reply before the POST acknowledgement
+  assert.equal(el('retry_max').value,String(retryOld));
+  delayed.finish();await saving;
+  assert.equal(settings.retry_max,retryOld+1);
+  assert.equal(el('retry_max').value,String(retryOld));
+  assert.equal(el('keepalive_interval').value,String(keepaliveOld+9));
+  assert.match(el('runtime-save-bar').textContent,/2 项修改未保存/);
+  assert.equal(w.consoleForms.dirty(),true);
+  await w.saveSettings();
+  for(const [key,before,after] of [['retry_max',retryOld+1,retryOld],['keepalive_interval',keepaliveOld,keepaliveOld+9]]){
+   assert.equal(lastSettings()[key],after);
+   assert.deepEqual(lastSettings()._expected[key],{present:true,value:before});
+  }
+  assert.equal(w.consoleForms.dirty(),false);
+
+  edit('retry_max',String(retryOld+2));
+  delayed=deferWrite('/api/settings');saving=w.saveSettings();
+  edit('retry_max',String(retryOld+3));w.consoleForms.discard('runtime');
+  delayed.finish();await saving;
+  assert.equal(el('retry_max').value,String(retryOld+2));
+  assert.equal(w.consoleForms.dirty(),false);
+  check('Delayed runtime receipts acknowledge only submitted controls, retain later reverted/disjoint edits across reload, and honor discard');
+
+  edit('retry_max',String(retryOld+3));
+  delayed=deferWrite('/api/settings');saving=w.saveSettings();
+  settings.retry_max=retryOld+4; // another editor changed the value after this write committed
+  settings.keepalive_interval=keepaliveOld+12;
+  await w.loadParams();delayed.finish();await saving;
+  assert.equal(el('retry_max').value,String(retryOld+4));
+  assert.equal(el('keepalive_interval').value,String(keepaliveOld+12));
+  assert.equal(w.consoleForms.dirty(),false);
+  check('A delayed runtime receipt never replaces a visibly reloaded newer value');
+
+  w.switchTab('params');
+  for(const [model,endpoint] of [['text','/api/model-overrides/text'],['__global__','/api/settings']]){
+   edit('model-sel',model);
+   const old=Number(el('first_reply_timeout_seconds').value);
+   const before=model==='text'
+     ? {present:Object.hasOwn(overrides.text,'first_reply_timeout_seconds'),value:overrides.text.first_reply_timeout_seconds}
+     : {present:true,value:old};
+   edit('first_reply_timeout_seconds',String(old+10));
+   delayed=deferWrite(endpoint);saving=w.saveModelOverride();
+   assert.equal(delayed.submitted()._expected.first_reply_timeout_seconds.present,before.present);
+   edit('first_reply_timeout_seconds',String(old));
+   const max=String(Number(el('default_max_tokens').value)+345);
+   edit('default_max_tokens',max);
+   edit('model-sel','image');edit('inject_prefill','other model draft');
+   delayed.finish();await saving;
+   assert.equal(el('model-sel').value,'image');
+   assert.equal(el('inject_prefill').value,'other model draft');
+   w.discardModelDraft();edit('model-sel',model);
+   assert.equal(el('first_reply_timeout_seconds').value,String(old));
+   assert.equal(el('default_max_tokens').value,max);
+   assert.equal(el('scope-draft-state').classList.contains('hidden'),false);
+   await w.saveModelOverride();
+   const posted=requests.filter(r=>r.path===endpoint&&r.method==='POST').at(-1).body;
+   assert.deepEqual(posted._expected.first_reply_timeout_seconds,{present:true,value:old+10});
+   assert.equal(posted.first_reply_timeout_seconds,old);
+   assert.equal(posted.default_max_tokens,Number(max));
+   assert.equal(w.consoleForms.dirty(),false);
+  }
+  check('Owned model and global-default writes preserve same-field reversions, disjoint drafts and the active scope after a delayed receipt');
+
+  edit('model-sel','text');
+  w.setFieldInheritance('first_reply_timeout_seconds',true);await w.saveModelOverride();
+  // Switching back to inheritance reaches the old absent baseline before the pin returns.
+  w.setFieldInheritance('first_reply_timeout_seconds',false);
+  delayed=deferWrite('/api/model-overrides/text');saving=w.saveModelOverride();
+  w.setFieldInheritance('first_reply_timeout_seconds',true);
+  delayed.finish();await saving;
+  assert.match(el('source-first_reply_timeout_seconds').textContent,/继承全局默认 · 未保存/);
+  await w.saveModelOverride();
+  assert.deepEqual(requests.filter(r=>r.path==='/api/model-overrides/text'&&r.method==='POST').at(-1).body._inherit,
+    ['first_reply_timeout_seconds']);
+  assert.equal(w.consoleForms.dirty(),false);
+
+  edit('default_max_tokens','123');
+  delayed=deferWrite('/api/model-overrides/text','POST',()=>({result:{override:{},saved_override:{}}}));
+  saving=w.saveModelOverride();delayed.finish();await saving;
+  assert.match(el('toast').textContent,/缺少完整/);
+  assert.equal(el('default_max_tokens').value,'123');assert.equal(w.consoleForms.dirty(),true);
+  delayed=deferWrite('/api/model-overrides/text','DELETE');saving=w.clearModelOverride();
+  edit('default_max_tokens','234');delayed.finish();await saving;
+  assert.equal(el('default_max_tokens').value,'234');
+  assert.equal(overrides.text,undefined);assert.equal(w.consoleForms.dirty(),true);
+  w.discardModelDraft();
+  assert.equal(el('default_max_tokens').value,String(settings.default_max_tokens));
+  assert.equal(w.consoleForms.dirty(),false);
+  check('Late inheritance intent and post-reset drafts survive; unconfirmed model receipts never clear edits');
+
   console.log(`${passed} groups of console DOM checks passed. Layout requires the browser suite.`);
  }finally{dom.window.close();}
 }

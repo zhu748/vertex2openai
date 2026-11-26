@@ -1023,7 +1023,7 @@ async def _finalize_cookie_stream(gen: "CookieGeneration", st: _StreamAttemptSta
     if (finish_reason == "tool_calls" or is_unrestorable_tool_terminal(finish_reason)) and (
             not gen.prefill_text and not st.pending_safety_html):
         st.signature_origin.finish_plain_parts(st.ordinary_metadata, st.part_order, finish_reason=finish_reason,
-                                               stage_terminal=gen.request_obj._stage_terminal_signature_fence,
+                                               stage_origin=gen.request_obj._stage_signature_origin,
                                                destination=destination)
     yield "data: [DONE]\n\n"
 
@@ -1336,7 +1336,7 @@ def _assemble_whole_response(gen: "CookieGeneration", st: _WholeBodyState) -> "R
     if not gen.request_obj.stream:
         note_accepted_destination(gen.request_obj, gen.signature_destination)
         publish_completed_origins(gen.request_obj._signature_output_prefix, payload["choices"],
-                                  stage_terminal=gen.request_obj._stage_terminal_signature_fence,
+                                  stage_origin=gen.request_obj._stage_signature_origin,
                                   destination=gen.signature_destination)
     return response
 
@@ -1527,7 +1527,7 @@ async def deliver_buffered_frames(gen: "CookieGeneration") -> AsyncIterator[str]
                 if frame == "data: [DONE]\n\n":
                     note_accepted_destination(gen.request_obj, gen.signature_destination)
                     publish_completed_origins(gen.request_obj._signature_output_prefix, payload["choices"],
-                                              stage_terminal=gen.request_obj._stage_terminal_signature_fence,
+                                              stage_origin=gen.request_obj._stage_signature_origin,
                                               destination=gen.signature_destination)
                 yield frame
     except asyncio.CancelledError:

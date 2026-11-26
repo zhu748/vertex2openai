@@ -41,6 +41,7 @@ const COMMON_ARS = [
   '9:21'
 ];
 const MODEL_DRAFTS = new Map();
+const MODEL_WRITES = new Map();
 let renderedModel = null,
   modelSnapshot = null;
 
@@ -185,6 +186,10 @@ function recordModelField(key, kind = 'edit') {
   if (kind === 'edit' && old?.kind === 'pin') kind = 'pin';
   const current = modelSnapshot[key];
   const edit = { kind, raw: modelFieldValue(key), origin: old?.origin || current };
+  const write = MODEL_WRITES.get(renderedModel);
+  // Returning to the old baseline can remove a draft while this save is in
+  // flight; it is still the user's new intent once the server acknowledges it.
+  if (write?.keys.has(key)) write.later.set(key, edit);
   if (modelDraftConverged(key, edit, current)) {
     draft.delete(key);
     if (kind === 'inherit' || modelWireValue(key, edit.raw) !== modelWireValue(key, current.raw))
@@ -217,7 +222,7 @@ function captureModelDraft() {
 }
 function finishModelRender(model) {
   renderedModel = model;
-  const baseline = model === '__global__' ? GLOBAL_SETTINGS : SAVED_MODEL_OVERRIDES[model] || {};
+  const baseline = modelOwnedFields(model);
   const expected = settingsExpectation(baseline, PER_MODEL_KEYS);
   modelSnapshot = Object.fromEntries(
     PER_MODEL_KEYS.map((key) => [key, { raw: modelFieldValue(key), expected: expected[key] }])
@@ -241,7 +246,9 @@ function finishModelRender(model) {
   updateModelCapabilities();
 }
 function discardModelDraft() {
-  MODEL_DRAFTS.delete($('model-sel').value);
+  const model = $('model-sel').value;
+  MODEL_WRITES.get(model)?.later.clear();
+  MODEL_DRAFTS.delete(model);
   renderCaps(false);
 }
 function inheritedModelValue(model, key) {
@@ -321,12 +328,24 @@ document.addEventListener('click', (event) => {
       ?.focus({ preventScroll: true });
   }
 });
+function modelOwnedFields(model) {
+  return model === '__global__' ? GLOBAL_SETTINGS : SAVED_MODEL_OVERRIDES[model] || {};
+}
+function modelEffectiveValue(model, key) {
+  const override = model === '__global__' ? {} : OVERRIDES[model] || {};
+  return Object.hasOwn(override, key)
+    ? override[key]
+    : key === 'anti_truncation_mode'
+      ? 'off'
+      : GLOBAL_SETTINGS[key];
+}
+function modelRawValue(key, value) {
+  return $(key).type === 'checkbox' ? !!value : value == null ? '' : String(value);
+}
 // 按编辑作用域回填模型参数：专属值优先，否则使用全局默认。
 function applyModelParamFields(model) {
-  // __global__ = 全局默认作用域：只显示全局值，不掺任何模型专属值
-  const ov = model === '__global__' ? {} : OVERRIDES[model] || {};
   PER_MODEL_KEYS.forEach((k) => {
-    const v = k in ov ? ov[k] : k === 'anti_truncation_mode' ? 'off' : GLOBAL_SETTINGS[k];
+    const v = modelEffectiveValue(model, k);
     if (k === 'image_aspect_ratio') {
       curAR = v || '';
     } else setV(k, v);
@@ -344,12 +363,22 @@ function applyModelParamFields(model) {
       ? '当前编辑：模型专属参数（★）。保存仅影响此模型。'
       : '当前继承默认值。保存后将创建此模型的专属参数。';
 }
+function settingSnapshot(source, key) {
+  return Object.hasOwn(source, key) ? { present: true, value: source[key] } : { present: false };
+}
 function settingsExpectation(baseline, keys) {
-  return Object.fromEntries(
-    keys.map((key) => [
-      key,
-      Object.hasOwn(baseline, key) ? { present: true, value: baseline[key] } : { present: false }
-    ])
+  return Object.fromEntries(Array.from(keys, (key) => [key, settingSnapshot(baseline, key)]));
+}
+function supersededSettings(before, current, receipt) {
+  // A point-in-time save receipt is not a newer reload. Keep any observed
+  // scalar value that is neither the submitted baseline nor our saved value.
+  return new Set(
+    Object.entries(before).flatMap(([key, earlier]) => {
+      const now = settingSnapshot(current, key);
+      return sameExpectation(now, earlier) || sameExpectation(now, settingSnapshot(receipt, key))
+        ? []
+        : [key];
+    })
   );
 }
 function changedSettings(values) {
@@ -359,39 +388,86 @@ function changedSettings(values) {
     )
   );
 }
-function postFormSettings(values, onSaved) {
+async function postFormSettings(values, onSaved, draftGroup) {
   const patch = changedSettings(values);
-  if (!Object.keys(patch).length) {
+  const keys = Object.keys(patch);
+  if (!keys.length) {
     toast('没有需要保存的修改');
     return false;
   }
-  const body = { ...patch, _expected: settingsExpectation(GLOBAL_SETTINGS, Object.keys(patch)) };
-  if (window.consoleForms?.guardSettings)
-    body._expected = window.consoleForms.guardSettings(body._expected);
-  return postSettings(body, (saved) => {
-    // Do not publish stale values from the response for an unrelated form.
-    Object.keys(patch).forEach((key) => (GLOBAL_SETTINGS[key] = saved[key]));
-    onSaved(saved);
-  });
+  const before = settingsExpectation(GLOBAL_SETTINGS, keys);
+  const body = { ...patch, _expected: before };
+  const forms = window.consoleForms;
+  if (forms?.guardSettings) body._expected = forms.guardSettings(body._expected);
+  const write = draftGroup && forms?.beginSettingsWrite(draftGroup, keys);
+  if (draftGroup && forms && !write) return false;
+  try {
+    return await postSettings(body, (saved) => {
+      const superseded = write ? supersededSettings(before, GLOBAL_SETTINGS, saved) : new Set();
+      if (write) forms.acceptSettingsWrite(write, saved, superseded);
+      // Do not publish stale values from the response for an unrelated form.
+      for (const key of keys) if (!superseded.has(key)) GLOBAL_SETTINGS[key] = saved[key];
+      onSaved(saved);
+    });
+  } finally {
+    if (write) forms.endSettingsWrite(write);
+  }
 }
 
-function applyModelReceipt(model, receipt) {
+function completeModelWrite(model, write, applyBaseline) {
+  captureModelDraft(); // the selected scope may no longer be the saved one
+  const superseded = applyBaseline();
+  const draft = MODEL_DRAFTS.get(model) || new Map();
+  const expected = settingsExpectation(modelOwnedFields(model), write.keys);
+  for (const key of write.keys) {
+    const later = write.later.get(key);
+    const current = {
+      raw: modelRawValue(key, modelEffectiveValue(model, key)),
+      expected: expected[key]
+    };
+    const edit = later && { ...later, origin: superseded.has(key) ? later.origin : current };
+    if (edit && !modelDraftConverged(key, edit, current)) {
+      draft.set(key, edit);
+    } else draft.delete(key);
+  }
+  if (draft.size) MODEL_DRAFTS.set(model, draft);
+  else MODEL_DRAFTS.delete(model);
+  renderCaps(false);
+}
+
+function applyModelReceipt(model, receipt, write, { patch = {}, inherit = [], reset = false }) {
   const maps = [
     [OVERRIDES, receipt?.override],
     [SAVED_MODEL_OVERRIDES, receipt?.saved_override]
   ];
-  if (maps.some(([, value]) => !value || typeof value !== 'object' || Array.isArray(value))) {
-    // An old/partial response cannot distinguish a built-in default from an
-    // owned field. Keep the draft; reload is safe even if the save committed.
+  const own = receipt?.saved_override;
+  if (
+    maps.some(([, value]) => !value || typeof value !== 'object' || Array.isArray(value)) ||
+    Object.entries(patch).some(
+      ([key, value]) =>
+        !Object.hasOwn(own, key) || own[key] !== value || receipt.override[key] !== value
+    ) ||
+    inherit.some((key) => Object.hasOwn(own, key)) ||
+    (reset && Object.keys(own).length > 0)
+  ) {
+    // An old or partial receipt cannot confirm a field's write or inheritance.
     toast('模型保存响应缺少完整的专属参数，请重新加载配置后核对草稿。');
     return false;
   }
-  for (const [target, value] of maps) {
-    if (Object.keys(value).length) target[model] = value;
-    else delete target[model];
-  }
-  MODEL_DRAFTS.delete(model);
-  renderCaps(false);
+  completeModelWrite(model, write, () => {
+    const superseded = supersededSettings(write.before, modelOwnedFields(model), own);
+    for (const [target, value] of maps) {
+      const fields = { ...value };
+      for (const key of superseded) {
+        const live = target[model] || {};
+        if (Object.hasOwn(live, key)) fields[key] = live[key];
+        else delete fields[key];
+      }
+      if (Object.keys(fields).length) target[model] = fields;
+      else delete target[model];
+    }
+    return superseded;
+  });
   return true;
 }
 
@@ -401,7 +477,7 @@ async function saveModelOverride() {
     return;
   }
   const m = $('model-sel').value;
-  if (!m) return;
+  if (!m || MODEL_WRITES.has(m)) return;
   captureModelDraft();
   const patch = {},
     expected = {},
@@ -412,22 +488,31 @@ async function saveModelOverride() {
     else patch[key] = modelWireValue(key, edit.raw);
     expected[key] = edit.origin.expected;
   }
-  if (!Object.keys(expected).length) {
+  const keys = new Set(Object.keys(expected));
+  if (!keys.size) {
     toast('没有需要保存的修改');
     return;
   }
+  const write = {
+    keys,
+    later: new Map(),
+    before: settingsExpectation(modelOwnedFields(m), m === '__global__' ? keys : PER_MODEL_KEYS)
+  };
+  MODEL_WRITES.set(m, write);
   const body = { ...patch, ...(inherit.length ? { _inherit: inherit } : {}), _expected: expected };
-  if (m === '__global__') {
-    // 全局默认作用域：写进全局设置，而不是任何模型的专属值
-    await postSettings(body, () => {
-      Object.assign(GLOBAL_SETTINGS, patch);
-      MODEL_DRAFTS.delete(m);
-      renderCaps(false);
-      toast('已保存为全局默认');
-    });
-    return;
-  }
   try {
+    if (m === '__global__') {
+      // 全局默认作用域：写进全局设置，而不是任何模型的专属值
+      await postSettings(body, (saved) => {
+        completeModelWrite(m, write, () => {
+          const superseded = supersededSettings(write.before, GLOBAL_SETTINGS, saved);
+          for (const key of keys) if (!superseded.has(key)) GLOBAL_SETTINGS[key] = saved[key];
+          return superseded;
+        });
+        toast('已保存为全局默认');
+      });
+      return;
+    }
     const r = await fetch('/api/model-overrides/' + encodeURIComponent(m), {
       signal: AbortSignal.timeout(30000),
       method: 'POST',
@@ -436,11 +521,13 @@ async function saveModelOverride() {
     });
     const d = await r.json();
     if (r.ok) {
-      if (!applyModelReceipt(m, d)) return;
+      if (!applyModelReceipt(m, d, write, { patch, inherit })) return;
       toast('已保存 ' + m + ' 专属参数');
     } else toast(await responseError(r, '保存失败', d));
   } catch (e) {
     toast('❌ 网络请求失败');
+  } finally {
+    MODEL_WRITES.delete(m);
   }
 }
 async function clearModelOverride() {
@@ -449,12 +536,18 @@ async function clearModelOverride() {
     return;
   }
   const m = $('model-sel').value;
-  if (!m) return;
+  if (!m || MODEL_WRITES.has(m)) return;
   if (!OVERRIDES[m]) {
     toast('该模型没有专属参数');
     return;
   }
   if (!confirm('清除 ' + m + ' 的全部专属参数及本页草稿，恢复全局 / 内置默认？')) return;
+  const write = {
+    keys: new Set(PER_MODEL_KEYS),
+    later: new Map(),
+    before: settingsExpectation(modelOwnedFields(m), PER_MODEL_KEYS)
+  };
+  MODEL_WRITES.set(m, write);
   try {
     const r = await fetch('/api/model-overrides/' + encodeURIComponent(m), {
       signal: AbortSignal.timeout(30000),
@@ -464,11 +557,13 @@ async function clearModelOverride() {
     });
     if (r.ok) {
       const d = await r.json();
-      if (!applyModelReceipt(m, d)) return;
+      if (!applyModelReceipt(m, d, write, { reset: true })) return;
       toast('已恢复 ' + m + ' 默认参数');
     } else toast(await responseError(r, '清除失败'));
   } catch (e) {
     toast('❌ 网络请求失败');
+  } finally {
+    MODEL_WRITES.delete(m);
   }
 }
 function refreshModelSelStars() {
@@ -670,8 +765,9 @@ async function saveSettings() {
   };
   const m = $('model-sel').value;
   const overriding = !!(OVERRIDES[m] && Object.keys(OVERRIDES[m]).length > 0);
-  await postFormSettings(values, () => {
-    window.consoleForms?.saved('runtime');
-    toast(overriding ? '全局运行设置已保存；模型专属参数保持不变' : '全局运行设置已保存');
-  });
+  await postFormSettings(
+    values,
+    () => toast(overriding ? '全局运行设置已保存；模型专属参数保持不变' : '全局运行设置已保存'),
+    'runtime'
+  );
 }

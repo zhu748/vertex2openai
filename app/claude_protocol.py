@@ -1081,12 +1081,12 @@ class ClaudeStreamState:
     """
 
     def __init__(self, display_model: str, message_id: Optional[str] = None,
-                 omit_thinking: bool = False, projection=None, terminal_fence=None):
+                 omit_thinking: bool = False, projection=None, delivered_origin=None):
         self.model = display_model
         self.id = message_id or new_message_id()
         self.omit_thinking = omit_thinking
         self.projection = projection
-        self.terminal_fence = terminal_fence
+        self.delivered_origin = delivered_origin
         self._next_index = 0
         self._open: Optional[dict] = None       # 当前打开的块 {"kind","index",...}
         self._tools: dict[int, dict] = {}        # OpenAI tool index → {id,name,parts}（按到达序）
@@ -1201,6 +1201,23 @@ class ClaudeStreamState:
             raise IncompleteResponseError("上游流式工具调用超过缓冲限制。")
         self._tool_bytes += size
 
+    def _observe_signature_source(self, payload, choices, choice, delta):
+        index = choice.get("index", 0)
+        valid = len(choices) == 1 and type(index) is int and index == 0 and not self.finish
+        after_tool = self._tools and (delta.get("content") or delta.get("reasoning_content"))
+        if self.projection is not None and self.projection.prefix:
+            if valid and not after_tool:
+                self.projection.source(payload.get("id"))
+            else:
+                self.projection.discard()
+        if self.delivered_origin is not None:
+            if valid:
+                self.delivered_origin.source(payload.get("id"))
+                if after_tool:
+                    self.delivered_origin.reject_terminal()
+            else:
+                self.delivered_origin.discard()
+
     # ---- 喂入 ----
     def feed_openai_chunk(self, payload: dict) -> list[str]:
         """单条 OpenAI chunk → Anthropic 事件。
@@ -1220,16 +1237,8 @@ class ClaudeStreamState:
         choice = choices[0] if isinstance(choices[0], dict) else {}
         delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
         projection = self.projection
-        if self.terminal_fence is not None or projection is not None and projection.prefix:
-            choice_index = choice.get("index", 0)
-            valid = (len(choices) == 1 and type(choice_index) is int and choice_index == 0 and not self.finish
-                     and not (self._tools and (delta.get("content") or delta.get("reasoning_content"))))
-            for proof in (projection, self.terminal_fence):
-                if proof is not None:
-                    if valid:
-                        proof.source(payload.get("id"))
-                    else:
-                        proof.discard()
+        if projection is not None or self.delivered_origin is not None:
+            self._observe_signature_source(payload, choices, choice, delta)
         if self._buffered_source:
             if payload.get("id") == self._buffered_source[0]:
                 if self._consume_buffered_choice(choice, delta):
@@ -1391,10 +1400,11 @@ class ClaudeStreamState:
             if not terminal_without_bytes:
                 _parse_tool_arguments(args or "{}")
             calls.append((known, args))
-        if terminal_without_bytes and self.terminal_fence is not None:
-            # The remaining tuples exactly correspond to the shown public
-            # tool events. Do not commit an upstream-only or partial batch.
-            self.terminal_fence.confirm_batch(len(calls))
+        if self.delivered_origin is not None:
+            # Confirm the tool blocks this adapter will actually emit, not
+            # merely an accepted upstream candidate or a partial batch.
+            count = len(calls) + sum(block["type"] == "tool_use" for block in self._buffered_blocks or ())
+            self.delivered_origin.confirm_batch(self.finish, count)
         if self.projection is not None:
             if ((self.finish == "tool_calls" or terminal_without_bytes) and not self._buffered_blocks
                     and list(self._tools) == list(range(len(self._tools)))):

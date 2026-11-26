@@ -3,6 +3,7 @@ import base64
 import json
 from contextlib import asynccontextmanager
 from copy import deepcopy
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
@@ -11,7 +12,7 @@ from google.genai import types
 
 import config
 from runtime_state import app_state
-from signature_destination import UNQUALIFIED, publisher_destination
+from signature_destination import UNQUALIFIED, publisher_destination, sdk_destination
 from test_claude_buffered_tool_order import read_events, reconstruct
 from test_parallel_tool_controls import _request
 from test_schema_contract_fidelity import SchemaRouteHarness
@@ -42,6 +43,21 @@ def test_qualified_resource_names_are_bounded_and_not_inferred_from_aliases():
         assert publisher_destination(invalid) == UNQUALIFIED
 
 
+def test_custom_endpoint_and_request_override_are_not_trusted_vertex_bare():
+    def client(host, version="v1", *, vertex=True):
+        return SimpleNamespace(_api_client=SimpleNamespace(
+            vertexai=vertex, _http_options=types.HttpOptions(base_url=host, api_version=version)))
+
+    official = client("https://aiplatform.googleapis.com/")
+    assert sdk_destination(official, MODEL, {}) == UNQUALIFIED
+    for not_official in (client("https://unverified.fixture/"),
+                         client("https://aiplatform.googleapis.com/custom/"),
+                         client("https://aiplatform.googleapis.com/", "v1alpha"),
+                         client("https://aiplatform.googleapis.com/", vertex=False)):
+        assert sdk_destination(not_official, MODEL, {}) != UNQUALIFIED
+    assert sdk_destination(official, MODEL, {"http_options": {"base_url": "https://unverified.fixture/"}}) != UNQUALIFIED
+
+
 class ProviderDestinationRoutes(SchemaRouteHarness):
     async def asyncSetUp(self):
         await super().asyncSetUp()
@@ -50,6 +66,7 @@ class ProviderDestinationRoutes(SchemaRouteHarness):
         self.fail_on = None
         self.rotate_to = None
         self.pick_unknown_endpoint = False
+        self.custom_project = None
         self.sdk_selections = 0
         self.wire = []
 
@@ -101,11 +118,12 @@ class ProviderDestinationRoutes(SchemaRouteHarness):
             project = self.rotate_to if exclude_key and self.rotate_to else self.project
             return {"key": f"fixture-{project}", "project_id": project}
 
-        def raw_client(*args):
+        def raw_client(key, *_):
             self.sdk_selections += 1
             # Prepare() sees the official client; actual invocation resolves
             # again and sees the custom endpoint. Both are mock transports.
-            return unverified if self.pick_unknown_endpoint and self.sdk_selections > 1 else official
+            custom = self.pick_unknown_endpoint or key == f"fixture-{self.custom_project}"
+            return unverified if custom and self.sdk_selections > 1 else official
 
         for manager in (
             patch.object(self.key_manager, "get_express_record", side_effect=select),
@@ -246,6 +264,71 @@ class ProviderDestinationRoutes(SchemaRouteHarness):
         trace = await self.replay(request, "json")
         self.assert_trace(trace, ["p-a"], [[("custom-route", None)]])
         self.assertEqual(trace[0][1], "unverified.fixture")
+
+    async def test_custom_endpoint_does_not_borrow_from_or_count_as_trusted_bare(self):
+        self.settings["express_location"] = ""
+        for dialect in ("openai", "claude", "omitted"):
+            for mode in MODES:
+                for custom_source in (False, True):
+                    ident = f"bare-or-custom-{dialect}-{mode}-{custom_source}__thought__cmF3"
+                    calls = [(ident, "Paris", SIGNATURE)]
+                    self.pick_unknown_endpoint, self.sdk_selections = custom_source, 0
+                    request = await self.offer(ident, mode, dialect, calls)
+                    self.assertEqual(self.wire[0][1], "unverified.fixture" if custom_source else "aiplatform.googleapis.com")
+                    for custom_target in (False, True):
+                        with self.subTest(dialect=dialect, mode=mode, source=custom_source, target=custom_target):
+                            self.pick_unknown_endpoint, self.sdk_selections = custom_target, 0
+                            trace = await self.replay(request, mode)
+                            expected = None if custom_source or custom_target else SIGNATURE
+                            self.assert_trace(trace, [None], [[(ident, expected)]])
+                            self.assertEqual(trace[0][1], "unverified.fixture" if custom_target else "aiplatform.googleapis.com")
+
+    async def test_same_custom_host_does_not_redeem_locally_inferred_bytes_on_rotation_or_unpin(self):
+        self.project, self.rotate_to, self.pick_unknown_endpoint = "p-a", "p-b", True
+        for dialect in ("openai", "claude", "omitted"):
+            for mode in MODES:
+                ident = f"custom-path-retry-{dialect}-{mode}"
+                calls = [(ident, "Paris", SIGNATURE), (ident+"-sibling", "Berlin", b"second")]
+                self.sdk_selections = 0
+                request = await self.offer(ident, mode, dialect, calls)
+                self.assertEqual([(project, host) for project, host, _, _ in self.wire], [("p-a", "unverified.fixture")])
+                absent = [(ident, None) for ident, _, _ in calls]
+                for code, status, message, fallback in (
+                        (503, "UNAVAILABLE", "fixture primary failure", "p-b"),
+                        (404, "NOT_FOUND", "Publisher model not found", None)):
+                    with self.subTest(dialect=dialect, mode=mode, fallback=fallback):
+                        self.fail_on, self.sdk_selections = (code, status, message), 0
+                        trace = await self.replay(request, mode)
+                        self.assert_trace(trace, ["p-a", fallback], [absent, absent])
+                        self.assertEqual([row[1] for row in trace], ["unverified.fixture"] * 2)
+
+    async def test_custom_failed_attempt_cannot_taint_the_official_winner(self):
+        self.project, self.rotate_to, self.custom_project = "p-a", "p-b", "p-a"
+        for dialect in ("openai", "claude", "omitted"):
+            for mode in MODES:
+                with self.subTest(dialect=dialect, mode=mode):
+                    self.project, self.sdk_selections = "p-a", 0
+                    ident = f"official-win-{dialect}-{mode}"
+                    calls = [(ident, "Paris", SIGNATURE)]
+                    self.fail_on = 503, "UNAVAILABLE", "fixture primary failure"
+                    request = await self.offer(ident, mode, dialect, calls)
+                    self.assertEqual([(project, host) for project, host, _, _ in self.wire],
+                                     [("p-a", "unverified.fixture"), ("p-b", "aiplatform.googleapis.com")])
+                    self.project = "p-b"
+                    self.assert_trace(await self.replay(request, mode), ["p-b"], [pairs(calls)])
+
+    async def test_explicit_genuine_carrier_keeps_bytes_and_literal_id_on_custom_attempts(self):
+        for mode in MODES:
+            with self.subTest(mode=mode):
+                ident = f"custom-carried-{mode}__thought__cmF3"
+                calls = [(ident, "Paris", SIGNATURE)]
+                self.project, self.rotate_to, self.pick_unknown_endpoint = "p-a", "p-b", False
+                request = await self.offer(ident, mode, "openai", calls, carrier=True)
+                self.pick_unknown_endpoint, self.sdk_selections = True, 0
+                self.fail_on = 503, "UNAVAILABLE", "fixture primary failure"
+                trace = await self.replay(request, mode)
+                self.assert_trace(trace, ["p-a", "p-b"], [pairs(calls)] * 2)
+                self.assertEqual([row[1] for row in trace], ["unverified.fixture"] * 2)
 
     async def test_explicit_carrier_is_never_rewritten_but_unknown_producer_is_not_proof(self):
         calls = [("genuine-carrier__thought__cmF3", "Paris", SIGNATURE)]

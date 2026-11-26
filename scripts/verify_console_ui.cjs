@@ -1239,6 +1239,38 @@ async function main() {
     assert.deepEqual(Object.keys(merged.request().postDataJSON()).sort(),['_expected','keepalive_interval']);
     assert.equal((await merged.json()).retry_max,oldRetry+3);
     check('重新加载时仅合并实际编辑字段；同字段冲突在多次刷新后仍返回 409');
+    // Hold a real committed receipt, then exercise the settings reload lifecycle
+    // before the browser receives it. The normal save interaction still locks
+    // its fieldset (this is not a claim that the user can type into a busy form).
+    const lateBase=Number(await runtimeA.inputValue('#retry_max'));
+    let announceCommit,deliverReceipt;
+    const receiptCommitted=new Promise(resolve=>{announceCommit=resolve;});
+    const receiptReady=new Promise(resolve=>{deliverReceipt=resolve;});
+    const heldRuntimeSave=async route=>{
+      if(route.request().method()!=='POST')return route.continue();
+      const response=await route.fetch();
+      announceCommit(response.status());
+      await receiptReady;
+      return route.fulfill({response});
+    };
+    await runtimeA.route('**/api/settings',heldRuntimeSave);
+    await runtimeA.fill('#retry_max',String(lateBase+1));
+    const lateSave=saveRuntime(runtimeA);
+    try{
+      assert.equal(await receiptCommitted,200);
+      assert.equal(await runtimeA.locator('#retry_max').isDisabled(),true);
+      const newer=await runtimeB.request.post(origin+'/api/settings',{data:{retry_max:lateBase+2}});
+      assert.equal(newer.status(),200);
+      await runtimeA.evaluate(()=>loadParams());
+    }finally{
+      deliverReceipt();
+    }
+    assert.equal((await lateSave).status(),200);
+    await runtimeA.waitForFunction(()=>!document.querySelector('#retry_max').matches(':disabled'));
+    assert.equal(await runtimeA.inputValue('#retry_max'),String(lateBase+2));
+    assert.equal(await runtimeA.evaluate(()=>consoleForms.dirty()),false);
+    await runtimeA.unroute('**/api/settings',heldRuntimeSave);
+    check('迟到的运行设置保存回执不会覆盖重新加载已看到的最新设置；处理中仍锁定表单');
     await runtimeA.close();await runtimeB.close();
     check('运行设置双标签页：独立字段合并，同字段冲突返回 409 并保留草稿');
     const modelA=await context.newPage(), modelB=await context.newPage();

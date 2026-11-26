@@ -230,6 +230,9 @@ curl -s https://你的域名/v1beta/models -H "x-goog-api-key: 你的API_KEY"
   Cookie 模式下，`generateContent` / `streamGenerateContent` 转换为私有 batchGraphql 请求；
   其它模式优先使用 Express，没有 Key 而有 Cookie 时可桥接生成接口。
   `countTokens` / `embedContent` 仍需要 Express Key；仅有 Cookie 时返回明确的 400。
+- **SDK 多轮签名**：Cookie 桥接将 `thoughtSignature` 和 `inlineData.data`（含工具结果中的内联媒体）
+  的合法 ProtoJSON Base64 转成 GraphQL 所需的标准 Base64，保留原始字节与 Part 顺序。
+  普通参数、工具结果 JSON 及 Express 的原生透传不作此改写。
 - **面板统计**：两个前缀的原生 POST 请求均计入总请求数，每个客户端请求只计一次；成功、
   失败、拥堵重试分别计数。流式成功在转发完成时计入，中途失败计入错误。模型列表 GET 不计数。
 - **模型路径拼接与 SDK 完全一致**：裸模型名拼 `publishers/google/models/{model}`（Express 端点
@@ -590,9 +593,13 @@ SAPISID=cookie-b; SID=sid-b
 
 OpenAI 兼容端点通过 `extra_content.google` 携带 Gemini 原始思考签名。客户端完整保留并回传这些扩展时，签名回放不依赖进程内缓存。标准 Claude / Claude Code 不回传这项扩展；网关需要在同一进程内，按匹配的会话历史和工具调用批次找回签名。
 
+Claude 接口只在最终响应正文的 ASGI 发送完成、且未观察到发送中断线后，才更新签名缓存。仅收到上游完成信号不会让已缓存的旧回复签名失效；ASGI 发送完成也不代表客户端应用已收到。
+
 如果 harness 会剥离扩展字段，请保留原始工具 ID、名称、参数和顺序。对使用同一认证凭据及内部模型、历史由纯文本/工具轮次组成、当前 assistant 轮含工具调用（可以先有普通正文或公开思考文本）的情况，代理会按完整历史前缀、准确的可见正文/思考和整个有序批次恢复各自的签名，包括确有签名的并行后续调用。不同会话复用同一 ID 不会互取签名。媒体、缺失的思考、不能无歧义表示的交错顺序，以及过大或被改写的历史不保证恢复；同一可见来源对应不同签名时，代理不会选「最近一次」或为冲突额外补哨兵，严格上游可能拒绝。跨实例、重启或缓存过期仍应依靠客户端原样保留的扩展字段。
 
-如果能确定出站的 Vertex 模型资源路径，缓存恢复还要匹配实际成功的上游项目、区域及模型。重试换项目、回退裸模型或切到无法核实的端点时，不沿用已绑定的缓存签名，也不为这类不匹配添加跳过哨兵；默认把未签名的调用发给上游，由上游决定是否接受。拥有同一完整资源路径的 Studio 和标准模式仍可互通；两边都无法确定资源时只保留旧的进程内尽力恢复，不能视为同项目连续性证明。此规则也适用于 Claude `thinking.display=omitted` 的缓存恢复，不改写客户端明确回传的原始签名或工具 ID。
+如果能确定出站的 Vertex 模型资源路径，缓存恢复还要匹配实际成功的上游项目、区域及模型。重试换项目或从完整资源路径回退到裸模型时，不沿用已绑定的缓存签名，也不为这类不匹配添加跳过哨兵；默认把未签名的调用发给上游，由上游决定是否接受。使用同一完整资源路径的 Studio 和标准模式仍可互通。
+
+两次请求都走已识别的官方 Vertex SDK 端点、但都只指定裸模型名时，仍保留原有的进程内尽力恢复；这不能证明两次请求使用了同一项目。自定义或无法识别的 SDK 端点，以及带单次 HTTP 设置覆盖的请求，均不参与本地签名推断恢复，即使两次配置相同。该规则也适用于 Claude `thinking.display=omitted`，不改写客户端明确回传的原始签名或工具 ID。
 
 如果上游给出的不透明工具 ID 恰好与旧格式 `前缀__thought__规范base64` 完全相同，OpenAI 回复会在该条工具调用的 `extra_content.vertex2openai.literal_call_id_sha256_v1` 标记原 ID。请原样回传**整个工具调用的 `extra_content`**，不要只提取签名：这样即使缓存过期，调用和紧随其后的工具结果也能保留原 ID。该标记只说明 ID 的编码方式，不包含思考签名，也不证明调用者身份；必需签名本身仍应保存在 `extra_content.google.thought_signature`。普通 ID 和标准 Claude 输出不添加标记。对于未带标记、也找不到缓存依据的 OpenAI 历史，仍兼容旧 ID 格式。标准 Claude 的 `tool_use.id` 始终按不透明 ID 处理；即使缓存失效，调用和对应工具结果也保留原 ID，不会把 ID 后缀当成 Gemini 签名。
 
@@ -615,9 +622,10 @@ OpenAI 兼容端点通过 `extra_content.google` 携带 Gemini 原始思考签�
 ```
 
 - 支持文本 `input` 或显式历史数组（`user`、`developer`、`system`、`assistant`），普通文本和 JSON 函数工具（`type:"function"`）。支持 `instructions`、`max_output_tokens`、`temperature`、`top_p`、`reasoning.effort`（按现有 Gemini 模型规则映射）、`tool_choice` 的 `auto/none/required` 或点名一个已声明函数。函数参数默认尽力遵循声明，不承诺 OpenAI 严格解码；显式 `strict:true` 不支持。启用函数时不支持 `parallel_tool_calls:false`。
-- 工具续轮请把上一轮的输入与 `response.output` 按原顺序带回，再追加每个 `{"type":"function_call_output","call_id":"…","output":"…"}`。结果通过收到的 `call_id` 匹配；函数输出项的 `id`（`fc_…`）不是调用 ID。输出必须是字符串，属于同一批的结果可按任意完成顺序提交，不能遗漏或重复。
+- 工具续轮请把上一轮的输入与 `response.output` 按原顺序带回，再追加每个 `{"type":"function_call_output","call_id":"…","output":"…"}`。结果通过收到的 `call_id` 匹配；函数输出项的 `id`（`fc_…`）不是调用 ID。`output` 可以是字符串，也可以是最多 128 个 `{"type":"input_text","text":"…"}` 的数组（允许空数组，原生函数结果保留块顺序和边界）。仍不支持图像、文件等其他输出块。属于同一批的结果可按任意完成顺序提交，不能遗漏或重复。
 - 建议原样回传输出项的完整 `extra_content`。其中的 `google.thought_signature` 是 Gemini 原始字节的 Base64，工具独占一轮时可能还携带 `vertex2openai.assistant_extra_content`。可见思考若由当前通道返回，会投影成 `reasoning_text`；此端点不会生成或接受 OpenAI 的 `encrypted_content`。客户端丢弃扩展时，仅同进程、同认证与模型、完整可见历史和调用批次精确匹配才可能恢复已交付签名。找不到时，默认保留原始 `call_id`，不伪造签名或补跳过哨兵；上游仍可能拒绝。该默认不影响已开启的严格签名校验。
-- `stream:true` 是**缓冲 SSE**：先发 Responses 的创建事件和等待心跳，待上游完成后才发送已验证的正文与工具事件，不保证逐 token 即时到达。成功终点为 `response.completed`；截断/过滤使用 `response.incomplete`，不输出未完成调用；慢错误使用 `response.failed`。它不发送 Chat 的 `[DONE]`，也不提供 Chat 续传。用量沿用所选通道的统计，若已启用 Cookie 缺失用量估算则沿用该估算。
+- `stream:true` 是**缓冲 SSE**：先发 Responses 的创建事件和等待心跳，待上游完成后才发送已验证的正文与工具事件，不保证逐 token 即时到达。若返回可见思考，`reasoning_text` 增量也有对应的 `response.content_part.added/done`。成功终点为 `response.completed`；截断/过滤使用 `response.incomplete`，不输出未完成调用；慢错误使用 `response.failed`。它不发送 Chat 的 `[DONE]`，也不提供 Chat 续传。
+- 用量沿用所选通道的统计。Cookie 启用缺失用量估算并实际使用估算时，`usage.estimated` 为 `true`。为兼容当前 Responses SDK，`usage.input_tokens_details.cache_write_tokens` 在没有可报告的写入量时为 `0`，不能作为 Gemini 缓存计费依据。
 - 始终无状态：省略 `store` 也按 `false`，不支持响应检索、`previous_response_id`、`conversation`、后台模式、WebSocket、断点续传或幂等键。也不支持图像/音频/文件、内置工具、自由格式 `type:"custom"`、JSON 输出格式、OpenAI 思考摘要或其他带值的未实现参数。请求体和上游中间 JSON 回复各限 8 MiB。**这不等于完整 OpenAI Responses 或 Codex 客户端兼容。**
 
 ---

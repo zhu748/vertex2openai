@@ -487,19 +487,31 @@ def is_complete_terminal_call(call, index):
             and type(position) is int and position == index)
 
 
-class TerminalOriginFence:
-    """A translating route may defer one negative batch until public delivery.
+def _commit_origin(keys, signatures, destination):
+    if signatures is None:
+        for key in keys:
+            mark_unrestorable_origin(key)
+    else:
+        signature_store.register_origin_batch(keys, signatures, destination)
 
-    These are only bounded, exact origin digests from the accepted producer
-    attempt, never the original signatures, arguments, or any message text.
+
+class DeliveredOrigin:
+    """Stage at most one verified producer batch until its public response is sent.
+
+    Keep only bounded origin digests, optional original signature bytes, and
+    the actual destination. Never keep arguments or message text here.
     """
 
     def __init__(self):
         self._pending = None
         self._source = None
         self._valid = True
+        self._terminal_valid = True
+        self._confirmed = False
 
     def source(self, source_id):
+        if not self._valid:
+            return
         if not isinstance(source_id, str) or not source_id or len(source_id) > 256:
             self.discard()
         elif self._source is None:
@@ -507,32 +519,42 @@ class TerminalOriginFence:
         elif self._source != source_id:
             self.discard()
 
-    def stage(self, finish, keys):
-        if (not self._valid or self._pending is not None or not is_unrestorable_tool_terminal(finish)
-                or not 0 < len(keys) <= _MAX_CALLS or any(not isinstance(k, bytes) or len(k) != 32 for k in keys)):
-            self.discard()
-        else:
-            self._pending = finish, keys
+    def reject_terminal(self):
+        # Late ordinary content can still collide after the true-stream
+        # projection flattens it; only an incomplete terminal requires the
+        # stronger natural-order check already applied to that projection.
+        self._terminal_valid = False
 
-    def confirm_batch(self, count):
-        if self._pending is None or len(self._pending[1]) != count:
+    def stage(self, finish, keys, signatures, destination):
+        if not self._valid or self._pending is not None:
             self.discard()
+            return
+        # OriginBatch already verified key/count, per-slot and aggregate
+        # byte limits. It hands over immutable snapshots, not its work state.
+        self._pending = finish, keys, signatures, destination
+
+    def confirm_batch(self, finish, count):
+        if (self._pending is None or self._pending[0] != finish or len(self._pending[1]) != count
+                or is_unrestorable_tool_terminal(finish) and not self._terminal_valid):
+            self.discard()
+            return
+        self._confirmed = True
 
     @property
     def ready(self):
-        return self._pending is not None
+        return self._confirmed
 
     def discard(self):
         self._valid = False
+        self._confirmed = False
         self._pending = None
         self._source = None
 
-    async def publish(self, finish):
-        pending = self._pending
+    async def publish(self):
+        pending = self._pending if self._confirmed else None
         self.discard()
-        if pending is not None and pending[0] == finish:
-            for key in pending[1]:
-                mark_unrestorable_origin(key)
+        if pending is not None:
+            _commit_origin(*pending[1:])
 
 
 class OriginBatch:
@@ -596,7 +618,7 @@ class OriginBatch:
         except (TypeError, AttributeError, KeyError, ValueError, OverflowError, RecursionError):
             self.withhold()
 
-    def finish_plain_parts(self, parts, order, *, finish_reason="tool_calls", stage_terminal=None, destination=None):
+    def finish_plain_parts(self, parts, order, *, finish_reason="tool_calls", stage_origin=None, destination=None):
         if not self.prefix or len(parts) > _MAX_BLOCKS:
             self.discard()
             return
@@ -613,9 +635,9 @@ class OriginBatch:
                 return
         if not _plain_metadata({"google": {"ordinary_parts": parts, "part_order": order}}, len(self.tags)):
             self.reject_topology()
-        self.finish(finish_reason=finish_reason, stage_terminal=stage_terminal, destination=destination)
+        self.finish(finish_reason=finish_reason, stage_origin=stage_origin, destination=destination)
 
-    def finish(self, *, finish_reason="tool_calls", stage_terminal=None, destination=None):
+    def finish(self, *, finish_reason="tool_calls", stage_origin=None, destination=None):
         terminal_fence = is_unrestorable_tool_terminal(finish_reason)
         if finish_reason != "tool_calls" and not terminal_fence:
             self.discard()
@@ -628,18 +650,16 @@ class OriginBatch:
             return
         prefix = _step_prefix(self.prefix, text, reasoning) if self.prefix else None
         keys = _slot_keys(prefix, self.tags)
-        if terminal_fence and stage_terminal is not None:
-            if keys:
-                stage_terminal(finish_reason, keys)
-        elif self.withheld or terminal_fence:
-            for key in keys:
-                mark_unrestorable_origin(key)
-        elif keys:
-            signature_store.register_origin_batch(keys, self.signatures, destination)
+        if keys:
+            signatures = None if self.withheld or terminal_fence else self.signatures
+            if stage_origin is not None:
+                stage_origin(finish_reason, keys, tuple(signatures) if signatures is not None else None, destination)
+            else:
+                _commit_origin(keys, signatures, destination)
         self.discard()
 
 
-def publish_completed_origins(prefix, choices, *, stage_terminal=None, destination=None):
+def publish_completed_origins(prefix, choices, *, stage_origin=None, destination=None):
     if not prefix or len(choices) > 8:
         return
     for choice in choices:
@@ -658,7 +678,7 @@ def publish_completed_origins(prefix, choices, *, stage_terminal=None, destinati
         origin.reasoning.feed(message.get("reasoning_content"))
         for call in calls:
             origin.add(call)
-        origin.finish(finish_reason=finish, stage_terminal=stage_terminal, destination=destination)
+        origin.finish(finish_reason=finish, stage_origin=stage_origin, destination=destination)
 
 
 def observe_stream_origin(batches, prefix, choice):
@@ -700,8 +720,8 @@ def observe_stream_origin(batches, prefix, choice):
         origin.discard()
 
 
-def publish_stream_origins(batches, *, stage_terminal=None, destination=None):
-    """Commit after the whole stream is accepted, not while processing a finish frame."""
+def publish_stream_origins(batches, *, stage_origin=None, destination=None):
+    """Only the accepted producer attempt reaches the public delivery stage."""
     for origin in batches.values():
         if origin.stream_terminal:
-            origin.finish(finish_reason=origin.stream_terminal, stage_terminal=stage_terminal, destination=destination)
+            origin.finish(finish_reason=origin.stream_terminal, stage_origin=stage_origin, destination=destination)

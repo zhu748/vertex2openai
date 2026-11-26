@@ -347,7 +347,7 @@ async def _fake_stream_response_frames(
                 )
             note_accepted_destination(request_obj, destination)
             publish_completed_origins(request_obj._signature_output_prefix, openai_response_dict["choices"],
-                                      stage_terminal=request_obj._stage_terminal_signature_fence,
+                                      stage_origin=request_obj._stage_signature_origin,
                                       destination=destination)
         yield chunk_sse
     # 发射完毕先断开本帧对 25MB+ content 的最后一处本地引用（走引用
@@ -1230,7 +1230,7 @@ class SDKGeneration:
             )
 
         note_accepted_destination(self.request_obj, route.destination)
-        publish_stream_origins(tool_indexer.signature_origins, stage_terminal=self.request_obj._stage_terminal_signature_fence,
+        publish_stream_origins(tool_indexer.signature_origins, stage_origin=self.request_obj._stage_signature_origin,
                                destination=route.destination)
         yield "data: [DONE]\n\n"
         print(
@@ -1451,7 +1451,7 @@ class SDKGeneration:
             result = JSONResponse(content=openai_response_content)
         note_accepted_destination(self.request_obj, route.destination)
         publish_completed_origins(self.request_obj._signature_output_prefix, openai_response_content["choices"],
-                                  stage_terminal=self.request_obj._stage_terminal_signature_fence,
+                                  stage_origin=self.request_obj._stage_signature_origin,
                                   destination=route.destination)
         print(f"✅ [Express] {self.request_obj.model} | 非流式响应完成")
         return result

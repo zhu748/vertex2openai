@@ -2,6 +2,7 @@ import atexit
 import builtins
 import io
 from collections import deque
+from contextvars import ContextVar
 import sys
 import time
 import re
@@ -12,6 +13,54 @@ from log_stream import SSELogger
 
 original_print = builtins.print
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+
+
+# Only the Chat SSE relay installs this on a body pull. It is inherited by
+# that pull's child tasks, never left installed across an async iterator yield.
+_stream_counts = ContextVar("stream_counts", default=None)
+
+
+def discard_current_stream_attempt():
+    """Return a losing attempt's failure only for its possible error replay."""
+    if (pending := _stream_counts.get()) is not None:
+        return pending.discard_attempt()
+    return None
+
+
+class StreamCounts:
+    """Per-generation outcome proposals. Upstream token usage is not provisional."""
+
+    __slots__ = ("failure", "success", "_counted")
+
+    def __init__(self):
+        self.failure = None
+        self.success = None
+        self._counted = False
+
+    async def pull(self, iterator):
+        token = _stream_counts.set(self)
+        try:
+            return await anext(iterator)
+        finally:
+            _stream_counts.reset(token)
+
+    def discard_attempt(self):
+        failure = self.failure
+        self.failure = self.success = None
+        return failure
+
+    def commit_error(self, default=None):
+        if not self._counted and (counter := self.failure or default) is not None:
+            self._counted = True
+            self.failure = self.success = None
+            counter.add_error()
+
+    def commit_terminal(self):
+        if self.failure is not None:
+            self.commit_error()
+        elif not self._counted and self.success is not None:
+            self._counted = True
+            self.success.add_success()
 
 
 class ProxyStats:
@@ -30,6 +79,9 @@ class ProxyStats:
             self.total_requests += 1
 
     def add_error(self):
+        if (pending := _stream_counts.get()) is not None:
+            pending.failure = self
+            return
         with self.lock:
             self.error_requests += 1
 
@@ -41,14 +93,21 @@ class ProxyStats:
 
     def add_success(self):
         """直接计一次成功请求（Cookie / Gemini 原生透传不走 SDK token 统计）。"""
+        if (pending := _stream_counts.get()) is not None:
+            pending.success = self
+            return
         with self.lock:
             self.success_requests += 1
 
     def add_tokens(self, p_tokens, c_tokens):
+        pending = _stream_counts.get()
+        if pending is not None:
+            pending.success = self
         with self.lock:
             self.prompt_tokens += p_tokens
             self.completion_tokens += c_tokens
-            self.success_requests += 1
+            if pending is None:
+                self.success_requests += 1
 
     def get_json_stats(self):
         with self.lock:

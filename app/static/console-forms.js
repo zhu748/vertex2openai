@@ -1,7 +1,8 @@
 /* Form state lives only in this page. Never persist credentials in browser storage. */
 (() => {
   const snapshots = new Map(),
-    accountOpen = new Map();
+    accountOpen = new Map(),
+    settingsWrites = new Map();
   const settingsGroups = ['runtime', 'proxy', 'fingerprint', 'express-fingerprint'];
   // Keep the pre-edit expectation for a genuine conflict, even after another reload.
   const conflicts = new Map();
@@ -28,7 +29,10 @@
     const server = serverValue(id),
       key = settingKey(id);
     conflicts.delete(key);
-    if (sameSetting(id, local, server) || sameSetting(id, local, origin.base)) {
+    if (
+      sameSetting(id, local, server) ||
+      (!origin.keepReverted && sameSetting(id, local, origin.base))
+    ) {
       setV(id, server); // converged, or the user undid the original edit
     } else {
       if (!sameSetting(id, server, origin.base)) conflicts.set(key, origin);
@@ -141,6 +145,53 @@
       refresh();
     }
   }
+  function beginSettingsWrite(name, keys) {
+    if (settingsWrites.has(name)) return null;
+    // Capture rendered values at submission, not when the receipt arrives.
+    // Only the fields in the actual sparse patch can move their baseline.
+    const fields = new Map(
+      read(group(name))
+        .filter(({ id }) => keys.includes(settingKey(id)))
+        .map(({ id, value }) => [id, { last: value, later: null }])
+    );
+    const write = { name, fields };
+    settingsWrites.set(name, write);
+    return write;
+  }
+  function captureLaterSettings(name, current) {
+    const writing = settingsWrites.get(name)?.fields;
+    for (const field of current) {
+      const entry = writing?.get(field.id);
+      if (entry && !sameSetting(field.id, field.value, entry.last)) {
+        entry.last = field.value;
+        entry.later = {
+          ...field,
+          origin: { ...settingOrigin(field.id), keepReverted: true }
+        };
+      }
+    }
+    return writing;
+  }
+  function acceptSettingsWrite(write, saved, superseded) {
+    captureLaterSettings(write.name, read(group(write.name)));
+    const baseline = snapshots.get(write.name).map((field) => {
+      const entry = write.fields.get(field.id);
+      if (!entry) return field;
+      const key = settingKey(field.id);
+      const newer = superseded.has(key);
+      setV(field.id, newer ? field.value : saved[key]);
+      const confirmed = value($(field.id));
+      if (entry.later && !sameSetting(field.id, entry.later.value, confirmed))
+        setV(field.id, entry.later.value);
+      if (!newer || !entry.later) conflicts.delete(key);
+      return { id: field.id, value: confirmed };
+    });
+    snapshots.set(write.name, baseline);
+  }
+  function endSettingsWrite(write) {
+    settingsWrites.delete(write.name);
+    refresh(write.name);
+  }
   function rebaseKeys() {
     snapshots.set('keys', keyState(SAVED_KEYS));
     refresh('keys');
@@ -148,17 +199,20 @@
   function capture() {
     return Object.fromEntries(
       groups()
-        .filter((el) => changed(el.dataset.draftGroup))
+        .filter((el) => changed(el.dataset.draftGroup) || settingsWrites.has(el.dataset.draftGroup))
         .map((el) => {
           const name = el.dataset.draftGroup,
             current = read(el);
           if (!settingsGroups.includes(name)) return [name, current];
           const baseline = snapshots.get(name);
-          const edits = current.flatMap((field, i) =>
-            sameSetting(field.id, field.value, baseline[i].value)
+          const writing = captureLaterSettings(name, current);
+          const edits = current.flatMap((field, i) => {
+            const later = writing?.get(field.id)?.later;
+            if (later) return [later];
+            return sameSetting(field.id, field.value, baseline[i].value)
               ? []
-              : [{ ...field, origin: settingOrigin(field.id, baseline[i].value) }]
-          );
+              : [{ ...field, origin: settingOrigin(field.id, baseline[i].value) }];
+          });
           return [name, edits];
         })
     );
@@ -170,6 +224,9 @@
       if (!el) continue;
       snapshots.set(name, read(el)); // the latest server values remain the discard target
       for (const field of drafts?.[name] || []) restoreSetting(field.id, field.value, field.origin);
+      // A reload is not another edit. Preserve the last intent separately,
+      // including a revert to the pre-submit value while the write is pending.
+      for (const [id, entry] of settingsWrites.get(name)?.fields || []) entry.last = value($(id));
     }
     updateExpressCustomVis();
     updateProxyDraft();
@@ -192,6 +249,10 @@
       for (const field of snapshots.get(name) || []) {
         if ($(field.id)) setV(field.id, field.value);
       }
+    for (const [id, entry] of settingsWrites.get(name)?.fields || []) {
+      entry.last = value($(id));
+      entry.later = null;
+    }
     updateExpressCustomVis();
     updateProxyDraft();
     refresh();
@@ -394,6 +455,9 @@
   });
   window.consoleForms = {
     saved,
+    beginSettingsWrite,
+    acceptSettingsWrite,
+    endSettingsWrite,
     rebaseKeys,
     guardSettings,
     settingOrigin,

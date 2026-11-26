@@ -11,6 +11,7 @@ import model_capabilities as mc
 from google.genai import types
 from ordinary_history import exact_ordinary_slots
 from schema_validation import SchemaValidationError
+from signature_destination import UNTRUSTED
 from signature_store import (
     SKIP_VALIDATOR_SENTINEL,
     SKIP_VALIDATOR_SENTINELS,
@@ -398,7 +399,8 @@ def resolve_tool_call_signature(
         record = signature_store.get_record(real_id) if not explicit_unsigned else None
 
     if record is not None:
-        if destination is not None and record.destination is not None and destination != record.destination:
+        if (destination == UNTRUSTED or record.destination == UNTRUSTED
+                or destination is not None and record.destination is not None and destination != record.destination):
             # A local origin from another route is evidence against guessing.
             # Leave it unsigned in compatibility mode, not a new bypass.
             if strict:

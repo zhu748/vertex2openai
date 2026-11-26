@@ -5,8 +5,11 @@ import secrets
 
 
 # None denotes consumers without attempt provenance (standalone converters).
-# An empty digest means an actual attempt whose resource cannot be qualified.
+# Allow legacy best effort for a recognized endpoint without a qualified resource.
 UNQUALIFIED = b""
+# A custom/unsupported SDK route cannot authorize local replay, even to itself.
+# Its marker is neither a qualified digest nor the recognized endpoint's bare route.
+UNTRUSTED = b"\xff"
 _KEY = secrets.token_bytes(32)
 _PUBLISHER_MODEL = re.compile(
     r"projects/[a-z0-9][a-z0-9-]{0,127}/locations/[a-z0-9][a-z0-9-]{0,63}"
@@ -26,13 +29,13 @@ def sdk_destination(client, model: str, config: dict) -> bytes:
     # An override may alter host or path. Do not infer a project from the Key
     # record even if the original configured model had a pinned resource.
     if config.get("http_options") is not None:
-        return UNQUALIFIED
+        return UNTRUSTED
     api = getattr(client, "_api_client", None)
     options = getattr(api, "_http_options", None)
     if (getattr(api, "vertexai", None) is not True
             or getattr(options, "base_url", None) not in _VERTEX_ENDPOINTS
             or getattr(options, "api_version", None) not in ("v1", "v1beta1")):
-        return UNQUALIFIED
+        return UNTRUSTED
     return publisher_destination(model)
 
 

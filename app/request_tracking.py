@@ -81,6 +81,56 @@ def _anthropic_sent_counts(payload: dict) -> tuple[int, int, bool]:
     return content, reasoning, tool
 
 
+def _responses_call_present(item):
+    return (isinstance(item, dict) and item.get("type") == "function_call"
+            and isinstance((name := item.get("name")), str) and bool(name) and not name.isspace())
+
+
+def _responses_part_chars(parts, kinds):
+    if not isinstance(parts, list):
+        return 0
+    chars = 0
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        kind = part.get("type")
+        if kind in kinds and isinstance((text := part.get("refusal" if kind == "refusal" else "text")), str):
+            chars += len(text)
+    return chars
+
+
+def _responses_sent_counts(payload: dict) -> tuple[int, int, bool]:
+    """Count public JSON items or incremental SSE, never repeated end snapshots."""
+    event = payload.get("type")
+    delta = payload.get("delta")
+    if event in ("response.output_text.delta", "response.refusal.delta"):
+        return len(delta) if isinstance(delta, str) else 0, 0, False
+    if event in ("response.reasoning_text.delta", "response.reasoning_summary_text.delta"):
+        return 0, len(delta) if isinstance(delta, str) else 0, False
+    if event == "response.output_item.added":
+        return 0, 0, _responses_call_present(payload.get("item"))
+    if event == "response.function_call_arguments.delta":
+        return 0, 0, isinstance(delta, str) and bool(delta) and not delta.isspace()
+    if event is not None or payload.get("object") != "response":
+        return 0, 0, False
+
+    content = reasoning = 0
+    tool = False
+    output = payload.get("output")
+    for item in output if isinstance(output, list) else ():
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("type")
+        if kind == "message" and item.get("role") == "assistant":
+            content += _responses_part_chars(item.get("content"), ("output_text", "refusal"))
+        elif kind == "reasoning":
+            reasoning += _responses_part_chars(item.get("content"), ("reasoning_text",))
+            reasoning += _responses_part_chars(item.get("summary"), ("summary_text",))
+        elif kind == "function_call":
+            tool |= _responses_call_present(item)
+    return content, reasoning, tool
+
+
 class RequestTrace:
     def __init__(self, path):
         self.id = "trace-" + secrets.token_hex(8)
@@ -248,6 +298,15 @@ class RequestTrace:
         self.data["usage"] = snapshot
         self._native_usage = native
 
+    def _observe_sent(self, content, reasoning, tools, other_reply=False):
+        with self._lock:
+            self.data["sent_content_chars"] += content
+            self.data["sent_reasoning_chars"] += reasoning
+        if content or reasoning or tools or other_reply:
+            self.milestone("first_sent_reply", "首个有效模型回复已通过服务端 ASGI 发送。")
+        if content:
+            self.milestone("first_sent_content", "首段正文已通过服务端 ASGI 发送；不代表客户端已渲染。")
+
     def inspect_payload(self, payload, *, sent=False):
         if not isinstance(payload, dict):
             return
@@ -256,8 +315,11 @@ class RequestTrace:
             self.fail(error.get("message", str(error)) if isinstance(error, dict) else error,
                       error.get("code") if isinstance(error, dict) else None)
             return
-        # Generation observes the internal OpenAI/Gemini reply. The sent
-        # observer instead sees Messages wire blocks after protocol conversion.
+        # Generation observes the internal Chat/Gemini reply. Responses wire
+        # output has its own typed items and must not count repeated snapshots.
+        if sent and self.data["path"] == "/v1/responses":
+            self._observe_sent(*_responses_sent_counts(payload))
+            return
         content, reasoning, tools = (_anthropic_sent_counts(payload)
                                      if sent and "type" in payload else (0, 0, 0))
         reasons = []
@@ -279,33 +341,26 @@ class RequestTrace:
                 other_reply = other_reply or native_other_part_has_reply(part)
             if candidate.get("finishReason"):
                 reasons.append(redact(candidate["finishReason"])[:100])
-        with self._lock:
-            if sent:
-                self.data["sent_content_chars"] += content
-                self.data["sent_reasoning_chars"] += reasoning
-            else:
-                self.data["content_chars"] += content
-                self.data["reasoning_chars"] += reasoning
-                self.data["tool_deltas"] += tools
-                self.data["finish_reasons"] = sorted(set(self.data["finish_reasons"] + reasons))
-                if isinstance(usage := payload.get("usage"), dict) and usage:
-                    self._set_usage_locked(usage)
-                elif isinstance(usage := payload.get("usageMetadata"), dict):
-                    self._set_usage_locked(usage, native=True)
         if sent:
-            if content or reasoning or tools or other_reply:
-                self.milestone("first_sent_reply", "首个有效模型回复已通过服务端 ASGI 发送。")
-            if content:
-                self.milestone("first_sent_content", "首段正文已通过服务端 ASGI 发送；不代表客户端已渲染。")
-        else:
-            if content or reasoning or tools or other_reply:
-                self.milestone("first_reply", "收到模型首个有效回复，首回复计时结束。")
-            if reasoning:
-                self.milestone("first_reasoning", "开始返回思考内容。", phase="thinking")
-            if content:
-                self.milestone("first_content", "开始返回正文（服务端首字）。", phase="streaming")
-            if tools:
-                self.milestone("first_tool", "开始返回工具调用。", phase="streaming")
+            self._observe_sent(content, reasoning, tools, other_reply)
+            return
+        with self._lock:
+            self.data["content_chars"] += content
+            self.data["reasoning_chars"] += reasoning
+            self.data["tool_deltas"] += tools
+            self.data["finish_reasons"] = sorted(set(self.data["finish_reasons"] + reasons))
+            if isinstance(usage := payload.get("usage"), dict) and usage:
+                self._set_usage_locked(usage)
+            elif isinstance(usage := payload.get("usageMetadata"), dict):
+                self._set_usage_locked(usage, native=True)
+        if content or reasoning or tools or other_reply:
+            self.milestone("first_reply", "收到模型首个有效回复，首回复计时结束。")
+        if reasoning:
+            self.milestone("first_reasoning", "开始返回思考内容。", phase="thinking")
+        if content:
+            self.milestone("first_content", "开始返回正文（服务端首字）。", phase="streaming")
+        if tools:
+            self.milestone("first_tool", "开始返回工具调用。", phase="streaming")
 
     def snapshot(self, detail=False):
         with self._lock:

@@ -46,7 +46,7 @@ from starlette.background import BackgroundTask
 from starlette.requests import ClientDisconnect
 
 from admission import GenerationCapacityError, ManagedStreamingResponse
-from signature_origin import TerminalOriginFence, bind_signature_origins
+from signature_origin import DeliveredOrigin, bind_signature_origins
 from claude_signature_projection import OmittedClaudeProjection, bind_omitted_claude_projection
 from auth import constant_time_equal, extract_candidate_key
 from claude_protocol import (
@@ -247,10 +247,18 @@ def _translate_openai_sse_frame(state: ClaudeStreamState, item: Optional[bytes])
     return None, state.feed_openai_chunk(payload)
 
 
+async def _publish_delivered_signature(proof, connection):
+    if connection is not None and not connection.delivery_possible:
+        proof.discard()
+    else:
+        await proof.publish()
+
+
 def _claude_stream_response(response: StreamingResponse, display_model: str, *,
                            omit_thinking: bool,
                            started_at: Optional[float] = None,
-                           state: Optional[ClaudeStreamState] = None) -> ManagedStreamingResponse:
+                           state: Optional[ClaudeStreamState] = None,
+                           connection: Optional[ClientConnection] = None) -> ManagedStreamingResponse:
     """把上游 OpenAI SSE 流翻译成 Anthropic 事件流（claude_messages 的流式段）。
 
     职责与保活策略（详见模块 docstring 与 IDLE_PING_SECONDS 注释）：
@@ -262,6 +270,8 @@ def _claude_stream_response(response: StreamingResponse, display_model: str, *,
     if state is None:
         state = ClaudeStreamState(display_model, omit_thinking=omit_thinking)
     upstream_iterator = response.body_iterator
+    proof = state.projection if state.projection is not None else state.delivered_origin
+    serialized = wire_done = False
 
     async def _bytes_source():
         async for chunk in upstream_iterator:
@@ -283,9 +293,8 @@ def _claude_stream_response(response: StreamingResponse, display_model: str, *,
             ready.set()
 
     async def event_stream():
+        nonlocal serialized, wire_done
         failed = False
-        delivered = False  # message_stop 已完整发出（客户端断开/异常时不算完成）
-        wire_done = False
         producer = asyncio.create_task(_produce_frames())
         producer.add_done_callback(lambda _: ready.set())
         try:
@@ -308,12 +317,7 @@ def _claude_stream_response(response: StreamingResponse, display_model: str, *,
                     raise IncompleteResponseError("上游 OpenAI 流缺少结束原因，回复可能不完整。")
                 for event in state.finish_events():
                     yield event
-                delivered = True
-                if wire_done:
-                    if state.projection is not None:
-                        await state.projection.publish()
-                    if state.terminal_fence is not None:
-                        await state.terminal_fence.publish(state.finish)
+                serialized = True
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -322,14 +326,11 @@ def _claude_stream_response(response: StreamingResponse, display_model: str, *,
             print(f"❌ [Claude] 模型 {display_model} 流式转发失败 | HTTP {code} | {message[:200]}")
             yield error_event(anthropic_error_type(code), message[:1024])
         finally:
-            if state.projection is not None:
-                state.projection.discard()
-            if state.terminal_fence is not None:
-                state.terminal_fence.discard()
-            # 与 OpenAI 通道的完成日志同构：显示模型（claude-* 或原样 gemini-*）
-            # | 耗时 | tokens；上游内部管线已按内部模型名打过 📊/✅，这里补齐
-            # Claude 协议视角的收尾行。
-            if delivered:
+            if proof is not None and not (serialized and wire_done):
+                proof.discard()
+            # This is a translation milestone, not proof of successful ASGI
+            # delivery. Keep the existing iterator-level log and token usage.
+            if serialized:
                 elapsed = time.monotonic() - started_at if started_at is not None else 0.0
                 usage = state.usage or {}
                 tokens = ""
@@ -339,6 +340,13 @@ def _claude_stream_response(response: StreamingResponse, display_model: str, *,
             # Drain the producer in a separate owned task. Its expected
             # cancellation must not consume an independent server cancellation.
             await await_owned_close(stop_producer(producer))
+
+    async def after_send():
+        # The iterator can end before the final ASGI body is sent. A silent
+        # disconnect during that write also makes an otherwise complete reply
+        # ineligible, even when the server's send() did not raise.
+        if serialized and wire_done and proof is not None:
+            await _publish_delivered_signature(proof, connection)
 
     async def stop_producer(producer):
         producer.cancel()
@@ -361,12 +369,20 @@ def _claude_stream_response(response: StreamingResponse, display_model: str, *,
             except Exception:
                 pass
 
-    return ManagedStreamingResponse(
+    async def close_public_response():
+        if proof is not None:
+            proof.discard()
+        await cleanup()
+
+    translated = ManagedStreamingResponse(
         event_stream(),
         media_type="text/event-stream",
         headers=SSE_NO_BUFFER_HEADERS,
-        cleanup=cleanup,
+        cleanup=close_public_response,
+        background=BackgroundTask(after_send) if proof is not None else None,
     )
+    translated.client_connection = connection
+    return translated
 
 
 # ============================================================
@@ -409,7 +425,7 @@ async def claude_messages(fastapi_request: Request, api_key: str = Depends(get_c
     bind_signature_origins(request_obj, api_key)
     omit_thinking = anthropic_omit_thinking(body)
     projection = None
-    terminal_fence = None
+    delivered_origin = None
     if omit_thinking:
         projection = OmittedClaudeProjection(request_obj._signature_output_prefix, body.get("metadata"))
         request_obj._signature_output_destination = projection.set_destination
@@ -420,14 +436,15 @@ async def claude_messages(fastapi_request: Request, api_key: str = Depends(get_c
     elif request_obj._signature_output_prefix:
         # Unlike the internal Chat delivery, this translator can still refuse
         # or abandon a reply before a real public Messages result exists.
-        terminal_fence = TerminalOriginFence()
-        request_obj._stage_terminal_signature_fence = terminal_fence.stage
+        delivered_origin = DeliveredOrigin()
+        request_obj._stage_signature_origin = delivered_origin.stage
     request_started = time.monotonic()
     stream_state = None
     if request_obj.stream:
         stream_state = ClaudeStreamState(display_model, omit_thinking=omit_thinking, projection=projection,
-                                        terminal_fence=terminal_fence)
+                                        delivered_origin=delivered_origin)
         request_obj._select_buffered_order = stream_state.select_buffered_order
+    connection = ClientConnection.for_request(fastapi_request)
 
     track_configure(model=display_model, protocol="claude",
                     stream=bool(request_obj.stream), channel=_track_channel())
@@ -479,20 +496,18 @@ async def claude_messages(fastapi_request: Request, api_key: str = Depends(get_c
         background = None
         if projection is not None:
             projection.prepare_json(payload, anthropic_payload)
-            if projection.ready:
-                background = BackgroundTask(projection.publish)
-        elif (terminal_fence is not None and terminal_fence.ready
-              and anthropic_payload["stop_reason"] in ("max_tokens", "refusal")):
-            terminal_fence.confirm_batch(sum(block["type"] == "tool_use" for block in anthropic_payload["content"]))
-            background = BackgroundTask(terminal_fence.publish, payload["choices"][0]["finish_reason"])
+        elif delivered_origin is not None:
+            delivered_origin.confirm_batch(payload["choices"][0]["finish_reason"],
+                                          sum(block["type"] == "tool_use" for block in anthropic_payload["content"]))
+        proof = projection if projection is not None else delivered_origin
+        if proof is not None and proof.ready:
+            background = BackgroundTask(_publish_delivered_signature, proof, connection)
         return response_class(content=anthropic_payload, background=background)
 
     # ---- 流式：OpenAI SSE 帧 → Anthropic SSE 事件 ----
-    translated = _claude_stream_response(response, display_model, omit_thinking=omit_thinking,
-                                         started_at=request_started, state=stream_state)
     # The adapter, rather than its upstream iterator, owns the actual ASGI send.
-    translated.client_connection = ClientConnection.for_request(fastapi_request)
-    return translated
+    return _claude_stream_response(response, display_model, omit_thinking=omit_thinking, started_at=request_started,
+                                   state=stream_state, connection=connection)
 
 
 # ============================================================

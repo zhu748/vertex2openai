@@ -205,6 +205,62 @@ class ResponsesWireTests(SchemaRouteHarness):
                     self.assertIn("signature", denied.text)
                     self.assertEqual(len(self.sent), old_size)
 
+    async def test_structured_text_results_keep_boundaries_order_and_later_thin_origins(self):
+        for channel in ("api_key", "web_proxy"):
+            self.channel = channel
+            for stream in (False, True):
+                with self.subTest(channel=channel, stream=stream):
+                    label = f"structured/{channel}/{stream}"
+                    prompt = [{"type": "message", "role": "user", "content": [
+                        {"type": "input_text", "text": f"Count the colors ({label})."}]}]
+                    first_id, second_id = f"first:{label}", f"second:{label}__thought__YQ=="
+                    self.reply = [assistant(first_id, SIGNATURES[0]), assistant(second_id, SIGNATURES[1], shade="gold")]
+                    started = await self.client.post(PATH, json=request(input=prompt, stream=stream))
+                    self.assertEqual(started.status_code, 200, started.text[:360])
+                    source = event_list(started.text)[-1]["response"] if stream else started.json()
+                    thin = [thin_item(item) for item in source["output"]]
+
+                    red_blocks = [" red 🌈\n", "", "![literal](data:image/png;base64,not-an-attachment)"]
+                    gold_blocks = ["gold", "amber"]
+                    def result(call_id, blocks):
+                        return {"type": "function_call_output", "call_id": call_id, "output": [
+                            {"type": "input_text", "text": value} for value in blocks]}
+
+                    # Race-like reverse arrival is still correlated by the opaque call IDs.
+                    results = [result(second_id, gold_blocks), result(first_id, red_blocks)]
+                    history = [*prompt, *thin, *results]
+                    newest_id = f"next:{label}"
+                    newest_signature = b"\x00\x98\xfe-next"
+                    self.reply = assistant(newest_id, newest_signature)
+                    continued = await self.client.post(PATH, json=request(input=history, stream=stream))
+                    self.assertEqual(continued.status_code, 200, continued.text[:360])
+                    wire = self.sent[-1]
+                    calls = calls_in_wire(wire, "functionCall")
+                    self.assertEqual([part["functionCall"]["id"] for part in calls], [first_id, second_id])
+                    self.assertEqual([signature(part) for part in calls], list(SIGNATURES))
+                    replies = calls_in_wire(wire, "functionResponse")
+                    self.assertEqual([part["functionResponse"]["id"] for part in replies], [first_id, second_id])
+                    self.assertTrue(all("thoughtSignature" not in part and "parts" not in part["functionResponse"]
+                                        for part in replies))
+                    self.assertEqual([part["functionResponse"]["response"] for part in replies],
+                                     [{"result": [{"type": "text", "text": value} for value in blocks]}
+                                      for blocks in (red_blocks, gold_blocks)])
+
+                    # Structured history also participates in the proof for later tool turns.
+                    newest = event_list(continued.text)[-1]["response"] if stream else continued.json()
+                    tail = [thin_item(newest["output"][0]), result(newest_id, [])]
+                    self.reply = {"text": "done"}
+                    for matching in (True, False):
+                        changed = history if matching else [*prompt, *thin, results[0],
+                                                           result(first_id, list(reversed(red_blocks)))]
+                        done = await self.client.post(PATH, json=request(input=[*changed, *tail]))
+                        self.assertEqual(done.status_code, 200, done.text[:360])
+                        last_call = calls_in_wire(self.sent[-1], "functionCall")[-1]
+                        self.assertEqual(last_call["functionCall"]["id"], newest_id)
+                        self.assertEqual(signature(last_call), newest_signature if matching else None)
+                        last_reply = calls_in_wire(self.sent[-1], "functionResponse")[-1]
+                        self.assertEqual(last_reply["functionResponse"]["response"], {"result": []})
+
     async def test_signed_ordinary_tool_only_part_is_carried_without_a_fake_output_message(self):
         for channel in ("api_key", "web_proxy"):
             self.channel = channel
@@ -382,6 +438,34 @@ class ResponsesBoundaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(reply.status_code, 502, reply.text[:360])
             self.assertIn("limit", reply.json()["error"]["message"])
 
+    async def test_text_output_parts_are_bounded_and_nontext_never_reaches_dispatch(self):
+        base = [
+            {"role": "user", "content": "Return colors."},
+            {"type": "function_call", "call_id": "known", "name": "count_colors", "arguments": "{}"},
+        ]
+        plain = {"type": "input_text", "text": "a"}
+        for output, param in (
+            ([{"type": "input_image", "image_url": "fixture"}], "input[2].output[0]"),
+            ([{"type": "input_file", "file_id": "fixture"}], "input[2].output[0]"),
+            ([{"type": "encrypted_content", "encrypted_content": "fixture"}], "input[2].output[0]"),
+            ([{"type": "input_text", "text": ["not a scalar"]}], "input[2].output[0].text"),
+            ([{"type": "input_text", "text": "a", "prompt_cache_breakpoint": {}}],
+             "input[2].output[0]"),
+            ([plain] * 129, "input[2].output"),
+        ):
+            with self.subTest(output=str(output)[:200]), patch.object(
+                    responses_api, "call_upstream", new_callable=AsyncMock) as upstream:
+                result = {"type": "function_call_output", "call_id": "known", "output": output}
+                resp = await self.client.post(PATH, json=request(input=[*base, result], stream=True))
+                self.assertEqual(resp.status_code, 400, resp.text[:360])
+                self.assertEqual(resp.json()["error"]["param"], param)
+                upstream.assert_not_awaited()
+        with patch.object(responses_api, "call_upstream", AsyncMock(return_value=JSONResponse(completion()))) as upstream:
+            result = {"type": "function_call_output", "call_id": "known", "output": [plain] * 128}
+            resp = await self.client.post(PATH, json=request(input=[*base, result]))
+            self.assertEqual(resp.status_code, 200, resp.text[:360])
+            self.assertEqual(len(upstream.await_args.args[0].messages[-1].content), 128)
+
     async def test_token_usage_and_reasoning_only_replayed_if_actually_delivered(self):
         with patch.object(responses_api, "call_upstream",
                           AsyncMock(return_value=JSONResponse(completion({
@@ -397,9 +481,34 @@ class ResponsesBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pub["summary"], [])
         self.assertNotIn("encrypted_content", pub)
         self.assertEqual(message["content"][0]["text"], "done")
+        actual = [event for event in e if event.get("output_index") == 0 and "item_id" in event]
+        self.assertEqual([event["type"] for event in actual], [
+            "response.content_part.added", "response.reasoning_text.delta",
+            "response.reasoning_text.done", "response.content_part.done"])
+        self.assertTrue(all(event["item_id"] == pub["id"] and event["content_index"] == 0 for event in actual))
+        self.assertEqual(actual[0]["part"], {"type": "reasoning_text", "text": ""})
+        self.assertEqual(actual[1]["delta"], pub["content"][0]["text"])
+        self.assertEqual(actual[2]["text"], pub["content"][0]["text"])
+        self.assertEqual(actual[-1]["part"], pub["content"][0])
         self.assertEqual(result["usage"], {"input_tokens": 7, "output_tokens": 5, "total_tokens": 12,
-                                           "input_tokens_details": {"cached_tokens": 2},
+                                           "input_tokens_details": {"cached_tokens": 2, "cache_write_tokens": 0},
                                            "output_tokens_details": {"reasoning_tokens": 3}})
+
+    async def test_usage_marked_as_estimated_without_inventing_cache_writes(self):
+        for reported, estimated, expected in ((4, None, 4), (None, True, 0), (True, False, 0), (-1, None, 0)):
+            with self.subTest(reported=reported, estimated=estimated):
+                raw = completion()
+                raw["usage"]["prompt_tokens_details"]["cache_write_tokens"] = reported
+                raw["usage"]["estimated"] = estimated
+                with patch.object(responses_api, "call_upstream", AsyncMock(return_value=JSONResponse(raw))):
+                    response = await self.client.post(PATH, json=request())
+                self.assertEqual(response.status_code, 200, response.text[:360])
+                usage = response.json()["usage"]
+                self.assertEqual(usage["input_tokens_details"], {"cached_tokens": 2, "cache_write_tokens": expected})
+                if estimated is True:
+                    self.assertIs(usage["estimated"], True)
+                else:
+                    self.assertNotIn("estimated", usage)
 
 
     async def test_large_unicode_output_has_valid_independent_events(self):
@@ -413,6 +522,33 @@ class ResponsesBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(len(deltas), 1)
         self.assertEqual("".join(deltas), body)
         self.assertEqual(events[-1]["response"]["output"][0]["content"][0]["text"], body)
+
+    async def test_dense_metadata_keeps_exact_sse_bytes_without_thousands_of_sends(self):
+        ordinary = [{"kind": "text", "text": "🌈\n"} for _ in range(512)]
+        order = [{"type": "ordinary", "index": index} for index in range(len(ordinary))]
+        extra = {"google": {"ordinary_parts": ordinary, "part_order": order}}
+        chunks = list(responses_api.ResponsesEvents().event("response.completed", response=extra))
+        payload = {"type": "response.completed", "sequence_number": 0, "response": extra}
+        line = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+        self.assertEqual(b"".join(chunks), b"event: response.completed\ndata: " + line + b"\n\n")
+        # In this fixture every source fragment is tiny. Aggregation cannot grow
+        # a large frame copy or represent every punctuation mark as an ASGI send.
+        self.assertLessEqual(max(map(len, chunks)), 16 * 1024)
+        frames = []
+
+        async def send(message):
+            if chunk := message.get("body"):
+                frames.append(chunk)
+
+        text = "".join(part["text"] for part in ordinary)
+        raw = completion({"content": text, "extra_content": extra})
+        with patch.object(responses_api, "call_upstream", AsyncMock(return_value=JSONResponse(raw))):
+            await responses_asgi(request(stream=True), send, asyncio.Event())
+        events = event_list(b"".join(frames).decode())
+        item, = events[-1]["response"]["output"]
+        self.assertEqual(item["content"][0]["text"], text)
+        self.assertEqual(item["extra_content"], extra)
+        self.assertLess(len(frames), 64)
 
     async def test_incomplete_outputs_are_not_executable(self):
         raw = {"content": "partial", "tool_calls": [{"id": "partial", "type": "function",

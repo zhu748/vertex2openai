@@ -89,7 +89,9 @@ class OpenAIMessage(BaseModel):
 class OpenAIRequest(BaseModel):
     _signature_output_prefix: bytes | None = PrivateAttr(default=None)
     _signature_origin_cutoff: int | None = PrivateAttr(default=None)
-    _stage_terminal_signature_fence: Callable[[str, tuple[bytes, ...]], None] | None = PrivateAttr(default=None)
+    _stage_signature_origin: Callable[
+        [str, tuple[bytes, ...], tuple[bytes | None, ...] | None, bytes | None], None
+    ] | None = PrivateAttr(default=None)
     _signature_output_destination: Callable[[bytes], None] | None = PrivateAttr(default=None)
     model: str
     messages: list[OpenAIMessage]

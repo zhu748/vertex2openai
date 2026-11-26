@@ -26,11 +26,12 @@ Express 通道可以字节级透传原生 REST 请求；Cookie 通道的私有 G
 """
 
 import asyncio
+import base64
 import json
 import re
 import time
 from contextlib import aclosing
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 from fastapi import Request
@@ -49,7 +50,7 @@ from credential_manager import credential_manager
 from impersonate import open_upstream_client
 from logger import stats
 from proxy_failover import ProxyChain
-from protojson import int32_value
+from protojson import int32_value, standard_base64
 from response_validation import IncompleteResponseError, PendingMetadataGate
 from resumable import request_timeout_seconds
 from retry_policy import advisory_fits, get_retry_settings, note_retry_deadline
@@ -58,6 +59,7 @@ from schema_validation import (
     MAX_SCHEMA_DEPTH, MAX_SCHEMA_NODES, SchemaValidationError, native_definition_ref,
     sanitize_for_gemini, validate_json_schema, validate_schema_size,
 )
+from signature_store import SKIP_VALIDATOR_SENTINELS
 from streaming import (
     HEARTBEAT, HEARTBEAT_FRAME, SSE_NO_BUFFER_HEADERS, StreamDeadlineExceeded,
     reads_before_deadline, with_heartbeats,
@@ -239,7 +241,10 @@ def _normalize_system_instruction(si: Any) -> Optional[dict]:
     return None
 
 
-def _proto_shape(leaves: str = "", **children: dict | tuple) -> dict:
+_ProtoShape = dict | tuple | Callable[[Any], Any] | None
+
+
+def _proto_shape(leaves: str = "", **children: _ProtoShape) -> dict:
     """Both ProtoJSON spellings point to one canonical field and a typed child, if any."""
     shape = {}
     for snake, child in {**dict.fromkeys(leaves.split()), **children}.items():
@@ -249,10 +254,12 @@ def _proto_shape(leaves: str = "", **children: dict | tuple) -> dict:
     return shape
 
 
-def _proto_message(obj: Any, shape: dict | tuple | None) -> Any:
+def _proto_message(obj: Any, shape: _ProtoShape) -> Any:
     """Copy on change. Recurse only through declared message/repeated-message edges."""
     if shape is None:
         return obj
+    if callable(shape):
+        return shape(obj)
     if isinstance(shape, tuple):
         if not isinstance(obj, list):
             return obj
@@ -283,14 +290,36 @@ def _proto_message(obj: Any, shape: dict | tuple | None) -> Any:
     return result
 
 
+_GRAPHQL_SIGNATURE_SENTINELS = {
+    literal.decode("ascii"): base64.b64encode(literal).decode("ascii") for literal in SKIP_VALIDATOR_SENTINELS
+}
+_MAX_SENTINEL_CHARS = max(map(len, _GRAPHQL_SIGNATURE_SENTINELS))
+
+
+def _graphql_bytes(value: Any) -> Any:
+    # ProtoJSON accepts both alphabets and optional padding. The private
+    # Bytes scalar expects standard Base64; leave invalid inputs to its own
+    # validation rather than substituting different bytes.
+    canonical = standard_base64(value)
+    return value if canonical is None else canonical
+
+
+def _graphql_signature(value: Any) -> Any:
+    if isinstance(value, str) and len(value) <= _MAX_SENTINEL_CHARS:
+        if (encoded := _GRAPHQL_SIGNATURE_SENTINELS.get(value)) is not None:
+            return encoded  # Explicit REST sentinel; not a model signature.
+    return _graphql_bytes(value)
+
+
 # Only protocol envelopes belong here. In particular args, response, schema
-# properties, metadata and all free-form dictionaries keep their original keys.
-_BLOB = _proto_shape("mime_type display_name")
+# properties, metadata and all free-form dictionaries keep their original keys/values.
+_BLOB = _proto_shape("mime_type display_name", data=_graphql_bytes)
 _FILE = _proto_shape("file_uri mime_type display_name")
 _RESPONSE_PART = _proto_shape(inline_data=_BLOB, file_data=_FILE)
 _PARTIAL_ARG = _proto_shape("json_path bool_value null_value number_value string_value will_continue")
 _PART = _proto_shape(
-    "thought_signature part_metadata code_execution_result executable_code speech_metadata media_processing",
+    "part_metadata code_execution_result executable_code speech_metadata media_processing",
+    thought_signature=_graphql_signature,
     inline_data=_BLOB, file_data=_FILE,
     media_resolution=_proto_shape("num_tokens"), video_metadata=_proto_shape("start_offset end_offset"),
     audio_transcription=_proto_shape("language_code speaker_label start_offset end_offset",

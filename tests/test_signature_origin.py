@@ -177,10 +177,10 @@ def test_stream_needs_normal_terminal_and_cannot_publish_text_or_partial_subset(
 
 def test_private_origin_cannot_be_supplied_as_a_request_field(store):
     obj = OpenAIRequest.model_validate({"model": MODEL, "tools": TOOLS, "_signature_output_prefix": "spoof",
-        "_stage_terminal_signature_fence": "spoof",
+        "_stage_signature_origin": "spoof",
         "messages": [*PREFIX, {"role": "assistant", "tool_calls": [call("a")], "_signature_slots": ["spoof"]}]})
     assert obj._signature_output_prefix is None
-    assert obj._stage_terminal_signature_fence is None
+    assert obj._stage_signature_origin is None
     origin.bind_signature_origins(obj, "tenant-one")
     assert origin.origin_slot(obj.messages[-1], 0) == b""
 
