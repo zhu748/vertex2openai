@@ -9,6 +9,7 @@ import asyncio
 import json
 import re
 import time
+from collections import deque
 from contextlib import suppress
 from typing import Optional
 
@@ -39,6 +40,8 @@ cookie_upstream = CookieProxyUpstream()
 
 _DONE_FRAME_BYTES = DONE_FRAME.encode("ascii")
 _TERMINAL_FINALIZE_TIMEOUT_SECONDS = 0.25
+_FALLBACK_PREFIX_MAX_BYTES = 2 * 1024 * 1024
+_FALLBACK_PREFIX_MAX_FRAMES = 128
 
 # ============================================================
 # 跨通道兜底重试（对齐上游 bad-woman/vertex2openai 的 Key ↔ Cookie 互备）
@@ -121,12 +124,12 @@ _CONTENT_FRAME_RE = re.compile(
 def _sse_frame_kind(frame: str) -> tuple[str, Optional[int]]:
     """解析一帧 SSE：返回 (类型, 错误码)。
 
-    类型 ∈ keepalive（注释帧/保活帧）/ done（[DONE]）/ error（错误负载）/
+    类型 ∈ keepalive（注释帧/保活帧）/ done（[DONE]）/ error（含 advisory_error）/
     content（真实内容：正文、思考或工具调用增量）/ finish（仅含结束标记、
     无任何内容增量的空收尾帧）/ other（role 声明等）。
 
-    分类顺序按热路径成本排布（2026-11 O-7）：兜底开启时长流的每帧都要
-    过本函数——内容帧（绝大多数）用廉价子串预筛直通、零 JSON 解析；
+    分类顺序按热路径成本排布：在兜底的预提交阶段，内容帧用廉价子串
+    预筛直通、零 JSON 解析；提交后不再分类。
     疑似错误/收尾/角色/用量帧再走完整反序列化。子串模式只在「值确为
     非空」时命中（空串/空列表不匹配），与解析后 has_payload 口径一致；
     JSON 转义会把内嵌的同类子串打上反斜杠，不会误报。bytes 帧归一化。
@@ -135,7 +138,8 @@ def _sse_frame_kind(frame: str) -> tuple[str, Optional[int]]:
         frame = frame.decode("utf-8", "replace")
     stripped = frame.strip()
     if not stripped.startswith("data:"):
-        return ("keepalive", None)
+        comments_only = all(not line or line.startswith(":") for line in stripped.splitlines())
+        return ("keepalive" if comments_only else "other", None)
     payload_text = stripped[len("data:"):].strip()
     if payload_text == "[DONE]":
         return ("done", None)
@@ -228,46 +232,54 @@ async def _stream_with_fallback_frames(
     deadline: float,
     *, close_primary=None,
 ):
-    """主通道流式帧转发：在首个真实内容帧之前以可兜底错误终止时，切换备用通道。
-
-    主通道的错误帧与后续收尾帧（[DONE] 等）会被吞掉，客户端只看到备用
-    通道的接力输出；一旦出现过真实内容帧（或主通道正常结束），不再兜底。
-    """
+    """Switch only before committing any generation-specific data to the caller."""
     primary_label = _channel_label(primary_channel)
     fallback_label = _channel_label(fallback_channel)
-    saw_content = False
-    fallback_started = False
+    committed = False
+    prefix = deque()
+    prefix_bytes = 0
     pending_error_frame: Optional[str] = None
     pending_error_code: Optional[int] = None
     close_primary = close_primary or _stream_closer(primary_response)
     try:
         async for frame in primary_response.body_iterator:
+            if committed:
+                yield frame
+                continue
             kind, code = _sse_frame_kind(frame)
-            if kind == "content" and not fallback_started:
-                # REQ-P2-7（2026-11 收敛）：主通道 error 帧之后迟到的
-                # content 帧属于已被判死的尝试（错误帧已吞、内容不会
-                # 下发），不再计入 saw_content——否则流既不切备用通道、
-                # 又因错误帧被吞而无 [DONE] 终止语义，客户端只能靠
-                # 自身超时判死。修正后 saw_content 与 fallback_started
-                # 互斥（内容先于错误则错误分支不触发）。
-                saw_content = True
-            elif (kind == "error" and not saw_content and not fallback_started
-                    and _fallback_eligible_code(code if code is not None else 502)):
-                # 吞掉错误帧，主通道收尾后切换备用通道接力
-                fallback_started = True
+            if kind == "keepalive":
+                yield frame
+                continue
+            if kind == "error" and _fallback_eligible_code(code if code is not None else 502):
                 pending_error_frame = frame
                 pending_error_code = code if code is not None else 502
-                continue
-            if fallback_started:
-                # 主通道错误后的收尾帧（[DONE] / 尾随心跳 / 迟到内容）不再下发
-                continue
+                break  # close the losing attempt; never read or forward its trailers
+            if kind in ("other", "finish"):
+                # Even without text, role, usage and opaque signatures carry this
+                # response's identity. Do not mix them into a winning standby response.
+                remaining = _FALLBACK_PREFIX_MAX_BYTES - prefix_bytes
+                if len(prefix) < _FALLBACK_PREFIX_MAX_FRAMES and len(frame) <= remaining:
+                    size = (len(frame.encode("utf-8"))
+                            if isinstance(frame, str) and not frame.isascii() else len(frame))
+                    if size <= remaining:
+                        prefix.append(frame)
+                        prefix_bytes += size
+                        continue
+            # Content, a terminal/advisory, or a full staging buffer commits
+            # the primary. A full buffer is not permission to drop signed data.
+            committed = True
+            while prefix:
+                yield prefix.popleft()
             yield frame
+        else:
+            # Preserve a metadata-only response when the producer ends normally.
+            while prefix:
+                yield prefix.popleft()
     finally:
+        prefix.clear()
         await close_primary()
 
-    # 互斥不变量：fallback_started=True 蕴含 saw_content=False（上方守卫）。
-    # 未触发兜底时主通道全部帧已原样转发（含自身的 [DONE]），直接结束。
-    if not fallback_started:
+    if pending_error_frame is None:
         return
 
     alt = await _try_channel_fallback(

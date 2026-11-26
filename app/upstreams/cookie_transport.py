@@ -334,7 +334,7 @@ async def _execute_stream_request_generator_once(
     """
     has_content = False
     got_finish = False
-    boundary = CookieCandidateBoundary()
+    boundary = CookieCandidateBoundary(check_tool_ids=not preserve_parts)
     try:
         upstream_attempt()
         async with client.stream(

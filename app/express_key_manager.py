@@ -30,7 +30,7 @@ class ExpressKeyManager:
     # ---------- 读取 ----------
 
     def get_records(self) -> List[dict]:
-        """当前启用的 Key 记录（每次调用直接读内存态，控制台改完立即生效）。"""
+        """当前启用且已提交的 Key 记录（从内存读取，不等待控制台写盘）。"""
         return [r for r in app_state.get_express_keys() if r.get("enabled", True)]
 
     def get_total_keys(self) -> int:

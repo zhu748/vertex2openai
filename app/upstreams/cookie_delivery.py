@@ -833,7 +833,7 @@ async def _stream_attempt_frames(gen: "CookieGeneration", events: AsyncIterator,
             # extract_events emits a part's signature immediately after its
             # source. A filtered thought has no visible slot to attach to.
             part_kind = data.get("part_kind")
-            if preceding_kind is None or part_kind != preceding_kind:
+            if not data.get("empty_part") and (preceding_kind is None or part_kind != preceding_kind):
                 part_kind = "signature_only"
                 data = {**data, "part_kind": part_kind}
             signature = apply_wire_signature(data, st.ordinary_metadata, st.part_order)

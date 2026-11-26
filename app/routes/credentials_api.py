@@ -48,7 +48,7 @@ class KeyProjectBody(BaseModel):
 
 def _express_keys_payload(receipt: tuple[list, str] | None = None) -> dict:
     """控制台按用户要求**明文**返回 Key（控制台本身有密码保护）；日志里仍打掩码。"""
-    records, revision = receipt if receipt is not None else app_state.credential_snapshot("keys")
+    records, revision = receipt if receipt is not None else app_state.credential_snapshot("keys", committed=True)
     return {
         "revision": revision,
         "keys": records,

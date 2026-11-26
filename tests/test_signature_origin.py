@@ -113,7 +113,8 @@ def test_unrepresentable_choices_do_not_publish_and_budgets_never_truncate(store
     assert not store._data
     # A middle unsupported turn disables only the later suffix, never hashes over it.
     partial = deepcopy(PREFIX) + [{"role": "assistant", "tool_calls": [call("a")]},
-                                  {"role": "assistant", "content": "thinking", "reasoning_content": "not supported"}]
+                                  {"role": "assistant", "content": "thinking",
+                                   "extra_content": {"google": {"ordinary_parts": [{"kind": "image", "text": ""}]}}}]
     obj = request(prefix=partial, calls=[call("a")])
     assert origin.origin_slot(obj.messages[-3], 0)
     assert origin.origin_slot(obj.messages[-1], 0) == b"" and obj._signature_output_prefix is None

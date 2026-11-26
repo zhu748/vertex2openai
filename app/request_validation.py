@@ -1,8 +1,11 @@
 """Validate loose OpenAI extension dictionaries before either upstream uses them."""
 
+import config as app_config
 import model_capabilities as mc
 from models import MAX_CANDIDATES, message_text, normalize_content_part, wants_json_output
-from thought_signatures import google_metadata
+from signature_origin import origin_slot
+from thought_signatures import checked_public_signature, google_metadata, historical_literal_id, requires_signature
+from tool_history import current_signature_turn_start, first_wire_call_index, history_call_signature
 from tool_arguments import parse_tool_arguments
 from schema_validation import SchemaValidationError, validate_request_schemas
 from tool_policy import (
@@ -135,12 +138,19 @@ def validate_openai_request(request, *, sdk_schema=False):
             raise SchemaValidationError("tool_choice 'required' requires at least one tool")
     validate_model_tool_choice(request.model, choice)
     validate_parallel_tool_calls(request)
+    # Only new adapter dispatches get here. An already committed resumable response
+    # can still be read after its process-local signature entry has expired.
+    strict_turn = (current_signature_turn_start(request.messages)
+                   if app_config.GEMINI_STRICT_THOUGHT_SIGNATURES and requires_signature(request.model) else None)
     for index, message in enumerate(request.messages):
         label = f"messages[{index}]"
         if message.role in ("assistant", "model") and (message.model_extra or {}).get("function_call") is not None:
             raise SchemaValidationError(f"{label}.function_call is not supported; use assistant tool_calls "
                                         "and tool results with matching tool_call_id")
         call_ids = set()
+        strict_first = (first_wire_call_index(message)
+                        if strict_turn is not None and index >= strict_turn and message.role in ("assistant", "model")
+                        and message.tool_calls else None)
         for call_index, call in enumerate(message.tool_calls or []):
             call_label = f"{label}.tool_calls[{call_index}]"
             if call.get("type") not in (None, "function"):
@@ -154,6 +164,13 @@ def validate_openai_request(request, *, sdk_schema=False):
                     raise SchemaValidationError(f"{call_label}.id duplicates another call in this message")
                 call_ids.add(call_id)
             parse_tool_arguments(call["function"].get("arguments"), label=f"{call_label}.function.arguments")
+            if "extra_content" in call:
+                checked_public_signature(google_metadata(call).get("thought_signature"))
+            if call_index == strict_first:
+                # Resolve before headers, credentials, or an upstream request, even in
+                # streaming mode. The adapter applies the same policy on actual replay.
+                literal = historical_literal_id(call, origin_slot(message, call_index), message._claude_literal_tool_ids)
+                history_call_signature(message, call_index, True, (literal,) if literal is not None else (), first=True)
         for part_index, part in enumerate(message.content if isinstance(message.content, list) else ()):
             part = normalize_content_part(part)
             if not isinstance(part, dict):

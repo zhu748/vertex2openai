@@ -35,6 +35,7 @@ def normalize_content_part(part: Any) -> Any:
 class OpenAIMessage(BaseModel):
     _signature_slots: tuple[bytes, ...] = PrivateAttr(default=())
     _signature_scoped: bool = PrivateAttr(default=False)
+    _claude_literal_tool_ids: bool = PrivateAttr(default=False)
     _signature_observed_reasoning: tuple[int, bytes] | None = PrivateAttr(default=None)
     role: str
     content: str | list[ContentPartText | ContentPartImage | dict[str, Any]] | None = None

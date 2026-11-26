@@ -1,10 +1,12 @@
 """PRF-P1-3：get_effective_settings 修订号 + 每模型缓存回归。
 
-缓存正确性优先于性能：全部已知失效路径（控制台 mutator、reload、
-测试直写 _state、原地 pop）都必须让缓存让位于新值。
+缓存只反映已提交的模型设置，且不能被草稿或旧缓存未命中覆盖。
 """
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 import unittest
+from unittest import mock
 
 from runtime_state import AppState, app_state
 
@@ -19,7 +21,10 @@ class EffectiveSettingsCacheTests(unittest.TestCase):
         second = app_state.get_effective_settings("gemini-3.6-flash")
         self.assertEqual(first, second)
         self.assertGreaterEqual(len(app_state._effective_cache), 1)
-        # 返回的是浅拷贝：调用方改顶层键不污染缓存。
+        # 返回的是浅拷贝：冷/热读取都不暴露缓存字典本身。
+        first["retry_max"] = 998
+        self.assertNotEqual(
+            app_state.get_effective_settings("gemini-3.6-flash")["retry_max"], 998)
         second["retry_max"] = 999
         self.assertNotEqual(
             app_state.get_effective_settings("gemini-3.6-flash")["retry_max"], 999)
@@ -37,22 +42,29 @@ class EffectiveSettingsCacheTests(unittest.TestCase):
         app_state.clear_model_override(model)
         self.assertEqual(app_state.get_effective_settings(model)["first_reply_timeout_seconds"], base_value)
 
-    def test_direct_state_write_and_inplace_pop_invalidate_cache(self):
-        # 测试基建 / 特殊部署路径会绕过 mutator 直写 _state：
-        # 缓存键的字典身份 + 键数指纹必须让这类写入立即生效。
-        app_state.get_effective_settings("direct-write-model")
-        with app_state._lock:
-            app_state._state["settings"] = dict(app_state._state.get("settings") or {})
-            app_state._state["settings"]["retry_max"] = 7
-        self.assertEqual(app_state.get_effective_settings("direct-write-model")["retry_max"], 7)
-        # 原地 pop（键数变化）也必须失效：此后回落到内置默认 10 而非残留 7。
-        with app_state._lock:
-            app_state._state["settings"].pop("retry_max", None)
-        self.assertEqual(
-            app_state.get_effective_settings("direct-write-model")["retry_max"],
-            app_state.get_effective_settings("direct-write-model")["retry_max"])
-        self.assertEqual(
-            app_state.get_effective_settings("direct-write-model")["retry_max"], 10)
+    def test_cold_reader_cannot_republish_a_superseded_revision(self):
+        model = "cold-reader-model"
+        app_state.update_settings({"retry_max": 7})
+        source = app_state._committed
+        merging, release = Event(), Event()
+        merge = app_state._merged_settings
+
+        def gated(snapshot):
+            if snapshot is source:
+                merging.set()
+                assert release.wait(5)
+            return merge(snapshot)
+
+        with mock.patch.object(app_state, "_merged_settings", side_effect=gated), ThreadPoolExecutor(2) as pool:
+            pending = pool.submit(app_state.get_effective_settings, model)
+            try:
+                self.assertTrue(merging.wait(5))
+                pool.submit(app_state.update_settings, {"retry_max": 2}).result(3)
+            finally:
+                release.set()
+            self.assertEqual(pending.result(3)["retry_max"], 7)
+        self.assertNotIn(model, app_state._effective_cache)
+        self.assertEqual(app_state.get_effective_settings(model)["retry_max"], 2)
 
     def test_reload_invalidates_cache(self):
         app_state.get_effective_settings("reload-model")

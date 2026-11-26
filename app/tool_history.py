@@ -1,13 +1,55 @@
 """Align complete parallel result turns for Gemini's positional function protocol."""
 from collections.abc import Iterator, Sequence
 
-from models import OpenAIMessage
-from thought_signatures import google_metadata, marked_literal_call_id, merge_by_order, replay_tool_call_id
+import config as app_config
+from models import OpenAIMessage, normalize_content_part
+from signature_origin import origin_slot
+from thought_signatures import (google_metadata, historical_literal_id, merge_by_order, replay_tool_call_id,
+                                resolve_tool_call_signature, signature_from_extra)
 
 
 def has_tool_history(messages: Sequence[OpenAIMessage]) -> bool:
     """A declaration-free continuation can still carry a previous call or result."""
     return any(message.role in ("tool", "function") or message.tool_calls for message in messages)
+
+
+def current_signature_turn_start(messages: Sequence[OpenAIMessage]) -> int:
+    """Only a fresh user prompt starts another Gemini validation turn, not a tool result."""
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if msg.role != "user":
+            continue
+        if isinstance(msg.content, str) and msg.content:
+            return i
+        if isinstance(msg.content, list):
+            for block in map(normalize_content_part, msg.content):
+                if isinstance(block, dict) and (
+                    block.get("type") == "image_url" or block.get("type") == "text" and block.get("text")
+                ):
+                    return i
+    return 0
+
+
+def first_wire_call_index(message: OpenAIMessage) -> int:
+    """Native replay can put a different named slot first using an explicit Part order."""
+    order = google_metadata(message).get("part_order")
+    if isinstance(order, list):
+        for slot in order:
+            if (isinstance(slot, dict) and slot.get("type") == "tool_call"
+                    and type(i := slot.get("index")) is int and 0 <= i < len(message.tool_calls)):
+                return i
+    return 0
+
+
+def history_call_signature(message, index, current_required, literal_ids, *, first):
+    call = message.tool_calls[index]
+    ident = str(call.get("id") or "")
+    explicit, _ = signature_from_extra(call, strict_encoding=app_config.GEMINI_STRICT_THOUGHT_SIGNATURES)
+    return resolve_tool_call_signature(
+        ident, require_signature=current_required and first, explicit_signature=explicit,
+        explicit_unsigned=not first, origin_key=origin_slot(message, index),
+        literal_id=ident in literal_ids, claude_literal=message._claude_literal_tool_ids,
+    )
 
 
 def _base_id(value, literal_ids) -> str:
@@ -57,7 +99,9 @@ def gemini_history_with_ids(
         if not calls:
             yield message, empty
             continue
-        literal_ids = frozenset(ident for call in calls if (ident := marked_literal_call_id(call)) is not None)
+        literal_ids = frozenset(ident for n, call in enumerate(calls) if
+                                (ident := historical_literal_id(call, origin_slot(message, n),
+                                                                message._claude_literal_tool_ids)) is not None)
         yield message, literal_ids
         if len(calls) < 2 and not literal_ids:
             continue

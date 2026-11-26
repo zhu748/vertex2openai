@@ -36,6 +36,8 @@ services:
       # Optional: set true to rotate all enabled accounts in order instead of random selection.
       - ROUNDROBIN=false
       # Optional: fake streaming keeps client connections alive while waiting for non-streaming Gemini responses.
+      # Tool harnesses can require original Gemini signatures instead of a compatibility placeholder.
+      - GEMINI_STRICT_THOUGHT_SIGNATURES=${GEMINI_STRICT_THOUGHT_SIGNATURES:-false}
       - FAKE_STREAMING=false
       - FAKE_STREAMING_INTERVAL=1.0
       # Optional: 全局出站代理（仅作初始值，控制台保存后以控制台为准）。

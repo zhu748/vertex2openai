@@ -17,7 +17,8 @@ from cookie_auth import (
 from image_history import ManagedImageHistory
 from media_tasks import prompt_needs_media_pool, run_media_task
 from tool_arguments import parse_tool_arguments
-from tool_history import gemini_history_with_ids, has_tool_history
+from tool_history import (current_signature_turn_start, first_wire_call_index, gemini_history_with_ids,
+                          has_tool_history, history_call_signature)
 from message_processing import (
     anthropic_tool_result_is_error, openai_content_to_wire_parts, tool_observation_json, tool_response_with_media,
 )
@@ -25,17 +26,14 @@ from models import OpenAIRequest, normalize_content_part
 from ordinary_history import exact_ordinary_slots
 from runtime_state import app_state
 from schema_validation import SchemaValidationError, sanitize_for_gemini
-from signature_origin import origin_slot
 from thought_signatures import (
-    canonical_wire_signature,
+    ordinary_signature,
     replay_tool_call_id,
     encode_thought_signature,
     google_metadata,
     is_thought_part,
     merge_replayed_parts,
     requires_signature,
-    resolve_tool_call_signature,
-    signature_from_extra,
     standalone_message_signature,
 )
 from tool_policy import (
@@ -346,8 +344,8 @@ def _ordinary_wire_parts_from_extra(message: Any, history: ManagedImageHistory |
             part = {"text": item["text"]}
             if item["kind"] == "thought":
                 part["thought"] = True
-        if item.get("thought_signature"):
-            part["thoughtSignature"] = canonical_wire_signature(item["thought_signature"])
+        if (signature := ordinary_signature(item.get("thought_signature"), wire=True)) is not None:
+            part["thoughtSignature"] = signature
         parts.append(part)
     return parts
 
@@ -408,7 +406,8 @@ def _convert_messages_to_contents(messages: list, model_name: str = "", native_t
     system_parts = []
     require_sig = requires_signature(model_name)
     call_names = {}
-    for msg, literal_ids in gemini_history_with_ids(messages, native=native_tools):
+    turn_start = current_signature_turn_start(messages) if require_sig else 0
+    for i, (msg, literal_ids) in enumerate(gemini_history_with_ids(messages, native=native_tools)):
         role = msg.role
         content = msg.replay_content()
         # Resolve against preceding calls only. A later turn may reuse a
@@ -490,18 +489,11 @@ def _convert_messages_to_contents(messages: list, model_name: str = "", native_t
                 continue
 
             call_parts = []
+            first = first_wire_call_index(msg)
             for tool_index, tc in enumerate(tool_calls):
                 fn = (tc or {}).get("function") or {}
-                explicit_sig, _ = signature_from_extra(tc)
-                public_id = str((tc or {}).get("id") or "")
-                call_id, signature = resolve_tool_call_signature(
-                    public_id,
-                    require_signature=require_sig and tool_index == 0,
-                    explicit_signature=explicit_sig,
-                    explicit_unsigned=tool_index > 0,
-                    origin_key=origin_slot(msg, tool_index),
-                    literal_id=public_id in literal_ids,
-                )
+                call_id, signature = history_call_signature(
+                    msg, tool_index, require_sig and i >= turn_start, literal_ids, first=tool_index == first)
                 part = {
                     "functionCall": {
                         "name": str(fn.get("name") or "unknown"),

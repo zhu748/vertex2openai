@@ -24,6 +24,7 @@ from message_processing import (
 )
 from prefill import PrefillDeduper, strip_prefill_overlap
 from response_validation import (
+    StreamToolCallIds,
     map_finish_reason_to_openai,
     complete_function_arguments,
     sdk_function_call,
@@ -119,13 +120,15 @@ class ToolCallIndexer:
 
     def __init__(self, keep_unsigned_parts: bool = True):
         self.keep_unsigned_parts = keep_unsigned_parts
+        self._tool_ids = StreamToolCallIds()
         self._next: Dict[int, int] = {}
         self._seen_tool_calls: set[int] = set()
         self.signature_origins: dict = {}
         self._ordinary_parts: Dict[int, list] = {}
         self._part_order: Dict[int, list] = {}
 
-    def next_index(self, candidate_index: int = 0) -> int:
+    def next_index(self, candidate_index: int = 0, call_id: Optional[str] = None) -> int:
+        self._tool_ids.observe(call_id, candidate_index)
         i = self._next.get(candidate_index, 0)
         self._next[candidate_index] = i + 1
         self._seen_tool_calls.add(candidate_index)
@@ -229,7 +232,7 @@ def _build_chunk_payload(
                     continue
                 arguments = complete_function_arguments(fc)
                 tc_index = (
-                    indexer.next_index(output_index)
+                    indexer.next_index(output_index, fc.id)
                     if indexer
                     else len(tool_call_deltas)
                 )

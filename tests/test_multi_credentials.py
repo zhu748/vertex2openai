@@ -162,7 +162,8 @@ class EnvironmentTests(StateFixture, unittest.TestCase):
         with mock.patch.object(config, "UPSTREAM_MODE", "mixed"):
             app_state.initialize_channel_mode_once()
         self.assertEqual(AppState().get_channel_mode(), "mixed")
-        app_state._state = {"use_web_proxy": True}
+        Path(runtime_state.STATE_FILE).write_text('{"use_web_proxy":true}', encoding="utf-8")
+        app_state.reload()
         app_state.initialize_channel_mode_once()
         self.assertEqual(app_state.get_channel_mode(), "web_proxy")
 

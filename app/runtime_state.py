@@ -120,7 +120,7 @@ class CredentialsRepository:
 
     def get_express_keys(self) -> list:
         with self._host._lock:
-            return self._express_records(self._host._state)
+            return self._express_records(self._host._committed)
 
     def _cookie_records(self, state: dict) -> list:
         return [rec for item in self._cookie_items(state) if (rec := self._normalize_cookie_record(item))]
@@ -136,13 +136,13 @@ class CredentialsRepository:
                                              separators=(",", ":")).encode()).hexdigest()
         return records, revision
 
-    def credential_snapshot(self, kind: str, *, committed=False) -> tuple[list, str]:
+    def credential_snapshot(self, kind: str, *, committed=True) -> tuple[list, str]:
         with self._host._lock:
             return self._snapshot_from(self._host._committed if committed else self._host._state, kind)
 
     def _check_credential_revision(self, kind: str, expected_revision: str | None) -> None:
         # Called while the mutation lock is held; optional for legacy API clients.
-        if expected_revision is not None and self.credential_snapshot(kind)[1] != expected_revision:
+        if expected_revision is not None and self.credential_snapshot(kind, committed=False)[1] != expected_revision:
             raise CredentialRevisionConflictError("服务器凭证列表已更新，当前草稿已保留。请重新加载列表并合并修改后再保存。")
 
 
@@ -273,7 +273,7 @@ class CredentialsRepository:
             return [{"cookie": state["google_cookie"], "project_id": project}]
         return app_config.initial_cookie_accounts(project)
 
-    def get_cookie_accounts(self, *, committed=False) -> list:
+    def get_cookie_accounts(self, *, committed=True) -> list:
         with self._host._lock:
             return self._cookie_records(self._host._committed if committed else self._host._state)
 
@@ -327,7 +327,7 @@ class CredentialsRepository:
     def set_legacy_cookie(self, cookie: str, project_id: str = "", *, clear: bool = False) -> bool:
         """Edit the first enabled account under the same lock as manual list saves."""
         with self._host._write_transaction() as commit:
-            records = self.get_cookie_accounts()
+            records = self.get_cookie_accounts(committed=False)
             active = next((rec for rec in records if rec["enabled"]), None)
             if clear:
                 if active is not None:
@@ -342,7 +342,7 @@ class CredentialsRepository:
                 if records:
                     raise CookieAccountConflictError("没有启用的 Cookie 账号，请在账号列表中选择并更新。")
                 records.append(self._normalize_cookie_record(
-                    {"cookie": cookie, "project_id": project_id or self._host.get_project_id()}))
+                    {"cookie": cookie, "project_id": project_id or self._host.get_project_id(committed=False)}))
                 changed = True
             else:
                 changed = False
@@ -373,7 +373,7 @@ class CredentialsRepository:
         with self._host._write_transaction(on_saved=saved.append) as commit:
             self._check_credential_revision("cookies", expected_revision)
             if preserve_cookie_ids:
-                current = {rec["id"]: rec for rec in self.get_cookie_accounts()}
+                current = {rec["id"]: rec for rec in self.get_cookie_accounts(committed=False)}
                 for rec in clean:
                     if rec["id"] in preserve_cookie_ids:
                         if rec["id"] not in current:
@@ -392,7 +392,7 @@ class CredentialsRepository:
         with self._host._write_transaction() as commit:
             if self._host._state.get("cookie_accounts_initialized"):
                 return 0
-            records = self._clean_cookie_accounts(self.get_cookie_accounts())
+            records = self._clean_cookie_accounts(self.get_cookie_accounts(committed=False))
             self._store_cookie_accounts(records)
             commit()
         return len(records)
@@ -459,7 +459,8 @@ class AppState:
         # 写入序号：并发 _save 时防止旧快照覆盖新快照（见 _save）。
         self._save_seq = 0
         self._persisted_seq = 0
-        # Only mutators wait for a pending transaction. Getters keep using _lock.
+        # Only mutators wait for a pending transaction. Runtime and console
+        # readers use the published snapshot, never a draft still awaiting I/O.
         self._saved_all = threading.Condition(self._lock)
         self._inflight: set = set()
         self._state = self._read_from_disk() or {}
@@ -470,10 +471,10 @@ class AppState:
         # model_overrides 的整棵设置树（约 90µs，全部发生在 RLock 内，
         # Cookie 路径还在媒体线程再次竞争同一把锁）。设置只在控制台保存
         # 时变化：命中缓存直接返回浅拷贝，未命中才全量合成。
-        # 缓存键同时含修订号 / 存储字典身份 / 键数，覆盖全部已知的失效
-        # 路径（mutator、reload、测试直写 _state、原地 pop）。
+        # Publish/invalidate this model cache only when the durable settings
+        # change, so a pending write or its failure has no effect on readers.
         self._settings_rev = 0
-        self._effective_cache: dict[tuple, dict] = {}
+        self._effective_cache: dict[str, dict] = {}
         # QUA-P2-6：凭证 CRUD 委托给仓库（存储/持久化仍归本类）。
         self._credentials = CredentialsRepository(self)
 
@@ -652,12 +653,13 @@ class AppState:
                     return self._committed
                 self._write_snapshot(snapshot)
                 with self._lock:
+                    if snapshot.get("settings") != self._committed.get("settings"):
+                        self._invalidate_effective_cache_locked()
                     self._persisted_seq = seq
                     self._committed = snapshot
             except Exception as exc:
                 with self._lock:
                     self._state = copy.deepcopy(self._committed)
-                    self._invalidate_effective_cache_locked()
                 print(f"⚠️ [状态管理器] 无法保存状态到磁盘: {exc}")
                 raise StatePersistenceError(
                     "配置保存失败，请检查状态目录权限和磁盘空间；本次更新已回滚。") from exc
@@ -755,7 +757,7 @@ class AppState:
             return "web_proxy" if state["use_web_proxy"] else "api_key"
         return app_config.UPSTREAM_MODE
 
-    def get_channel_mode(self, *, committed=False) -> str:
+    def get_channel_mode(self, *, committed=True) -> str:
         with self._lock:
             return self._stored_channel_mode(self._committed if committed else self._state)
 
@@ -780,16 +782,17 @@ class AppState:
             commit()
         print(f"🔄 [状态管理器] 项目 ID 已保存: {project_id}")
 
-    def get_project_id(self) -> str:
+    def get_project_id(self, *, committed=True) -> str:
         with self._lock:
-            return self._state.get("google_project_id", app_config.GOOGLE_PROJECT_ID or "")
+            state = self._committed if committed else self._state
+            return state.get("google_project_id", app_config.GOOGLE_PROJECT_ID or "")
 
     # ---------- 凭证 CRUD（QUA-P2-6：实现拆至 CredentialsRepository，此处委托转发） ----------
 
     def get_express_keys(self) -> list:
         return self._credentials.get_express_keys()
 
-    def credential_snapshot(self, kind: str, *, committed=False) -> tuple[list, str]:
+    def credential_snapshot(self, kind: str, *, committed=True) -> tuple[list, str]:
         return self._credentials.credential_snapshot(kind, committed=committed)
 
     def set_express_keys(self, records: list, *, expected_revision: str | None = None,
@@ -805,7 +808,7 @@ class AppState:
     def import_env_express_keys_once(self, env_keys: list) -> int:
         return self._credentials.import_env_express_keys_once(env_keys)
 
-    def get_cookie_accounts(self, *, committed=False) -> list:
+    def get_cookie_accounts(self, *, committed=True) -> list:
         return self._credentials.get_cookie_accounts(committed=committed)
 
     def get_cookie_dispatch_account(self, account_id: str) -> dict | None:
@@ -841,7 +844,7 @@ class AppState:
 
     # ---------- 控制台可调设置 ----------
 
-    def get_settings(self, *, committed=False) -> dict:
+    def get_settings(self, *, committed=True) -> dict:
         """完整设置（内置默认 + 持久化覆盖），保证所有键都存在；返回深拷贝。"""
         with self._lock:
             return self._merged_settings(self._committed if committed else self._state)
@@ -882,9 +885,9 @@ class AppState:
         # Fast scalar path for hot runtime controls; never lend a mutable tree.
         return value if value is None or isinstance(value, (str, int, float, bool)) else copy.deepcopy(value)
 
-    def get_setting(self, key: str, default=None):
+    def get_setting(self, key: str, default=None, *, committed=True):
         with self._lock:
-            return self._setting_from(self._state, key, default)
+            return self._setting_from(self._committed if committed else self._state, key, default)
 
     def get_committed_setting(self, key: str, default=None):
         """Live runtime control; never expose a draft awaiting disk I/O."""
@@ -906,7 +909,7 @@ class AppState:
         从未保存过（返回 default/None）= 跟随环境变量初始值。
         """
         with self._lock:
-            stored = self._state.get("settings")
+            stored = self._committed.get("settings")
             if isinstance(stored, dict) and key in stored:
                 return copy.deepcopy(stored[key])
             return default
@@ -923,7 +926,7 @@ class AppState:
         # Return this write's durable view, never a subsequently staged draft.
         saved = []
         with self._write_transaction(on_saved=saved.append) as commit:
-            _check_expected_settings(self.get_settings(), expected)
+            _check_expected_settings(self.get_settings(committed=False), expected)
             previous = self.get_committed_settings(*watch) if watch else {}
             current = self._state.get("settings")
             current = dict(current) if isinstance(current, dict) else {}
@@ -940,7 +943,6 @@ class AppState:
                 current["proxy_urls"] = proxies
                 current["proxy_url"] = proxies[0] if proxies else ""
             self._state["settings"] = current
-            self._invalidate_effective_cache_locked()
             commit()
         print(f"🔧 [状态管理器] 已更新 {accepted} 项运行时设置。")
         updated = self._merged_settings(saved[0])
@@ -955,7 +957,7 @@ class AppState:
     def get_saved_model_overrides(self) -> dict:
         """User-owned fields only; distinguish inheritance from built-in defaults."""
         with self._lock:
-            return copy.deepcopy(_saved_model_map(self._state))
+            return copy.deepcopy(_saved_model_map(self._committed))
 
     def get_model_editor_settings(self) -> tuple[dict, dict]:
         """Capabilities and both override maps must describe the same durable settings."""
@@ -996,7 +998,6 @@ class AppState:
                 overrides.pop(model_name, None)
             settings["model_overrides"] = overrides
             self._state["settings"] = settings
-            self._invalidate_effective_cache_locked()
             commit()
         receipt = model_override_receipt(model_name, _saved_model_map(applied[0]).get(model_name, {}))
         if receipt["saved_override"] != previous:
@@ -1022,8 +1023,6 @@ class AppState:
             overrides.pop(model_name, None)
             settings["model_overrides"] = overrides
             self._state["settings"] = settings
-            # 原地 pop 不改变存储字典身份/键数，必须显式作废缓存。
-            self._invalidate_effective_cache_locked()
             commit()
         if _saved_model_map(applied[0]).get(model_name):
             raise SettingsConflictError(model_name)
@@ -1038,10 +1037,8 @@ class AppState:
         每个模型都 deepcopy 一次完整设置树（含全部 model_overrides）。
         本方法只做**顶层标量**赋值，浅拷贝入参即安全，不会改到调用方的基础。
 
-        若不传 base，则命中「设置修订号 + 每模型」缓存（PRF-P1-3）：设置
-        只在控制台保存时变化，命中直接返回浅拷贝，未命中才做一次全量
-        deepcopy 合成。缓存键含修订号 / 存储字典身份 / 键数三重指纹，
-        覆盖 mutator、reload、测试直写 _state 与原地 pop 全部失效路径。
+        若不传 base，使用已提交的每模型设置。命中直接返回浅拷贝，未命中
+        才复制已提交的设置树（PRF-P1-3），且不会等写盘结束。
 
         覆盖键查找做后缀归一：控制台按基础名（如 gemini-3.6-flash）保存的
         专属参数，在 -search 等别名后缀的请求下也要生效——旧实现拿原始
@@ -1052,26 +1049,22 @@ class AppState:
         再退回剥掉已知别名后缀（-search / -1k/-2k/-4k/-512 / -think-*）
         的基础名。
         """
-        cache_store = None
+        key = (model_name or "").strip()
+        revision = None
         if base is None:
-            model_key = (model_name or "").strip()
             with self._lock:
-                stored = self._state.get("settings")
-                stored = stored if isinstance(stored, dict) else None
-                cache_key = (self._settings_rev, id(stored),
-                             len(stored) if stored is not None else -1, model_key)
-                cached = self._effective_cache.get(cache_key)
-            if cached is not None:
-                return dict(cached)  # 浅拷贝：调用方只读，不互相污染
-            base = self.get_settings()
-            cache_store = cache_key
+                cached = self._effective_cache.get(key)
+                if cached is not None:
+                    return dict(cached)
+                revision, committed = self._settings_rev, self._committed
+            # Committing swaps the snapshot; it never mutates a published one.
+            base = self._merged_settings(committed)
         else:
             base = dict(base)
         # Legacy global transport defaults must not publish every model's
         # aliases. Only an explicit per-model choice (including built-ins) does.
         base["anti_truncation_mode"] = "off"
         overrides = base.get("model_overrides") or {}
-        key = (model_name or "").strip()
         ov = overrides.get(key)
         if not isinstance(ov, dict):
             # 顶部导入（无循环依赖）：此函数在每请求/每模型路径上执行，
@@ -1083,12 +1076,13 @@ class AppState:
             for k in app_config.PER_MODEL_KEYS:
                 if k in ov:
                     base[k] = ov[k]
-        if cache_store is not None:
-            # 有界缓存：模型目录规模有限（数百），超限淘汰最旧条目。
+        if revision is not None:
             with self._lock:
-                if len(self._effective_cache) >= 512:
-                    self._effective_cache.pop(next(iter(self._effective_cache)), None)
-                self._effective_cache[cache_store] = base
+                if revision == self._settings_rev and key not in self._effective_cache:
+                    if len(self._effective_cache) >= 512:
+                        self._effective_cache.pop(next(iter(self._effective_cache)))
+                    # As on cache hits, callers own the top-level dict.
+                    self._effective_cache[key] = dict(base)
         return base
 
 

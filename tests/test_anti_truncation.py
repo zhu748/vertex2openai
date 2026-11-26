@@ -71,6 +71,7 @@ class PrepareTests(unittest.TestCase):
         patch = mock.patch.object(state, "_write_snapshot")
         patch.start()
         self.addCleanup(patch.stop)
+        state._save()
         return state
 
     def test_builtin_anti_truncation_models_publish_aliases_and_plain_ids_never_enable(self):
@@ -230,6 +231,7 @@ class CatalogHTTPTests(unittest.IsolatedAsyncioTestCase):
         ):
             patch.start()
             self.addCleanup(patch.stop)
+        self.state._save()
         self.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app),
                                         base_url="http://adapter.test",
                                         headers={"Authorization": "Bearer " + config.API_KEY})

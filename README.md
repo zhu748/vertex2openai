@@ -428,6 +428,7 @@ TCP+TLS 握手（每次约省 100~300ms 与相应 CPU）；429 重试场景收�
 | `IMAGE_PUBLIC_BASE_URL` | 否 | 自动 | 对外服务根地址，例如 `https://example.onrender.com`，不要加 `/v1`。未设置时优先用 Render 的 `RENDER_EXTERNAL_URL`，否则从请求地址推导；反代子路径部署应显式指定含前缀的地址。 |
 | `FAKE_STREAMING_INTERVAL` | 否 | `1.0` | 假流式等待期间 keep-alive 间隔秒数。可在控制台热改。 |
 | `MODELS_CONFIG_URL` | 否 | `zhu748/vertex2openai` 的 `main` 分支 `vertexModels.json` | 远程模型列表地址；改远程文件即可刷新，无需重部署。已有环境变量会覆盖内置默认地址。 |
+| `GEMINI_STRICT_THOUGHT_SIGNATURES` | 否 | `false` | 设为 `true` 并重启服务后，当前 Gemini 工具回合中找不到必需的原始思考签名时会报错，不发送跳过哨兵。适用于优先保证签名保真的 Claude Code 或 OpenAI harness；不能恢复已丢失的签名，也不替代 Gemini 对客户端所带签名的校验。默认保留历史兼容行为。 |
 | `SAFETY_SCORE` | 否 | `false` | 是否把 Gemini safety ratings 附加到输出。可在控制台热改。 |
 | `PROXY_URL` | 否 | 空 | 全局出站代理（仅作初始值，控制台保存后以控制台为准）。支持 HTTP / SOCKS 原生代理、sing-box 分享链接，以及 `turn://` / `turns://` / `sstp://` 节点；镜像内置两种转换组件。保存时自动校验格式。 |
 | `PROXY_URLS` | 否 | 空 | 有序全局代理列表，JSON 字符串数组或每行一条；优先于 `PROXY_URL`。每次请求先尝试第一条，失败再尝试后续条目。 |
@@ -587,11 +588,11 @@ SAPISID=cookie-b; SID=sid-b
 | **2.5 Flash-Lite 思考预算** | 下限按 0 处理 | 下限 512（`0` 仍表示关闭） |
 | **生图比例白名单** | 所有生图模型共用同一套比例 | 按模型分别校验；Flash Image 支持含 `9:21` 在内的扩展比例，Pro Image 使用较小白名单 |
 
-思考签名优先使用请求/响应中的 `extra_content.google` 携带，因此跨进程、多副本部署不依赖本地缓存；旧格式、进程内缓存与跳过校验哨兵仅用于兼容缺失显式签名的客户端。
+OpenAI 兼容端点通过 `extra_content.google` 携带 Gemini 原始思考签名。客户端完整保留并回传这些扩展时，签名回放不依赖进程内缓存。标准 Claude / Claude Code 不回传这项扩展；网关需要在同一进程内，按匹配的会话历史和工具调用批次找回签名。
 
 如果 harness 会剥离扩展字段，请保留原始工具 ID、名称、参数和顺序。对使用同一认证凭据及内部模型、历史由纯文本/工具轮次组成、当前 assistant 轮含工具调用（可以先有普通正文或公开思考文本）的情况，代理会按完整历史前缀、准确的可见正文/思考和整个有序批次恢复各自的签名，包括确有签名的并行后续调用。不同会话复用同一 ID 不会互取签名。媒体、缺失的思考、不能无歧义表示的交错顺序，以及过大或被改写的历史不保证恢复；同一可见来源对应不同签名时，代理不会选「最近一次」或为冲突额外补哨兵，严格上游可能拒绝。跨实例、重启或缓存过期仍应依靠客户端原样保留的扩展字段。
 
-如果上游给出的不透明工具 ID 恰好与旧格式 `前缀__thought__规范base64` 完全相同，OpenAI 回复会在该条工具调用的 `extra_content.vertex2openai.literal_call_id_sha256_v1` 标记原 ID。请原样回传**整个工具调用的 `extra_content`**，不要只提取签名：这样即使缓存过期，调用和紧随其后的工具结果也能保留原 ID。该标记只说明 ID 的编码方式，不包含思考签名，也不证明调用者身份；必需签名本身仍应保存在 `extra_content.google.thought_signature`。普通 ID 和标准 Claude 输出不添加标记。客户端丢弃标记、使用旧回复或标准 Claude 历史时，缓存失效后无法从 ID 本身判断它究竟是原始 ID 还是老格式，仍沿用旧兼容解释。
+如果上游给出的不透明工具 ID 恰好与旧格式 `前缀__thought__规范base64` 完全相同，OpenAI 回复会在该条工具调用的 `extra_content.vertex2openai.literal_call_id_sha256_v1` 标记原 ID。请原样回传**整个工具调用的 `extra_content`**，不要只提取签名：这样即使缓存过期，调用和紧随其后的工具结果也能保留原 ID。该标记只说明 ID 的编码方式，不包含思考签名，也不证明调用者身份；必需签名本身仍应保存在 `extra_content.google.thought_signature`。普通 ID 和标准 Claude 输出不添加标记。对于未带标记、也找不到缓存依据的 OpenAI 历史，仍兼容旧 ID 格式。标准 Claude 的 `tool_use.id` 始终按不透明 ID 处理；即使缓存失效，调用和对应工具结果也保留原 ID，不会把 ID 后缀当成 Gemini 签名。
 
 ---
 

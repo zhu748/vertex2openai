@@ -50,6 +50,7 @@ SKIP_VALIDATOR_SENTINELS = (
 
 DEFAULT_TTL_SECONDS = 2 * 60 * 60
 DEFAULT_MAX_ENTRIES = 5000
+DEFAULT_MAX_BYTES = 32 * 1024 * 1024
 
 
 class SignatureState(str, Enum):
@@ -75,11 +76,14 @@ CacheKey = str | bytes  # Public IDs are strings; private exact-origin keys are 
 
 
 class SignatureStore:
-    """Thread-safe tool_call_id -> :class:`SignatureRecord` TTL/LRU cache."""
+    """Time-, count-, and payload-bounded cache for public IDs and exact origins."""
 
-    def __init__(self, ttl_seconds: int = DEFAULT_TTL_SECONDS, max_entries: int = DEFAULT_MAX_ENTRIES):
+    def __init__(self, ttl_seconds: int = DEFAULT_TTL_SECONDS, max_entries: int = DEFAULT_MAX_ENTRIES,
+                 max_bytes: int = DEFAULT_MAX_BYTES):
         self._ttl = ttl_seconds
         self._max = max_entries
+        self._max_bytes = max_bytes
+        self._resident_bytes = 0
         self._lock = threading.Lock()
         self._data: OrderedDict[CacheKey, tuple[float, SignatureRecord]] = OrderedDict()
         # Reads reorder the LRU, while absolute expiry follows the last write.
@@ -93,8 +97,37 @@ class SignatureStore:
 
     @staticmethod
     def _tag(key: CacheKey) -> bytes:
-        raw = b"s" + key.encode("utf-8", "surrogatepass") if isinstance(key, str) else b"b" + key
-        return hashlib.blake2b(raw, digest_size=16).digest()
+        h = hashlib.blake2b(digest_size=16)
+        if isinstance(key, str):
+            h.update(b"s")
+            for start in range(0, len(key), 16384):
+                h.update(key[start:start + 16384].encode("utf-8", "surrogatepass"))
+        else:
+            h.update(b"b")
+            h.update(key)
+        return h.digest()
+
+    @staticmethod
+    def _payload_size(key: CacheKey, record: SignatureRecord) -> int:
+        # Overestimates Unicode storage and shared signature references. Fixed
+        # Python object/index overhead is independently bounded by the count.
+        return len(key) * (4 if isinstance(key, str) else 1) + len(record.signature or b"")
+
+    def _drop(self, key: CacheKey) -> Optional[SignatureRecord]:
+        item = self._data.pop(key, None)
+        if item is None:
+            return None
+        self._expiry.pop(key, None)
+        record = item[1]
+        self._resident_bytes -= self._payload_size(key, record)
+        return record
+
+    def _remember_displaced(self, key: CacheKey, now: float, state: SignatureState) -> None:
+        tag = self._tag(key)
+        self._displaced[tag] = now + self._ttl
+        self._displaced.move_to_end(tag)
+        if state is SignatureState.AMBIGUOUS:
+            self._displaced_conflicts.add(tag)
 
     def put_record(self, call_id: CacheKey, record: SignatureRecord) -> None:
         if not call_id:
@@ -108,10 +141,20 @@ class SignatureStore:
             elif (now <= self._unknown_until or
                   self._displaced and now <= self._displaced.get(self._tag(call_id), float("-inf"))):
                 record = SignatureRecord(SignatureState.AMBIGUOUS)
+            if self._payload_size(call_id, record) > self._max_bytes:
+                # An unretainable original is not evidence for some other
+                # origin. Keep a bounded no-bytes marker without flushing the
+                # cache to make room for something that could never fit.
+                record = SignatureRecord(SignatureState.AMBIGUOUS)
+            self._drop(call_id)
+            size = self._payload_size(call_id, record)
+            if size > self._max_bytes:
+                self._remember_displaced(call_id, now, record.state)
+                self._evict(now)
+                return
+            self._resident_bytes += size
             self._data[call_id] = (now, record)
-            self._data.move_to_end(call_id)
             self._expiry[call_id] = now
-            self._expiry.move_to_end(call_id)
             self._evict(now)
 
     def register_call_signature(self, call_id: CacheKey, signature: Optional[bytes],
@@ -154,8 +197,7 @@ class SignatureStore:
                 return None
             ts, record = item
             if now - ts > self._ttl:
-                self._data.pop(call_id, None)
-                self._expiry.pop(call_id, None)
+                self._drop(call_id)
                 return None
             self._data.move_to_end(call_id)
             return record
@@ -164,21 +206,15 @@ class SignatureStore:
         while self._expiry:
             oldest_key, ts = next(iter(self._expiry.items()))
             if now - ts > self._ttl:
-                self._expiry.popitem(last=False)
-                self._data.pop(oldest_key, None)
+                self._drop(oldest_key)
                 continue
             break
         while self._displaced and now > next(iter(self._displaced.values())):
             tag, _ = self._displaced.popitem(last=False)
             self._displaced_conflicts.discard(tag)
-        while len(self._data) > self._max:
-            oldest_key, (_, evicted) = self._data.popitem(last=False)
-            self._expiry.pop(oldest_key, None)
-            tag = self._tag(oldest_key)
-            self._displaced[tag] = now + self._ttl
-            self._displaced.move_to_end(tag)
-            if evicted.state is SignatureState.AMBIGUOUS:
-                self._displaced_conflicts.add(tag)
+        while self._data and (len(self._data) > self._max or self._resident_bytes > self._max_bytes):
+            oldest_key = next(iter(self._data))
+            self._remember_displaced(oldest_key, now, self._drop(oldest_key).state)
         while len(self._displaced) > self._max:
             tag, until = self._displaced.popitem(last=False)
             self._displaced_conflicts.discard(tag)

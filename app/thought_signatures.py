@@ -6,6 +6,7 @@ import hashlib
 import uuid
 from typing import Any, List, Optional, Tuple
 
+import config as app_config
 import model_capabilities as mc
 from google.genai import types
 from ordinary_history import exact_ordinary_slots
@@ -23,6 +24,16 @@ _LITERAL_ID_KEY = "literal_call_id_sha256_v1"
 
 _URL_TO_STANDARD = str.maketrans("-_", "+/")
 _SIGNATURE_LITERALS = frozenset(s.decode("ascii") for s in SKIP_VALIDATOR_SENTINELS)
+# A REST/proto client can hand us bytes already decoded from the literal.
+# Neither that representation nor Base64 of the literal is a model-issued signature.
+_PLACEHOLDER_BYTES = {raw: s for s in SKIP_VALIDATOR_SENTINELS for raw in (
+    s, base64.urlsafe_b64decode(s + b"=" * (-len(s) % 4)),
+)}
+_PLACEHOLDER_MAX = max(map(len, _PLACEHOLDER_BYTES))
+
+
+def _original_signature(raw):
+    return None if not raw or (len(raw) <= _PLACEHOLDER_MAX and raw in _PLACEHOLDER_BYTES) else raw
 
 
 def _protojson_signature(value: str) -> Optional[bytes]:
@@ -55,10 +66,24 @@ def decode_thought_signature(value: Any) -> Optional[bytes]:
     return raw if raw is not None else value.encode("utf-8")
 
 
-def canonical_wire_signature(value: Any):
-    """Normalize actual bytes for Cookie's Bytes field; leave legacy wire literals alone."""
+def checked_public_signature(value: Any):
+    if value is not None and not isinstance(value, (str, bytes)):
+        raise SchemaValidationError("extra_content.google.thought_signature must be a Base64 string, not a JSON object or scalar.")
+    return value
+
+
+def ordinary_signature(value: Any, *, wire=False):
+    """Keep genuine optional metadata; a compatibility placeholder is not a signed ordinary Part."""
+    checked_public_signature(value)
+    if not value:
+        return None
     raw = _protojson_signature(value) if isinstance(value, str) else value
-    return encode_thought_signature(raw) if isinstance(raw, bytes) else value
+    signature = _original_signature(raw if raw is not None else value.encode("utf-8"))
+    if signature is None:
+        return None
+    if wire:
+        return encode_thought_signature(raw) if isinstance(raw, bytes) else value
+    return signature
 
 
 def signature_bytes(part: Any, fc: Any) -> Optional[bytes]:
@@ -142,12 +167,12 @@ def google_metadata(value: Any) -> dict:
     )
 
 
-def signature_from_extra(value: Any) -> Tuple[Optional[bytes], Optional[str]]:
+def signature_from_extra(value: Any, *, strict_encoding=False) -> Tuple[Optional[bytes], Optional[str]]:
     google = google_metadata(value)
-    encoded = google.get("thought_signature")
-    # Preserve explicit non-string legacy values through their historic string form.
-    raw = encoded if isinstance(encoded, (str, bytes)) else str(encoded) if encoded else None
-    return decode_thought_signature(raw), google.get("thought_signature_part")
+    encoded = checked_public_signature(google.get("thought_signature"))
+    raw = (_protojson_signature(encoded) if strict_encoding and isinstance(encoded, str)
+           else decode_thought_signature(encoded))
+    return raw, google.get("thought_signature_part")
 
 
 def standalone_message_signature(message: Any) -> Tuple[Optional[bytes], Optional[str]]:
@@ -155,7 +180,8 @@ def standalone_message_signature(message: Any) -> Tuple[Optional[bytes], Optiona
     role = message.get("role") if isinstance(message, dict) else getattr(message, "role", None)
     if role not in ("assistant", "model") or "ordinary_parts" in google_metadata(message):
         return None, None
-    return signature_from_extra(message)
+    signature, kind = signature_from_extra(message)
+    return _original_signature(signature), kind
 
 
 def ordinary_part_metadata(kind: str, text: str, signature: Optional[bytes], *, thought=False) -> dict:
@@ -176,7 +202,7 @@ def ordinary_parts_from_extra(value: Any, image_loader=None, history=None) -> Op
     parts = []
     for item, media in slots:
         kind = item["kind"]
-        signature = sdk_thought_signature_field(decode_thought_signature(item.get("thought_signature")))
+        signature = ordinary_signature(item.get("thought_signature"))
         if media is not None:
             part = image_loader(media) if image_loader else None
             if part is None:
@@ -308,61 +334,87 @@ def replay_tool_call_id(call_id: str, literal_ids=frozenset()) -> str:
     return call_id if call_id in literal_ids else _split_legacy_call_id(call_id)[0]
 
 
+def historical_literal_id(call: dict, origin_key: bytes | None, claude_ids: bool) -> str | None:
+    """Prove the interpretation of a full ID before decoding any legacy suffix."""
+    ident = call.get("id")
+    if not isinstance(ident, str) or LEGACY_THOUGHT_SEP not in ident:
+        return None
+    if claude_ids:
+        return ident if _legacy_components(ident)[1] is not None else None
+    if origin_key and signature_store.get_record(origin_key) is not None:
+        return ident
+    return marked_literal_call_id(call)
+
+
+def _missing_required():
+    raise SchemaValidationError(
+        "Required signature missing: Gemini needs the original thought signature for this tool step. "
+        "Retry with the unchanged tool history on the same gateway, preserve "
+        "tool_calls[].extra_content.google.thought_signature, or restart the tool turn."
+    )
+
+
 def resolve_tool_call_signature(
     tool_call_id: str,
     require_signature: bool = False,
     explicit_signature: Optional[bytes] = None,
     explicit_unsigned: bool = False,
     origin_key: bytes | None = None,
-    *, literal_id: bool = False,
+    *, literal_id: bool = False, claude_literal: bool = False,
 ) -> Tuple[str, Optional[bytes]]:
-    """Restore ``(real id, signature)`` with explicit OpenAI metadata first.
-
-    The skip sentinel is used only for the first call in a required Gemini 3
-    step when neither explicit metadata, the legacy id, nor the fallback store
-    can recover a signature. Explicitly unsigned parallel followers stay bare.
-    """
+    """Prefer genuine carried bytes, then a proven origin. Never upgrade a placeholder to proof."""
     ident = str(tool_call_id or "")
+    known = None
+    if not literal_id and origin_key and LEGACY_THOUGHT_SEP in ident:
+        # Also defend direct resolver callers that didn't precompute the ID set
+        # used to correlate adjacent functionResponse parts.
+        known = signature_store.get_record(origin_key)
+        literal_id = known is not None
     real_id, legacy_sig = (ident, None) if literal_id else _split_legacy_call_id(ident)
-    sig = explicit_signature if explicit_signature is not None else legacy_sig
+    sig = _original_signature(explicit_signature) or _original_signature(legacy_sig)
+    if sig is not None:
+        return real_id, sig
 
-    if sig is None and origin_key is not None:
-        exact = signature_store.get_record(origin_key) if origin_key else None
-        if exact is not None:
-            if exact.state is SignatureState.SIGNED:
-                return real_id, exact.signature
-            if exact.state in (SignatureState.UNSIGNED_FOLLOWER, SignatureState.AMBIGUOUS):
-                return real_id, None
-        else:
-            # A bare ID from another prefix, tenant or batch is not evidence
-            # for this one. In particular it cannot sign a later sibling.
+    required = require_signature and not explicit_unsigned
+    strict = required and app_config.GEMINI_STRICT_THOUGHT_SIGNATURES
+    if origin_key is not None:
+        record = known or (signature_store.get_record(origin_key) if origin_key else None)
+        if record is None:
+            # Data at another scope can veto guessing, never authorize its bytes.
             bare = signature_store.get_record(real_id)
             if bare and bare.state is not SignatureState.UNKNOWN:
+                if strict:
+                    _missing_required()
                 return real_id, None
+    else:
+        record = signature_store.get_record(real_id) if not explicit_unsigned else None
 
-    record = signature_store.get_record(real_id) if sig is None and not explicit_unsigned and origin_key is None else None
-    if record and record.state is SignatureState.AMBIGUOUS:
-        # Two turns claimed incompatible topology. An omitted signature may
-        # be rejected upstream; a different turn's bytes or a new bypass are worse.
+    if record is not None:
+        if record.state is SignatureState.SIGNED and (sig := _original_signature(record.signature)):
+            return real_id, sig
+        if record.state is SignatureState.UNSIGNED_FOLLOWER:
+            if strict:
+                _missing_required()
+            return real_id, None
+        if record.state is SignatureState.AMBIGUOUS:
+            if strict:
+                _missing_required()
+            return real_id, None
+
+    if not required:
         return real_id, None
-    if sig is None and record and record.state is SignatureState.SIGNED:
-        sig = record.signature
-    is_unsigned_follower = explicit_unsigned or bool(
-        record and record.state is SignatureState.UNSIGNED_FOLLOWER
-    )
-
-    if sig is None and require_signature and not is_unsigned_follower:
-        if literal_id:
-            raise SchemaValidationError(
-                "Required signature missing for a literal tool call ID; preserve the original "
-                "tool_calls[].extra_content.google.thought_signature."
-            )
-        sig = SKIP_VALIDATOR_SENTINEL
-        print(
-            "⚠️ [工具调用] 必需的思考签名无法恢复，已使用官方跳过校验哨兵。请求不会失败，但模型表现可能下降。"
-        )
-
-    return real_id, sig
+    if strict:
+        _missing_required()
+    if literal_id:
+        if claude_literal:
+            # A bare Claude tool_use ID never carries Google bytes. Its contents
+            # are not a reason to synthesize a signature or change the ID.
+            return real_id, None
+        _missing_required()
+    print("⚠️ [工具调用] 必需的思考签名无法恢复，已使用兼容模式的跳过校验哨兵。")
+    # Preserve an explicitly selected documented legacy placeholder *only* at
+    # the existing compatibility fallback, never as evidence or as a follower.
+    return real_id, _PLACEHOLDER_BYTES.get(explicit_signature or legacy_sig, SKIP_VALIDATOR_SENTINEL)
 
 
 def requires_signature(model_name: str) -> bool:

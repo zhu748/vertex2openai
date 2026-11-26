@@ -19,7 +19,7 @@ from image_processing import (
     optimize_image_bytes,
 )
 from tool_arguments import parse_tool_arguments
-from tool_history import gemini_history_with_ids
+from tool_history import current_signature_turn_start, first_wire_call_index, gemini_history_with_ids, history_call_signature
 from models import OpenAIMessage, file_data_markdown, message_text, normalize_content_part
 from response_validation import (
     complete_function_arguments,
@@ -30,7 +30,6 @@ from response_validation import (
 )
 from schema_validation import SchemaValidationError
 from runtime_state import app_state
-from signature_origin import origin_slot
 from thought_signatures import (
     replay_tool_call_id,
     attach_signature_extra,
@@ -42,9 +41,7 @@ from thought_signatures import (
     ordinary_part_metadata,
     ordinary_parts_from_extra,
     requires_signature,
-    resolve_tool_call_signature,
     signature_bytes,
-    signature_from_extra,
     standalone_message_signature,
     sdk_thought_signature_field,
     thought_signature_extra,
@@ -428,26 +425,14 @@ def _assistant_tool_parts(
     """Restore parallel calls, their signatures and the original ordinary-part order."""
     parts = []
     tool_parts = []
+    first = first_wire_call_index(message)
     for tool_index, tool_call in enumerate(message.tool_calls):
         function_call_data = tool_call.get("function", {})
         function_name = function_call_data.get("name", "unknown")
         arguments_str = function_call_data.get("arguments", "{}")
-        tool_call_id_str = tool_call.get("id", "") or ""
-
         parsed_arguments = parse_tool_arguments(arguments_str, label="tool_call.function.arguments")
-
-        explicit_sig, _ = signature_from_extra(tool_call)
-        # One assistant message is one function-calling step: only its
-        # first call requires a signature. Later calls are explicitly
-        # unsigned parallel followers and must not receive sentinels.
-        real_tool_id, thought_sig_bytes = resolve_tool_call_signature(
-            tool_call_id_str,
-            require_signature=require_sig and tool_index == 0,
-            explicit_signature=explicit_sig,
-            explicit_unsigned=tool_index > 0,
-            origin_key=origin_slot(message, tool_index),
-            literal_id=tool_call_id_str in literal_ids,
-        )
+        real_tool_id, thought_sig_bytes = history_call_signature(
+            message, tool_index, require_sig, literal_ids, first=tool_index == first)
 
         fc_kwargs = {"name": function_name, "args": parsed_arguments}
         if real_tool_id:
@@ -632,7 +617,8 @@ def create_gemini_prompt(
     require_sig = requires_signature(model_name)
     tool_name_by_id = {}
     contents = []
-    for message, literal_ids in gemini_history_with_ids(messages):
+    turn_start = current_signature_turn_start(messages) if require_sig else 0
+    for i, (message, literal_ids) in enumerate(gemini_history_with_ids(messages)):
         if message.role in ("system", "developer"):
             continue  # These instructions are sent in system_instruction.
         if message.role in ("tool", "function"):
@@ -644,7 +630,7 @@ def create_gemini_prompt(
                 if call_id and call_name:
                     tool_name_by_id[call_id] = call_name
                     tool_name_by_id[replay_tool_call_id(call_id, literal_ids)] = call_name
-            role, parts = "model", _assistant_tool_parts(message, require_sig, history, literal_ids=literal_ids)
+            role, parts = "model", _assistant_tool_parts(message, require_sig and i >= turn_start, history, literal_ids=literal_ids)
         else:
             role, parts = _ordinary_message_parts(message, history if message.role in ("assistant", "model") else None)
         if parts:

@@ -58,7 +58,10 @@ from schema_validation import (
     MAX_SCHEMA_DEPTH, MAX_SCHEMA_NODES, SchemaValidationError, native_definition_ref,
     sanitize_for_gemini, validate_json_schema, validate_schema_size,
 )
-from streaming import HEARTBEAT, HEARTBEAT_FRAME, SSE_NO_BUFFER_HEADERS, with_heartbeats
+from streaming import (
+    HEARTBEAT, HEARTBEAT_FRAME, SSE_NO_BUFFER_HEADERS, StreamDeadlineExceeded,
+    reads_before_deadline, with_heartbeats,
+)
 from tool_policy import has_search_suffix
 from usage import merge_usage_metadata
 from upstream_errors import google_status_detail
@@ -889,20 +892,11 @@ async def _timed_events(request: Request, record: dict, body: dict, model: str, 
     deadline = note_retry_deadline(request, deadline)
     source = _events_with_retry(request, record, body, model, deadline=deadline)
     async with aclosing(with_heartbeats(source, request)) as events:
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise NativeBridgeError(504, "请求超过总超时时间。")
-            try:
-                # Never keep an asyncio timeout scope open across a yield:
-                # StreamingResponse may read/close us from a different task.
-                async with asyncio.timeout(remaining):
-                    item = await anext(events)
-            except StopAsyncIteration:
-                return
-            except TimeoutError:
-                raise NativeBridgeError(504, "请求超过总超时时间。") from None
-            yield ("heartbeat", None) if item is HEARTBEAT else item
+        try:
+            async for item in reads_before_deadline(events, deadline):
+                yield ("heartbeat", None) if item is HEARTBEAT else item
+        except StreamDeadlineExceeded:
+            raise NativeBridgeError(504, "请求超过总超时时间。") from None
 
 
 async def handle_native_request(fastapi_request: Request, model: str, action: str,

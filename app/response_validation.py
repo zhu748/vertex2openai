@@ -1,5 +1,6 @@
 """校验上游响应是否被拦截、是否完整，并提供明确的错误类型。"""
 
+from hashlib import blake2s
 from typing import Optional
 
 from google.genai.types import Language, Outcome, ToolType
@@ -99,6 +100,28 @@ class IncompleteResponseError(ValueError):
 
 class ToolStreamError(IncompleteResponseError):
     """Local tool-fragment validation failure, never evidence of a bad proxy."""
+
+
+MAX_TOOL_CALLS = 1024
+
+
+class StreamToolCallIds:
+    """Validate complete provider calls in one attempt, isolated by candidate."""
+    def __init__(self):
+        self._count = 0
+        self._seen = set()
+
+    def observe(self, ident: Optional[str], candidate: int = 0) -> None:
+        self._count += 1
+        if self._count > MAX_TOOL_CALLS:
+            raise ToolStreamError("上游流式工具调用数量超过上限。")
+        if not ident:
+            return  # The adapter generates IDs for omitted values.
+        # Do not retain unbounded provider ID strings until the stream ends.
+        key = (candidate, blake2s(ident.encode("utf-8", "surrogatepass")).digest())
+        if key in self._seen:
+            raise ToolStreamError("上游在同一候选回复内重复使用工具调用 ID，无法可靠匹配工具结果。")
+        self._seen.add(key)
 
 
 def require_unique_tool_call_ids(ids) -> None:

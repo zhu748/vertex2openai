@@ -29,6 +29,7 @@ class AppSettings(BaseSettings):
     MODELS_CONFIG_URL: str = ""
     ROUNDROBIN: bool = False
     SAFETY_SCORE: bool = False
+    GEMINI_STRICT_THOUGHT_SIGNATURES: bool = False
     # 出站代理（全局默认）：支持 http:// https:// socks5:// socks5h:// 原生协议，
     # 以及 vless:// vmess:// trojan:// ss:// socks4:// hysteria2:// tuic:// 等分享链接
     # （经内置 sing-box 转成本地 socks5，见 app/proxy_resolver.py）。
@@ -61,6 +62,7 @@ class AppSettings(BaseSettings):
 _settings = AppSettings()
 
 API_KEY = _settings.API_KEY
+GEMINI_STRICT_THOUGHT_SIGNATURES = _settings.GEMINI_STRICT_THOUGHT_SIGNATURES
 
 # 控制台登录口令（SEC-P1-2）：设置后控制台登录 / Cookie reveal 二次验证
 # 均用它，与 API_KEY（仅生成端点鉴权）解耦；未设置时回退 API_KEY。

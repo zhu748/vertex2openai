@@ -145,7 +145,7 @@ class LiteralToolIDCarrier(SchemaRouteHarness):
                 first["tool_calls"][0]["function"]["arguments"] = '{"city":"different"}'
                 await self.replay([first, _result(ident)], status=400)
 
-    async def test_standard_claude_output_keeps_existing_unmarked_cold_grammar(self):
+    async def test_standard_claude_ids_remain_literal_even_on_unmarked_cold_history(self):
         for channel in ("api_key", "web_proxy"):
             self.channel = channel
             base = "strict-old-" + channel
@@ -162,4 +162,4 @@ class LiteralToolIDCarrier(SchemaRouteHarness):
                             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": ident, "content": "done"}]},
                         ], protocol="claude")
                     self.assertEqual((calls[0]["functionCall"]["id"], _signature(calls[0]), results[0]["id"]),
-                                     (base, b"b", base))
+                                     (ident, None, ident))

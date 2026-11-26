@@ -47,6 +47,7 @@ from starlette.requests import ClientDisconnect
 
 from admission import GenerationCapacityError, ManagedStreamingResponse
 from signature_origin import bind_signature_origins
+from claude_signature_projection import OmittedClaudeProjection, bind_omitted_claude_projection
 from auth import constant_time_equal, extract_candidate_key
 from claude_protocol import (
     ClaudeRequestError,
@@ -284,6 +285,7 @@ def _claude_stream_response(response: StreamingResponse, display_model: str, *,
     async def event_stream():
         failed = False
         delivered = False  # message_stop 已完整发出（客户端断开/异常时不算完成）
+        wire_done = False
         producer = asyncio.create_task(_produce_frames())
         producer.add_done_callback(lambda _: ready.set())
         try:
@@ -299,6 +301,7 @@ def _claude_stream_response(response: StreamingResponse, display_model: str, *,
                     yield frames.pop()
                 if terminal:
                     failed = terminal == "error"
+                    wire_done = terminal == "done"
                     break
             if not failed:
                 if not state.finish:
@@ -306,6 +309,8 @@ def _claude_stream_response(response: StreamingResponse, display_model: str, *,
                 for event in state.finish_events():
                     yield event
                 delivered = True
+                if wire_done and state.projection is not None:
+                    await state.projection.publish()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -314,6 +319,8 @@ def _claude_stream_response(response: StreamingResponse, display_model: str, *,
             print(f"❌ [Claude] 模型 {display_model} 流式转发失败 | HTTP {code} | {message[:200]}")
             yield error_event(anthropic_error_type(code), message[:1024])
         finally:
+            if state.projection is not None:
+                state.projection.discard()
             # 与 OpenAI 通道的完成日志同构：显示模型（claude-* 或原样 gemini-*）
             # | 耗时 | tokens；上游内部管线已按内部模型名打过 📊/✅，这里补齐
             # Claude 协议视角的收尾行。
@@ -396,10 +403,17 @@ async def claude_messages(fastapi_request: Request, api_key: str = Depends(get_c
     # includeThoughts 口径；模型照常思考，reasoning_tokens 照计 usage）。
     bind_signature_origins(request_obj, api_key)
     omit_thinking = anthropic_omit_thinking(body)
+    projection = None
+    if omit_thinking:
+        projection = OmittedClaudeProjection(request_obj._signature_output_prefix, body.get("metadata"))
+        # The OpenAI wire projection contains reasoning the public Claude
+        # response has explicitly omitted. Never register it as delivered.
+        request_obj._signature_output_prefix = None
+        bind_omitted_claude_projection(request_obj, body.get("metadata"))
     request_started = time.monotonic()
     stream_state = None
     if request_obj.stream:
-        stream_state = ClaudeStreamState(display_model, omit_thinking=omit_thinking)
+        stream_state = ClaudeStreamState(display_model, omit_thinking=omit_thinking, projection=projection)
         request_obj._select_buffered_order = stream_state.select_buffered_order
 
     track_configure(model=display_model, protocol="claude",
@@ -449,7 +463,12 @@ async def claude_messages(fastapi_request: Request, api_key: str = Depends(get_c
         print(f"✅ [Claude] 模型 {display_model} | 非流式响应完成 | "
               f"耗时 {time.monotonic() - request_started:.1f}s{tokens}")
         response_class = LargeJSONResponse if body_size > 1024 * 1024 else JSONResponse
-        return response_class(content=anthropic_payload)
+        background = None
+        if projection is not None:
+            projection.prepare_json(payload, anthropic_payload)
+            if projection.ready:
+                background = BackgroundTask(projection.publish)
+        return response_class(content=anthropic_payload, background=background)
 
     # ---- 流式：OpenAI SSE 帧 → Anthropic SSE 事件 ----
     translated = _claude_stream_response(response, display_model, omit_thinking=omit_thinking,

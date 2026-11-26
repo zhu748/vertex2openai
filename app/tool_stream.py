@@ -17,6 +17,7 @@ import re
 
 from response_validation import (
     IncompleteResponseError,
+    MAX_TOOL_CALLS,
     ToolStreamError,
     complete_function_arguments,
     has_finish_reason,
@@ -25,7 +26,6 @@ from response_validation import (
 from json_encoding import estimate_json_chars
 
 MAX_TOOL_STREAM_BYTES = 32 * 1024 * 1024
-MAX_TOOL_CALLS = 1024
 MAX_ARGUMENT_FIELDS = 65536
 # RFC 9535 §2.5.1.1: non-ASCII scalar values are allowed regardless of
 # Unicode category. Names are compared literally, without normalization.

@@ -66,7 +66,8 @@ class SavedGenerationPolicyTests(unittest.IsolatedAsyncioTestCase):
             task = asyncio.create_task(asyncio.to_thread(self.state.update_settings, self.new))
             try:
                 self.assertTrue(await asyncio.to_thread(writing.wait, 5))
-                self.assertEqual(self.state.get_setting("retry_max"), 3)  # inspector still sees its draft
+                self.assertEqual(self.state.get_setting("retry_max", committed=False), 3)
+                self.assertEqual(self.state.get_setting("retry_max"), 0)
                 result = await self.post()
                 self.assertEqual(result.status_code, 200)
                 buf = await self.store.get_exact(result.headers["x-resume-id"])

@@ -11,7 +11,8 @@ from image_delivery import has_inline_image
 from models import file_data_markdown
 from message_processing import iter_giant_content
 
-from response_validation import IncompleteResponseError, complete_function_arguments, has_finish_reason, validate_generation_finish_reason
+from response_validation import (IncompleteResponseError, StreamToolCallIds, complete_function_arguments,
+                                 has_finish_reason, validate_generation_finish_reason)
 from json_stream import MAX_JSON_OBJECT_BYTES, JsonObjects as _JsonObjects
 from signature_store import signature_store
 from upstreams.cookie_candidate_metadata import native_candidate_metadata, native_prompt_feedback
@@ -49,9 +50,9 @@ def apply_wire_signature(data: dict, ordinary_metadata: list, part_order: list) 
     signature = signature_bytes_from_wire(data.get("value"))
     if not signature:
         return None
-    if data.get("part_kind") == "signature_only":
+    if data.get("part_kind") == "signature_only" or data.get("empty_part"):
         part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
-        ordinary_metadata.append(ordinary_part_metadata("signature_only", "", signature))
+        ordinary_metadata.append(ordinary_part_metadata(data["part_kind"], "", signature))
     elif ordinary_metadata:
         ordinary_metadata[-1]["thought_signature"] = encode_thought_signature(signature)
         if data.get("part_kind") == "image":
@@ -301,8 +302,9 @@ def has_pending_inline_image(obj: dict) -> bool:
 
 class CookieCandidateBoundary:
     """A Cookie attempt has exactly one candidate; remember only its first finish."""
-    def __init__(self) -> None:
+    def __init__(self, *, check_tool_ids: bool = False) -> None:
         self.finish: str | None = None
+        self.tool_ids = StreamToolCallIds() if check_tool_ids else None
 
     def observe(self, reason: Any, parts: list) -> None:
         finish = str(reason) if has_finish_reason(reason) else None
@@ -313,6 +315,19 @@ class CookieCandidateBoundary:
                 raise IncompleteResponseError("上游候选返回了相互矛盾的结束原因。")
         elif finish is not None:
             self.finish = finish
+
+
+def _finish_native_part(native_part: dict, signature: Any, *, empty_text: bool, thought: bool) -> None:
+    if signature:
+        if not isinstance(signature, str):
+            raise IncompleteResponseError("上游 thoughtSignature 必须是字符串。")
+        # Signed standalone empty text is data, unlike proto defaults on
+        # functionCall/media Parts. Never invent it for an absent text field.
+        if not native_part and empty_text:
+            native_part["text"] = ""
+        native_part["thoughtSignature"] = signature
+    if native_part and thought:
+        native_part["thought"] = True
 
 
 def extract_events(obj: dict, *, preserve_parts: bool = False, strip_thoughts: bool = False,
@@ -395,6 +410,8 @@ def extract_events(obj: dict, *, preserve_parts: bool = False, strip_thoughts: b
 
                 function_call = _complete_wire_call(part.get("functionCall"))
                 if function_call is not None:
+                    if boundary.tool_ids is not None:
+                        boundary.tool_ids.observe(function_call.get("id"))
                     native_part["functionCall"] = function_call
                     if not preserve_parts:
                         yield "function_call", {
@@ -433,20 +450,20 @@ def extract_events(obj: dict, *, preserve_parts: bool = False, strip_thoughts: b
                     # its payload. If signed, the next event owns an opaque slot.
                     yield "hidden_thought", True
 
-                if part.get("thoughtSignature") and function_call is None and not preserve_parts:
-                    # Signatures describe this Part. Emit them after its media
-                    # event, so consumers cannot attach them to preceding text.
-                    yield "thought_signature", {"value": part["thoughtSignature"], "part_kind": ordinary_kind}
+                signature = part.get("thoughtSignature")
+                if signature and function_call is None and not preserve_parts:
+                    # A genuine empty thought has no public delta, but its signed
+                    # Part still has the thought bit and owns its own position.
+                    if not native_part and thought and part.get("text") == "":
+                        yield "thought_signature", {"value": signature, "part_kind": "thought", "empty_part": True}
+                    else:
+                        # Emit attached signatures immediately after their own
+                        # text/media event; stripped thoughts stay opaque.
+                        yield "thought_signature", {"value": signature, "part_kind": ordinary_kind}
 
                 if preserve_parts:
-                    signature = part.get("thoughtSignature")
-                    if signature:
-                        if not isinstance(signature, str):
-                            raise IncompleteResponseError("上游 thoughtSignature 必须是字符串。")
-                        native_part["thoughtSignature"] = signature
+                    _finish_native_part(native_part, signature, empty_text=part.get("text") == "", thought=thought)
                     if native_part:
-                        if thought:
-                            native_part["thought"] = True
                         yield "native_part", native_part
 
             # finishReason 全量透出（含 SAFETY/PROHIBITED_CONTENT 等），由消费方统一映射；

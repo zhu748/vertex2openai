@@ -145,13 +145,13 @@ class ConfigurationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_late_probe_cannot_overwrite_a_manual_project_edit(self):
         state = AppState()
-        state._state = {"express_keys": [{"key": "offline-key"}]}
         async def probe(key):
             state.update_express_key_project(key, "manually-selected", source="manual")
             return "stale-auto-result", "success"
-        with mock.patch.object(state, "_save"), \
+        with mock.patch.object(state, "_write_snapshot"), \
              mock.patch.object(express_key_probe, "app_state", state), \
              mock.patch.object(express_key_probe, "probe_project_id", side_effect=probe):
+            state.set_express_keys([{"key": "offline-key"}])
             result = await express_key_probe.probe_and_store("offline-key")
         self.assertEqual(state.get_express_keys()[0]["project_id"], "manually-selected")
         self.assertEqual(result["project_id"], "manually-selected")

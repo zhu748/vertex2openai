@@ -441,6 +441,8 @@ def _append_assistant_blocks(label: str, content: list, openai_messages: list) -
         role="assistant", content=text or None, tool_calls=tool_calls or None,
         extra_content={"google": {"ordinary_parts": ordinary, "part_order": order}} if tool_calls else None,
     )
+    # Claude tool_use IDs are opaque, never the historical OpenAI ID+signature carrier.
+    message._claude_literal_tool_ids = bool(tool_calls)
     if observed_reasoning is not None:
         message._signature_observed_reasoning = observed_reasoning.result()
     openai_messages.append(message)
@@ -1079,10 +1081,11 @@ class ClaudeStreamState:
     """
 
     def __init__(self, display_model: str, message_id: Optional[str] = None,
-                 omit_thinking: bool = False):
+                 omit_thinking: bool = False, projection=None):
         self.model = display_model
         self.id = message_id or new_message_id()
         self.omit_thinking = omit_thinking
+        self.projection = projection
         self._next_index = 0
         self._open: Optional[dict] = None       # 当前打开的块 {"kind","index",...}
         self._tools: dict[int, dict] = {}        # OpenAI tool index → {id,name,parts}（按到达序）
@@ -1131,6 +1134,11 @@ class ClaudeStreamState:
                 # Keep the accepted argument spelling and do not store a parsed JSON tree.
                 tools.append({"type": "tool_use", "id": ident, "name": tool["name"], "arguments": raw})
             self._buffered_blocks = _ordered_completion_blocks(delta, tools, self.omit_thinking)
+            if self.projection is not None:
+                # This finite order mode is reserved for interleaved source
+                # topology, which a digest of flattened display text cannot
+                # independently prove. Keep the public rendering unchanged.
+                self.projection.discard()
             if self._buffered_blocks is None:
                 # Stale or incomplete topology: process this delta by the usual
                 # validated tool-after-text path instead of trusting its order.
@@ -1210,6 +1218,13 @@ class ClaudeStreamState:
             return []
         choice = choices[0] if isinstance(choices[0], dict) else {}
         delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+        projection = self.projection
+        if projection is not None and projection.prefix:
+            projection.source(payload.get("id"))
+            choice_index = choice.get("index", 0)
+            if (len(choices) != 1 or type(choice_index) is not int or choice_index != 0 or self.finish
+                    or self._tools and (delta.get("content") or delta.get("reasoning_content"))):
+                projection.discard()
         if self._buffered_source:
             if payload.get("id") == self._buffered_source[0]:
                 if self._consume_buffered_choice(choice, delta):
@@ -1267,8 +1282,22 @@ class ClaudeStreamState:
                 if arguments:
                     self._reserve_tool_bytes(arguments)
                     known["parts"].append(arguments)
+                if projection is not None and projection.prefix:
+                    # Upstream-generated metadata, not the signature_delta
+                    # emitted in the public Claude thinking format.
+                    extra = google_metadata(tc).get("thought_signature")
+                    if extra is not None:
+                        prior = known.get("thought_signature")
+                        if (not isinstance(extra, str)
+                                or len(extra) > projection.max_encoded_signature
+                                or prior is not None and prior != extra):
+                            projection.discard()
+                        elif prior is not None or projection.reserve_signature(len(extra)):
+                            known["thought_signature"] = extra
             self.has_tools = True
 
+        if projection is not None:
+            projection.check_order(delta.get("extra_content"))
         # 4) 结束原因
         finish = choice.get("finish_reason")
         if isinstance(finish, str) and finish:
@@ -1295,7 +1324,10 @@ class ClaudeStreamState:
         # 2) 文本增量（content → text_delta）：先于工具处理
         content = delta.get("content")
         if isinstance(content, str) and content:
-            if not (self._open and self._open["kind"] == "text"):
+            opening = not (self._open and self._open["kind"] == "text")
+            if self.projection is not None:
+                self.projection.add_text(content, start=opening)
+            if opening:
                 events += self._start_block("text", {"type": "text", "text": ""})
             events.append(_sse_event("content_block_delta", {
                 "type": "content_block_delta", "index": self._open["index"],
@@ -1353,6 +1385,15 @@ class ClaudeStreamState:
             if self.finish not in ("length", "content_filter"):
                 _parse_tool_arguments(args)
             calls.append((known, args))
+        if self.projection is not None:
+            if (self.finish == "tool_calls" and not self._buffered_blocks
+                    and list(self._tools) == list(range(len(self._tools)))):
+                self.projection.prepare(
+                    (known["id"], known["name"], args, {"extra_content": {"google": known}})
+                    for known, args in calls
+                )
+            else:
+                self.projection.discard()
         self._finished = True
         events = self._close_block()
         # 延迟发射的全部 tool_use 块：start → 单条完整 input_json_delta → stop
