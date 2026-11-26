@@ -17,6 +17,7 @@ import httpx
 from curl_cffi.requests.exceptions import RequestException as CurlRequestError
 from http_io import BoundedAsyncClient, buffer_upstream_response, decoded_http_response
 from proxy_tls import build_httpx_proxy
+from stream_cleanup import AttemptCancellation
 
 from runtime_state import app_state
 from client_pool import register_extra_pool_closer, schedule_graceful_close, _closer
@@ -210,6 +211,7 @@ class _CurlClientShim:
     async def _stream_ctx(self, method: str, url: str, *, headers=None, json=None, timeout=None):
         # Own response closure: AsyncSession.stream() unconditionally awaits
         # the raw aclose(), which re-raises a cancelled producer on early exit.
+        cancellation = AttemptCancellation()
         try:
             resp = await self._s.request(method, url, headers=headers, json=json,
                                          timeout=self._stream_timeout if timeout is None else timeout, stream=True)
@@ -222,6 +224,8 @@ class _CurlClientShim:
             response = decoded_http_response(exc.response, None)
         else:
             response = _CurlRespShim(resp, from_stream=True)
+        # Match the HTTPX boundary before a whole POST starts reading the body.
+        await cancellation.transfer(response, lambda result: result.aclose())
         try:
             yield response
         finally:

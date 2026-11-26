@@ -23,7 +23,7 @@ async function main(){
  const cap={family:'3',thinking:{kind:'level',levels:['low','medium','high']},supports_anti_truncation:true,supports_search:true,image_sizes:['1K','2K','4K'],image_aspect_ratios:['1:1','16:9']};
  const summary={connections:1,generations:1,background:0,retry_wait:0,active:1};
  const record={id:'trace-1234567890abcdef',model:'text',protocol:'openai',channel:'express',mode:'stream',phase:'streaming',status:'running',connection:'open',created_at:Date.now()/1000,duration_ms:1000,timings:{},attempts:1,retries:0,finish_reasons:[],usage:{},events:[],logs:[]};
- let scrollPosition=0,transport=null,requestTotal=1,modelCatalog=['text','image'];
+ let scrollPosition=0,transport=null,holdRead=null,requestTotal=1,modelCatalog=['text','image'];
  Object.defineProperty(w,'scrollY',{get:()=>scrollPosition});
  w.AbortSignal=AbortSignal;w.AbortController=AbortController;w.matchMedia=()=>({matches:false});w.scrollTo=({top})=>{scrollPosition=top;};w.HTMLElement.prototype.scrollIntoView=()=>{};w.confirm=()=>true;w.prompt=()=>'console-password';
  w.CSS={escape:s=>s};w.HTMLDialogElement.prototype.showModal=function(){this.open=true;};w.HTMLDialogElement.prototype.close=function(){this.open=false;this.dispatchEvent(new w.Event('close'));};
@@ -64,8 +64,18 @@ async function main(){
   else if(target.pathname==='/api/proxy/parse')result={proxies:[]};
   else if(target.pathname==='/api/settings/mode'){mode=body.mode;result={status:'success',mode};}
   else throw Error('Unexpected endpoint '+target.pathname);
-  return new Response(JSON.stringify(result),{status:200,headers:{'content-type':'application/json'}});
+  const response=new Response(JSON.stringify(result),{status:200,headers:{'content-type':'application/json'}});
+  return (method==='GET'&&holdRead?.(target.pathname,response))||response;
  };
+ function holdConfigRead(endpoint){
+  let release;
+  holdRead=(pathname,response)=>{
+   if(pathname!==endpoint)return;
+   holdRead=null;
+   return new Promise(resolve=>{release=()=>resolve(response);});
+  };
+  return ()=>release();
+ }
  const el=id=>d.getElementById(id);
  function edit(id,value){const input=el(id);if(input.type==='checkbox')input.checked=value;else input.value=value;input.dispatchEvent(new w.Event('input',{bubbles:true}));input.dispatchEvent(new w.Event('change',{bubbles:true}));}
  async function save(id){el(id).click();await tick();}
@@ -865,6 +875,74 @@ async function main(){
      {first_reply_timeout_seconds:0,_expected:{first_reply_timeout_seconds:{present:true,value:31}}});
    assert.equal(unloadBlocked(),false);
    check('A model disappearing during a pending write still retains a later explicit reset on reappearance');
+  }
+
+  {
+   w.switchTab('runtime');
+   settings.retry_max=10;settings.retry_jitter_seconds=1;settings.keepalive_interval=60;
+   await w.loadParams();
+   settings.retry_jitter_seconds=2; // disjoint server change, not in our write
+   const release=holdConfigRead('/api/settings');
+   const pending=w.loadParams();
+   edit('retry_max','7');await clickRuntime();
+   assert.equal(settings.retry_max,7);
+   edit('keepalive_interval','75');
+   release();await pending;
+   assert.equal(el('retry_max').value,'7');
+   assert.equal(el('retry_jitter_seconds').value,'2');
+   assert.equal(el('keepalive_interval').value,'75');
+   assert.match(el('runtime-save-bar').textContent,/1 项修改未保存/);
+   edit('retry_max','8');await clickRuntime();
+   assert.deepEqual(lastSettings(),{retry_max:8,keepalive_interval:75,
+     _expected:{retry_max:{present:true,value:7},keepalive_interval:{present:true,value:60}}});
+   settings.retry_max=9;await w.loadParams();
+   assert.equal(el('retry_max').value,'9');assert.equal(w.consoleForms.dirty(),false);
+   check('A read started before a runtime save cannot rewind it or its CAS, but adopts unrelated fields and preserves later drafts');
+  }
+
+  {
+   w.switchTab('params');
+   settings.first_reply_timeout_seconds=15;
+   overrides.text={first_reply_timeout_seconds:40};
+   overrides.image={};
+   await w.loadParams();edit('model-sel','text');
+   overrides.image.default_max_tokens=128; // independent model update in the delayed read
+   const release=holdConfigRead('/api/capabilities');
+   const pending=w.loadParams();
+   el('source-first_reply_timeout_seconds').querySelector('button').click();
+   await save('btn-scope-save');
+   assert.equal(Object.hasOwn(overrides.text,'first_reply_timeout_seconds'),false);
+   release();await pending;
+   assert.equal(el('first_reply_timeout_seconds').value,'15');
+   assert.match(el('source-first_reply_timeout_seconds').textContent,/继承全局/);
+   edit('model-sel','image');assert.equal(el('default_max_tokens').value,'128');
+   edit('model-sel','text');edit('first_reply_timeout_seconds','33');await save('btn-scope-save');
+   assert.deepEqual(requests.filter(r=>r.path==='/api/model-overrides/text'&&r.method==='POST').at(-1).body,
+     {first_reply_timeout_seconds:33,_expected:{first_reply_timeout_seconds:{present:false}}});
+   overrides.text.first_reply_timeout_seconds=38;await w.loadParams();
+   assert.equal(el('first_reply_timeout_seconds').value,'38');
+   check('A delayed capability read preserves an acknowledged inheritance/removal and only protects the saved model fields');
+  }
+
+  {
+   w.switchTab('params');edit('model-sel','image');
+   settings.retry_max=11; // only the held older settings GET succeeds
+   const release=holdConfigRead('/api/settings'), pending=w.loadParams();
+   const previous=el('retry_max').value;
+   modelCatalog=['image'];
+   transport=(url,opts)=>url.pathname==='/api/settings'&&!opts.method?new Response('{}',{status:503}):undefined;
+   await w.loadParams();transport=null;
+   assert.equal(el('model-sel').querySelector('[value=text]'),null);
+   assert.equal(el('retry_max').value,previous);
+   edit('default_max_tokens','321');
+   release();await pending;
+   assert.equal(el('retry_max').value,'11');
+   assert.equal(el('model-sel').querySelector('[value=text]'),null);
+   assert.equal(el('model-sel').value,'image');assert.equal(el('default_max_tokens').value,'321');
+   assert.match(el('params-load-error').textContent,/503/);
+   modelCatalog=['text','image'];await w.loadParams();w.discardModelDraft();
+   assert.equal(el('params-load-error').classList.contains('hidden'),true);
+   check('Different configuration datasets arbitrate overlapping GETs independently; a failed newer settings read does not poison the model list');
   }
 
   console.log(`${passed} groups of console DOM checks passed. Layout requires the browser suite.`);

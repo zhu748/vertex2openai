@@ -4,7 +4,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
-    from signature_origin import DirectChatOriginDelivery, ResponsesLineage
+    from signature_origin import ChatOriginDelivery, ResponsesLineage
 
 # Define data models
 MAX_CANDIDATES = 8
@@ -103,7 +103,7 @@ class OpenAIRequest(BaseModel):
         [str, tuple[bytes, ...], tuple[bytes | None, ...] | None, bytes | None], None
     ] | None = PrivateAttr(default=None)
     _signature_output_destination: Callable[[bytes], None] | None = PrivateAttr(default=None)
-    _chat_origin_delivery: "DirectChatOriginDelivery | None" = PrivateAttr(default=None)
+    _chat_origin_delivery: "ChatOriginDelivery | None" = PrivateAttr(default=None)
     model: str
     messages: list[OpenAIMessage]
     # Legacy field accepted for compatibility; only an enabled model suffix

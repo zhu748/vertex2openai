@@ -24,9 +24,10 @@ from message_processing import (
 )
 from prefill import PrefillDeduper, strip_prefill_overlap
 from response_validation import (
-    StreamToolCallIds,
+    IncompleteResponseError, ResponsesMediaError, ResponsesTextCallOwner, StreamToolCallIds,
     map_finish_reason_to_openai,
     complete_function_arguments,
+    responses_partial_call,
     sdk_function_call,
     sdk_media_payload,
 )
@@ -84,6 +85,41 @@ def completed_response_needs_media_pool(response: Any) -> bool:
             if chars_left < 0:
                 return True
     return False
+
+
+def responses_sdk_source(response: GenerateContentResponse, private_text_name: str | None = None) -> GenerateContentResponse:
+    """Gate the original typed candidate before Chat renders media or registers a call.
+
+    A length/filter finish never authorizes an executable subset. Leave a private
+    text-transport call to its own decoder; its arguments represent visible text.
+    """
+    candidates = getattr(response, "candidates", None) or ()
+    if len(candidates) != 1:
+        raise IncompleteResponseError("Upstream completion must contain one candidate.")
+    candidate, = candidates
+    parts = getattr(candidate.content, "parts", None) or ()
+    finish = map_finish_reason_to_openai(candidate.finish_reason, default=None)
+    incomplete = finish in ("length", "content_filter")
+    kept = None
+    owner = ResponsesTextCallOwner(private_text_name) if private_text_name else None
+    for index, part in enumerate(parts):
+        if sdk_media_payload(part) is not None:
+            raise ResponsesMediaError()
+        if incomplete and (fc := sdk_function_call(part)) is not None:
+            fragmented = responses_partial_call(fc)
+            if not (owner and owner.owns(fc.name, fc.id, fc.will_continue, fragmented)):
+                # Validate the shape, never stage a public ID/signature for dropped data.
+                if not fragmented:
+                    complete_function_arguments(fc)
+                if kept is None:
+                    kept = parts[:index]
+                continue
+        if kept is not None:
+            kept.append(part)
+    if kept is None:
+        return response
+    content = candidate.content.model_copy(update={"parts": kept})
+    return response.model_copy(update={"candidates": [candidate.model_copy(update={"content": content})]})
 
 
 def is_gemini_response_valid(response: Any, *, allow_empty_length: bool = False) -> bool:

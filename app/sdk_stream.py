@@ -4,27 +4,13 @@ import asyncio
 from contextvars import ContextVar
 from typing import Any, AsyncIterable, Awaitable, Callable, Self
 
-import anyio
 import httpx
 
 from http_io import close_httpx_response, own_httpx_response
-from stream_cleanup import await_owned_close
+from stream_cleanup import AttemptCancellation, await_owned_close
 
 
 _active_responses = ContextVar("sdk_responses", default=None)
-
-
-class SDKAttemptCancellation:
-    """Remember cancellation of this attempt, even if the transport replaced it."""
-    def __init__(self) -> None:
-        self.owner = asyncio.current_task()
-        self.initial = self.owner.cancelling()
-
-    async def check(self) -> None:
-        # Keep AnyIO's cancellation identity when an ASGI peer was lost.
-        await anyio.lowlevel.checkpoint_if_cancelled()
-        if self.owner.cancelling() > self.initial:
-            raise asyncio.CancelledError()
 
 
 class _Responses:
@@ -68,7 +54,7 @@ async def capture_sdk_response(response: httpx.Response) -> None:
 async def read_sdk_response(generate: Callable[..., Awaitable[Any]], **kwargs: Any) -> Any:
     """Own a whole SDK response before HTTPX implicitly reads and closes it."""
     responses = _Responses()
-    cancellation = SDKAttemptCancellation()
+    cancellation = AttemptCancellation()
     token = _active_responses.set(responses)
 
     try:

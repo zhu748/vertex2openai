@@ -39,10 +39,16 @@ from request_tracking import current_trace, redact
 from replay_event import ReplayEvent
 from retry_policy import bounded_sse_advisory
 from json_encoding import json_size_offloop
+from signature_origin import RetainedChatOrigins
 from upstream_errors import google_status_detail
 
 # 终止帧：与 OpenAI 流一致，客户端见到它即可判定「本轮完整结束」
 # DONE_FRAME 由 streaming 统一导出（上方 import），此处不再重复定义。
+
+# Raw originals are optional extra memory, not part of the public replay
+# payload budget. Keep a bounded ambiguity-only receipt when they do not fit.
+_CHAT_ORIGIN_SIGNATURES_PER_BUFFER = 1024 * 1024
+_CHAT_ORIGIN_SIGNATURES_PER_STORE = 8 * 1024 * 1024
 
 
 class BufferCapacityError(RuntimeError):
@@ -430,6 +436,8 @@ class ResumableBuffer:
         self.owner_key_digest = ""
         self.bytes_stored = 0
         self._account_bytes = None
+        self._chat_origins = None
+        self._account_chat_origins = None
         # per-buffer 限额在创建时快照：append 每个 SSE 帧都会检查，
         # 旧写法每帧都进 app_state 锁读设置（变更频率极低，纯浪费）。
         # 全局总预算（resumable_max_total_mb）仍实时读，保证放宽后立即生效。
@@ -464,7 +472,8 @@ class ResumableBuffer:
 
     async def finish(self, status: str = "done", error: str | dict | None = None,
                      payload: Optional[dict] = None, status_code: Optional[int] = None,
-                     *, terminal_frame: str | ReplayEvent | None = None, retry_after: Optional[str] = None) -> None:
+                     *, terminal_frame: str | ReplayEvent | None = None, retry_after: Optional[str] = None,
+                     chat_origins=()) -> None:
         if self.done:
             return
         # Account potentially large JSON outside the condition. A watchdog can
@@ -501,7 +510,36 @@ class ResumableBuffer:
                 self.payload = payload
             if status_code is not None:
                 self.status_code = status_code
+            if chat_origins and self.status == "done" and 200 <= self.status_code < 300:
+                self._retain_chat_origins(chat_origins)
             self._settled_locked()
+
+    def _retain_chat_origins(self, batches):
+        account = self._account_chat_origins
+        if account is None:
+            return  # unregistered/retired buffer cannot own a delivery
+        proof = RetainedChatOrigins.capture(batches)
+        # Digests are backed by this buffer's already charged public reply;
+        # even many withheld batches cannot grow the ledger independently of it.
+        if proof.key_bytes > self.bytes_stored:
+            return
+        if (proof.signature_bytes > _CHAT_ORIGIN_SIGNATURES_PER_BUFFER
+                or not account(proof.key_bytes, proof.signature_bytes)):
+            proof = proof.without_originals()
+            account(proof.key_bytes, 0)
+        self._chat_origins = proof
+
+    def _take_chat_origins(self):
+        proof, self._chat_origins = self._chat_origins, None
+        if proof is not None:
+            self._account_chat_origins(-proof.key_bytes, -proof.signature_bytes)
+        return proof
+
+    def acknowledge_chat_origins(self, connection):
+        # Stronger than the ordinary delivered bit, which may accept suffixes.
+        if (connection is not None and connection.final_body_sent and connection.delivery_possible
+                and not self._retired_by and (proof := self._take_chat_origins()) is not None):
+            proof.publish()
 
     def _settled_locked(self) -> None:
         # Wall time is for displaying the result; only elapsed time determines
@@ -781,10 +819,12 @@ class ResumableBuffer:
         finally:
             self.readers = max(0, self.readers - 1)
 
-    async def acknowledge_http_send(self, connection) -> None:
+    async def acknowledge_http_send(self, connection, *, full_chat_reply=False) -> None:
         """Response background hook: only a completed, non-ambiguous final ASGI send counts."""
         if self.done and (connection is None or connection.delivery_possible):
             self.mark_delivered()
+            if full_chat_reply:
+                self.acknowledge_chat_origins(connection)
 
     def includes_delivery_terminal(self, start: int, end: int) -> bool:
         """An at-end cursor alone is not an OpenAI [DONE] send receipt."""
@@ -833,6 +873,8 @@ class ResumableStore:
         self._all_pumps: set[asyncio.Task] = set()
         self._requests: Dict[str, str] = {}
         self._bytes_used = 0
+        self._chat_origin_key_bytes = 0
+        self._chat_origin_signature_bytes = 0
         self._cleanup_tasks: set[asyncio.Task] = set()
 
     def _own_response_close(self, buf, pump, close):
@@ -862,6 +904,15 @@ class ResumableStore:
             self._bytes_used += size
             return True
         buf._account_bytes = account
+
+        def account_chat_origins(key_bytes, signature_bytes):
+            if (signature_bytes > 0 and self._chat_origin_signature_bytes + signature_bytes
+                    > _CHAT_ORIGIN_SIGNATURES_PER_STORE):
+                return False
+            self._chat_origin_key_bytes += key_bytes
+            self._chat_origin_signature_bytes += signature_bytes
+            return True
+        buf._account_chat_origins = account_chat_origins
         buf.on_grace_expired = self._grace_expired
 
     async def get_exact(self, stream_id: str) -> Optional[ResumableBuffer]:
@@ -989,6 +1040,7 @@ class ResumableStore:
         else:
             settled = await buf.fail("客户端断开已超过续传窗口，本轮上游请求已取消。", 410, "superseded")
             buf._retired_by = "grace"  # even an already-settled receipt can become stale
+            buf._take_chat_origins()
         if settled:
             task = self._live_pump(buf)
             if task and task is not asyncio.current_task() and not task.cancelling():
@@ -1012,6 +1064,8 @@ class ResumableStore:
         buf = self._buffers.pop(stream_id, None)
         if buf is not None:
             buf._cancel_grace_timer()
+            buf._take_chat_origins()
+            buf._account_chat_origins = None
             if self._requests.get(buf.request_key) == stream_id:
                 self._requests.pop(buf.request_key, None)
             if not buf.done:
@@ -1156,14 +1210,14 @@ def frame_with_id(seq: int, frame: str | ReplayEvent, stream_id: Optional[str] =
     return event.with_id(f"{stream_id}:{seq}" if stream_id else str(seq))
 
 
-async def pump_stream(buf: ResumableBuffer, body_iterator: AsyncIterator[Any]) -> None:
+async def pump_stream(buf: ResumableBuffer, body_iterator: AsyncIterator[Any], *, chat_proof=None) -> None:
     """后台把上游 SSE 帧抽进缓冲区。**不依赖前端连接**。
 
     每个 data 帧按落缓冲的顺序分配单调序列号并写入 `id:` 行，
     前端凭 Last-Event-ID / resume_from 续传时与这里的序号对齐。
     """
     stream_error = None
-    terminal = DONE_FRAME
+    terminal = None
     accepted_outcome = None
     stream_error_code = 200
     last_data_at = time.monotonic()
@@ -1205,8 +1259,11 @@ async def pump_stream(buf: ResumableBuffer, body_iterator: AsyncIterator[Any]) -
         if buf.done:
             return
         status = "error" if stream_error is not None else "done"
+        # A synthetic wire DONE preserves the old replay framing, but not
+        # origin proof. The dispatcher also checked the real producer's EOF.
+        origins = chat_proof.take(stream=True) if chat_proof and terminal is not None and status == "done" else ()
         await buf.finish(status, error=stream_error, status_code=stream_error_code,
-                         terminal_frame=terminal)
+                         terminal_frame=terminal or DONE_FRAME, chat_origins=origins)
         accepted_outcome = "error" if status == "error" else "succeeded"
         print(f"📦 [续传缓冲] {buf.id} 上游读取结束，状态={buf.status}，共 {len(buf.events)} 个事件已落缓冲。")
     except (asyncio.CancelledError, StreamDeadlineExceeded):
@@ -1220,6 +1277,8 @@ async def pump_stream(buf: ResumableBuffer, body_iterator: AsyncIterator[Any]) -
         code, message = extract_upstream_error(e)
         await buf.fail(message, code, within_deadline=True)
     finally:
+        if chat_proof is not None:
+            chat_proof.discard()
         aclose = getattr(body_iterator, "aclose", None)
         if aclose:
             try:
@@ -1281,6 +1340,8 @@ class ReplayStreamResponse(StreamingResponse):
                 if (connection is None or connection.delivery_possible) and buf.includes_delivery_terminal(
                         self.start, buf.next_seq):
                     buf.mark_delivered()
+                    if self.start == 0:
+                        buf.acknowledge_chat_origins(connection)
             finally:
                 if connection is not None and peer_closed in connection.listeners:
                     connection.listeners.remove(peer_closed)

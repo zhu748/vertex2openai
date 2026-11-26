@@ -66,6 +66,10 @@ const COMMON_ARS = [
 ];
 const MODEL_DRAFTS = new Map();
 const MODEL_WRITES = new Map();
+const PARAMS_READS = new Set();
+let nextParamsRead = 0;
+const settingsReads = { applied: 0, reported: 0, error: '' };
+const capabilityReads = { applied: 0, reported: 0, error: '' };
 let renderedModel = null,
   modelSnapshot = null;
 
@@ -96,20 +100,80 @@ function setV(id, v) {
   if (el.type === 'checkbox') el.checked = !!v;
   else el.value = v === null || v === undefined ? '' : v;
 }
+
+// A GET begun before a save acknowledgement may be carrying a pre-save
+// snapshot. Protect only the acknowledged fields on reads already in flight;
+// a later GET is authoritative again, including external changes.
+function protectSettingsReads(keys) {
+  for (const { settings } of PARAMS_READS) {
+    for (const key of keys) {
+      settings.add(key);
+      if (key === 'proxy_urls') settings.add('proxy_url');
+    }
+  }
+}
+function protectModelReads(model, keys) {
+  for (const { models } of PARAMS_READS) {
+    const fields = models.get(model) || new Set();
+    for (const key of keys) fields.add(key);
+    models.set(model, fields);
+  }
+}
+function retainReadFields(snapshot, current, fields) {
+  if (!fields.size) return snapshot;
+  const result = { ...snapshot };
+  for (const key of fields) {
+    if (Object.hasOwn(current, key)) result[key] = current[key];
+    else delete result[key];
+  }
+  return result;
+}
+function retainModelReadFields(snapshot, current, models) {
+  if (!models.size) return snapshot;
+  const result = Object.assign(Object.create(null), snapshot);
+  for (const [model, fields] of models) {
+    const own = Object.hasOwn(result, model) ? result[model] : {};
+    const live = Object.hasOwn(current, model) ? current[model] : {};
+    const merged = retainReadFields(own, live, fields);
+    if (Object.keys(merged).length) result[model] = merged;
+    else delete result[model];
+  }
+  return result;
+}
+function acceptParamsRead(history, order, outcome, title) {
+  // A failed newer request must not block a valid result from the other
+  // endpoint or the only available older result for this one.
+  if (order > history.reported) {
+    history.reported = order;
+    history.error = outcome.status === 'fulfilled' ? '' : title + outcome.reason.message;
+  }
+  if (outcome.status !== 'fulfilled' || order <= history.applied) return false;
+  history.applied = order;
+  return true;
+}
 async function loadParams() {
   loadNotice('params', '');
   // 设置与模型能力两个接口互不依赖：并行拉取，面板加载不再串行等两次往返。
+  const load = { order: ++nextParamsRead, settings: new Set(), models: new Map() };
+  PARAMS_READS.add(load);
   const [sRes, cRes] = await Promise.allSettled([
     readJSON('/api/settings'),
     readJSON('/api/capabilities')
   ]);
+  PARAMS_READS.delete(load);
+  const applySettings = acceptParamsRead(settingsReads, load.order, sRes, '设置');
+  const applyCaps = acceptParamsRead(capabilityReads, load.order, cRes, '模型能力');
+  const errors = [settingsReads.error, capabilityReads.error].filter(Boolean);
+  loadNotice('params', errors.length ? errors.join('；') + '。重新加载成功后再保存。' : '');
+  if (!applySettings && !applyCaps) return;
+
   // The selection and edits may have changed while the two reads were in flight.
   const selected = $('model-sel').value;
   captureModelDraft();
-  if (sRes.status === 'fulfilled') {
+  if (applySettings) {
     // Capture immediately before applying the response, not before the network wait.
     const formDrafts = window.consoleForms?.capture();
-    const s = sRes.value;
+    const s = retainReadFields(sRes.value, GLOBAL_SETTINGS, load.settings);
     GLOBAL_SETTINGS = s;
     settingsLoaded = true;
     curAR = s.image_aspect_ratio || '';
@@ -147,14 +211,16 @@ async function loadParams() {
     window.consoleForms?.loaded(formDrafts);
     // Legacy thinking switches are normalized by the server. Do not reinterpret
     // an explicitly saved request mode using stale legacy flags.
-  } else {
-    loadNotice('params', '设置' + sRes.reason.message + '。重新加载成功后再保存。');
   }
-  if (cRes.status === 'fulfilled') {
+  if (applyCaps) {
     const c = cRes.value;
     CAPS = c.capabilities || {};
-    OVERRIDES = c.overrides || {};
-    SAVED_MODEL_OVERRIDES = c.saved_overrides || c.overrides || {};
+    OVERRIDES = retainModelReadFields(c.overrides || {}, OVERRIDES, load.models);
+    SAVED_MODEL_OVERRIDES = retainModelReadFields(
+      c.saved_overrides || c.overrides || {},
+      SAVED_MODEL_OVERRIDES,
+      load.models
+    );
     BUILTIN_OVERRIDES = c.builtin_overrides || {};
     MODEL_CATALOG = new Set(
       (c.models || []).filter((m) => m !== '__global__' && Object.hasOwn(CAPS, m) && CAPS[m])
@@ -165,10 +231,10 @@ async function loadParams() {
       '<option value="__global__">＊ 全局默认（对所有模型）</option>' +
       [...MODEL_CATALOG].map((m) => `<option value="${esc(m)}">${esc(m)}</option>`).join('');
     select.value = modelScopeAvailable(selected) ? selected : '__global__';
+  }
+  if (capabilitiesLoaded) {
     renderCaps(false);
     renderOrphanedModelDrafts();
-  } else {
-    loadNotice('params', '模型能力' + cRes.reason.message + '。重新加载成功后再保存模型参数。');
   }
 }
 function modelFieldValue(key) {
@@ -184,6 +250,7 @@ function sameExpectation(left, right) {
   return left.present === right.present && left.value === right.value;
 }
 function modelDraftConverged(key, edit, current) {
+  if (edit.badInput) return false; // invalid input is not a reset, even if value is ''
   if (edit.kind === 'inherit') return !current.expected.present;
   const value = modelWireValue(key, edit.raw);
   if (current.expected.present && current.expected.value === value) return true;
@@ -247,9 +314,16 @@ function recordModelField(key, kind = 'edit') {
   if (!modelSnapshot || !renderedModel) return;
   const draft = MODEL_DRAFTS.get(renderedModel) || new Map();
   const old = draft.get(key);
+  const badInput =
+    kind !== 'inherit' && ($(key).validity.badInput || (kind === 'pin' && old?.badInput));
   if (kind === 'edit' && old?.kind === 'pin') kind = 'pin';
   const current = modelSnapshot[key];
-  const edit = { kind, raw: modelFieldValue(key), origin: old?.origin || current };
+  const edit = {
+    kind,
+    raw: modelFieldValue(key),
+    origin: old?.origin || current,
+    ...(badInput && { badInput: true })
+  };
   const write = MODEL_WRITES.get(renderedModel);
   // Returning to the old baseline can remove a draft while this save is in
   // flight; it is still the user's new intent once the server acknowledges it.
@@ -280,9 +354,19 @@ function captureModelDraft() {
   // Also capture direct DOM edits before switching/reloading, even without an input event.
   for (const key of PER_MODEL_KEYS) {
     const edit = modelFieldEdit(key);
-    if (modelFieldValue(key) !== (edit ? edit.raw : modelSnapshot[key].raw)) recordModelField(key);
+    if (
+      modelFieldValue(key) !== (edit ? edit.raw : modelSnapshot[key].raw) ||
+      ($(key).validity.badInput && !edit?.badInput)
+    )
+      recordModelField(key);
   }
   refreshModelDraft();
+}
+function modelNumberError(key) {
+  const input = $(key);
+  input.setAttribute('aria-invalid', 'true');
+  window.consoleForms?.fieldError(input, '数字尚未输入完成。请输入有效数字，或撤销本模型修改。');
+  return input;
 }
 function finishModelRender(model) {
   renderedModel = model;
@@ -300,6 +384,9 @@ function finishModelRender(model) {
       }
       // Inheritance follows the latest defaults; pins retain the chosen value.
       setV(key, edit.kind === 'inherit' ? inheritedModelValue(model, key) : edit.raw);
+      // Native number controls cannot be repopulated with the invalid token:
+      // assigning their exposed empty value clears badInput, not the draft.
+      if (edit.badInput) modelNumberError(key);
       edit.raw = modelFieldValue(key);
     }
     if (!draft.size) MODEL_DRAFTS.delete(model);
@@ -538,6 +625,7 @@ function applyModelReceipt(model, receipt, write, { patch = {}, inherit = [], re
     }
     return superseded;
   });
+  protectModelReads(model, write.keys);
   return true;
 }
 
@@ -549,10 +637,19 @@ async function saveModelOverride() {
   const m = $('model-sel').value;
   if (!modelScopeAvailable(m) || m !== renderedModel || MODEL_WRITES.has(m)) return;
   captureModelDraft();
+  const draft = MODEL_DRAFTS.get(m) || new Map();
+  const invalid = [...draft].find(([, edit]) => edit.badInput)?.[0];
+  if (invalid) {
+    const input = modelNumberError(invalid);
+    input.scrollIntoView({ block: 'center' });
+    input.focus({ preventScroll: true });
+    toast('请修正标出的字段后再保存');
+    return;
+  }
   const patch = {},
     expected = {},
     inherit = [];
-  for (const [key, edit] of MODEL_DRAFTS.get(m) || []) {
+  for (const [key, edit] of draft) {
     if (m === '__global__' && key === 'anti_truncation_mode') continue;
     if (edit.kind === 'inherit') inherit.push(key);
     else patch[key] = modelWireValue(key, edit.raw);

@@ -1,14 +1,16 @@
 """Discover models page by page through public SDK/REST routes, with no live provider."""
 from unittest import IsolatedAsyncioTestCase
 from unittest.mock import AsyncMock, patch
+from urllib.parse import quote
 
 import httpx
 from google import genai
-from google.genai import types
+from google.genai import errors, types
 
 from main import app
 from model_catalog import native_catalog_ids
 from routes import claude_api, gemini_native, models_api
+from upstreams import native_passthrough
 
 
 class CatalogPagination(IsolatedAsyncioTestCase):
@@ -55,6 +57,68 @@ class CatalogPagination(IsolatedAsyncioTestCase):
         retrieved = await self.sdk.aio.models.get(model=expected[-1])
         self.assertEqual(retrieved.name, models[-1].name)
         self.assertEqual(retrieved.supported_actions, models[-1].supported_actions)
+
+    async def test_real_google_sdk_retrieves_exact_advertised_resource_names(self):
+        base = "gemini-fixture"
+        scoped = f"projects/fixture/locations/global/publishers/google/models/{base}"
+        self.raw[:] = [base, f"models/{base}", f"publishers/google/models/{base}", scoped]
+
+        pager = await self.sdk.aio.models.list(config={"page_size": 3})
+        self.assertEqual(len(pager.page), 3)
+        models = [model async for model in pager]
+        self.assertEqual(len(models), 8)
+        for listed in models:
+            with self.subTest(name=listed.name):
+                fetched = await self.sdk.aio.models.get(model=listed.name)
+                self.assertEqual(fetched.model_dump(), listed.model_dump())
+
+        # ASGI supplies decoded path components once. Exact retrieval must not
+        # strip a relative prefix, infer a leaf, or resolve a different project.
+        encoded_scope = quote(scoped, safe="")
+        encoded = await self.client.get(f"/v1beta/models/{encoded_scope}")
+        self.assertEqual((encoded.status_code, encoded.json()["name"]), (200, f"models/{scoped}"))
+        async def assert_not_found(ident):
+            with self.assertRaises(errors.ClientError) as caught:
+                await self.sdk.aio.models.get(model=f"models/{ident}")
+            self.assertEqual((caught.exception.code, caught.exception.status), (404, "NOT_FOUND"))
+
+        self.raw.remove(f"models/{base}")  # the bare ID alone does not authorize the full ID
+        await assert_not_found(f"models/{base}")
+        self.raw.remove(base)  # the surviving scoped IDs must not authorize the bare one
+        for ident in (base, quote(encoded_scope, safe=""), scoped.replace("/fixture/", "/other/"), scoped + ":"):
+            with self.subTest(ident=ident):
+                await assert_not_found(ident)
+
+        path = "/v1beta/models/" + scoped
+        bad_key = await self.client.get(path, headers={"Authorization": "Bearer wrong"})
+        self.assertEqual((bad_key.status_code, bad_key.json()["error"]["status"]), (401, "UNAUTHENTICATED"))
+        action = await self.client.get(path + ":generateContent")
+        self.assertEqual((action.status_code, action.json()["error"]["status"]), (400, "INVALID_ARGUMENT"))
+
+    async def test_real_google_sdk_scoped_post_still_uses_the_full_resource(self):
+        scoped = "projects/fixture/locations/global/publishers/google/models/gemini-fixture"
+        self.raw[:] = [scoped]
+        requests = []
+
+        def wire(request):
+            requests.append(request)
+            return httpx.Response(200, json={"candidates": [{"content": {
+                "role": "model", "parts": [{"text": "offline"}]}, "finishReason": "STOP"}]})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(wire)) as upstream:
+            with (patch.object(app.state.express_key_manager, "get_express_record",
+                               return_value={"key": "offline-fixture", "project_id": "other"}) as reserve,
+                  patch.object(gemini_native.app_state, "get_channel_mode", return_value="api_key"),
+                  patch.object(native_passthrough.passthrough_client_pool, "get", return_value=upstream)):
+                pager = await self.sdk.aio.models.list(config={"page_size": 1})
+                listed = pager.page[0]
+                await self.sdk.aio.models.get(model=listed.name)
+                reserve.assert_not_called()
+                self.assertEqual(requests, [])
+                response = await self.sdk.aio.models.generate_content(model=listed.name, contents="fixture")
+        self.assertEqual(response.text, "offline")
+        self.assertEqual([request.url.path for request in requests],
+                         [f"/v1beta1/{scoped}:generateContent"])
 
     async def test_gemini_rejects_bad_or_stale_token_and_invalid_size_without_restarting(self):
         first = (await self.gemini(pageSize=3)).json()

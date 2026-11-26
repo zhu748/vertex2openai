@@ -38,6 +38,7 @@ from signature_origin import (
     bind_signature_origins,
     publish_completed_origins,
     publish_responses_item_origins,
+    responses_ordinary_witness,
 )
 from stream_cleanup import await_owned_close
 from streaming import SSE_NO_BUFFER_HEADERS, close_stream_response
@@ -152,7 +153,8 @@ async def _publish(prefix, proof, connection, destination):
 
     def publish(_finish, keys, signatures, accepted_destination):
         publish_responses_item_origins(keys, signatures, accepted_destination, proof["item_witness"],
-                                       lineage=proof["item_lineage"])
+                                       lineage=proof["item_lineage"],
+                                       ordinary=responses_ordinary_witness(proof["message"]))
 
     if proof["withheld"]:
         message = proof["message"]

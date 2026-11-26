@@ -46,6 +46,7 @@ from request_tracking import (
     upstream_chunk,
 )
 from response_validation import (
+    ResponsesProjectionError,
     AntiTruncationError,
     IncompleteResponseError,
     map_finish_reason_to_openai,
@@ -1147,6 +1148,7 @@ class _WholeBodyState:
     got_thought: bool = False
     safety_html: str = ""
     tool_calls: list = field(default_factory=list)
+    partial_response_call: bool = False
     ordinary_metadata: list = field(default_factory=list)
     part_order: list = field(default_factory=list)
     message_extra: Optional[dict] = None
@@ -1175,6 +1177,9 @@ def _apply_whole_body_event(gen: "CookieGeneration", st: _WholeBodyState, event_
         else:
             st.text_pieces.append(data)
         _record_output_slot(st.ordinary_metadata, st.part_order, event_type, data)
+    elif event_type == "responses_partial_call":
+        # No call ID, arguments or signature are retained for this marker.
+        st.partial_response_call = True
     elif event_type == "function_call":
         st.part_order.append({"type": "tool_call", "index": len(st.tool_calls)})
         # Keep raw calls until the complete turn and its finish reason are
@@ -1198,12 +1203,18 @@ def _apply_whole_body_event(gen: "CookieGeneration", st: _WholeBodyState, event_
 
 
 def _whole_object_events(obj: dict, strip_thoughts: bool, text_decoder: Any,
-                         boundary: CookieCandidateBoundary, responses_prompt_feedback: bool) -> list:
+                         boundary: CookieCandidateBoundary, responses_output: bool) -> list:
     # Keep only the stable event list; a loop-local closure can retain the
     # entire raw object across the next cursor pull.
     events = extract_events(obj, strip_thoughts=strip_thoughts, boundary=boundary,
-                            responses_prompt_feedback=responses_prompt_feedback)
-    return list(text_decoder.cookie_events(events) if text_decoder else events)
+                            responses_output=responses_output)
+    if text_decoder:
+        events = text_decoder.cookie_events(events)
+    if not responses_output:
+        return list(events)  # Preserve the ordinary Chat event materializer.
+    # Drop the fragment body after its owner, if any, inspected it. Never pin
+    # discarded public args while subsequent complete-object records are read.
+    return [(kind, None if kind == "responses_partial_call" else value) for kind, value in events]
 
 
 async def _collect_whole_body(gen: "CookieGeneration", response_text: str, text_decoder: Any) -> _WholeBodyState:
@@ -1216,8 +1227,8 @@ async def _collect_whole_body(gen: "CookieGeneration", response_text: str, text_
     st = _WholeBodyState()
     cursor = CompleteTextObjectCursor(response_text)
     boundary = CookieCandidateBoundary()
-    responses_prompt_feedback = getattr(gen.request_obj, "_completion_target", "chat") == "responses"
-    while st.api_error is None and not (responses_prompt_feedback and st.blocked_msg):
+    responses_output = getattr(gen.request_obj, "_completion_target", "chat") == "responses"
+    while st.api_error is None and not (responses_output and st.blocked_msg):
         obj = cursor.next_object()
         if obj is None:
             break
@@ -1226,9 +1237,9 @@ async def _collect_whole_body(gen: "CookieGeneration", response_text: str, text_
         # 落盘不在事件循环上）；纯文本对象保持原地零开销。
         if has_pending_inline_image(obj):
             events = await run_media_task(_whole_object_events, obj, gen.strip_thoughts, text_decoder,
-                                          boundary, responses_prompt_feedback, heavy=True)
+                                          boundary, responses_output, heavy=True)
         else:
-            events = _whole_object_events(obj, gen.strip_thoughts, text_decoder, boundary, responses_prompt_feedback)
+            events = _whole_object_events(obj, gen.strip_thoughts, text_decoder, boundary, responses_output)
         # 正文/工具内容已到即停止留存诊断样本（样本只服务
         # 「无正文」日志；留存会钉住含巨型 inlineData 的对象）。
         if any(et in BODY_EVENT_TYPES for et, _ in events):
@@ -1264,6 +1275,16 @@ def _assemble_whole_response(gen: "CookieGeneration", st: _WholeBodyState) -> "R
         # Prompt-level blocking is an authoritative outcome, not assistant
         # prose. Don't attach even signed items from a contradictory record.
         st = _WholeBodyState(usage_meta=st.usage_meta, got_thought=st.got_thought)
+    typed_finish = "content_filter" if prompt_blocked else None
+    if typed_output and not prompt_blocked:
+        require_finish_reason(st.finish_raw)
+        typed_finish = map_finish_reason_to_openai(st.finish_raw, has_tool_calls=bool(st.tool_calls))
+        if typed_finish in ("length", "content_filter"):
+            # Even the individually complete siblings are not executable.
+            # Do not serialize them or register any of their signatures.
+            st.tool_calls.clear()
+        elif st.partial_response_call:
+            raise ResponsesProjectionError("上游返回尚未完成的工具参数；当前工具通道需要完整调用。")
     got_text = bool(st.full_text.strip())
     got_output = got_text or bool(st.tool_calls)
     elapsed = time.time() - gen.start_time
@@ -1273,8 +1294,8 @@ def _assemble_whole_response(gen: "CookieGeneration", st: _WholeBodyState) -> "R
         credential_manager.record_cookie_success(gen.account_id, credential=gen.record)
 
     if got_output or typed_output:
-        if prompt_blocked:
-            finish_reason = "content_filter"
+        if typed_output:
+            finish_reason = typed_finish
         else:
             require_finish_reason(st.finish_raw)
             finish_reason = map_finish_reason_to_openai(st.finish_raw, has_tool_calls=bool(st.tool_calls))
@@ -1290,7 +1311,7 @@ def _assemble_whole_response(gen: "CookieGeneration", st: _WholeBodyState) -> "R
         if got_output:
             credential_manager.record_cookie_success(gen.account_id, credential=gen.record)
             # 预填充智能兼容：去重后把预填充文本拼回输出开头
-            if gen.prefill_text and got_text:
+            if gen.prefill_text and got_text and typed_finish not in ("length", "content_filter"):
                 st.full_text = gen.prefill_text + strip_prefill_overlap(
                     gen.prefill_text, st.full_text
                 )
@@ -1385,13 +1406,16 @@ async def _collect_with_tool_fallback(
             hint = response_retry_after(response)
             text = response.text
             response = None
-            decoder = gen.text_transport.decoder() if gen.text_transport else None
+            decoder = None
+            if gen.text_transport:
+                decoder = (gen.text_transport.decoder(allow_empty_incomplete=True)
+                           if gen.request_obj._completion_target == "responses" else gen.text_transport.decoder())
             st = await _collect_whole_body(gen, text, decoder)
             del text
             if st.api_error is not None:
                 st.api_error_hint = hint
             if (fallback_body is None or not st.tool_rejection or retry_after_seconds(st.api_error_hint) or st.part_order
-                    or st.got_thought or st.message_extra or st.finish_raw or st.blocked_msg):
+                    or st.partial_response_call or st.got_thought or st.message_extra or st.finish_raw or st.blocked_msg):
                 return None, st, decoder
         elif (fallback_body is None or response_requests_delay(response)
               or not is_native_tool_error_response(response.status_code, response.text)):
@@ -1484,6 +1508,9 @@ async def deliver_collect_response(gen: "CookieGeneration") -> "Response":
 
             return _assemble_whole_response(gen, st)
 
+        except ResponsesProjectionError:
+            # A completed but unrepresentable generation is not a transport outage to reissue.
+            raise
         except SchemaValidationError as exc:
             return JSONResponse(status_code=400, content=create_openai_error_response(400, str(exc), "invalid_request_error"))
         except Exception as e:

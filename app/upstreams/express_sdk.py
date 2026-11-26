@@ -272,6 +272,8 @@ class ExpressSDKUpstream(BaseUpstream):
         # 传入真实模型名：create_gemini_prompt 需要它来判断是否对缺失的思考签名
         # 启用官方哨兵（仅 Gemini 3.x 强校验，见 thought_signatures.resolve_tool_call_signature）
         prompt_func = partial(create_gemini_prompt, model_name=base_model_name)
+        if request_obj._completion_target == "responses":
+            prompt_func = partial(prompt_func, literal_text=True)
 
         if app_state.get_setting("debug_outbound", False):
             _dbg = {

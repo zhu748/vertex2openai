@@ -42,7 +42,7 @@ import first_reply as first_reply_module
 from first_reply import FirstReplyGuard, native_has_reply
 from json_stream import MAX_JSON_OBJECT_BYTES, JsonObjects
 from http_io import (buffer_upstream_response, close_httpx_response as _close_upstream,
-                     own_httpx_response, read_upstream_bytes)
+                     read_upstream_bytes, send_owned_httpx)
 from runtime_state import app_state
 from express_endpoint import is_location_pin_failure
 from express_fingerprint import build_direct_headers
@@ -50,6 +50,7 @@ from client_pool import passthrough_client_pool
 from proxy_resolver import ProxyResolveError, resolve_proxy_uri
 from proxy_failover import ProxyChain
 from proxy_tls import build_httpx_proxy
+from stream_cleanup import AttemptCancellation
 from streaming import (SSE_NO_BUFFER_HEADERS, sse_frames, with_heartbeats, HEARTBEAT, GEMINI_HEARTBEAT_FRAME,
                        StreamDeadlineExceeded, reads_before_deadline)
 from resumable import (resumable_store, resolve_buffer, ResumableBuffer, ResumeRequestError, BufferCapacityError,
@@ -111,10 +112,7 @@ async def _passthrough_once(client: httpx.AsyncClient, express_key: str,
         "POST", url, content=payload,
         headers=build_direct_headers(express_key),
     )
-    response = await client.send(req, stream=True)
-    # HTTPX also closes implicitly at EOF while buffering a 2xx body. Install
-    # the same owner before the first read, not only before relaying streams.
-    own_httpx_response(response)
+    response = await send_owned_httpx(client.send, req)
     if stream or response.is_error:
         # The status and Retry-After are authoritative as soon as headers arrive.
         # A broken diagnostic body must not turn a known 400 into a retryable
@@ -182,6 +180,7 @@ async def _buffered_upstream_result(upstream: httpx.Response) -> tuple:
     响应——已知错误码保留、成功码改 502 并回退 JSON 错误体；retry-after
     是客户端退避的关键依据，一并透传。
     """
+    cancellation = AttemptCancellation()
     status = upstream.status_code
     ctype = upstream.headers.get("content-type", "application/json")
     headers = {k: v for k, v in upstream.headers.items() if k.lower() == "retry-after"}
@@ -192,7 +191,11 @@ async def _buffered_upstream_result(upstream: httpx.Response) -> tuple:
         body = _native_error(status, "上游响应未完整传输，请重试。").body
         ctype = "application/json"
     finally:
-        await _close_upstream(upstream)
+        try:
+            await _close_upstream(upstream)
+        finally:
+            # Do not let a late diagnostic unlock a key or model-path retry.
+            await cancellation.check()
     return status, ctype, headers, body
 
 

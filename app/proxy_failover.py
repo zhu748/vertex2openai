@@ -14,6 +14,7 @@ import httpx
 from proxy_resolver import ProxyResolveError, mask_proxy_uri, resolve_proxy_uri_async, resolved_proxy_scope
 from retry_policy import exception_retry_after, retry_after_seconds
 from runtime_state import get_effective_proxy_uris_for_account
+from stream_cleanup import AttemptCancellation, await_owned_close
 
 PROXY_FAILURE_STATUSES = {407, 502, 503, 504}
 
@@ -100,9 +101,21 @@ class ProxyChain:
               f"{mask_proxy_uri(current) or '直连'}")
         return True
 
-    def _advance_response(self, response, index):
-        return self.advance(status=getattr(response, "status_code", None), failed_index=index,
-                            retry_after=(getattr(response, "headers", None) or {}).get("retry-after"))
+    async def _retry_http_response(self, response, index, cancellation, close):
+        status = getattr(response, "status_code", None)
+        if status is None:  # A non-HTTP result (e.g. the SDK's fully owned stream/prefix).
+            return False
+        await cancellation.transfer(response, close)
+        hint = (getattr(response, "headers", None) or {}).get("retry-after")
+        if index + 1 >= len(self.candidates) or status not in PROXY_FAILURE_STATUSES or retry_after_seconds(hint):
+            return False
+        # Physical closure can itself be cancelled or replace cancellation
+        # with an error. Don't select or count the next outlet until it ends.
+        try:
+            await await_owned_close(close(response))
+        finally:
+            await cancellation.check()
+        return self.advance(status=status, failed_index=index, retry_after=hint)
 
     @staticmethod
     async def _prepare_at(raw, factory):
@@ -122,6 +135,7 @@ class ProxyChain:
     async def run(self, operation):
         """Operation receives (raw URI, resolved URL); resources belong to it."""
         attempted = False
+        cancellation = AttemptCancellation()
         while True:
             index, raw = self._snapshot()
             try:
@@ -135,11 +149,11 @@ class ProxyChain:
                     with resolved_proxy_scope(raw, resolved):
                         result = await operation(raw, resolved)
             except Exception as exc:
+                await cancellation.check()
                 if self.advance(exc, failed_index=index):
                     continue
                 raise
-            if self._advance_response(result, index):
-                await close_response(result)
+            if await self._retry_http_response(result, index, cancellation, close_response):
                 continue
             return result
 
@@ -186,6 +200,7 @@ class FailoverHTTPClient:
     @asynccontextmanager
     async def stream(self, *args, **kwargs):
         attempted = False
+        cancellation = AttemptCancellation()
         while True:
             index, raw = self.chain._snapshot()
             try:
@@ -199,11 +214,12 @@ class FailoverHTTPClient:
                     attempted = True
                     response = await context.__aenter__()
             except Exception as exc:
+                await cancellation.check()
                 if self.chain.advance(exc, failed_index=index):
                     continue
                 raise
-            if self.chain._advance_response(response, index):
-                await context.__aexit__(None, None, None)
+            if await self.chain._retry_http_response(response, index, cancellation,
+                                                     lambda _, ctx=context: ctx.__aexit__(None, None, None)):
                 continue
             break
         # Do not catch exceptions from the response consumer: it may already
@@ -253,9 +269,9 @@ class FailoverSDKClient:
             async def start(raw, resolved):
                 from first_reply import sdk_has_reply
                 from response_validation import IncompleteResponseError, has_finish_reason
-                from sdk_stream import SDKAttemptCancellation, open_sdk_stream
+                from sdk_stream import open_sdk_stream
 
-                cancellation = SDKAttemptCancellation()
+                cancellation = AttemptCancellation()
                 self.client = self.factory(raw, resolved)
                 actual = _actual_attempt(self.client, kwargs) if _actual_attempt else kwargs
                 source = None

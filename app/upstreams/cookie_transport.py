@@ -15,7 +15,7 @@ from cookie_auth import BATCH_GRAPHQL_URL
 from json_encoding import estimate_json_chars
 from media_tasks import run_media_task
 from http_io import UNAVAILABLE_DIAGNOSTIC, read_status_body
-from first_reply import FirstReplyGuard, FirstReplyTimeout, timeout_seconds
+from first_reply import check_private_retry, FirstReplyGuard, FirstReplyTimeout, timeout_seconds
 from request_tracking import upstream_attempt, upstream_chunk
 from response_validation import (
     IncompleteResponseError,
@@ -528,9 +528,11 @@ async def _execute_stream_request_generator_raw(
 
     # 先归还被拒请求的连接，再构造/启动替代请求。
     # 降级状态由调用方提供的 fallback_body 回调锁定，传输层只执行替代请求。
+    await check_private_retry()
     resolved_fallback = fallback_body() if callable(fallback_body) else fallback_body
     if hasattr(resolved_fallback, "__await__"):
         resolved_fallback = await resolved_fallback
+        await check_private_retry()
     print(
         "⚠️ [Studio] 当前模型/协议拒绝原生工具字段；本次及后续重试固定降级为文本工具观测，图片保留为视觉输入。"
     )

@@ -13,8 +13,8 @@ from models import file_data_markdown
 from message_processing import iter_giant_content
 from protojson import standard_base64
 
-from response_validation import (IncompleteResponseError, StreamToolCallIds, complete_function_arguments,
-                                 has_finish_reason, responses_prompt_block_reason, validate_generation_finish_reason)
+from response_validation import (IncompleteResponseError, ResponsesMediaError, StreamToolCallIds, complete_function_arguments,
+                                 has_finish_reason, responses_partial_call, responses_prompt_block_reason, validate_generation_finish_reason)
 from json_stream import MAX_JSON_OBJECT_BYTES, JsonObjects as _JsonObjects
 from signature_store import signature_store
 from upstreams.cookie_candidate_metadata import native_candidate_metadata, native_prompt_feedback
@@ -295,8 +295,8 @@ def _prompt_block_message(feedback: Any) -> Optional[str]:
 
 
 def _prompt_feedback_events(feedback: Any, usage: Any, *, preserve_parts: bool,
-                            responses_prompt_feedback: bool) -> tuple[tuple[str, Any], ...]:
-    if responses_prompt_feedback:
+                            responses_output: bool) -> tuple[tuple[str, Any], ...]:
+    if responses_output:
         feedback = _wire_object(feedback, "promptFeedback")
         blocked = responses_prompt_block_reason(feedback.get("blockReason"))
     else:
@@ -304,7 +304,7 @@ def _prompt_feedback_events(feedback: Any, usage: Any, *, preserve_parts: bool,
     if not blocked:
         return ()
     event = ("blocked", blocked)
-    if (preserve_parts or responses_prompt_feedback) and isinstance(usage, dict) and usage:
+    if (preserve_parts or responses_output) and isinstance(usage, dict) and usage:
         # Both paths terminate on a prompt block. Deliver actual usage first.
         return ("usage", usage), event
     return (event,)
@@ -350,6 +350,19 @@ class CookieCandidateBoundary:
             self.finish = finish
 
 
+def _inline_wire_fields(blob: dict, *, responses_output: bool) -> tuple[str, str]:
+    mime, data = blob.get("mimeType", ""), blob.get("data", "")
+    if responses_output:
+        # ProtoJSON null on these optional scalars is absence. A genuine
+        # payload remains unsupported even without its MIME; don't render it.
+        mime, data = "" if mime is None else mime, "" if data is None else data
+    if not isinstance(mime, str) or not isinstance(data, str):
+        raise IncompleteResponseError("上游 inlineData 的 mimeType / data 必须是字符串。")
+    if responses_output and data:
+        raise ResponsesMediaError()
+    return mime, data
+
+
 def _finish_native_part(native_part: dict, signature: str | None, *, empty_text: bool, thought: bool) -> None:
     if signature:
         # Signed standalone empty text is data, unlike proto defaults on
@@ -363,7 +376,7 @@ def _finish_native_part(native_part: dict, signature: str | None, *, empty_text:
 
 def extract_events(obj: dict, *, preserve_parts: bool = False, strip_thoughts: bool = False,
                    boundary: CookieCandidateBoundary | None = None,
-                   responses_prompt_feedback: bool = False) -> Iterator[tuple]:
+                   responses_output: bool = False) -> Iterator[tuple]:
     boundary = boundary or CookieCandidateBoundary()
     obj = _wire_object(obj, "响应", allow_null=False)
     errors = envelope_errors(obj)
@@ -390,9 +403,9 @@ def extract_events(obj: dict, *, preserve_parts: bool = False, strip_thoughts: b
         # （proto 枚举默认值 = 未拦截），必须过滤掉，只透出真实拦截。
         usage = data.get("usageMetadata")
         if block := _prompt_feedback_events(data.get("promptFeedback"), usage, preserve_parts=preserve_parts,
-                                            responses_prompt_feedback=responses_prompt_feedback):
+                                            responses_output=responses_output):
             yield from block
-            if responses_prompt_feedback:
+            if responses_output:
                 # This is a terminal prompt outcome; neither malformed nor
                 # well-formed candidate Parts in the same record are output.
                 return
@@ -443,7 +456,13 @@ def extract_events(obj: dict, *, preserve_parts: bool = False, strip_thoughts: b
                     ordinary_kind = "thought" if thought else "text"
                     yield ordinary_kind, text
 
-                function_call = _complete_wire_call(part.get("functionCall"))
+                raw_call = part.get("functionCall")
+                partial_call = responses_output and isinstance(raw_call, dict) and responses_partial_call(raw_call)
+                if partial_call:
+                    # The finish may arrive in a later GraphQL record. Keep this
+                    # as a separate, never-executable event until that boundary.
+                    yield "responses_partial_call", raw_call
+                function_call = None if partial_call else _complete_wire_call(raw_call)
                 if function_call is not None:
                     if boundary.tool_ids is not None:
                         boundary.tool_ids.observe(function_call.get("id"))
@@ -454,10 +473,7 @@ def extract_events(obj: dict, *, preserve_parts: bool = False, strip_thoughts: b
                         }
                 inline_data = _wire_object(part.get("inlineData"), "inlineData")
                 if inline_data:
-                    mime_type = inline_data.get("mimeType", "")
-                    b64 = inline_data.get("data", "")
-                    if not isinstance(mime_type, str) or not isinstance(b64, str):
-                        raise IncompleteResponseError("上游 inlineData 的 mimeType / data 必须是字符串。")
+                    mime_type, b64 = _inline_wire_fields(inline_data, responses_output=responses_output)
                     if mime_type and b64:
                         native_part["inlineData"] = {"mimeType": mime_type, "data": b64}
                         if not preserve_parts and not hidden:
@@ -473,7 +489,9 @@ def extract_events(obj: dict, *, preserve_parts: bool = False, strip_thoughts: b
                     mime_type = "" if mime_type is None else mime_type
                     if not isinstance(uri, str) or not isinstance(mime_type, str):
                         raise IncompleteResponseError("上游 fileData 的 fileUri / mimeType 必须是字符串。")
-                    if uri:
+                    if responses_output and uri.strip():
+                        raise ResponsesMediaError()
+                    if uri and not responses_output:
                         native_part["fileData"] = dict(file_data)
                         if not preserve_parts and not hidden:
                             is_image = not mime_type or mime_type.startswith("image/")
@@ -485,7 +503,7 @@ def extract_events(obj: dict, *, preserve_parts: bool = False, strip_thoughts: b
                     # its payload. If signed, the next event owns an opaque slot.
                     yield "hidden_thought", True
 
-                if signature and function_call is None and not preserve_parts:
+                if signature and function_call is None and not partial_call and not preserve_parts:
                     # A genuine empty thought has no public delta, but its signed
                     # Part still has the thought bit and owns its own position.
                     if not native_part and thought and part.get("text") == "":

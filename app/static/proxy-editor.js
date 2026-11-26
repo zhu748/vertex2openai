@@ -540,6 +540,7 @@
           if (proxyEditor !== editor) return false;
           GLOBAL_SETTINGS.proxy_urls = saved.proxy_urls;
           GLOBAL_SETTINGS.proxy_url = saved.proxy_url;
+          protectSettingsReads(['proxy_urls']);
           updateProxyPill(saved.proxy_urls.length);
         }
         if (!persist && window.consoleForms?.restoreSetting) {

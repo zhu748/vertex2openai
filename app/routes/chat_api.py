@@ -7,7 +7,7 @@ from schema_validation import SchemaValidationError, preflight_schema_contracts,
 from starlette.background import BackgroundTask, BackgroundTasks
 from starlette.requests import ClientDisconnect
 from request_connection import ClientConnection
-from signature_origin import DirectChatOriginDelivery, bind_signature_origins
+from signature_origin import ChatOriginDelivery, bind_signature_origins
 from models import OpenAIRequest
 from tool_policy import validate_model_tool_choice, validate_parallel_tool_calls
 from auth import get_api_key, get_api_key_flexible
@@ -173,6 +173,14 @@ def _setup_http_receipt(request, buf, *, replay, original=None):
                         headers=_setup_receipt_headers(buf, replay=replay), background=tasks)
 
 
+def _begin_chat_origin_delivery(request):
+    if request._signature_output_prefix:
+        proof = request._chat_origin_delivery = ChatOriginDelivery()
+        request._stage_signature_origin = proof.stage
+        return proof
+    return None
+
+
 async def _resumable_stream(fastapi_request: Request, request_obj: OpenAIRequest, api_key: str):
     """流式：缓冲命中则重放/续传；否则建缓冲、后台泵抽帧，当前连接只做缓冲的读者。
 
@@ -201,29 +209,40 @@ async def _resumable_stream(fastapi_request: Request, request_obj: OpenAIRequest
     # 连准备阶段也由后台任务持有：前端在鉴权/预处理/首次连接时断开，
     # 不会取消上游或迫使重连者重复生成；淘汰/停机仍可经 store 取消它。
     detached = DetachedRequest(fastapi_request)
+    proof = _begin_chat_origin_delivery(request_obj)
 
     async def start_stream():
         try:
             resp = await _call_upstream(request_obj, detached)
         except asyncio.CancelledError:
+            if proof is not None:
+                proof.discard()
             raise
         except Exception as exc:
             code, message = extract_upstream_error(exc)
             resp = JSONResponse(create_openai_error_response(code, message[:1024], "upstream_error"),
                                 status_code=code, headers=advisory_headers(exc))
         if not isinstance(resp, StreamingResponse):
+            if proof is not None:
+                proof.discard()
             status = resp.status_code if 400 <= resp.status_code <= 599 else 502
             hint = response_retry_after(resp)
             await buf.fail_openai_setup(_openai_setup_payload(resp, status), status,
                                         hint if hint is not None and len(hint) <= 128 else None)
             return resp
         if buf.done:
+            if proof is not None:
+                proof.discard()
             close = getattr(resp, "aclose", None) or getattr(resp.body_iterator, "aclose", None)
             if close:
                 await close()
             return await json_response_offloop(status_code=buf.status_code, content=buf.payload or
                                                 create_openai_error_response(503, "响应缓冲已释放。", "buffer_evicted"))
-        pump_task = hold_ingress(asyncio.create_task(within_request_deadline(buf, lambda: pump_stream(buf, resp.body_iterator))))
+        candidate = proof if 200 <= resp.status_code < 300 else None
+        if candidate is None and proof is not None:
+            proof.discard()
+        pump_task = hold_ingress(asyncio.create_task(within_request_deadline(
+            buf, lambda: pump_stream(buf, resp.body_iterator, chat_proof=candidate))))
         # 泵结束的收尾必须走 resp.aclose（若可用）而不是只关 body_iterator：
         # resp 是 ManagedStreamingResponse，只有 aclose 才会执行 cleanup 链
         # （case B 下会取消 setup 任务并关闭内层上游流；只关 body_iterator 会让
@@ -257,8 +276,8 @@ async def _resumable_stream(fastapi_request: Request, request_obj: OpenAIRequest
     return ReplayStreamResponse(fastapi_request, buf, 0, headers=_resume_headers(stream_id))
 
 
-def _delivery_ack(buf, connection):
-    return BackgroundTask(buf.acknowledge_http_send, connection)
+def _delivery_ack(buf, connection, *, full_chat_reply=False):
+    return BackgroundTask(buf.acknowledge_http_send, connection, full_chat_reply=full_chat_reply)
 
 
 async def _read_while_connected(connection, operation, headers):
@@ -290,7 +309,8 @@ async def _json_from_buffer(request, buf, *, replay: bool):
         result_headers = ({**headers, "Retry-After": buf.json_retry_after}
                           if buf.json_retry_after is not None else headers)
         return await json_response_offloop(content=buf.payload, status_code=buf.status_code,
-                                           headers=result_headers, background=_delivery_ack(buf, connection))
+                                           headers=result_headers,
+                                           background=_delivery_ack(buf, connection, full_chat_reply=True))
 
     return await _read_while_connected(connection, read_response, headers)
 
@@ -311,8 +331,9 @@ async def _resumable_json(fastapi_request: Request, request_obj: OpenAIRequest, 
         return await _json_from_buffer(fastapi_request, buf, replay=True)
 
     detached = DetachedRequest(fastapi_request)
+    proof = _begin_chat_origin_delivery(request_obj)
 
-    async def _pump_json():
+    async def _produce_json():
         # 后台跑上游调用：这条前端连接断了，Google 的回复也要收完进缓冲。
         try:
             resp = await _call_upstream(request_obj, detached)
@@ -338,9 +359,20 @@ async def _resumable_json(fastapi_request: Request, request_obj: OpenAIRequest, 
             raise IncompleteResponseError("上游返回无效或不完整的 JSON 响应。") from None
         if not isinstance(payload, dict):
             raise IncompleteResponseError("上游返回的 JSON 不是响应对象。")
+        origins = ()
+        if 200 <= status < 300 and not payload.get("error") and proof is not None and proof.matches_json(resp):
+            origins = proof.take()
         await buf.finish("done" if 200 <= status < 300 else "error", payload=payload, status_code=status,
-                         retry_after=response_retry_after(resp) if 400 <= status <= 599 else None)
+                         retry_after=response_retry_after(resp) if 400 <= status <= 599 else None,
+                         chat_origins=origins)
         print(f"📦 [响应缓冲] {stream_id}（{id_src}）：非流式完整回复已落缓冲（HTTP {buf.status_code}）。")
+
+    async def _pump_json():
+        try:
+            await _produce_json()
+        finally:
+            if proof is not None:
+                proof.discard()
 
     pump_task = hold_ingress(asyncio.create_task(within_request_deadline(buf, _pump_json)))
     resumable_store.register_pump(stream_id, pump_task, buffer=buf)
@@ -401,12 +433,8 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
                 print(f"🖼️ [生图直通] {request.model}：绕过续传缓冲（resumable_image_streams=false），降低内存驻留。")
         if explicit:
             raise ResumeRequestError(409, "当前请求不支持续传；如需重新生成，请移除续传 ID 与游标。")
-        # Only this branch owns a direct public send, including implicit
-        # replay-capacity fallback. Detached producers keep their own policy.
-        proof = None
-        if request._signature_output_prefix:
-            proof = request._chat_origin_delivery = DirectChatOriginDelivery()
-            request._stage_signature_origin = proof.stage
+        # Direct public send, including the implicit capacity fallback.
+        proof = _begin_chat_origin_delivery(request)
         response = await _call_upstream(request, fastapi_request)
         if unbuffered:
             response.headers["X-Resumable"] = "false"
@@ -549,4 +577,5 @@ async def _poll_result(buf, start, poll_limit, poll_wait, connection, headers):
     return await json_response_offloop(
         content=content,
         headers=headers,
-        background=_delivery_ack(buf, connection) if buf.includes_delivery_terminal(start, end) else None)
+        background=_delivery_ack(buf, connection, full_chat_reply=start == 0)
+        if buf.includes_delivery_terminal(start, end) else None)

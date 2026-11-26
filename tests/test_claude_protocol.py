@@ -107,6 +107,25 @@ class ModelResolutionTests(unittest.TestCase):
         _, internal = resolve_claude_model("claude-opus-4-1", catalogue)
         self.assertEqual(internal, "gemini-3.1-pro-preview")
 
+    def test_family_detection_and_version_do_not_read_resource_addresses(self):
+        def scoped(project, model):
+            return f"projects/{project}/locations/global/publishers/google/models/{model}"
+
+        # The resource prefix "projects/" is not a Pro marker, nor does an
+        # image-oriented project turn its text model into an image model.
+        flash = scoped("fixture", "gemini-3.6-flash")
+        pro = scoped("image-studio", "gemini-2.5-pro")
+        self.assertEqual(resolve_claude_model("claude-opus-4-1", [flash, pro])[1], pro)
+        image = scoped("fixture", "gemini-5-pro-image")
+        self.assertEqual(resolve_claude_model("claude-opus-4-1", [image, flash])[1], flash)
+
+        # Family and version markers in project slugs likewise have no effect.
+        lite = scoped("fixture", "gemini-2.5-flash-lite")
+        decoy_lite = scoped("gemini-99-flash-lite", "gemini-3.5-flash")
+        self.assertEqual(resolve_claude_model("claude-haiku-4-5", [decoy_lite, lite])[1], lite)
+        decoy_version = scoped("gemini-99", "gemini-3.5-flash")
+        self.assertEqual(resolve_claude_model("claude-sonnet-4-5", [decoy_version, flash])[1], flash)
+
     def test_non_claude_names_pass_through(self):
         for raw in ("gemini-3.8-flash", "gemini-3.8-flash-search",
                     "gemini-3.8-flash-antitruncation-stream", "whatever"):

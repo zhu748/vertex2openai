@@ -99,6 +99,17 @@ class IncompleteResponseError(ValueError):
     code = 502
 
 
+class ResponsesProjectionError(IncompleteResponseError):
+    """A provider result that the text/function projection cannot publish; not a network failure."""
+
+
+class ResponsesMediaError(ResponsesProjectionError):
+    """A real provider media Part cannot be represented by this text/function endpoint."""
+
+    def __init__(self):
+        super().__init__("Media output is not supported by this Responses endpoint.")
+
+
 class ToolStreamError(IncompleteResponseError):
     """Local tool-fragment validation failure, never evidence of a bad proxy."""
 
@@ -301,6 +312,68 @@ def _native_partial_delta(arg):
     except ValueError:
         return None
     return kind, path
+
+
+class ResponsesTextCallOwner:
+    """Identify one private text call without borrowing an unnamed public sibling's arguments."""
+    def __init__(self, name):
+        self.name = name
+        self.open = self.saw_other_fragment = False
+        self.ident = None
+
+    def owns(self, name, ident, continuing, fragmented):
+        private = name == self.name
+        if name and self.open and ident and self.ident and (ident == self.ident) != private:
+            raise ResponsesProjectionError("上游正文传输调用的标识发生冲突。")
+        if not name and self.open:
+            if ident and self.ident:
+                private = ident == self.ident
+            elif self.saw_other_fragment:
+                raise ResponsesProjectionError("上游增量参数无法确定归属。")
+            else:
+                private = True
+        if private:
+            self.ident = self.ident or ident
+            self.open = continuing is True
+        elif fragmented:
+            # Conservatively remember ambiguity, but retain no public IDs or fragment bodies.
+            self.saw_other_fragment = True
+        return private
+
+
+def responses_partial_call(call) -> bool:
+    """Recognize a real, non-executable argument fragment; malformed data is not truncation evidence.
+
+    Test the same protobuf fields on typed SDK Parts and their Cookie JSON equivalent.
+    Only the candidate's separate, verified terminal can authorize discarding this batch.
+    """
+    if isinstance(call, dict):
+        def get(key, camel=None):
+            if camel and camel in call and key in call:
+                raise ResponsesProjectionError("上游增量调用包含重复字段。")
+            return call.get(key, call.get(camel))
+    else:
+        def get(key, camel=None):
+            return getattr(call, key, None)
+
+    partial = get("partial_args", "partialArgs")
+    continuing = get("will_continue", "willContinue")
+    if ((partial is not None and not isinstance(partial, list))
+            or (continuing is not None and type(continuing) is not bool)):
+        raise ResponsesProjectionError("上游增量调用字段类型无效。")
+    if not partial and not continuing:
+        return False
+    name, ident, args = get("name"), get("id"), get("args")
+    if (name is not None and not isinstance(name, str) or ident is not None and not isinstance(ident, str)
+            or not (name and name.strip() or ident or partial) or args is not None and args != {}
+            or len(partial or ()) > MAX_ARGUMENT_FIELDS):
+        raise ResponsesProjectionError("上游增量调用的归属或参数无效。")
+    for arg in partial or ():
+        # Preserve explicit nullValue as distinct from an absent oneof arm.
+        wire = arg.model_dump(by_alias=True, exclude_unset=True) if callable(getattr(arg, "model_dump", None)) else arg
+        if _native_partial_delta(wire) is None:
+            raise ResponsesProjectionError("上游增量参数缺少有效的路径或唯一类型字段。")
+    return True
 
 
 def _native_partial_args_have_reply(items: list) -> bool:

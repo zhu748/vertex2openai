@@ -65,6 +65,8 @@ class TranslatedScopedModelRoutes(Round15Harness):
             if self.express_error and "variables" not in payload:
                 return httpx.Response(503, json={"error": {
                     "code": 503, "status": "UNAVAILABLE", "message": "Fixture unavailable."}})
+            if request.url.path.endswith(":countTokens"):
+                return httpx.Response(200, json={"totalTokens": 12})
             value = {"candidates": [{"content": {"role": "model", "parts": [self.reply]},
                                      "finishReason": "STOP"}]}
             return httpx.Response(200, json={"results": [{"data": value}]} if "variables" in payload else value)
@@ -96,6 +98,7 @@ class TranslatedScopedModelRoutes(Round15Harness):
             patch.object(app_state, "get_cookie_accounts", return_value=self.cookie_rows),
             patch.object(app_state, "get_project_id", return_value=""),
             patch.object(express_sdk, "get_pooled_express_client", return_value=sdk),
+            patch.object(claude_api, "get_pooled_express_client", return_value=sdk),
             patch.object(claude_api, "_available_models", AsyncMock(return_value=[MODEL])),
             patch.object(cookie_proxy, "build_headers", side_effect=headers),
             patch.object(cookie_delivery, "build_headers", side_effect=headers),
@@ -139,6 +142,50 @@ class TranslatedScopedModelRoutes(Round15Harness):
             return await self.client.post(f"/v1beta/models/{model}:generateContent",
                                           json={"contents": [{"parts": [{"text": "Read the temperature."}]}]})
         return await self.client.post(path, json={**body, "model": model})
+
+    async def test_claude_alias_metadata_and_generation_keep_the_same_scoped_target(self):
+        flash = resource()
+        pro = resource(model="gemini-2.5-pro")
+        lite = resource(model="gemini-2.5-flash-lite")
+        expected = {"claude-opus-4-1": pro, "claude-sonnet-4-5": flash, "claude-haiku-4-5": lite}
+        self.express_rows[0]["project_id"] = "other-key-project"
+        self.enterContext(patch.object(
+            claude_api, "_available_models", AsyncMock(return_value=[flash, pro, lite])))
+        headers = {"anthropic-version": "2023-06-01"}
+
+        for self.channel in ("api_key", "web_proxy"):
+            self.wire.clear()
+            listing = await self.client.get("/v1/models?limit=3", headers=headers)
+            self.assertEqual(listing.status_code, 200, listing.text)
+            self.assertTrue(listing.json()["has_more"])
+            self.assertEqual([entry["id"] for entry in listing.json()["data"]], list(expected))
+            entries_by_id = {}
+            for entry in listing.json()["data"]:
+                retrieved = await self.client.get(f"/v1/models/{entry['id']}", headers=headers)
+                self.assertEqual(retrieved.status_code, 200, retrieved.text)
+                entries_by_id[entry["id"]] = (entry, retrieved.json())
+            self.assertEqual(self.wire, [])
+
+            for alias, target in expected.items():
+                with self.subTest(channel=self.channel, alias=alias):
+                    response = await self.send("messages", alias)
+                    self.assertEqual(response.status_code, 200, response.text)
+                    self.assertEqual(response.json()["model"], alias)
+                    self.assertEqual(len(self.wire), 1)
+                    path, body = self.wire[0]
+                    if self.channel == "web_proxy":
+                        self.assertEqual(body["model"], target)
+                    else:
+                        self.assertEqual(path, "/v1beta1/" + target + ":generateContent")
+                    for entry in entries_by_id[alias]:
+                        self.assertEqual(entry["display_name"], f"Claude 别名 （映射 {target}）")
+
+        self.channel = "api_key"
+        self.wire.clear()
+        count = await self.client.post("/v1/messages/count_tokens", headers=headers,
+                                      json={"model": "claude-opus-4-1", "messages": PROMPT})
+        self.assertEqual((count.status_code, count.json()), (200, {"input_tokens": 12}))
+        self.assertEqual([path for path, _ in self.wire], ["/v1beta1/" + pro + ":countTokens"])
 
     async def test_qualified_and_bare_text_use_same_provider_url_tools_and_defaults(self):
         for channel in ("api_key", "web_proxy"):

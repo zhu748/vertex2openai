@@ -172,9 +172,10 @@ def responses_item_witness(tokens: list[bytes | None]) -> bytes | None:
     return _hash(b"resp-items-v1", *tokens)
 
 
-def _responses_item_key(keys: tuple[bytes, ...], witness: bytes | None, predecessor: bytes | None) -> bytes:
-    if keys and witness and predecessor is not None:
-        return _hash(b"resp-origin-v2", predecessor, witness, *keys)
+def _responses_item_key(keys: tuple[bytes, ...], witness: bytes | None,
+                        predecessor: bytes | None, ordinary: bytes | None) -> bytes:
+    if keys and witness and predecessor is not None and ordinary is not None:
+        return _hash(b"resp-origin-v3", predecessor, witness, ordinary, *keys)
     return b""
 
 
@@ -184,6 +185,7 @@ class ResponsesLineage:
     key: bytes | None = b""
     destination: bytes | None = None
     legacy_only: bool = True
+    signed_ordinary: bool = False
 
     def permits(self, destination: bytes | None) -> bool:
         # For a nonempty chain, every verified ancestor must match the
@@ -341,16 +343,80 @@ def _history_text(content, budget, *, can_embed_media, is_tool_result):
     return h.digest()
 
 
-def _tool_visible_text(content, budget):
+def _tool_text(content):
     if isinstance(content, list):
         if not content:
-            return b""
+            return None
         # A single plain segment shares the scalar projection on both wires;
         # multiple list blocks can affect Part boundaries on Cookie.
         if len(content) != 1:
             raise _Unsupported
         content = _block_text(content[0])
-    return budget.visible(content)
+    return content
+
+
+def _responses_ordinary_tag(google, content, reasoning, budget):
+    """Bind signed ordinary Parts of a sanitized, plain Responses tool turn.
+
+    When any Part actually carries an original, the whole ordered ordinary
+    layout identifies its position relative to the call batch. No bytes or
+    text from that layout are stored. Unsigned runs keep the thin projection.
+    """
+    def decode(value):
+        if not value:
+            return None
+        budget.consume(_signature_size(value))
+        raw, _ = signature_from_extra({"extra_content": {"google": {"thought_signature": value}}},
+                                      strict_encoding=True)
+        return ordinary_signature(raw)
+
+    if "ordinary_parts" in google:
+        # Exact descriptors, checked against the visible fields by Responses,
+        # supersede the legacy top-level duplicate (including its bytes).
+        if not any(part.get("thought_signature") for part in google["ordinary_parts"]):
+            return b""
+        parts = [(part["kind"], part["text"], decode(part.get("thought_signature")))
+                 for part in google["ordinary_parts"]]
+        if not any(sig for _, _, sig in parts):
+            return b""
+        # _plain_google only accepts an explicit order with ordinary Parts
+        # before all calls. Without an order, both tool adapters use call-first.
+        ordinary_first = google.get("part_order") is not None
+    else:
+        sig = decode(google.get("thought_signature"))
+        if not sig:
+            return b""
+        parts = []
+        if reasoning:
+            parts.append(("thought", reasoning, None))
+        if content:
+            parts.append(("text", content, None))
+        kind = google.get("thought_signature_part")
+        if parts:
+            i = next((i for i in range(len(parts) - 1, -1, -1) if parts[i][0] == kind), len(parts) - 1)
+            parts[i] = (*parts[i][:2], sig)
+        else:
+            parts.append(("text", "", sig))
+        ordinary_first = False
+
+    h = _digest(b"resp-ordinary-v1")
+    _feed_field(h, b"first" if ordinary_first else b"last")
+    for kind, text, sig in parts:
+        budget.consume(_BLOCK_COST)
+        _feed_field(h, kind.encode())
+        _feed_field(h, budget.visible(text))
+        _feed_field(h, sig or b"")
+    return h.digest()
+
+
+def responses_ordinary_witness(message):
+    """Return the public turn's bounded ordinary witness; None cannot certify a turn."""
+    try:
+        google = _plain_google(message.get("extra_content"), len(message["tool_calls"]))
+        return _responses_ordinary_tag(google, _tool_text(message.get("content")),
+                                       message.get("reasoning_content"), _Budget())
+    except (TypeError, AttributeError, KeyError, ValueError):
+        return None
 
 
 def _prior_assistant_extra(extra, budget):
@@ -487,10 +553,11 @@ def bind_signature_origins(request, api_key):
             if len(calls) > _MAX_CALLS:
                 raise _Unsupported
             if calls:
-                if (m.role != "assistant" or m.name or m.tool_call_id or
-                        not _plain_metadata(m.extra_content, len(calls))):
+                if m.role != "assistant" or m.name or m.tool_call_id:
                     raise _Unsupported
-                text_tag = _tool_visible_text(m.content, budget)
+                google = _plain_google(m.extra_content, len(calls))
+                tool_text = _tool_text(m.content)
+                text_tag = budget.visible(tool_text)
                 reason_tag = (budget.observed(m._signature_observed_reasoning) if m._signature_observed_reasoning
                               else budget.visible(m.reasoning_content))
                 tags = [_call_tag(c, budget) for c in calls]
@@ -499,10 +566,12 @@ def bind_signature_origins(request, api_key):
                 prefix = _step_prefix(prefix, text_tag, reason_tag)
                 keys = _slot_keys(prefix, tags)
                 witness = m._responses_item_witness
-                if witness is None and (lineage is None or lineage.legacy_only):
+                ordinary = (_responses_ordinary_tag(google, tool_text, m.reasoning_content, budget)
+                            if lineage is not None else b"")
+                if witness is None and not ordinary and (lineage is None or lineage.legacy_only):
                     m._signature_slots = keys
                 if lineage is not None:
-                    item_key = _responses_item_key(keys, witness, lineage.key)
+                    item_key = _responses_item_key(keys, witness, lineage.key, ordinary)
                     issued = _responses_receipt(item_key) if item_key else None
                     if (issued is not None and lineage.permits(issued.destination)
                             and _responses_carriers_match(issued.signature, calls, budget)):
@@ -510,9 +579,11 @@ def bind_signature_origins(request, api_key):
                         # A contradictory explicit carrier is still sent, but
                         # cannot combine inferred slots from another lineage.
                         m._signature_slots = (item_key,) * len(keys)
-                        lineage = ResponsesLineage(item_key, issued.destination, False)
+                        lineage = ResponsesLineage(item_key, issued.destination, False,
+                                                   lineage.signed_ordinary or bool(ordinary))
                     else:
-                        lineage = ResponsesLineage(None, legacy_only=lineage.legacy_only and witness is None)
+                        lineage = ResponsesLineage(None, legacy_only=lineage.legacy_only and witness is None
+                                                   and not ordinary)
                 prefix = _hash(b"tool-step-v1", prefix, *tags)
                 continue
             prefix = _hash(b"tool-message-v2", prefix, _history_tag(m, budget))
@@ -558,14 +629,16 @@ def _commit_origin(keys, signatures, destination):
 
 def publish_responses_item_origins(keys: tuple[bytes, ...], signatures: tuple[bytes | None, ...] | None,
                                    destination: bytes | None, witness: bytes | None, *,
-                                   lineage: ResponsesLineage) -> None:
+                                   lineage: ResponsesLineage, ordinary: bytes | None) -> None:
     """Commit the legacy origin and the exact whole-batch receipt after delivery."""
     exact = lineage.permits(destination)
     # Keep the old projection for histories with no item IDs. A delivered
-    # reply under a broken witnessed lineage may collide with such a reply,
-    # but cannot positively certify the weaker alias.
-    signature_store.register_origin_batch(keys, signatures if exact or lineage.legacy_only else None, destination)
-    if not exact or not (key := _responses_item_key(keys, witness, lineage.key)):
+    # reply under a broken witnessed lineage or one with signed ordinary
+    # Parts may collide with such a reply, but cannot certify the weaker
+    # alias: it does not bind those original bytes or their positions.
+    weak = ordinary == b"" and not lineage.signed_ordinary and (exact or lineage.legacy_only)
+    signature_store.register_origin_batch(keys, signatures if weak else None, destination)
+    if not exact or not (key := _responses_item_key(keys, witness, lineage.key, ordinary)):
         return
     if signatures is None or destination is None or destination == UNTRUSTED:
         mark_unrestorable_origin(key)
@@ -695,8 +768,8 @@ class DeliveredOrigin:
             _commit_origin(*pending[1:])
 
 
-class DirectChatOriginDelivery:
-    """Bounded, one-shot delivery stage for the direct Chat route only."""
+class ChatOriginDelivery:
+    """A bounded producer stage; only its accepted Chat sender can commit it."""
 
     def __init__(self):
         self.start_attempt()
@@ -739,14 +812,49 @@ class DirectChatOriginDelivery:
         self._valid = False
         self._pending.clear()
 
-    async def publish(self, connection, *, stream):
+    def take(self, *, stream=False):
         batches = ()
-        if (self._valid and self._pending and (not stream or self._stream_terminal)
-                and connection.final_body_sent and connection.delivery_possible):
+        if self._valid and self._pending and (not stream or self._stream_terminal):
             batches = tuple(self._pending)
         self.discard()
+        return batches
+
+    async def publish(self, connection, *, stream):
+        if not connection.final_body_sent or not connection.delivery_possible:
+            self.discard()
+            return
+        batches = self.take(stream=stream)
         if batches:
             signature_store.register_origin_batches(batches)
+
+
+@dataclass(frozen=True, slots=True)
+class RetainedChatOrigins:
+    """Immutable, byte-accountable proof attached to one settled replay buffer."""
+
+    batches: tuple
+    key_bytes: int
+    signature_bytes: int
+
+    @classmethod
+    def capture(cls, batches):
+        compact = tuple((b"".join(keys), signatures, destination) for keys, signatures, destination in batches)
+        # Packed keys, plus conservative fixed overhead for this receipt and
+        # each small tuple. Original payloads have a separate optional budget.
+        key_bytes = 128 + sum(128 + len(keys) for keys, _, _ in compact)
+        signature_bytes = sum(
+            128 + 8 * len(signatures) + len(destination or b"")
+            + sum(48 + len(sig) for sig in signatures if sig is not None)
+            for _, signatures, destination in compact if signatures is not None)
+        return cls(compact, key_bytes, signature_bytes)
+
+    def without_originals(self):
+        return RetainedChatOrigins(tuple((keys, None, None) for keys, _, _ in self.batches), self.key_bytes, 0)
+
+    def publish(self):
+        signature_store.register_origin_batches(
+            (tuple(keys[i:i + 32] for i in range(0, len(keys), 32)), signatures, destination)
+            for keys, signatures, destination in self.batches)
 
 
 class OriginBatch:

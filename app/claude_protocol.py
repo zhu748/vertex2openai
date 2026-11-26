@@ -37,6 +37,7 @@ import re
 import secrets
 from typing import Any, Optional
 
+from model_resource import model_id_for_policy
 from models import OpenAIMessage, OpenAIRequest
 from tool_arguments import parse_tool_arguments
 from tool_policy import validate_model_tool_choice
@@ -171,16 +172,22 @@ def _is_chat_model(name: str) -> bool:
 
 def _pick_family_model(family: str, models: list[str]) -> Optional[str]:
     """从内部模型清单里按家族偏好选最合适的模型（版本号大者优先）。"""
-    chat = [m for m in models if _is_chat_model(m)]
+    # Classify the Google model ID, not project or location words. Keep the
+    # original resource as the destination (an address, not a family marker).
+    chat = []
+    for model in models:
+        leaf = model_id_for_policy(model).lower()
+        if _is_chat_model(leaf):
+            chat.append((model, leaf))
     if not chat:
         return None
 
     def best(ms):
-        return max(ms, key=_model_version)
+        return max(ms, key=lambda item: _model_version(item[1]))[0]
 
-    lites = [m for m in chat if "flash-lite" in m]
-    flashes = [m for m in chat if "flash" in m and "lite" not in m]
-    pros = [m for m in chat if "pro" in m]
+    lites = [item for item in chat if "flash-lite" in item[1]]
+    flashes = [item for item in chat if "flash" in item[1] and "lite" not in item[1]]
+    pros = [item for item in chat if "pro" in item[1]]
     if family == "haiku":
         if lites:
             return best(lites)
@@ -1593,9 +1600,10 @@ def anthropic_models_payload(available_models: list, catalog_variants: Optional[
                          "type": "model", "created_at": now})
 
     for alias in CANONICAL_CLAUDE_MODELS:
-        internal = _CLAUDE_MODEL_ALIASES.get(alias)
-        suffix = f"（映射 {internal}）" if internal else ""
-        add(alias, f"Claude 别名 {suffix}" if suffix else alias)
+        # A hot-reloaded catalog can displace the built-in default. Use the
+        # Messages/count_tokens resolver so list and retrieval describe it.
+        _, target = resolve_claude_model(alias, available_models)
+        add(alias, f"Claude 别名 （映射 {target}）")
     for model in (catalog_variants if catalog_variants is not None else available_models):
         if isinstance(model, str):
             add(model, model)

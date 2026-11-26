@@ -425,6 +425,7 @@ def _tool_result_parts(
 def _assistant_tool_parts(
     message: OpenAIMessage, require_sig: bool, history: ManagedImageHistory | None = None, *,
     literal_ids: frozenset[str] = frozenset(), signature_replay: "SDKSignatureReplay | None" = None,
+    literal_text: bool = False,
 ) -> list[types.Part]:
     """Restore parallel calls, their signatures and the original ordinary-part order."""
     parts = []
@@ -465,7 +466,7 @@ def _assistant_tool_parts(
     exact_history = ordinary_parts is not None
     if ordinary_parts is None and message.has_assistant_refusal():
         # The new ordered refusal form may interleave ordinary text or images.
-        ordinary_parts = _ordinary_message_parts(message, history)[1]
+        ordinary_parts = _ordinary_message_parts(message, history, literal_text=literal_text)[1]
     if ordinary_parts is None:
         ordinary_parts = []
         reasoning = getattr(message, "reasoning_content", None)
@@ -493,7 +494,7 @@ def _assistant_tool_parts(
             content_text = message.content
             image_parts_collected = []
         if isinstance(content_text, str) and content_text:
-            ordinary_parts.extend(_text_media_parts(content_text, history))
+            ordinary_parts.extend(_text_media_parts(content_text, history, parse_inline=not literal_text))
         ordinary_parts.extend(image_parts_collected)
 
         message_sig, signature_kind = standalone_message_signature(message)
@@ -525,7 +526,8 @@ def _restored_ordinary_parts(message: OpenAIMessage, history: ManagedImageHistor
     return ordinary_parts_from_extra(message, image, history)
 
 
-def _ordinary_message_parts(message: OpenAIMessage, history: ManagedImageHistory | None = None) -> tuple[str, list[types.Part]]:
+def _ordinary_message_parts(message: OpenAIMessage, history: ManagedImageHistory | None = None, *,
+                            literal_text: bool = False) -> tuple[str, list[types.Part]]:
     """Convert text/images/thoughts and attach an ordinary-part signature once."""
     content = message.replay_content()
     role = message.role
@@ -549,14 +551,14 @@ def _ordinary_message_parts(message: OpenAIMessage, history: ManagedImageHistory
         parts.extend(_thought_media_parts(reasoning, history))
 
     if exact_ordinary_parts is None and isinstance(content, str):
-        parts.extend(_text_media_parts(content, history))
+        parts.extend(_text_media_parts(content, history, parse_inline=not literal_text))
 
     elif exact_ordinary_parts is None and isinstance(content, list):
         def _emit_text(text_content: str):
             # F-1：pydantic 会把标准 part 解析成 ContentPartText / ContentPartImage 实例，
             # 归一成 dict 后只保留一条处理路径（原先 dict 与实例两套分支已出现行为分歧：
             # 实例分支直接 from_text，跳过了 markdown 内联图片抽取）。
-            parts.extend(_text_media_parts(text_content, history))
+            parts.extend(_text_media_parts(text_content, history, parse_inline=not literal_text))
 
         _iter_content_segments(
             content,
@@ -618,10 +620,12 @@ def _merge_gemini_turns(
 
 def create_gemini_prompt(
     messages: List[OpenAIMessage], model_name: str = "", *, signature_replay: "SDKSignatureReplay | None" = None,
+    literal_text: bool = False,
 ) -> List[types.Content]:
     """Convert OpenAI messages to Gemini contents, preserving tool/signature boundaries."""
     print("🔄 [消息转换] 正在将 OpenAI 格式消息转换为 Gemini contents。")
-    history = ManagedImageHistory.for_request()
+    # Responses input is typed text, even when it quotes a Chat attachment URL.
+    history = None if literal_text else ManagedImageHistory.for_request()
     require_sig = requires_signature(model_name)
     tool_name_by_id = {}
     contents = []
@@ -640,9 +644,10 @@ def create_gemini_prompt(
                     tool_name_by_id[replay_tool_call_id(call_id, literal_ids)] = call_name
             role, parts = "model", _assistant_tool_parts(
                 message, require_sig and i >= turn_start, history, literal_ids=literal_ids,
-                signature_replay=signature_replay)
+                signature_replay=signature_replay, literal_text=literal_text)
         else:
-            role, parts = _ordinary_message_parts(message, history if message.role in ("assistant", "model") else None)
+            role, parts = _ordinary_message_parts(message, history if message.role in ("assistant", "model") else None,
+                                                  literal_text=literal_text)
         if parts:
             contents.append(types.Content(role=role, parts=parts))
     return _merge_gemini_turns(contents)
@@ -787,7 +792,7 @@ def _wire_image_part(image_url: str, history: ManagedImageHistory | None = None)
 
 
 def openai_content_to_wire_parts(content: Any, history: ManagedImageHistory | None = None, *,
-                                 thought: bool = False) -> List[Dict[str, Any]]:
+                                 thought: bool = False, literal_text: bool = False) -> List[Dict[str, Any]]:
     """OpenAI 的 message.content → batchGraphql 的 parts 列表（P1-2）。
 
     与 Express 通道行为对齐：
@@ -802,7 +807,7 @@ def openai_content_to_wire_parts(content: Any, history: ManagedImageHistory | No
     def _add_text_with_inline_images(text: str):
         if not text:
             return
-        for item in _text_media_segments(text, history, parse_inline=not thought):
+        for item in _text_media_segments(text, history, parse_inline=not thought and not literal_text):
             if isinstance(item, str):
                 wire = {"text": item}
             elif (blob := item.inline_data) is not None and blob.data:

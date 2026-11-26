@@ -96,6 +96,7 @@ from upstreams.express_response import (  # noqa: F401
     completed_response_needs_media_pool,
     convert_chunk_to_openai,
     is_gemini_response_valid,
+    responses_sdk_source,
     iter_giant_chunk_payload,
     split_giant_chunk_payload,
 )
@@ -1428,8 +1429,11 @@ class SDKGeneration:
                 return result
         require_unblocked_response(response_obj_call)
         require_complete_response(response_obj_call)
+        if typed_output:
+            response_obj_call = responses_sdk_source(
+                response_obj_call, self.text_transport.tool_name if self.text_transport else None)
         if self.text_transport:
-            decoder = self.text_transport.decoder()
+            decoder = self.text_transport.decoder(allow_empty_incomplete=True) if typed_output else self.text_transport.decoder()
             response_obj_call = decoder.restore_sdk(response_obj_call)
             decoder.validate_end()
         if not is_gemini_response_valid(response_obj_call, allow_empty_length=typed_output):
@@ -1468,7 +1472,9 @@ class SDKGeneration:
         # 与假流式路径同因：释放 SDK 响应（持有图片原始 bytes），
         # 避免与 JSON 序列化拷贝叠加驻留。
         response_obj_call = None
-        _prepend_prefill(openai_response_content, self.prefill_text)
+        if not (typed_output and openai_response_content["choices"][0]["finish_reason"] in ("length", "content_filter")):
+            # An incomplete Response contains only actual provider output, never an inferred prefill.
+            _prepend_prefill(openai_response_content, self.prefill_text)
         # 巨帧（4K 生图）主动回收 SDK/pydantic 引用环（同假流式路径）。
         # Encode giant strings in bounded slices into the final byte buffer;
         # unlike pre-serializing with dumps(), this also avoids its accumulator

@@ -415,16 +415,20 @@ async def native_list_models(fastapi_request: Request,
     return result
 
 
-@router.get("/v1beta/models/{model_action}")
+@router.get("/v1beta/models/{model_action:path}")
 async def native_get_model(model_action: str, fastapi_request: Request,
                            _auth: str = Depends(get_gemini_auth)):
     # 与 native_list_models 一致：未配置任何通道时不返回模型详情
     # （旧实现缺这个检查，无 Key 也照常返回目录条目，与列表行为矛盾）。
-    model, action = _split_model_action(model_action)
+    # The SDK sends the exact name from models.list. The route already
+    # consumes its outer "models/" prefix; any remaining one is part of the
+    # configured ID and cannot be stripped as it is on generation paths.
+    _, _, suffix = model_action.partition(":")
+    action = suffix.strip()
     if action:
         return _native_error(400, f"GET 不支持 :{action}，请用 POST。")
     ids, has_keys = await _catalog_capabilities(fastapi_request)
-    if model and model in ids:
-        return _native_model_entry(model, can_count_tokens=has_keys)
-    return _native_error(404, f"Model {model} not found.", status_detail="NOT_FOUND")
+    if model_action in ids:
+        return _native_model_entry(model_action, can_count_tokens=has_keys)
+    return _native_error(404, f"Model {model_action} not found.", status_detail="NOT_FOUND")
 

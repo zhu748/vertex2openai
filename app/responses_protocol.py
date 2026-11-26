@@ -13,7 +13,7 @@ from uuid import uuid4
 
 from json_encoding import estimate_json_chars, iter_json_bytes
 from model_capabilities import get_profile
-from models import OpenAIMessage, OpenAIRequest, message_text
+from models import OpenAIMessage, OpenAIRequest
 from ordinary_history import exact_ordinary_slots
 from request_tracking import SURROGATE_RE
 from response_validation import IncompleteResponseError, MAX_TOOL_CALLS
@@ -86,18 +86,6 @@ def _number(value, param, high):
     if value is not None and (type(value) not in (int, float) or not 0 <= value <= high):
         _field_error(param, f"must be a finite number between 0 and {high}")
     return value
-
-
-def _has_media(text):
-    return "![" in text and ("](data:image/" in text or "/v1/generated-images/" in text)
-
-
-def _text_only(value, param):
-    text = _text(value, param)
-    # The legacy Chat pipeline interprets these as attached media inside text.
-    if _has_media(text):
-        _field_error(param, "embedded image attachments are not supported by this endpoint")
-    return text
 
 
 def _call_extra(item, param):
@@ -188,7 +176,7 @@ def _valid_assistant_extra(message, extra):
 
 def _message_content(value, role, param):
     if isinstance(value, str):
-        return _text_only(value, param)
+        return _text(value, param)
     if not isinstance(value, list) or not value or len(value) > _MAX_HISTORY_ITEMS:
         _field_error(param, "must be a string or a nonempty array of text parts")
     parts = []
@@ -199,7 +187,7 @@ def _message_content(value, role, param):
         if kind in ("input_text", "output_text") and (kind == "input_text" or role == "assistant"):
             # Annotations on a replayed assistant message describe client
             # presentation rather than instructions; only text enters Gemini.
-            parts.append({"type": "text", "text": _text_only(part.get("text"), f"{path}.text")})
+            parts.append({"type": "text", "text": _text(part.get("text"), f"{path}.text")})
         elif kind == "refusal" and role == "assistant":
             parts.append({"type": "refusal", "refusal": _text(part.get("refusal"), f"{path}.refusal")})
         else:
@@ -245,10 +233,6 @@ class _History:
         if extra:
             self.assistant["extra_content"] = extra
         message = OpenAIMessage(**self.assistant)
-        if message.tool_calls and isinstance(message.content, list):
-            # The SDK concatenates assistant tool-preamble text before
-            # parsing Markdown; a media marker can cross block boundaries.
-            _text_only(message_text(message.replay_content()), "input assistant content")
         # Responses call_id never encoded a signature. Keep all IDs opaque; a
         # missing origin must not create a new legacy placeholder fallback.
         message._opaque_tool_call_ids = bool(message.tool_calls)
@@ -353,7 +337,7 @@ class _History:
                 _fields(part, {"type", "text"}, path)
                 if part.get("type") != "reasoning_text":
                     _field_error(path, "expected a reasoning_text part")
-                texts.append(_text_only(part.get("text"), f"{path}.text"))
+                texts.append(_text(part.get("text"), f"{path}.text"))
             # A new reasoning item starts a new assistant turn; the gateway's
             # projection puts optional reasoning before its message and calls.
             self._flush()
@@ -527,8 +511,6 @@ def _completion_message(message):
         value = message.get(field)
         if value is not None and (not isinstance(value, str) or SURROGATE_RE.search(value)):
             raise IncompleteResponseError("Upstream completion contains unsupported assistant content.")
-        if value and _has_media(value):
-            raise IncompleteResponseError("Image output is not supported by this Responses endpoint.")
     return message
 
 

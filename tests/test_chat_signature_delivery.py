@@ -1,7 +1,8 @@
 """A detached upstream or iterator terminal is not a direct Chat send receipt."""
 
 import asyncio
-from contextlib import ExitStack, aclosing
+import base64
+from contextlib import AsyncExitStack, ExitStack, aclosing, asynccontextmanager
 import json
 from unittest.mock import patch
 
@@ -13,6 +14,7 @@ from starlette.background import BackgroundTask
 from starlette.requests import ClientDisconnect
 
 import channel_dispatch
+import resumable
 from routes import chat_api
 from runtime_state import app_state
 from signature_store import SKIP_VALIDATOR_SENTINEL
@@ -96,6 +98,208 @@ class ChatSignatureDeliveryRoutes(SchemaRouteHarness):
             await asyncio.wait_for(peer.run(before_send), 2)
         self.assertEqual(len(intercepted), 1)
         return peer
+
+    def retained_store(self, stack):
+        store = resumable.ResumableStore()
+        stack.push_async_callback(store.aclose)
+        stack.enter_context(patch.object(chat_api, "resumable_store", store))
+        stack.enter_context(patch.object(chat_api, "resumable_enabled", return_value=True))
+        return store
+
+    @asynccontextmanager
+    async def retained_case(self, **case):
+        with self.subTest(**case):
+            async with AsyncExitStack() as stack:
+                yield stack
+
+    async def test_retained_origin_waits_for_one_verified_full_send(self):
+        for self.channel in ("api_key", "web_proxy"):
+            for mode in ("json", "fake", "stream"):
+                for method, spec, failure in (("GET", "2.4", "silent"), ("POST", "2.4", "raise"),
+                                               ("POST", "2.3", "silent")):
+                    async with self.retained_case(channel=self.channel, mode=mode, method=method,
+                                                  failure=failure, spec=spec) as stack:
+                        cache = new_cache(stack)
+                        store = self.retained_store(stack)
+                        path, body = self.turn(mode)
+                        prior = await self.issue(path, body, mode, A)
+                        self.assertEqual(await self.replay(path, body, prior), [A])
+                        commits = stack.enter_context(patch.object(cache, "register_origin_batches",
+                                                                  wraps=cache.register_origin_batches))
+                        key = [(b"idempotency-key", b"retained-signature-fixture")]
+                        self.reply = [provider_call(CALL_ID, B)]
+                        lost = await self.abandon(path, body, spec=spec, failure=failure, stage="final",
+                                                  headers=key)
+                        rid = lost.receipt
+                        buf = await store.get_exact(rid)
+                        self.assertEqual(buf.status, "done")
+                        self.assertFalse(buf.fully_delivered)
+                        self.assertEqual(await self.replay(path, body, prior), [A])
+                        self.assertGreater(store._chat_origin_key_bytes, 0)
+                        self.assertGreater(store._chat_origin_signature_bytes, 0)
+                        self.assertLessEqual(store._chat_origin_key_bytes, buf.bytes_stored)
+                        poll_path = "/v1/resumable/" + rid
+                        if mode != "json":
+                            head = await self.client.get(poll_path, params={"from": 0, "limit": 1})
+                            self.assertFalse(head.json()["done"])
+                            at_end = await self.client.get(poll_path, params={"from": buf.next_seq})
+                            self.assertTrue(at_end.json()["done"])
+                            self.assertFalse(at_end.json()["events"])
+                            self.assertFalse(buf.fully_delivered)
+                            tail = await self.client.get(poll_path, params={"from": buf.next_seq - 1})
+                            self.assertTrue(tail.json()["done"])
+                            terminal, = tail.json()["events"]
+                            self.assertIn(DONE_FRAME, terminal["data"])
+                            self.assertTrue(buf.fully_delivered)  # Existing idempotency semantics.
+                            cursor = Peer(path, payload=body, headers=[(b"x-resume-id", rid.encode())],
+                                          query=f"resume_from={buf.next_seq - 1}".encode())
+                            await asyncio.wait_for(cursor.run(), 2)
+                            self.assertEqual(cursor.receipt, rid)
+                            raw = b"".join(m.get("body", b"") for m in cursor.messages)
+                            self.assertIn(DONE_FRAME.encode(), raw)
+                            self.assertNotIn(b"tool_calls", raw)
+                            self.assertEqual(await self.replay(path, body, prior), [A])
+                        self.assertEqual(commits.call_count, 0)
+
+                        # Losing a full replay after others fetched a suffix does not
+                        # borrow their successful delivery or discard the proof.
+                        again = await self.abandon(path, body, spec="2.4", failure="silent", stage="final",
+                            headers=[(b"x-resume-id", rid.encode())])
+                        self.assertEqual(again.receipt, rid)
+                        self.assertEqual(await self.replay(path, body, prior), [A])
+                        self.assertEqual(commits.call_count, 0)
+
+                        self.sent.clear()
+                        async def full():
+                            if method == "GET":
+                                response = await self.client.get(poll_path, params={"from": 0})
+                                self.assertEqual(response.status_code, 200)
+                                self.assertTrue(response.json()["done"])
+                            else:
+                                peer = Peer(path, payload=body, headers=key, spec=spec)
+                                await asyncio.wait_for(peer.run(), 2)
+                                self.assertEqual(peer.receipt, rid)
+                                self.assertEqual(dict(peer.messages[0]["headers"])[b"x-resumable-replay"], b"1")
+
+                        await asyncio.gather(full(), full())
+                        self.assertEqual(commits.call_count, 1)
+                        self.assertEqual(self.sent, [])  # Same keyed generation, no new call.
+                        self.assertTrue(buf.fully_delivered)
+                        self.assertEqual((store._chat_origin_key_bytes, store._chat_origin_signature_bytes), (0, 0))
+                        self.assertEqual(await self.replay(path, body, prior), [None])
+
+    async def test_abandoned_first_retained_generation_has_no_positive_origin_until_replay(self):
+        for self.channel in ("api_key", "web_proxy"):
+            for mode in ("json", "fake", "stream"):
+                async with self.retained_case(channel=self.channel, mode=mode) as stack:
+                    new_cache(stack)
+                    self.retained_store(stack)
+                    path, body = self.turn(mode)
+                    self.reply = [provider_call(CALL_ID, A)]
+                    lost = await self.abandon(path, body, spec="2.4", failure="silent", stage="final", headers=[])
+                    raw = b"".join(m.get("body", b"") for m in (*lost.messages, *lost.discarded))
+                    assistant = self.echo(httpx.Response(200, content=raw), "openai", mode)
+                    self.assertEqual(await self.replay(path, body, assistant), [None])
+                    replay = Peer(path, payload=body, headers=[(b"x-resume-id", lost.receipt.encode())])
+                    await asyncio.wait_for(replay.run(), 2)
+                    self.assertEqual(await self.replay(path, body, assistant), [A])
+
+    async def test_retained_synthetic_done_and_replacement_json_cannot_publish_a_stage(self):
+        for self.channel, upstream in (("api_key", channel_dispatch.express_upstream),
+                                       ("web_proxy", channel_dispatch.cookie_upstream)):
+            for mode in ("json", "fake", "stream"):
+                async with self.retained_case(channel=self.channel, mode=mode) as stack:
+                    new_cache(stack)
+                    store = self.retained_store(stack)
+                    path, body = self.turn(mode)
+                    prior = await self.issue(path, body, mode, A)
+                    real = upstream.chat_completions
+
+                    async def wrong_source(*args, **kwargs):
+                        response = await real(*args, **kwargs)
+                        if mode == "json":
+                            return JSONResponse({"error": {"code": 502, "message": "fixture replacement"}})
+                        source = response.body_iterator
+
+                        async def frames():
+                            async with aclosing(source):
+                                async for frame in source:
+                                    if frame != DONE_FRAME:
+                                        yield frame  # pump_stream synthesizes its usual framing.
+
+                        response.body_iterator = frames()
+                        return response
+
+                    self.reply = [provider_call(CALL_ID, B)]
+                    peer = Peer(path, payload=body)
+                    with patch.object(upstream, "chat_completions", side_effect=wrong_source):
+                        await asyncio.wait_for(peer.run(), 2)
+                    raw = b"".join(m.get("body", b"") for m in peer.messages)
+                    self.assertIn(b'"error"' if mode == "json" else DONE_FRAME.encode(), raw)
+                    self.assertTrue((await store.get_exact(peer.receipt)).fully_delivered)
+                    self.assertEqual((store._chat_origin_key_bytes, store._chat_origin_signature_bytes), (0, 0))
+                    self.assertEqual(await self.replay(path, body, prior), [A])
+
+    async def test_retained_proof_budget_preserves_only_a_fence_until_full_delivery(self):
+        for mode in ("json", "stream"):
+            for limit in ("_CHAT_ORIGIN_SIGNATURES_PER_BUFFER", "_CHAT_ORIGIN_SIGNATURES_PER_STORE"):
+                async with self.retained_case(mode=mode, limit=limit) as stack:
+                    new_cache(stack)
+                    store = self.retained_store(stack)
+                    stack.enter_context(patch.object(resumable, limit, 0))
+                    path, body = self.turn(mode)
+                    prior = await self.issue(path, body, mode, A)
+                    self.reply = [provider_call(CALL_ID, B)]
+                    lost = await self.abandon(path, body, spec="2.4", failure="silent", stage="final", headers=[])
+                    self.assertGreater(store._chat_origin_key_bytes, 0)
+                    self.assertEqual(store._chat_origin_signature_bytes, 0)
+                    self.assertEqual(await self.replay(path, body, prior), [A])
+                    later = Peer(path, payload=body, headers=[(b"x-resume-id", lost.receipt.encode())])
+                    await asyncio.wait_for(later.run(), 2)
+                    # The explicit original is still on the public wire, even
+                    # when the proof cannot keep a second in-memory copy.
+                    raw = b"".join(m.get("body", b"") for m in later.messages)
+                    self.assertIn(base64.b64encode(B), raw)
+                    self.assertEqual(await self.replay(path, body, prior), [None])
+                    self.assertEqual((store._chat_origin_key_bytes, store._chat_origin_signature_bytes), (0, 0))
+
+    async def test_expired_and_over_capacity_retained_replies_do_not_fence_prior_origin(self):
+        for mode in ("json", "stream"):
+            for loss in ("deadline", "grace", "drop", "body-budget"):
+                async with self.retained_case(mode=mode, loss=loss) as stack:
+                    new_cache(stack)
+                    store = self.retained_store(stack)
+                    path, body = self.turn(mode)
+                    prior = await self.issue(path, body, mode, A)
+                    self.reply = [provider_call(CALL_ID, B)]
+                    if loss == "deadline":
+                        async def too_late(*_args, **_kwargs):
+                            await asyncio.Future()
+                        with (patch.object(chat_api, "_call_upstream", side_effect=too_late),
+                              patch.object(resumable, "request_timeout_seconds", return_value=0.04)):
+                            peer = Peer(path, payload=body)
+                            await asyncio.wait_for(peer.run(), 2)
+                        self.assertEqual((await store.get_exact(peer.receipt)).status_code, 504)
+                    elif loss == "body-budget":
+                        byte_limit = resumable._byte_limit
+                        with patch.object(resumable, "_byte_limit", side_effect=lambda setting, default:
+                                          128 if setting == "resumable_max_buffer_mb" else byte_limit(setting, default)):
+                            peer = Peer(path, payload=body)
+                            await asyncio.wait_for(peer.run(), 2)
+                        self.assertEqual((await store.get_exact(peer.receipt)).status_code, 503)
+                    else:
+                        lost = await self.abandon(path, body, spec="2.4", failure="silent", stage="final", headers=[])
+                        buf = await store.get_exact(lost.receipt)
+                        self.assertGreater(store._chat_origin_signature_bytes, 0)
+                        if loss == "drop":
+                            self.assertTrue(await store.drop(buf.id, expected=buf))
+                        else:
+                            buf.last_disconnect_grace_seconds = 0
+                        peer = Peer(path, payload=body, headers=[(b"x-resume-id", lost.receipt.encode())])
+                        await asyncio.wait_for(peer.run(), 2)
+                        self.assertEqual(peer.messages[0]["status"], 404 if loss == "drop" else 410)
+                    self.assertEqual((store._chat_origin_key_bytes, store._chat_origin_signature_bytes), (0, 0))
+                    self.assertEqual(await self.replay(path, body, prior), [A])
 
     async def test_lost_final_and_done_do_not_fence_an_earlier_delivered_tool_turn(self):
         failures = (("2.4", "raise"), ("2.4", "silent"), ("2.3", "silent"))

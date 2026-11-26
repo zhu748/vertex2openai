@@ -21,6 +21,7 @@ from response_validation import (
     AntiTruncationError,
     FINISH_KNOWN,
     FINISH_TRUNCATING,
+    ResponsesTextCallOwner,
     sdk_function_call,
 )
 
@@ -53,8 +54,8 @@ class TextTransport:
     native_stream: bool = False
     client_tool_names: frozenset[str] = frozenset()
 
-    def decoder(self):
-        return TextDecoder(self.tool_name, self.client_tool_names)
+    def decoder(self, *, allow_empty_incomplete=False):
+        return TextDecoder(self.tool_name, self.client_tool_names, allow_empty_incomplete=allow_empty_incomplete)
 
 
 def prepare_transport(request, base_model: str, settings: dict, *,
@@ -138,7 +139,8 @@ class TextDecoder:
     when a synthetic call follows. Genuine tool calls and thoughts pass through.
     No upstream signatures from a synthetic call are attached to rewritten text.
     """
-    def __init__(self, tool_name: str, client_tool_names=None):
+    def __init__(self, tool_name: str, client_tool_names=None, *, allow_empty_incomplete=False):
+        self.response_owner = ResponsesTextCallOwner(tool_name) if allow_empty_incomplete else None
         self.tool_name = tool_name
         self.client_tool_names = client_tool_names
         self.seen = False
@@ -234,7 +236,8 @@ class TextDecoder:
     def validate_end(self):
         if not self.finish_reason:
             raise AntiTruncationError("抗截断：上游连接已结束，但未收到结束标记。")
-        if not self.visible and not self.real_tool:
+        if not self.visible and not self.real_tool and not (
+                self.response_owner and self.finish_reason in FINISH_TRUNCATING):
             raise AntiTruncationError("抗截断：上游没有返回正文或真实工具调用。")
 
     def restore_sdk(self, response):
@@ -280,7 +283,20 @@ class TextDecoder:
             # A subsequent opaque signature belongs to this real source part,
             # not a private transport call from earlier in the response.
             self.last_call_owned = False
+        if status == "responses_partial_call":
+            name = data.get("name")
+            if not self.response_owner.owns(name, data.get("id"),
+                                            data.get("willContinue", data.get("will_continue")), True):
+                self.last_call_owned = False
+                return [(status, None)]  # Never present client-visible arguments as text.
+            # Only this request's own private tool is a text transport. Preserve
+            # its visible prefix; its private name, signatures and ID stay hidden.
+            call = types.FunctionCall.model_validate(data)
+            text = self.call(call.name, call.args, call.partial_args, call.will_continue)
+            return [("text", text)] if text else []
         if status == "function_call":
+            if self.response_owner:
+                self.response_owner.owns(data.get("name"), data.get("id"), False, False)
             text = self.call(data.get("name"), data.get("args"))
             if text is None:
                 return [(status, data)]

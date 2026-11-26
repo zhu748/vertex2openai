@@ -3,6 +3,7 @@
 import asyncio
 import base64
 from contextlib import ExitStack
+from copy import deepcopy
 import json
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -212,6 +213,91 @@ class ResponsesItemWitnessTests(SchemaRouteHarness):
                                                  no_item_id(thin_item(altered)), (None, None, None), stream=stream)
                     await self.assert_descendant(prompt, first_thin, thin_item(original), (*FIRST, b"child of first"),
                                                  stream=stream)
+
+    async def test_receipt_binds_signed_ordinary_positions_before_inferring_a_tool_or_child(self):
+        first_ordinary = b"\xfb\xff-ordinary A"
+        other_ordinary = b"\xfd\xfe-ordinary B"
+        parent_sig, child_sig = b"original tool A", b"original child of A"
+        for self.channel in ("api_key", "web_proxy"):
+            for stream in (False, True):
+                for kind in ("text", "thought"):
+                    with self.subTest(channel=self.channel, stream=stream, kind=kind), ExitStack() as stack:
+                        new_cache(stack)
+                        prompt = "Check the ordinary Parts of a tool turn."
+
+                        def parts(sig, signed_position=0):
+                            return [{"text": text, **({"thought": True} if kind == "thought" else {}),
+                                     **({"thoughtSignature": base64.b64encode(sig).decode()}
+                                        if i == signed_position else {})}
+                                    for i, text in enumerate(("Inspect ", "colors."))]
+
+                        def model_parts():
+                            wire = self.sent[-1].get("variables", self.sent[-1])
+                            return [p for turn in wire["contents"] if turn["role"] == "model" for p in turn["parts"]]
+
+                        async def replay(owner, call, leaf, expected, ordinary):
+                            result = {"type": "function_call_output", "call_id": leaf["call_id"], "output": "ok"}
+                            await self.generate([*continuation(prompt, [owner, call]), leaf, result], stream,
+                                                {"text": "Finished."})
+                            wire = self.sent[-1]
+                            ids = [call["call_id"], leaf["call_id"]]
+                            for field in ("functionCall", "functionResponse"):
+                                self.assertEqual([p[field]["id"] for p in calls_in_wire(wire, field)], ids)
+                            self.assertEqual([signature(p) for p in calls_in_wire(wire, "functionCall")], expected)
+                            owners = [(p["text"], bool(p.get("thought")), signature(p))
+                                      for p in model_parts() if "text" in p and signature(p)]
+                            self.assertEqual(owners, [(text, kind == "thought", sig) for text, sig in ordinary])
+
+                        a, call = await self.generate(prompt, stream, [*parts(first_ordinary), assistant("parent", parent_sig)])
+                        b, other_call = await self.generate(prompt, stream, [
+                            *parts(other_ordinary), assistant("parent", b"original tool B")])
+                        moved, _ = await self.generate(prompt, stream, [
+                            *parts(first_ordinary, signed_position=1), assistant("parent", b"other placement")])
+                        self.assertNotEqual(call["id"], other_call["id"])
+                        self.assertEqual(call["call_id"], other_call["call_id"])
+                        thin_call = thin_item(call)
+                        child, = await self.generate(continuation(prompt, [a, thin_call]), stream, assistant("child", child_sig))
+                        self.assertEqual([signature(p) for p in model_parts()], [first_ordinary, None, parent_sig])
+                        leaf = thin_item(child)
+                        await replay(a, thin_call, leaf, [parent_sig, child_sig], [("Inspect ", first_ordinary)])
+
+                        # Compare originals, not spelling or the unused top-level duplicate.
+                        equivalent = deepcopy(a)
+                        normalized = equivalent["extra_content"]["google"]
+                        normalized["ordinary_parts"][0]["thought_signature"] = (
+                            base64.urlsafe_b64encode(first_ordinary).decode().rstrip("="))
+                        normalized["thought_signature"] = base64.b64encode(other_ordinary).decode()
+                        await replay(equivalent, thin_call, leaf, [parent_sig, child_sig], [("Inspect ", first_ordinary)])
+
+                        no_order = deepcopy(a)
+                        del no_order["extra_content"]["google"]["part_order"]
+                        malformed = deepcopy(a)
+                        malformed["extra_content"]["google"]["ordinary_parts"][0]["thought_signature"] = "*invalid-original*"
+                        wrong_text = deepcopy(a)
+                        wrong_text["extra_content"]["google"]["ordinary_parts"][0]["text"] = "Unrelated"
+                        for owner, originals in (
+                            (b, [("Inspect ", other_ordinary)]),
+                            (moved, [("colors.", first_ordinary)]),
+                            (no_order, [("Inspect ", first_ordinary)]),
+                            (malformed, []), (wrong_text, []), (thin_item(a), []),
+                        ):
+                            await replay(owner, thin_call, leaf, [None, None], originals)
+
+                        # Exact-mismatch veto must not rewrite any explicit Part
+                        # or call carrier, even when their ancestry differs.
+                        await replay(b, call, child, [parent_sig, child_sig], [("Inspect ", other_ordinary)])
+                        altered, = await self.generate(continuation(prompt, [b, thin_call]), stream,
+                                                       assistant("altered child", b"original child of altered history"))
+                        self.assertEqual([signature(p) for p in model_parts()], [other_ordinary, None, None])
+                        await replay(a, thin_call, thin_item(altered), [parent_sig, None], [("Inspect ", first_ordinary)])
+                        await replay(b, thin_call, thin_item(altered), [None, None], [("Inspect ", other_ordinary)])
+
+                        # Omitting all item IDs must not borrow A's ordinary
+                        # context through the legacy visible-only alias.
+                        idless, idless_leaf = no_item_id(thin_call), no_item_id(leaf)
+                        await replay(a, idless, idless_leaf, [None, None], [("Inspect ", first_ordinary)])
+                        await replay(thin_item(a), idless, idless_leaf, [None, None], [])
+                        await replay(a, thin_call, leaf, [parent_sig, child_sig], [("Inspect ", first_ordinary)])
 
     async def test_new_explicit_signature_on_unsigned_predecessor_slot_breaks_lineage(self):
         for self.channel in ("api_key", "web_proxy"):

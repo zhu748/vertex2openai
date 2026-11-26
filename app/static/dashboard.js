@@ -145,6 +145,7 @@
           toast('保存响应未确认提交的设置；请重新加载并核对草稿。');
           return false;
         }
+        protectSettingsReads(fields.map(([key]) => key));
         if (onSaved) onSaved(saved);
         return true;
       }

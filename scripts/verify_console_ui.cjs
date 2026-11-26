@@ -1424,6 +1424,124 @@ async function main() {
     await draftPage.close();
     check('手机上可查看并逐个撤销已下架模型的草稿；模型恢复后继续编辑且只写入原作用域');
 
+    // Exercise the real startup/recovery buttons while the initial settings
+    // and capability snapshots are delayed. No direct page-state mutation.
+    const readRacePage=await context.newPage();
+    const raceModel='/api/model-overrides/gemini-4-argon';
+    let holdInitial=true,failInitialMode=true,announceRead,releaseRead;
+    const initialSettings=new Promise(resolve=>{announceRead=resolve;});
+    const allowRead=new Promise(resolve=>{releaseRead=resolve;});
+    const originalCaps=readRacePage.waitForResponse(r=>new URL(r.url()).pathname==='/api/capabilities');
+    await readRacePage.route('**/api/settings/runtime',route=>{
+      if(!failInitialMode)return route.continue();
+      failInitialMode=false;
+      return route.fulfill({status:503,json:{error:'initial channel read failed'}});
+    });
+    await readRacePage.route('**/api/settings',async route=>{
+      if(!holdInitial||route.request().method()!=='GET')return route.continue();
+      holdInitial=false;
+      const response=await route.fetch();
+      announceRead(await response.json());
+      await allowRead;
+      return route.fulfill({response});
+    });
+    try {
+      await readRacePage.goto(origin+'/#channel');
+      const before=await initialSettings;
+      assert.equal((await originalCaps).status(),200);
+      await readRacePage.locator('#channel-load-error').getByRole('button',{name:'重新加载配置'}).click();
+      await readRacePage.waitForFunction(()=>!document.querySelector('#channel-load-error button').disabled);
+      await readRacePage.locator('.tab[data-tab=runtime]').click();
+      const retryValue=before.retry_max+1;
+      await readRacePage.fill('#retry_max',String(retryValue));
+      assert.equal((await saveRuntime(readRacePage)).status(),200);
+      await readRacePage.locator('.tab[data-tab=params]').click();
+      await readRacePage.selectOption('#model-sel','gemini-4-argon');
+      const timeoutValue=Number(await readRacePage.inputValue('#first_reply_timeout_seconds'))+5;
+      await readRacePage.fill('#first_reply_timeout_seconds',String(timeoutValue));
+      assert.equal((await saveModelScope(readRacePage,raceModel)).status(),200);
+      const lateRead=readRacePage.waitForResponse(r=>new URL(r.url()).pathname==='/api/settings'&&r.request().method()==='GET');
+      releaseRead();
+      assert.equal((await lateRead).status(),200);
+      await (await lateRead).finished();
+      // The next real click also checks the submitted CAS, rather than only
+      // comparing control text with a possibly not-yet-handled response.
+      assert.equal(await readRacePage.inputValue('#first_reply_timeout_seconds'),String(timeoutValue));
+      await readRacePage.fill('#first_reply_timeout_seconds',String(timeoutValue+1));
+      const nextModel=await saveModelScope(readRacePage,raceModel);
+      assert.equal(nextModel.status(),200);
+      assert.deepEqual(nextModel.request().postDataJSON()._expected.first_reply_timeout_seconds,
+        {present:true,value:timeoutValue});
+      await readRacePage.locator('.tab[data-tab=runtime]').click();
+      assert.equal(await readRacePage.inputValue('#retry_max'),String(retryValue));
+      await readRacePage.fill('#retry_max',String(retryValue+1));
+      const nextRuntime=await saveRuntime(readRacePage);
+      assert.equal(nextRuntime.status(),200);
+      assert.deepEqual(nextRuntime.request().postDataJSON()._expected.retry_max,{present:true,value:retryValue});
+      await readRacePage.waitForFunction(()=>!consoleForms.dirty());
+    } finally {
+      releaseRead();
+      await readRacePage.close();
+    }
+    check('初次配置读取迟到时，真实重载与保存按钮不会回滚已经确认的全局和模型设置');
+
+    const numberPage=await context.newPage();
+    const modelNumberWrites=[];
+    numberPage.on('request',request=>{
+      if(new URL(request.url()).pathname===raceModel&&request.method()==='POST')
+        modelNumberWrites.push(request.postDataJSON());
+    });
+    try {
+      const initial=await page.request.post(origin+raceModel,{data:{first_reply_timeout_seconds:40,default_max_tokens:512}});
+      assert.equal(initial.status(),200);
+      await numberPage.setViewportSize({width:390,height:844});
+      await numberPage.goto(origin+'/#params');
+      await numberPage.selectOption('#model-sel','gemini-4-argon');
+      const leaveAndReturn=async()=>{
+        await numberPage.selectOption('#model-sel','gemini-4-carbon');
+        await numberPage.selectOption('#model-sel','gemini-4-argon');
+      };
+      const timeout=numberPage.locator('#first_reply_timeout_seconds');
+      assert.equal(await timeout.inputValue(),'40');
+      await timeout.press('End');await timeout.press('e');
+      assert.equal(await timeout.evaluate(input=>input.validity.badInput),true);
+      await leaveAndReturn();
+      assert.equal(await timeout.evaluate(input=>input.validity.badInput),false);
+      assert.equal(await timeout.getAttribute('aria-invalid'),'true');
+      assert.match(await numberPage.textContent('#first_reply_timeout_seconds-error'),/尚未输入完成/);
+      // The mobile footer is another entry point to the same save.
+      await numberPage.locator('button[onclick="runAction(this,saveModelOverride)"]').click();
+      await numberPage.waitForFunction(()=>document.querySelector('#toast').textContent.includes('请修正'));
+      assert.deepEqual(modelNumberWrites,[]);
+      assert.equal(await numberPage.evaluate(()=>consoleForms.dirty()),true);
+      assert.equal((await (await page.request.get(origin+'/api/model-overrides')).json())['gemini-4-argon'].first_reply_timeout_seconds,40);
+      await timeout.fill('41');await timeout.fill('');
+      await leaveAndReturn();
+      const cleared=await saveModelScope(numberPage,raceModel);
+      assert.equal(cleared.status(),200);
+      assert.deepEqual(cleared.request().postDataJSON(),{first_reply_timeout_seconds:0,
+        _expected:{first_reply_timeout_seconds:{present:true,value:40}}});
+
+      const tokens=numberPage.locator('#default_max_tokens');
+      await tokens.press('End');await tokens.press('e');
+      assert.equal(await tokens.evaluate(input=>input.validity.badInput),true);
+      await leaveAndReturn();
+      assert.equal(await tokens.getAttribute('aria-invalid'),'true');
+      await numberPage.locator('button[onclick="discardModelDraft()"]').click();
+      assert.equal(await tokens.inputValue(),'512');
+      assert.equal(await tokens.getAttribute('aria-invalid'),null);
+      assert.deepEqual(modelNumberWrites,[cleared.request().postDataJSON()]);
+      await tokens.fill('');
+      const nullable=await saveModelScope(numberPage,raceModel);
+      assert.equal(nullable.status(),200);
+      assert.deepEqual(nullable.request().postDataJSON(),{default_max_tokens:null,
+        _expected:{default_max_tokens:{present:true,value:512}}});
+      assert.equal(await numberPage.evaluate(()=>consoleForms.dirty()),false);
+    } finally {
+      await numberPage.close();
+    }
+    check('模型切换保留未完成的数字及校验；撤销或明确清空才会恢复超时和采样默认值');
+
     const beforeLogout=page.url();
     await page.route('**/api/logout',route=>route.fulfill({status:503,json:{error:'测试退出失败'}}));
     pending=responseFor('/api/logout');

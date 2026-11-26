@@ -10,7 +10,7 @@ import httpx
 
 from request_errors import declared_body_exceeds
 from response_validation import IncompleteResponseError
-from stream_cleanup import await_owned_close
+from stream_cleanup import AttemptCancellation, await_owned_close
 
 MAX_UPSTREAM_RESPONSE_BYTES = 64 * 1024 * 1024
 MAX_UPSTREAM_ERROR_BYTES = 1024 * 1024
@@ -53,6 +53,14 @@ async def close_httpx_response(response: httpx.Response) -> None:
         # it is still releasing the connection. Keep the caller's lease too.
         if isinstance(owner, _OwnedHttpxStream) and not owner.finished.is_set():
             await await_owned_close(owner.finished.wait())
+
+
+async def send_owned_httpx(send, request, **kwargs) -> httpx.Response:
+    """Take ownership at headers; never start a body read for an abandoned send."""
+    cancellation = AttemptCancellation()
+    response = await send(request, stream=True, **kwargs)
+    own_httpx_response(response)
+    return await cancellation.transfer(response, close_httpx_response)
 
 
 async def read_limited_bytes(response, limit: int) -> bytes:
@@ -131,8 +139,7 @@ class BoundedAsyncClient(httpx.AsyncClient):
     """Cookie HTTP client: stream internally even for an ordinary post/get."""
 
     async def send(self, request, *, stream=False, **kwargs):
-        response = await super().send(request, stream=True, **kwargs)
-        own_httpx_response(response)
+        response = await send_owned_httpx(super().send, request, **kwargs)
         if stream:
             return response
         try:

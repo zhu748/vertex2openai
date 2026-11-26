@@ -7,7 +7,9 @@ from contextlib import asynccontextmanager, suppress
 from contextvars import ContextVar
 from typing import Any, AsyncIterable, AsyncIterator, Awaitable, Callable, Optional
 
-from stream_cleanup import await_owned_close
+import anyio
+
+from stream_cleanup import AttemptCancellation, await_owned_close
 
 import config as app_config
 from runtime_state import app_state
@@ -40,15 +42,21 @@ def _check_active_budget(guard: Optional["FirstReplyGuard"] = None) -> None:
         # A transport may translate CancelledError to a network error. Do not
         # open a second route or mark first output when cancellation is pending.
         raise asyncio.CancelledError()
-    if not current.ready and time.monotonic() >= current.deadline:
+    if current.seconds and not current.ready and time.monotonic() >= current.deadline:
         raise current._timeout_error()
+
+
+async def check_private_retry() -> None:
+    """A nested retry is still owned by the private read that produced its trigger."""
+    await anyio.lowlevel.checkpoint_if_cancelled()
+    _check_active_budget()
 
 
 @asynccontextmanager
 async def proxy_attempt(enabled: bool) -> AsyncIterator[None]:
     """Each candidate shares the outer wait's deadline; never start one after expiry."""
     if enabled:
-        _check_active_budget()
+        await check_private_retry()
     yield
 
 
@@ -123,8 +131,22 @@ class FirstReplyGuard:
         return FirstReplyTimeout(message + "。", seconds=self.seconds)
 
     async def wait(self, operation: Awaitable) -> Any:
-        if self.ready or not self.seconds:
-            return await operation
+        if self.ready:
+            return await operation  # no per-token cancellation bookkeeping after the first reply
+        if not self.seconds:
+            # Even without a first-reply timer the private startup read belongs
+            # to the peer/server or total deadline that cancelled it. Some HTTP
+            # adapters return EOF, an error event or buffered usage instead.
+            cancellation = AttemptCancellation()
+            token = _active_wait.set((self, cancellation.owner, cancellation.initial))
+            try:
+                result = await operation
+                return await cancellation.transfer(result, _close_unused)
+            except Exception:
+                await cancellation.check()
+                raise
+            finally:
+                _active_wait.reset(token)
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
             await _discard_unstarted(operation)

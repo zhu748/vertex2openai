@@ -396,14 +396,14 @@ def _merge_cookie_turns(contents: list[dict]) -> list[dict]:
 
 
 def _convert_messages_to_contents(messages: list, model_name: str = "", native_tools: bool = True, *,
-                                  destination: bytes | None = None) -> tuple:
+                                  destination: bytes | None = None, literal_text: bool = False) -> tuple:
     """OpenAI messages → batchGraphql contents.
 
     Native mode emits camelCase ``functionCall`` / ``functionResponse`` Parts.
     ``native_tools=False`` is the controlled compatibility fallback used only
     after a clear schema/model rejection from the upstream.
     """
-    history = ManagedImageHistory.for_request()
+    history = None if literal_text else ManagedImageHistory.for_request()
     contents = []
     system_parts = []
     require_sig = requires_signature(model_name)
@@ -520,7 +520,7 @@ def _convert_messages_to_contents(messages: list, model_name: str = "", native_t
                 reasoning = getattr(msg, "reasoning_content", None)
                 if reasoning:
                     ordinary_parts.extend(openai_content_to_wire_parts(reasoning, history, thought=True))
-                ordinary_parts.extend(openai_content_to_wire_parts(content, history))
+                ordinary_parts.extend(openai_content_to_wire_parts(content, history, literal_text=literal_text))
                 _attach_message_signature(ordinary_parts, msg)
 
             google = google_metadata(msg)
@@ -537,10 +537,10 @@ def _convert_messages_to_contents(messages: list, model_name: str = "", native_t
         parts = _ordinary_wire_parts_from_extra(msg, history) if role in ("assistant", "model") else None
         if parts is None:
             assistant = role in ("assistant", "model")
-            parts = openai_content_to_wire_parts(content, history if assistant else None)
+            parts = openai_content_to_wire_parts(content, history if assistant else None, literal_text=literal_text)
             if assistant:
                 reasoning = msg.reasoning_content
-                if reasoning and ("ordinary_parts" in google_metadata(msg) or history and history.pattern.search(reasoning)):
+                if reasoning and (literal_text or "ordinary_parts" in google_metadata(msg) or history and history.pattern.search(reasoning)):
                     parts = openai_content_to_wire_parts(reasoning, history, thought=True) + parts
                 _attach_message_signature(parts, msg)
         if parts:
@@ -583,7 +583,7 @@ def build_request_body(
     model_path = studio_model_resource(project_id, model_name)
     contents, system_text = _convert_messages_to_contents(
         request.messages, model_name=model_name, native_tools=native_tools,
-        destination=publisher_destination(model_path),
+        destination=publisher_destination(model_path), literal_text=request._completion_target == "responses",
     )
 
     settings = app_state.get_effective_settings(model_name)
