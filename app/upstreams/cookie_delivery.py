@@ -988,9 +988,6 @@ async def _finalize_cookie_stream(gen: "CookieGeneration", st: _StreamAttemptSta
                 google["thought_signature_part"] = last_signed["kind"]
             yield _choice_frame(gen, extra_content={"google": google})
         finish_reason = map_finish_reason_to_openai(st.finish_raw, has_tool_calls=st.got_tool_call)
-        if (finish_reason == "tool_calls" and not gen.prefill_text and not st.pending_safety_html
-                and st.signature_origin.prefix):
-            st.signature_origin.finish_plain_parts(st.ordinary_metadata, st.part_order)
         yield _choice_frame(gen, finish_reason=finish_reason)
     else:
         # 无正文：明确告知客户端 + 落诊断日志（旧版此处一个字节都不发就关流）
@@ -1013,12 +1010,15 @@ async def _finalize_cookie_stream(gen: "CookieGeneration", st: _StreamAttemptSta
         usage_prefix = notice  # Same logical content as the whole-response diagnostic.
         yield _choice_frame(gen, content=f"\n{notice}")
         yield _choice_frame(gen, finish_reason=no_body_finish)
+        finish_reason = no_body_finish
 
     if gen.want_usage:
         usage = _final_usage(st.usage_meta, gen.request_obj,
                              _stream_usage_fragments(usage_prefix, st.ordinary_metadata))
         yield make_usage_chunk(gen.response_id, gen.model_display, usage, created=gen.response_created)
 
+    if finish_reason == "tool_calls" and not gen.prefill_text and not st.pending_safety_html:
+        st.signature_origin.finish_plain_parts(st.ordinary_metadata, st.part_order)
     yield "data: [DONE]\n\n"
 
     elapsed = time.time() - gen.start_time
@@ -1325,9 +1325,11 @@ def _assemble_whole_response(gen: "CookieGeneration", st: _WholeBodyState) -> "R
         ],
         "usage": usage,
     }
-    publish_completed_origins(gen.request_obj._signature_output_prefix, payload["choices"])
     response_class = LargeJSONResponse if gen.is_image else JSONResponse
-    return response_class(content=payload)
+    response = response_class(content=payload)
+    if not gen.request_obj.stream:
+        publish_completed_origins(gen.request_obj._signature_output_prefix, payload["choices"])
+    return response
 
 
 async def _collect_with_tool_fallback(
@@ -1510,6 +1512,8 @@ async def deliver_buffered_frames(gen: "CookieGeneration") -> AsyncIterator[str]
             async for frame in buffered_sse(
                 payload, include_usage=gen.want_usage
             ).body_iterator:
+                if frame == "data: [DONE]\n\n":
+                    publish_completed_origins(gen.request_obj._signature_output_prefix, payload["choices"])
                 yield frame
     except asyncio.CancelledError:
         raise

@@ -360,7 +360,7 @@ def resolve_tool_call_signature(
     explicit_signature: Optional[bytes] = None,
     explicit_unsigned: bool = False,
     origin_key: bytes | None = None,
-    *, literal_id: bool = False, claude_literal: bool = False,
+    *, literal_id: bool = False,
 ) -> Tuple[str, Optional[bytes]]:
     """Prefer genuine carried bytes, then a proven origin. Never upgrade a placeholder to proof."""
     ident = str(tool_call_id or "")
@@ -406,11 +406,9 @@ def resolve_tool_call_signature(
     if strict:
         _missing_required()
     if literal_id:
-        if claude_literal:
-            # A bare Claude tool_use ID never carries Google bytes. Its contents
-            # are not a reason to synthesize a signature or change the ID.
-            return real_id, None
-        _missing_required()
+        # A literal ID or its format hint never carries Google bytes. Preserve
+        # the original ID and let Gemini decide whether it needs the signature.
+        return real_id, None
     print("⚠️ [工具调用] 必需的思考签名无法恢复，已使用兼容模式的跳过校验哨兵。")
     # Preserve an explicitly selected documented legacy placeholder *only* at
     # the existing compatibility fallback, never as evidence or as a follower.

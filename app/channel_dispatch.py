@@ -19,10 +19,11 @@ from starlette.requests import ClientDisconnect
 
 from admission import SETUP_FAST_WINDOW_SECONDS, ManagedStreamingResponse
 from channel_capabilities import cookie_feature_error
-from credential_manager import credential_manager
+from credential_manager import CookiePoolCoolingDown, credential_manager
 from logger import stats
 from models import OpenAIRequest
-from retry_policy import note_retry_deadline, response_requests_delay, response_retry_after, retry_after_seconds
+from retry_policy import (bounded_sse_advisory, exception_retry_after, note_retry_deadline,
+                          response_requests_delay, response_retry_after, retry_after_seconds)
 from request_connection import ClientConnection
 from stream_cleanup import await_owned_close
 from resumable import DONE_FRAME, DetachedRequest, request_timeout_seconds
@@ -67,6 +68,13 @@ def _fallback_eligible_code(code) -> bool:
 def _fallback_eligible_response(response, default_code: int) -> bool:
     return (_fallback_eligible_code(getattr(response, "status_code", default_code))
             and not response_requests_delay(response))
+
+
+def _carry_standby_delay(primary, value):
+    """Retain the primary status/body; the last provider can still advise a delay."""
+    hint = bounded_sse_advisory(value)
+    if retry_after_seconds(hint):
+        primary.headers["Retry-After"] = hint
 
 
 def _structured_locks_express(request_obj: OpenAIRequest) -> bool:
@@ -187,6 +195,7 @@ async def _try_channel_fallback(
     primary_label: str,
     reason: str,
     deadline: float,
+    *, record_failure=None,
 ):
     """启动备用通道调用；失败返回 None（由调用方回退主通道错误）。"""
     async def attempt():
@@ -201,6 +210,8 @@ async def _try_channel_fallback(
     except (asyncio.CancelledError, StreamDeadlineExceeded):
         raise
     except Exception as exc:
+        if record_failure is not None:
+            record_failure(exc)
         code, msg = extract_upstream_error(exc)
         # 不在此 add_error（2026-11 C-3 修复）：主通道失败已计过一次错误，
         # 兜底通道自身的流式/非流式路径也会按各自口径计数，这里再计会使
@@ -374,12 +385,14 @@ async def _apply_json_fallback(
         return result
     alt = await _try_channel_fallback(
         request_obj, fastapi_request, fallback_channel, _channel_label(primary_channel),
-        f"非流式失败（HTTP {code}）", deadline)
+        f"非流式失败（HTTP {code}）", deadline,
+        record_failure=lambda exc: _carry_standby_delay(result, exception_retry_after(exc)))
     if alt is None:
         return result
     if getattr(alt, "status_code", 502) < 400:
         return alt
     print(f"ℹ️ [跨通道兜底] 备用通道非流式也失败（HTTP {getattr(alt, 'status_code', 502)}），返回主通道错误。")
+    _carry_standby_delay(result, getattr(alt, "headers", {}).get("retry-after"))
     return result
 
 
@@ -400,8 +413,12 @@ async def _dispatch_upstream(request_obj: OpenAIRequest, fastapi_request: Reques
             # 结构化输出默认只选 Express（Cookie 私有协议未验证）；控制台
             # 打开 cookie_structured_output 后 Cookie 记录同样参与选择。
             structured = _structured_locks_express(request_obj)
-            record = credential_manager.get_mixed_record(
-                fastapi_request.app.state.express_key_manager, express_only=structured)
+            try:
+                record = credential_manager.get_mixed_record(
+                    fastapi_request.app.state.express_key_manager, express_only=structured)
+            except CookiePoolCoolingDown as exc:
+                return JSONResponse(status_code=503, headers={"retry-after": str(exc.retry_after)},
+                                    content=create_openai_error_response(503, str(exc), "upstream_error"))
             if record is None:
                 return JSONResponse(status_code=401, content=create_openai_error_response(
                     401, "没有可用的上游账号。请启用 Express Key 或填写完整的 Cookie 与 Project ID；结构化输出（未开启 Cookie 支持）、多候选与 logprobs 请求需要 Express Key。",

@@ -361,7 +361,8 @@ class ReplayHTTPDeliveryTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(buf.readers, 0)
                         buf.finished_monotonic -= 86400
                         self.assertEqual(await self.store.sweep(), 0)
-                        other = Peer("/v1/chat/completions", payload={"model": "other-model", "messages": []})
+                        other = Peer("/v1/chat/completions", payload={"model": "other-model", "messages": []},
+                                     headers=[(b"x-resumable", b"true")])
                         await other.run()
                         self.assertEqual(other.messages[0]["status"], 503)
                         self.assertIs(await self.store.get_exact(buf.id), buf)

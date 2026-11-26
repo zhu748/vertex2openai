@@ -121,6 +121,7 @@ class OmittedClaudeProjection:
         self._shape = origins._digest(b"claude-shape-v1")
         self._blocks = 0
         self._proof = None
+        self._withheld = False
         self._source = None
         self._buffered_after_tool = False
         self._ordered_count = None
@@ -131,6 +132,9 @@ class OmittedClaudeProjection:
 
     def discard(self):
         self.prefix = self._proof = None
+
+    def withhold(self):
+        self._withheld = True
 
     def source(self, source_id):
         if not isinstance(source_id, str) or not source_id or len(source_id) > 256:
@@ -146,7 +150,10 @@ class OmittedClaudeProjection:
         # Express fake streaming announces the complete topology on its
         # opening role frame, before it emits the fragmented tool calls.
         extra = google_metadata({"extra_content": value})
-        order, ordinary = extra.get("part_order"), extra.get("ordinary_parts")
+        # Express emits part_order alone for a tool-only response. The
+        # topology validator below still requires all contiguous tool slots
+        # and rejects an explicit non-list ordinary_parts value.
+        order, ordinary = extra.get("part_order"), extra.get("ordinary_parts", [])
         count = 0
         if order is not None:
             if not isinstance(order, list) or not isinstance(ordinary, list):
@@ -159,13 +166,16 @@ class OmittedClaudeProjection:
                 return
             self._ordered_count = count
         if not origins._plain_metadata(value, count):
-            self.discard()
+            self.withhold()
 
     def reserve_signature(self, size):
+        if self._withheld:
+            return False
         self._remaining_encoded -= size
         if self._remaining_encoded < 0:
-            self.discard()
-        return bool(self.prefix)
+            self.withhold()
+            return False
+        return True
 
     def add_text(self, text, *, start):
         if not self.prefix:
@@ -239,22 +249,16 @@ class OmittedClaudeProjection:
                 if arguments is None:
                     arguments = "{}"
                 payload = {"id": ident, "function": {"name": name, "arguments": arguments}}
-                encoded = google_metadata(source).get("thought_signature")
-                sig = b""
-                if encoded is not None:
-                    if not isinstance(encoded, str) or len(encoded) > self.max_encoded_signature:
-                        raise ValueError
-                    sig = base64.b64decode(encoded, validate=True)
-                    if not sig or base64.b64encode(sig).decode("ascii") != encoded:
-                        raise ValueError
-                if sig in SKIP_VALIDATOR_SENTINELS or len(sig) > origins._MAX_SIGNATURE_BYTES:
-                    raise ValueError
-                remaining_sig -= len(sig)
-                if remaining_sig < 0:
-                    raise ValueError
                 tags.append(origins._call_tag(payload, budget))
-                signatures.append(sig)
                 seen.add(ident)
+                if not self._withheld:
+                    signature = self._signature(google_metadata(source).get("thought_signature"), remaining_sig)
+                    if signature is None:
+                        self.withhold()
+                        signatures.clear()
+                    else:
+                        signatures.append(signature)
+                        remaining_sig -= len(signature)
         except (AttributeError, binascii.Error, KeyError, TypeError, ValueError, OverflowError, RecursionError):
             self.discard()
             return
@@ -267,13 +271,31 @@ class OmittedClaudeProjection:
             _shape_field(self._shape, self._text_block.result())
             self._text_block = None
         key = _batch_key(self.scope, origins._slot_keys(prefix, tags), self._shape.digest())
-        proof = b"".join(len(signature).to_bytes(_LENGTH_BYTES, "big") + signature for signature in signatures)
+        proof = (None if self._withheld else
+                 b"".join(len(signature).to_bytes(_LENGTH_BYTES, "big") + signature for signature in signatures))
         self._proof = key, proof
+
+    def _signature(self, encoded, remaining):
+        if encoded is None:
+            return b""
+        if not isinstance(encoded, str) or len(encoded) > self.max_encoded_signature:
+            return None
+        try:
+            signature = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError):
+            return None
+        if (not signature or len(signature) > min(remaining, origins._MAX_SIGNATURE_BYTES)
+                or signature in SKIP_VALIDATOR_SENTINELS or base64.b64encode(signature).decode() != encoded):
+            return None
+        return signature
 
     async def publish(self):
         if self._proof is not None:
             key, data = self._proof
-            origins.signature_store.register_call_signature(key, data)
+            if data is None:
+                origins.mark_unrestorable_origin(key)
+            else:
+                origins.signature_store.register_call_signature(key, data)
         self.discard()
 
     @property

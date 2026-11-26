@@ -16,6 +16,7 @@ from response_validation import (IncompleteResponseError, StreamToolCallIds, com
 from json_stream import MAX_JSON_OBJECT_BYTES, JsonObjects as _JsonObjects
 from signature_store import signature_store
 from upstreams.cookie_candidate_metadata import native_candidate_metadata, native_prompt_feedback
+from upstreams.cookie_native_parts import extend_native_metadata, extend_native_payload
 from thought_signatures import (
     attach_signature_extra,
     decode_thought_signature as signature_bytes_from_wire,
@@ -462,7 +463,9 @@ def extract_events(obj: dict, *, preserve_parts: bool = False, strip_thoughts: b
                         yield "thought_signature", {"value": signature, "part_kind": ordinary_kind}
 
                 if preserve_parts:
+                    extend_native_payload(part, native_part)
                     _finish_native_part(native_part, signature, empty_text=part.get("text") == "", thought=thought)
+                    extend_native_metadata(part, native_part)
                     if native_part:
                         yield "native_part", native_part
 

@@ -49,6 +49,10 @@ class BufferCapacityError(RuntimeError):
     code = 503
 
 
+class FreshReplayCapacityError(BufferCapacityError):
+    """A new request has no retained generation and cannot allocate a receipt."""
+
+
 class ResumeRequestError(ValueError):
     def __init__(self, code: int, message: str):
         self.code = code
@@ -868,9 +872,12 @@ class ResumableStore:
     async def get_or_create_request(self, request_key: str, *, model: str, kind: str,
                                     fingerprint_key: str, idempotent: bool = False):
         """A request key selects a generation; completed generations keep unique IDs."""
+        fresh = True
         while True:
             async with self._lock:
                 old = self._buffers.get(self._requests.get(request_key, request_key))
+                if old is not None:
+                    fresh = False
                 closing = None
                 if old and old.kind == kind:
                     if old.resume_expired():
@@ -883,7 +890,7 @@ class ResumableStore:
                         # but its terminal can precede both iterator and response close.
                         closing = self._draining(old)
                 if closing is None:
-                    return await self._admit_locked(request_key, model, kind, fingerprint_key), True
+                    return await self._admit_locked(request_key, model, kind, fingerprint_key, fresh=fresh), True
             # The old receipt and its request mapping remain authoritative
             # while cleanup owns resources, including if this waiter times out
             # or is cancelled. Only after cleanup do contenders elect one owner.
@@ -891,7 +898,7 @@ class ResumableStore:
             if not done:
                 raise BufferCapacityError("旧请求仍在关闭连接，请稍后重试。")
 
-    async def _admit_locked(self, request_key, model, kind, fingerprint_key):
+    async def _admit_locked(self, request_key, model, kind, fingerprint_key, *, fresh):
         if len(self._buffers) >= max_streams() or self._bytes_used >= _byte_limit("resumable_max_total_mb", 256):
             for candidate in sorted(self._buffers.values(), key=lambda b: b.started_monotonic):
                 if self._evictable(candidate):
@@ -899,7 +906,8 @@ class ResumableStore:
                     if len(self._buffers) < max_streams() and self._bytes_used < _byte_limit("resumable_max_total_mb", 256):
                         break
             else:
-                raise BufferCapacityError("响应缓冲容量已满，请稍后重试。")
+                error = FreshReplayCapacityError if fresh else BufferCapacityError
+                raise error("响应缓冲容量已满，请稍后重试。")
         buf = ResumableBuffer("rid-" + secrets.token_hex(16), model=model, kind=kind)
         buf.request_key, buf.fingerprint_key = request_key, fingerprint_key
         self._attach(buf)

@@ -50,6 +50,7 @@ from resumable import (
     within_request_deadline,
     buffered_setup_result,
     fast_setup_completed,
+    FreshReplayCapacityError,
     ResumeRequestError,
 )
 
@@ -381,16 +382,28 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
         # 普通聊天客户端通常把“取消后重发”理解为重新生成；允许单次请求
         # 直通，避免相同请求体反复接回一个仍在等待的后台任务。
         requested, explicit = resume_intent(fastapi_request, default_on=True)
+        unbuffered = False
         if requested and resumable_enabled():
             if not image_bypass_enabled(request.model):
-                if request.stream:
-                    return await _resumable_stream(fastapi_request, request, api_key)
-                return await _resumable_json(fastapi_request, request, api_key)
-            if not explicit:
+                try:
+                    if request.stream:
+                        return await _resumable_stream(fastapi_request, request, api_key)
+                    return await _resumable_json(fastapi_request, request, api_key)
+                except FreshReplayCapacityError:
+                    # No receipt or producer started. Only an implicit new
+                    # call can lose replay rather than fail: do not bypass a
+                    # caller's explicit opt-in, cursor, or idempotency contract.
+                    if explicit or any(name in fastapi_request.headers for name in (
+                            "x-resumable", "idempotency-key", "x-idempotency-key")):
+                        raise
+                    unbuffered = True
+            elif not explicit:
                 print(f"🖼️ [生图直通] {request.model}：绕过续传缓冲（resumable_image_streams=false），降低内存驻留。")
         if explicit:
             raise ResumeRequestError(409, "当前请求不支持续传；如需重新生成，请移除续传 ID 与游标。")
         response = await _call_upstream(request, fastapi_request)
+        if unbuffered:
+            response.headers["X-Resumable"] = "false"
         if isinstance(response, ManagedStreamingResponse):
             # Bind only the final direct sender. Detached replay setup/pumps use
             # the same dispatcher, but never enter this branch.

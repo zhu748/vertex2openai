@@ -1291,7 +1291,7 @@ class ClaudeStreamState:
                         if (not isinstance(extra, str)
                                 or len(extra) > projection.max_encoded_signature
                                 or prior is not None and prior != extra):
-                            projection.discard()
+                            projection.withhold()
                         elif prior is not None or projection.reserve_signature(len(extra)):
                             known["thought_signature"] = extra
             self.has_tools = True

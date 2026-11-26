@@ -33,7 +33,7 @@
   "app/upstreams/cookie_proxy.py": 6,
   "app/upstreams/cookie_request.py": 2,
   "app/upstreams/cookie_transport.py": 2,
-  "app/upstreams/express_pipeline.py": 41,
+  "app/upstreams/express_pipeline.py": 40,
   "app/upstreams/express_response.py": 2,
   "app/upstreams/express_sdk.py": 12,
   "app/upstreams/native_passthrough.py": 10,

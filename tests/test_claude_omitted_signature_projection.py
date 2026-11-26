@@ -108,6 +108,25 @@ class ClaudeOmittedSignatureRoutes(SchemaRouteHarness):
                     self.channel = "web_proxy" if channel == "api_key" else "api_key"
                     self.assertEqual(await self.follow_wire(public), list(CALLS))
 
+    async def test_tool_only_projection_has_no_ordinary_parts_to_describe(self):
+        for channel in ("api_key", "web_proxy"):
+            for mode in ("json", "fake", "stream"):
+                for entries in (CALLS[:1], CALLS):
+                    with self.subTest(channel=channel, mode=mode, calls=len(entries)), ExitStack() as stack:
+                        new_cache(stack)
+                        self.channel = channel
+                        self.settings["fake_streaming"] = mode == "fake"
+                        # Express advertises only part_order for tool-only
+                        # completions. No text/summary Part is required.
+                        self.reply = provider_calls(entries)
+                        stream = mode != "json"
+                        response = await self.post(stream=stream)
+                        self.assertEqual(response.status_code, 200, response.text)
+                        public = (reconstruct(self, read_events(response.text)) if stream
+                                  else response.json()["content"])
+                        self.assertEqual([b["type"] for b in public], ["tool_use"] * len(entries))
+                        self.assertEqual(await self.follow_wire(public), list(entries))
+
     async def test_edited_scope_shape_mode_and_ambiguous_projections_never_borrow(self):
         with ExitStack() as stack:
             new_cache(stack)

@@ -3,6 +3,7 @@ from collections.abc import Iterator, Sequence
 
 import config as app_config
 from models import OpenAIMessage, normalize_content_part
+from parallel_result_order import order_parallel_results
 from signature_origin import origin_slot
 from thought_signatures import (google_metadata, historical_literal_id, merge_by_order, replay_tool_call_id,
                                 resolve_tool_call_signature, signature_from_extra)
@@ -48,7 +49,7 @@ def history_call_signature(message, index, current_required, literal_ids, *, fir
     return resolve_tool_call_signature(
         ident, require_signature=current_required and first, explicit_signature=explicit,
         explicit_unsigned=not first, origin_key=origin_slot(message, index),
-        literal_id=ident in literal_ids, claude_literal=message._claude_literal_tool_ids,
+        literal_id=ident in literal_ids,
     )
 
 
@@ -65,20 +66,7 @@ def _order_siblings(message: OpenAIMessage, results: Sequence[OpenAIMessage], *,
         # Match the calls actually placed on the native wire even when exact
         # replay metadata supplies an interleaved or non-default part order.
         calls = merge_by_order(google_metadata(message).get("part_order"), calls, ()) or calls
-    names = {}
-    for call in calls:
-        ident = _base_id(call.get("id"), literal_ids)
-        name = (call.get("function") or {}).get("name")
-        if not ident or not name or ident in names:
-            return results
-        names[ident] = name
-    by_id = {}
-    for result in results:
-        ident = _base_id(result.tool_call_id, literal_ids)
-        if ident not in names or ident in by_id or (result.name and result.name != names[ident]):
-            return results
-        by_id[ident] = result
-    return [by_id[ident] for ident in names]
+    return order_parallel_results(calls, results, lambda value: _base_id(value, literal_ids))
 
 
 def gemini_history_with_ids(

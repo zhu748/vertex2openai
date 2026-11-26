@@ -68,7 +68,7 @@ if CORS_ALLOW_ORIGINS is not None:
         allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
-        expose_headers=["X-Resume-Id", "X-Resumable-Replay", "X-Trace-Id", "Retry-After"],
+        expose_headers=["X-Resume-Id", "X-Resumable", "X-Resumable-Replay", "X-Trace-Id", "Retry-After"],
     )
 
 

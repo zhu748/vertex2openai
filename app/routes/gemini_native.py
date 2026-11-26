@@ -254,6 +254,19 @@ def _passthrough_endpoint():
 
         model = scope + sep + model_id  # retain the full resource for dispatch and replay identity
 
+        # Preserve the normalized provider query in the original replay
+        # fingerprint. Credentials and replay cursors are not provider options.
+        qp = [(k, v) for k, v in request.query_params.multi_items() if k not in ("key", "resume_from")]
+        query = "&".join(f"{quote(k, safe='')}={quote(v, safe='')}" for k, v in qp)
+        is_stream = action == "streamGenerateContent"
+        sse = is_stream and "sse" in parse_qs(query).get("alt", [])
+        try:
+            requested, explicit = resume_intent(request, default_on=False)
+        except ResumeRequestError as exc:
+            return _native_error(exc.code, str(exc))
+        if requested and not sse:
+            return _native_error(400, "原生续传需要 streamGenerateContent?alt=sse。")
+
         # 通道选择（尊重控制台的通道模式开关，与 chat_api 的选路语义对齐）：
         # - web_proxy（Cookie 模式）：配置了 Cookie 账号就走 Cookie 通道**协议级桥接**
         #   （cookie_native：原生 JSON → batchGraphql 转码，响应重组回原生形状），
@@ -263,64 +276,55 @@ def _passthrough_endpoint():
         # - api_key / mixed：有 Key 优先字节级透传（最保真）；没有 Key 但配了
         #   Cookie 时回退 Cookie 桥接——旧实现在此直接 403，导致仅配 Cookie 的
         #   部署无法使用 Gemini 原生生态客户端。
-        # getattr 防御：单测的 SimpleNamespace 桩可能不带 app（生产 Starlette 必有）。
-        express_manager = getattr(getattr(request, "app", None), "state", None)
-        manager = getattr(express_manager, "express_key_manager", None)
-        from credential_manager import credential_manager
-        # Unknown pool (early startup/test stub) retains the old passthrough path.
-        has_keys = manager is None or manager.get_total_keys() > 0
-        mode = app_state.get_channel_mode()
-        if not has_keys or mode == "web_proxy":
-            has_cookie = manager is not None and credential_manager.has_cookie_record()
-            if has_cookie and action in ("generateContent", "streamGenerateContent"):
-                from upstreams.cookie_native import handle_native_request
-                is_stream = action == "streamGenerateContent"
-                track_configure(model=requested_model, protocol="gemini", channel="cookie",
-                                stream=is_stream, mode="stream" if is_stream else "json")
-                print(f"🔁 [Gemini 透传] {requested_model}:{action} | {'流式' if is_stream else '非流式'}"
-                      f" | Cookie 通道协议级桥接（{mode} 模式）")
-                response = await _run_direct(request, action, lambda: handle_native_request(
-                    request, model, action, parsed, requested_model=requested_model))
-                return _direct_sender(request, response)
-            if has_cookie and not has_keys:
-                # Cookie 模式 / 无 Key 部署：桥接不支持的明确报错（不要静默换通道）。
-                return _native_error(
-                    400,
-                    f"Cookie 通道暂不支持 :{action}（上游 batchGraphql 无对应操作），"
-                    "请配置 Express API Key 使用该操作。",
-                    "INVALID_ARGUMENT")
-            if not has_keys:
-                return _native_error(
-                    403,
-                    "该端点需要至少一个 Express API Key（字节级透传）或一个启用的 Cookie 账号"
-                    "（协议级桥接，仅 generateContent / streamGenerateContent）。"
-                    "请在控制台「通道与凭证」页配置，或设环境变量 VERTEX_EXPRESS_API_KEY / GOOGLE_COOKIE。",
-                    status_detail="PERMISSION_DENIED",
-                )
-            # 剩余组合：web_proxy 模式下 Cookie 桥接不支持该操作但有 Key 兜底，
-            # 或 api_key/mixed 模式有 Key——都落到下方 Key 透传。
+        # An explicit cursor reads an existing generation. Live provider
+        # availability is only relevant when admitting a new generation.
+        if not explicit:
+            # getattr 防御：单测的 SimpleNamespace 可能不带 app。
+            express_manager = getattr(getattr(request, "app", None), "state", None)
+            manager = getattr(express_manager, "express_key_manager", None)
+            from credential_manager import credential_manager
+            # Unknown pool (early startup/test stub) retains the old passthrough path.
+            has_keys = manager is None or manager.get_total_keys() > 0
+            mode = app_state.get_channel_mode()
+            if not has_keys or mode == "web_proxy":
+                has_cookie = manager is not None and credential_manager.has_cookie_record()
+                if has_cookie and action in ("generateContent", "streamGenerateContent"):
+                    from upstreams.cookie_native import handle_native_request
+                    track_configure(model=requested_model, protocol="gemini", channel="cookie",
+                                    stream=is_stream, mode="stream" if is_stream else "json")
+                    print(f"🔁 [Gemini 透传] {requested_model}:{action} | {'流式' if is_stream else '非流式'}"
+                          f" | Cookie 通道协议级桥接（{mode} 模式）")
+                    response = await _run_direct(request, action, lambda: handle_native_request(
+                        request, model, action, parsed, requested_model=requested_model))
+                    return _direct_sender(request, response)
+                if has_cookie and not has_keys:
+                    # Cookie 模式 / 无 Key 部署：桥接不支持的明确报错（不要静默换通道）。
+                    return _native_error(
+                        400,
+                        f"Cookie 通道暂不支持 :{action}（上游 batchGraphql 无对应操作），"
+                        "请配置 Express API Key 使用该操作。",
+                        "INVALID_ARGUMENT")
+                if not has_keys:
+                    return _native_error(
+                        403,
+                        "该端点需要至少一个 Express API Key（字节级透传）或一个启用的 Cookie 账号"
+                        "（协议级桥接，仅 generateContent / streamGenerateContent）。"
+                        "请在控制台「通道与凭证」页配置，或设环境变量 VERTEX_EXPRESS_API_KEY / GOOGLE_COOKIE。",
+                        status_detail="PERMISSION_DENIED",
+                    )
+                # Cookie 桥接不支持该操作但有 Key，仍可用 Express 透传。
 
-        # 透传 query（alt=sse 等），但剔除本服务鉴权用的 key 参数。
-        # query_params 取出的是已解码值，重新下发前必须再编码，否则值里
-        # 带 & / = / 空格会把 URL 拼坏（alt=sse 之外的参数被截断）。
-        qp = [(k, v) for k, v in request.query_params.multi_items() if k not in ("key", "resume_from")]
-        query = "&".join(f"{quote(k, safe='')}={quote(v, safe='')}" for k, v in qp)
-
-        is_stream = action == "streamGenerateContent"
-        if is_stream and hasattr(request, "scope"):
+        if is_stream and not explicit and hasattr(request, "scope"):
             request.scope.setdefault("state", {})["native_single_candidate"] = native_expects_one_candidate(parsed)
         # The Express hop, retries and replay fingerprint need only the final wire
         # bytes. Cookie dispatch and any variant rewrites above consumed the tree.
         parsed = None
         track_configure(model=requested_model, protocol="gemini", channel="express", stream=is_stream,
                         mode="stream" if is_stream else "json")
-        print(f"🔁 [Gemini 透传] {model}:{action} | {'流式' if is_stream else '非流式'}"
-              f" | 原生协议透传（Express 通道）")
+        if not explicit:
+            print(f"🔁 [Gemini 透传] {model}:{action} | {'流式' if is_stream else '非流式'}"
+                  f" | 原生协议透传（Express 通道）")
         try:
-            sse = is_stream and "sse" in parse_qs(query).get("alt", [])
-            requested, explicit = resume_intent(request, default_on=False)
-            if requested and not sse:
-                return _native_error(400, "原生续传需要 streamGenerateContent?alt=sse。")
             if requested and resumable_enabled() and not image_bypass_enabled(model_id):
                 return await _resumable_native(request, _auth, model, action, query, raw_body)
             if explicit:
@@ -367,9 +371,15 @@ for _prefix in ("/v1beta", "/v1"):
 
 async def _catalog_capabilities(request: Request) -> tuple[list[str], bool]:
     has_keys = request.app.state.express_key_manager.get_total_keys() > 0
-    has_channel = has_keys or app_state.get_channel_mode() in ("web_proxy", "mixed")
-    raw = await get_express_models() if has_channel else []
-    return _native_catalog_ids(raw), has_keys
+    if not has_keys:
+        from credential_manager import credential_manager
+
+        # Generation can fall back to Cookie in every mode. A global project
+        # can complete a Cookie account just as it does on the native POST.
+        has_global_project = bool((app_state.get_project_id() or "").strip())
+        if not credential_manager.has_cookie_record(require_project=not has_global_project):
+            return [], False
+    return _native_catalog_ids(await get_express_models()), has_keys
 
 
 @router.get("/v1beta/models")

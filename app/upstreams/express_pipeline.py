@@ -39,7 +39,7 @@ from message_processing import (
     convert_to_openai_format,
 )
 from models import OpenAIMessage, OpenAIRequest, wants_json_output
-from signature_origin import observe_stream_origin, publish_completed_origins
+from signature_origin import observe_stream_origin, publish_completed_origins, publish_stream_origins
 from request_tracking import (
     attempt_started_at,
     record_usage,
@@ -292,7 +292,6 @@ async def _fake_stream_response_frames(
         raise ValueError("上游假流式响应无有效内容。")
     openai_response_dict = await _convert_completed_response(raw_gemini_response, request_obj)
     _prepend_prefill(openai_response_dict, prefill_text)
-    publish_completed_origins(request_obj._signature_output_prefix, openai_response_dict["choices"])
     _record_usage(raw_gemini_response)
     # 4K 生图内存关键点：响应对象持有整张图的原始 bytes（0.75× base64
     # 体积）；转换完成后本参数引用立即断开（调用方的同名局部与
@@ -310,13 +309,15 @@ async def _fake_stream_response_frames(
     else:
         frames = _chunk_openai_response_dict_for_sse(openai_response_dict=openai_response_dict)
     async for chunk_sse in frames:
-        if chunk_sse.strip() == DONE_FRAME.strip() and wants_usage(request_obj):
-            yield make_usage_chunk(
-                openai_response_dict["id"],
-                request_obj.model,
-                openai_response_dict.get("usage", {}),
-                created=openai_response_dict["created"],
-            )
+        if chunk_sse.strip() == DONE_FRAME.strip():
+            if wants_usage(request_obj):
+                yield make_usage_chunk(
+                    openai_response_dict["id"],
+                    request_obj.model,
+                    openai_response_dict.get("usage", {}),
+                    created=openai_response_dict["created"],
+                )
+            publish_completed_origins(request_obj._signature_output_prefix, openai_response_dict["choices"])
         yield chunk_sse
     # 发射完毕先断开本帧对 25MB+ content 的最后一处本地引用（走引用
     # 计数即时释放主体），再触发 GC 回收引用环。
@@ -1193,6 +1194,7 @@ class SDKGeneration:
                 created=self.stream_created,
             )
 
+        publish_stream_origins(tool_indexer.signature_origins)
         yield "data: [DONE]\n\n"
         print(
             f"✅ [Express] {self.request_obj.model} | 流式传输顺利完毕 | 耗时 {time.monotonic() - stream_started:.1f}s"
@@ -1398,17 +1400,18 @@ class SDKGeneration:
         # 避免与 JSON 序列化拷贝叠加驻留。
         response_obj_call = None
         _prepend_prefill(openai_response_content, self.prefill_text)
-        publish_completed_origins(self.request_obj._signature_output_prefix, openai_response_content["choices"])
         # 巨帧（4K 生图）主动回收 SDK/pydantic 引用环（同假流式路径）。
         # Encode giant strings in bounded slices into the final byte buffer;
         # unlike pre-serializing with dumps(), this also avoids its accumulator
         # and the complete JSON-text -> UTF-8 copy.
         if _response_has_giant_content(openai_response_content):
             gc.collect()
-            print(f"✅ [Express] {self.request_obj.model} | 非流式响应完成")
-            return LargeJSONResponse(content=openai_response_content)
+            result = LargeJSONResponse(content=openai_response_content)
+        else:
+            result = JSONResponse(content=openai_response_content)
+        publish_completed_origins(self.request_obj._signature_output_prefix, openai_response_content["choices"])
         print(f"✅ [Express] {self.request_obj.model} | 非流式响应完成")
-        return JSONResponse(content=openai_response_content)
+        return result
 
 
 async def execute_gemini_call(

@@ -143,7 +143,13 @@ class LiteralToolIDCarrier(SchemaRouteHarness):
                                  ("old", b"explicit", "old"))
                 first["tool_calls"][0]["extra_content"].pop("google")
                 first["tool_calls"][0]["function"]["arguments"] = '{"city":"different"}'
-                await self.replay([first, _result(ident)], status=400)
+                turns = [first, _result(ident)]
+                with patch("config.GEMINI_STRICT_THOUGHT_SIGNATURES", False):
+                    calls, results = await self.replay(turns)
+                    self.assertEqual((calls[0]["functionCall"]["id"], _signature(calls[0]), results[0]["id"]),
+                                     (ident, None, ident))
+                with patch("config.GEMINI_STRICT_THOUGHT_SIGNATURES", True):
+                    await self.replay(turns, status=400)
 
     async def test_standard_claude_ids_remain_literal_even_on_unmarked_cold_history(self):
         for channel in ("api_key", "web_proxy"):

@@ -10,8 +10,9 @@ import json
 import secrets
 
 from models import ContentPartText
-from signature_store import signature_store
-from thought_signatures import signature_from_extra
+from parallel_result_order import order_parallel_results
+from signature_store import SignatureRecord, SignatureState, signature_store
+from thought_signatures import historical_literal_id, replay_tool_call_id, signature_from_extra
 
 
 _KEY = secrets.token_bytes(32)
@@ -20,6 +21,7 @@ _MAX_TEXT = 1024 * 1024  # Total UTF-8 proof work per history or candidate.
 _MAX_CALLS = 64
 _MAX_ID_BYTES = 16 * 1024
 _MAX_ARGS_BYTES = 128 * 1024
+_MAX_OBJECT_DEPTH = 64
 _MAX_SIGNATURE_BYTES = 256 * 1024
 _MAX_ENCODED_SIGNATURE = 4 * ((_MAX_SIGNATURE_BYTES + 2) // 3)
 _MAX_BATCH_SIGNATURE_BYTES = 2 * _MAX_SIGNATURE_BYTES
@@ -83,6 +85,52 @@ class _Budget:
         return self.observed(_visible_field(text, self.remaining, reject_markdown=reject_markdown))
 
 
+def _bound_argument_object(value, remaining, depth=0):
+    """Reject oversized decoded trees before sorted serialization."""
+    remaining -= 1
+    if remaining < 0 or depth > _MAX_OBJECT_DEPTH:
+        raise _Unsupported
+    if isinstance(value, str):
+        remaining -= len(value)
+    elif isinstance(value, dict):
+        if len(value) > remaining // 2:
+            raise _Unsupported
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise _Unsupported
+            remaining = _bound_argument_object(key, remaining, depth + 1)
+            remaining = _bound_argument_object(item, remaining, depth + 1)
+    elif isinstance(value, list):
+        if len(value) > remaining:
+            raise _Unsupported
+        for item in value:
+            remaining = _bound_argument_object(item, remaining, depth + 1)
+    elif value is not None and not isinstance(value, (bool, int, float)):
+        raise _Unsupported
+    if remaining < 0:
+        raise _Unsupported
+    return remaining
+
+
+def _argument_tag_bytes(raw, budget):
+    limit = min(_MAX_ARGS_BYTES, budget.remaining)
+    if isinstance(raw, dict):
+        _bound_argument_object(raw, limit)
+        parsed, raw_size = raw, 0
+    elif raw is None:
+        parsed, raw_size = {}, 0
+    else:
+        encoded = budget.encode(raw, _MAX_ARGS_BYTES)
+        parsed, raw_size = json.loads(encoded if encoded.strip() else b"{}"), len(encoded)
+    if not isinstance(parsed, dict):
+        raise _Unsupported
+    canonical = _encode(parsed)
+    if len(canonical) > limit:
+        raise _Unsupported
+    budget.consume(max(0, len(canonical) - raw_size))
+    return canonical
+
+
 def _call_tag(call, budget):
     fn = call["function"]
     ident, name = call["id"], fn["name"]
@@ -90,15 +138,9 @@ def _call_tag(call, budget):
             call.get("type", "function") != "function" or
             call.keys() - {"id", "type", "function", "index", "extra_content"} or fn.keys() - {"name", "arguments"}):
         raise _Unsupported
-    # Both public adapters produce JSON argument strings. Do not stringify a
-    # possibly giant arbitrary decoded object just to try a fallback lookup.
-    raw = fn.get("arguments", "{}")
-    raw = budget.encode(raw, _MAX_ARGS_BYTES)
-    parsed = json.loads(raw if raw.strip() else b"{}")
-    if not isinstance(parsed, dict):
-        raise _Unsupported
+    arguments = _argument_tag_bytes(fn.get("arguments"), budget)
     return _hash(b"tool-call-v1", budget.encode(ident, _MAX_ID_BYTES),
-                 budget.encode(name, _MAX_ID_BYTES), _encode(parsed))
+                 budget.encode(name, _MAX_ID_BYTES), arguments)
 
 
 def _slot_keys(prefix, tags):
@@ -237,7 +279,14 @@ def _plain_text_tag(text, budget, *, can_embed_media):
     return budget.visible(text, reject_markdown=False)
 
 
-def _history_text(content, budget, *, can_embed_media):
+def _history_text(content, budget, *, can_embed_media, is_tool_result):
+    # One nonempty plain text block has the same wire Part as scalar text,
+    # except on tool results where a list is structured function output.
+    if not is_tool_result and isinstance(content, list) and len(content) == 1:
+        text = _block_text(content[0])
+        if text:
+            budget.consume(_BLOCK_COST)
+            content = text
     if isinstance(content, str):
         return _hash(b"hist-scalar-v2", _plain_text_tag(content, budget, can_embed_media=can_embed_media))
     if not isinstance(content, list) or len(content) > _MAX_BLOCKS:
@@ -251,6 +300,8 @@ def _history_text(content, budget, *, can_embed_media):
 
 def _tool_visible_text(content, budget):
     if isinstance(content, list):
+        if not content:
+            return b""
         # A single plain segment shares the scalar projection on both wires;
         # multiple list blocks can affect Part boundaries on Cookie.
         if len(content) != 1:
@@ -307,8 +358,8 @@ def _history_tag(message, budget):
             # An explicitly successful result can wrap top-level error/output
             # properties; it is not always the same wire as an absent flag.
             extra = b"error" if anthropic["tool_result_is_error"] else b"success"
-    content = (b"" if message.content is None and reasoning
-               else _history_text(message.content, budget, can_embed_media=role in ("user", "assistant")))
+    content = (b"" if message.content is None and reasoning else _history_text(
+        message.content, budget, can_embed_media=role in ("user", "assistant"), is_tool_result=role == "tool"))
     return _hash(b"hist-message-v2", role.encode(), content, reasoning, extra,
                  budget.encode(message.name or "", _MAX_ID_BYTES),
                  budget.encode(message.tool_call_id or "", _MAX_ID_BYTES))
@@ -317,6 +368,41 @@ def _history_tag(message, budget):
 def origin_slot(message, index):
     slots = getattr(message, "_signature_slots", ())
     return slots[index] if index < len(slots) else (b"" if getattr(message, "_signature_scoped", False) else None)
+
+
+def _proof_history(messages, stop):
+    """Use the adapter order only for immediately adjacent, complete result runs."""
+    i = 0
+    while i < stop:
+        message = messages[i]
+        i += 1
+        yield message
+        calls = message.tool_calls or ()
+        end = i + len(calls)
+        if (len(calls) < 2 or end > stop
+                or end < len(messages) and messages[end].role in ("tool", "function")):
+            continue
+        results = messages[i:end]
+        if any(result.role != "tool" for result in results):
+            continue
+        # Proof only accepts natural call order (validated by _plain_metadata),
+        # so no further projection is needed. Compute literal IDs after the
+        # caller has bound the just-yielded assistant slots.
+        literals = frozenset(marked for index, call in enumerate(calls)
+                             if (marked := historical_literal_id(
+                                 call, origin_slot(message, index), message._claude_literal_tool_ids)) is not None)
+
+        def result_key(value, literals=literals):
+            return replay_tool_call_id(value, literals) if isinstance(value, str) and len(value) <= _MAX_ID_BYTES else ""
+
+        yield from order_parallel_results(calls, results, result_key)
+        i = end
+
+
+def _compatible_sdk_defaults(extra):
+    return all(key in _NULL_SDK_FIELDS and (
+        value is None or key == "annotations" and isinstance(value, list) and not value)
+        for key, value in (extra or {}).items())
 
 
 def bind_signature_origins(request, api_key):
@@ -343,11 +429,12 @@ def bind_signature_origins(request, api_key):
         budget = _Budget()
         prefix = _hash(b"tool-prefix-v2", budget.encode(api_key, _MAX_ID_BYTES),
                        budget.encode(request.model.strip(), _MAX_ID_BYTES))
-        for message_index, m in enumerate(request.messages):
-            if message_index == _MAX_MESSAGES or request._signature_origin_cutoff == message_index:
-                return
-            if m.refusal or any(key not in _NULL_SDK_FIELDS or value is not None
-                                for key, value in (m.model_extra or {}).items()):
+        stop = min(len(request.messages), _MAX_MESSAGES)
+        cutoff = request._signature_origin_cutoff
+        if cutoff is not None:
+            stop = min(stop, cutoff)
+        for m in _proof_history(request.messages, stop):
+            if m.refusal or not _compatible_sdk_defaults(m.model_extra):
                 raise _Unsupported
             calls = m.tool_calls or ()
             if len(calls) > _MAX_CALLS:
@@ -367,7 +454,7 @@ def bind_signature_origins(request, api_key):
                 prefix = _hash(b"tool-step-v1", prefix, *tags)
                 continue
             prefix = _hash(b"tool-message-v2", prefix, _history_tag(m, budget))
-        if request._signature_origin_cutoff is None:
+        if cutoff is None and stop == len(request.messages):
             request._signature_output_prefix = prefix
     except (TypeError, AttributeError, KeyError, ValueError, OverflowError, RecursionError):
         # Only complete prefixes are valid. A previously marked earlier turn
@@ -375,8 +462,16 @@ def bind_signature_origins(request, api_key):
         return
 
 
+_UNRESTORABLE_ORIGIN = SignatureRecord(SignatureState.AMBIGUOUS)
+
+
+def mark_unrestorable_origin(key):
+    """An accepted, identifiable generation also counts when its bytes cannot be kept."""
+    signature_store.put_record(key, _UNRESTORABLE_ORIGIN)
+
+
 class OriginBatch:
-    """Collect digests of complete calls, not raw arguments, until a successful terminal."""
+    """Collect the public identity separately from the originals it can carry."""
     def __init__(self, prefix):
         self.prefix = prefix
         self.tags = []
@@ -384,6 +479,8 @@ class OriginBatch:
         self.ids = set()
         self.budget = _Budget()
         self.signature_bytes_left = _MAX_BATCH_SIGNATURE_BYTES
+        self.withheld = False
+        self.stream_terminal = False
         self.text = VisibleText()
         self.reasoning = VisibleText()
 
@@ -393,6 +490,12 @@ class OriginBatch:
         self.signatures.clear()
         self.ids.clear()
 
+    def withhold(self):
+        # The rendered tool batch may still identify an older cached reply.
+        # Keep collecting its identity, but do not keep partial payload bytes.
+        self.withheld = True
+        self.signatures.clear()
+
     def add(self, call):
         if not self.prefix:
             return
@@ -400,25 +503,44 @@ class OriginBatch:
             if len(self.tags) >= _MAX_CALLS:
                 raise _Unsupported
             tag = _call_tag(call, self.budget)
+            ident = _hash(b"tool-id-v1", call["id"].encode())
+            if ident in self.ids:
+                raise _Unsupported
+        except (TypeError, AttributeError, KeyError, ValueError, OverflowError, RecursionError):
+            self.discard()
+            return
+        self.ids.add(ident)
+        self.tags.append(tag)
+        if self.withheld:
+            return
+        try:
             encoded = ((call.get("extra_content") or {}).get("google") or {}).get("thought_signature")
             _signature_size(encoded)
             signature, _ = signature_from_extra(call)
             self.signature_bytes_left -= len(signature or b"")
-            ident = _hash(b"tool-id-v1", call["id"].encode())
-            if self.signature_bytes_left < 0 or len(signature or b"") > _MAX_SIGNATURE_BYTES or ident in self.ids:
+            if self.signature_bytes_left < 0 or len(signature or b"") > _MAX_SIGNATURE_BYTES:
                 raise _Unsupported
-            self.ids.add(ident)
-            self.tags.append(tag)
             self.signatures.append(signature)
         except (TypeError, AttributeError, KeyError, ValueError, OverflowError, RecursionError):
-            self.discard()
+            self.withhold()
 
     def finish_plain_parts(self, parts, order):
-        if not _plain_metadata({"google": {"ordinary_parts": parts, "part_order": order}}, len(self.tags)):
+        if not self.prefix or len(parts) > _MAX_BLOCKS:
             self.discard()
             return
         for p in parts:
-            (self.reasoning if p["kind"] == "thought" else self.text).feed(p.get("text"))
+            kind, text = p.get("kind"), p.get("text")
+            if kind in ("text", "thought") and isinstance(text, str):
+                (self.reasoning if kind == "thought" else self.text).feed(text)
+            elif kind == "signature_only" and text == "" and p.get("thought_signature"):
+                # This carrier has no public text and cannot be confused
+                # with a visible image or another unresolved Part.
+                self.withhold()
+            else:
+                self.discard()
+                return
+        if not _plain_metadata({"google": {"ordinary_parts": parts, "part_order": order}}, len(self.tags)):
+            self.withhold()
         self.finish()
 
     def finish(self):
@@ -430,7 +552,10 @@ class OriginBatch:
         prefix = _step_prefix(self.prefix, text, reasoning) if self.prefix else None
         keys = _slot_keys(prefix, self.tags)
         for i, key in enumerate(keys):
-            signature_store.register_call_signature(key, self.signatures[i], unsigned_follower=i > 0)
+            if self.withheld:
+                mark_unrestorable_origin(key)
+            else:
+                signature_store.register_call_signature(key, self.signatures[i], unsigned_follower=i > 0)
         self.discard()
 
 
@@ -440,10 +565,11 @@ def publish_completed_origins(prefix, choices):
     for choice in choices:
         message = choice.get("message") or {}
         calls = message.get("tool_calls") or ()
-        if (choice.get("finish_reason") != "tool_calls" or not 0 < len(calls) <= _MAX_CALLS or
-                not _plain_metadata(message.get("extra_content"), len(calls))):
+        if choice.get("finish_reason") != "tool_calls" or not 0 < len(calls) <= _MAX_CALLS:
             continue
         origin = OriginBatch(prefix)
+        if not _plain_metadata(message.get("extra_content"), len(calls)):
+            origin.withhold()
         origin.text.feed(message.get("content"))
         origin.reasoning.feed(message.get("reasoning_content"))
         for call in calls:
@@ -464,19 +590,25 @@ def observe_stream_origin(batches, prefix, choice):
         return
     if origin.tags and (delta.get("content") or delta.get("reasoning_content")):
         # Thin flattened fields cannot distinguish source text after a tool.
-        origin.discard()
-        return
+        origin.withhold()
     origin.text.feed(delta.get("content"))
     origin.reasoning.feed(delta.get("reasoning_content"))
     calls = delta.get("tool_calls") or ()
     if not _plain_metadata(delta.get("extra_content"), len(origin.tags) + len(calls)):
-        origin.discard()
+        origin.withhold()
     if len(calls) > _MAX_CALLS:
         origin.discard()
     if origin.prefix:
         for call in calls:
             origin.add(call)
     if choice.get("finish_reason") == "tool_calls":
-        origin.finish()
+        origin.stream_terminal = True
     elif choice.get("finish_reason"):
         origin.discard()
+
+
+def publish_stream_origins(batches):
+    """Commit after the whole stream is accepted, not while processing a finish frame."""
+    for origin in batches.values():
+        if origin.stream_terminal:
+            origin.finish()

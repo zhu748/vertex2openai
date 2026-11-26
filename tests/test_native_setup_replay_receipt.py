@@ -8,17 +8,20 @@ from unittest.mock import Mock, patch
 import httpx
 
 from admission import generation_limiter
+from credential_manager import credential_manager
 from main import app
 from proxy_failover import ProxyChain
 import resumable
 from routes import gemini_native
 from test_replay_http_delivery import Peer
-from upstreams import native_passthrough as native
+from upstreams import cookie_native, native_passthrough as native
 
 
 ERROR = {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "wait briefly",
                    "details": [{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "2s"}]}}
 SUCCESS = b'data: {"candidates":[{"index":0,"finishReason":"STOP"}]}\n\n'
+SIGNED = (b'data: {"candidates":[{"index":0,"content":{"role":"model","parts":['
+          b'{"functionCall":{"id":"wire-id","name":"read","args":{}},"thoughtSignature":"AP9maXh0dXJl"}]}}]}\n\n')
 
 
 class NativeSetupReceiptTests(unittest.IsolatedAsyncioTestCase):
@@ -65,6 +68,98 @@ class NativeSetupReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(peer.messages[0]["status"], 429)
         self.assertEqual(json.loads(self.body(peer)), ERROR)
         self.assertEqual(dict(peer.messages[0]["headers"])[b"retry-after"], b"2")
+
+    def signed_next(self):
+        self.response = lambda: httpx.Response(
+            200, content=SIGNED + SUCCESS, headers={"content-type": "text/event-stream"})
+
+    async def test_explicit_cursor_replays_signed_events_without_a_current_provider(self):
+        self.signed_next()
+        first = await self.completed()
+        self.assertEqual(first.messages[0]["status"], 200)
+        signed, stop = [line for line in self.body(first).splitlines() if line.startswith(b"data: ")]
+        self.assertIn(b'"thoughtSignature":"AP9maXh0dXJl"', signed)
+        rid = first.receipt.encode()
+
+        with patch.object(cookie_native, "handle_native_request", wraps=cookie_native.handle_native_request) as cookie:
+            for mode, key_count, has_cookie in (("api_key", 0, False), ("web_proxy", 1, True), ("mixed", 0, True)):
+                with self.subTest(mode=mode), \
+                        patch.object(gemini_native.app_state, "get_channel_mode", return_value=mode) as channel, \
+                        patch.object(app.state.express_key_manager, "get_total_keys", return_value=key_count) as keys, \
+                        patch.object(credential_manager, "has_cookie_record", return_value=has_cookie):
+                    for headers, expected in (([(b"x-resume-id", rid)], [signed, stop]),
+                                              ([(b"last-event-id", rid + b":0")], [stop])):
+                        again = await self.completed(headers)
+                        self.assertEqual(again.messages[0]["status"], 200)
+                        self.assertEqual(again.receipt, first.receipt)
+                        self.assertEqual(dict(again.messages[0]["headers"])[b"x-resumable-replay"], b"1")
+                        body = self.body(again)
+                        self.assertEqual([line for line in body.splitlines() if line.startswith(b"data: ")], expected)
+                        self.assertNotIn(b"[DONE]", body)
+                        self.assertFalse(again.messages[-1].get("more_body"))
+                    channel.assert_not_called()
+                    keys.assert_not_called()
+            cookie.assert_not_awaited()
+        self.assertEqual(self.respond.call_count, 1)
+        self.assertEqual(len(self.store._buffers), 1)
+
+    async def test_replay_first_still_checks_auth_identity_cursor_and_policy(self):
+        self.signed_next()
+        payload = {"contents": [{"parts": [{"text": "hello"}]}]}
+        scoped = "/v1beta/models/projects/fixture/locations/global/publishers/google/models/gemini-test:streamGenerateContent"
+        first = Peer(scoped, query=b"alt=sse&fixture=a%20b%26c", payload=payload,
+                     headers=[(b"x-resumable", b"true")])
+        await first.run()
+        self.assertEqual(first.messages[0]["status"], 200)
+        rid = first.receipt.encode()
+
+        async def reconnect(*, path=scoped, query=b"fixture=a+b%26c&alt=sse", body=payload,
+                            cursor=rid, other_headers=(), auth=b"test-key"):
+            peer = Peer(path, query=query, payload=body,
+                        headers=[(b"x-resume-id", cursor), *other_headers])
+            peer.scope["headers"] = ([(k, v) for k, v in peer.scope["headers"] if k != b"authorization"]
+                                     + [(b"authorization", b"Bearer " + auth)])
+            await asyncio.wait_for(peer.run(), 2)
+            return peer
+
+        with patch.object(credential_manager, "has_cookie_record", return_value=True), \
+                patch.object(gemini_native.app_state, "get_channel_mode", return_value="web_proxy"), \
+                patch.object(cookie_native, "handle_native_request", wraps=cookie_native.handle_native_request) as cookie:
+            replay = await reconnect(path=scoped.replace("/v1beta/", "/v1/", 1))
+            self.assertEqual(replay.messages[0]["status"], 200)
+            self.assertEqual(replay.receipt, first.receipt)
+            self.assertIn(b'"thoughtSignature":"AP9maXh0dXJl"', self.body(replay))
+
+            cases = (({"body": {"contents": [{"parts": [{"text": "changed"}]}]}}, 409),
+                     ({"path": scoped.replace("/fixture/", "/different/")}, 409),
+                     ({"query": b"alt=sse&fixture=changed"}, 409),
+                     ({"query": b"alt=json"}, 400),
+                     ({"query": b"alt=sse&resume_from=-1"}, 400),
+                     ({"query": b"alt=sse&fixture=a+b%26c&resume_from=99"}, 409),
+                     ({"cursor": b"rid-unknown"}, 404),
+                     ({"other_headers": [(b"x-resumable", b"false")]}, 400),
+                     ({"auth": b"invalid"}, 401))
+            for kwargs, expected in cases:
+                with self.subTest(expected=expected, kwargs=kwargs):
+                    result = await reconnect(**kwargs)
+                    self.assertEqual(result.messages[0]["status"], expected)
+                    self.assertNotIn(b"AP9maXh0dXJl", self.body(result))
+            with patch.object(gemini_native, "API_KEY", "another-service-key"):
+                different_owner = await reconnect(auth=b"another-service-key")
+                self.assertEqual(different_owner.messages[0]["status"], 404)
+            with patch.object(gemini_native, "resumable_enabled", return_value=False):
+                disabled = await reconnect()
+                self.assertEqual(disabled.messages[0]["status"], 409)
+            old, = self.store._buffers.values()
+            if drain := self.store._draining(old):
+                await asyncio.wait_for(drain, 1)
+            old.finished_monotonic = time.monotonic() - 24 * 60 * 60
+            self.assertEqual(await self.store.sweep(), 1)
+            expired = await reconnect()
+            self.assertEqual(expired.messages[0]["status"], 404)
+            cookie.assert_not_awaited()
+        self.assertEqual(self.respond.call_count, 1)
+        self.assertFalse(self.store._buffers)
 
     async def test_delivered_fast_http_429_next_unkeyed_request_regenerates_immediately(self):
         first = await self.completed()

@@ -2,7 +2,7 @@
 
 OpenAI-compatible responses carry signatures in ``extra_content.google``. This
 store is deliberately only a fallback for clients that strip that extension. A
-record has three possible states because ``None`` alone is ambiguous:
+record has four possible states because ``None`` alone is ambiguous:
 
 * ``SIGNED``: this exact function-call part carried a signature.
 * ``UNSIGNED_FOLLOWER``: this was a later call in a parallel batch and must stay
@@ -13,6 +13,8 @@ record has three possible states because ``None`` alone is ambiguous:
 """
 
 import hashlib
+import math
+import secrets
 import threading
 import time
 from collections import OrderedDict
@@ -75,6 +77,65 @@ class SignatureRecord:
 CacheKey = str | bytes  # Public IDs are strings; private exact-origin keys are digests.
 
 
+class _DisplacementOverflow:
+    """Conservative membership for tags dropped from the exact displacement index.
+
+    Five expiry buckets ordinarily overlap a TTL, each covering a quarter of
+    it. A tag stays queryable until its bucket ends, never less than its exact
+    deadline. False positives can withhold bytes but cannot authorize replay.
+    Conflict bits are separate so a known conflict is not mistaken for a miss
+    and ordinary displacement does not disable the compatibility path.
+    """
+
+    _BYTES = 128 * 1024  # Per table, lazily allocated on overflow.
+    _MASK = _BYTES * 8 - 1
+    _HASHES = 4
+
+    def __init__(self, ttl: int):
+        self._period = max(0.001, ttl / 4)
+        self._buckets: dict[int, tuple[bytearray, bytearray | None]] = {}
+
+    def __bool__(self) -> bool:
+        return bool(self._buckets)
+
+    @classmethod
+    def _locations(cls, tag: bytes) -> tuple[tuple[int, int], ...]:
+        start = int.from_bytes(tag[:8], "big")
+        stride = int.from_bytes(tag[8:], "big") | 1
+        positions = ((start + i * stride) & cls._MASK for i in range(cls._HASHES))
+        return tuple((bit >> 3, 1 << (bit & 7)) for bit in positions)
+
+    def remember(self, tag: bytes, until: float, now: float, *, conflict: bool) -> None:
+        first = math.floor(now / self._period)
+        for bucket in tuple(self._buckets):
+            if bucket < first:
+                self._buckets.pop(bucket)
+        if until < now:
+            return
+        bucket = math.floor(until / self._period)
+        tables = self._buckets.get(bucket)
+        marks = tables[0] if tables is not None else bytearray(self._BYTES)
+        conflicts = tables[1] if tables is not None else None
+        if conflict and conflicts is None:
+            conflicts = bytearray(self._BYTES)
+        self._buckets[bucket] = (marks, conflicts)
+        for offset, mask in self._locations(tag):
+            marks[offset] |= mask
+            if conflict and conflicts is not None:
+                conflicts[offset] |= mask
+
+    def contains(self, tag: bytes, now: float, *, conflict: bool = False) -> bool:
+        if not self._buckets:
+            return False
+        first = math.floor(now / self._period)
+        locations = self._locations(tag)
+        for bucket, tables in self._buckets.items():
+            table = tables[int(conflict)]
+            if bucket >= first and table is not None and all(table[i] & bit for i, bit in locations):
+                return True
+        return False
+
+
 class SignatureStore:
     """Time-, count-, and payload-bounded cache for public IDs and exact origins."""
 
@@ -88,16 +149,15 @@ class SignatureStore:
         self._data: OrderedDict[CacheKey, tuple[float, SignatureRecord]] = OrderedDict()
         # Reads reorder the LRU, while absolute expiry follows the last write.
         self._expiry: OrderedDict[CacheKey, float] = OrderedDict()
-        # An LRU miss need not mean "never issued". Remember only digests of
-        # evicted live keys; beyond this second bound, fail closed on new keys
-        # until the forgotten quarantine expires.
+        # An LRU miss need not mean "never issued". Beyond the bounded exact
+        # index, preserve targeted conflict/displacement flags, not signatures.
         self._displaced: OrderedDict[bytes, float] = OrderedDict()
         self._displaced_conflicts: set[bytes] = set()  # Only tags already in _displaced.
-        self._unknown_until = float("-inf")
+        self._overflow = _DisplacementOverflow(ttl_seconds)
+        self._tag_key = secrets.token_bytes(16)
 
-    @staticmethod
-    def _tag(key: CacheKey) -> bytes:
-        h = hashlib.blake2b(digest_size=16)
+    def _tag(self, key: CacheKey) -> bytes:
+        h = hashlib.blake2b(digest_size=16, key=self._tag_key)
         if isinstance(key, str):
             h.update(b"s")
             for start in range(0, len(key), 16384):
@@ -129,6 +189,14 @@ class SignatureStore:
         if state is SignatureState.AMBIGUOUS:
             self._displaced_conflicts.add(tag)
 
+    def _was_displaced(self, key: CacheKey, now: float, *, conflict: bool = False) -> bool:
+        if not (self._displaced_conflicts if conflict else self._displaced) and not self._overflow:
+            return False
+        tag = self._tag(key)
+        live = now <= self._displaced.get(tag, float("-inf"))
+        return ((live and (not conflict or tag in self._displaced_conflicts))
+                or self._overflow.contains(tag, now, conflict=conflict))
+
     def put_record(self, call_id: CacheKey, record: SignatureRecord) -> None:
         if not call_id:
             return
@@ -138,8 +206,7 @@ class SignatureStore:
             if prev is not None and now - prev[0] <= self._ttl:
                 if prev[1] != record:
                     record = SignatureRecord(SignatureState.AMBIGUOUS)
-            elif (now <= self._unknown_until or
-                  self._displaced and now <= self._displaced.get(self._tag(call_id), float("-inf"))):
+            elif self._was_displaced(call_id, now):
                 record = SignatureRecord(SignatureState.AMBIGUOUS)
             if self._payload_size(call_id, record) > self._max_bytes:
                 # An unretainable original is not evidence for some other
@@ -186,21 +253,16 @@ class SignatureStore:
         with self._lock:
             now = time.monotonic()
             item = self._data.get(call_id)
-            if item is None:
-                if self._displaced_conflicts:
-                    tag = self._tag(call_id)
-                    if tag in self._displaced_conflicts and now <= self._displaced[tag]:
-                        # A retained live conflict is not an unknown cache miss.
-                        # Never mint a validator fallback for either the bare ID
-                        # or an indistinguishable private origin.
-                        return SignatureRecord(SignatureState.AMBIGUOUS)
-                return None
-            ts, record = item
-            if now - ts > self._ttl:
+            if item is not None:
+                ts, record = item
+                if now - ts <= self._ttl:
+                    self._data.move_to_end(call_id)
+                    return record
                 self._drop(call_id)
-                return None
-            self._data.move_to_end(call_id)
-            return record
+            if self._was_displaced(call_id, now, conflict=True):
+                # A retained live conflict is not an unknown cache miss.
+                return SignatureRecord(SignatureState.AMBIGUOUS)
+            return None
 
     def _evict(self, now: float) -> None:
         while self._expiry:
@@ -217,8 +279,8 @@ class SignatureStore:
             self._remember_displaced(oldest_key, now, self._drop(oldest_key).state)
         while len(self._displaced) > self._max:
             tag, until = self._displaced.popitem(last=False)
+            self._overflow.remember(tag, until, now, conflict=tag in self._displaced_conflicts)
             self._displaced_conflicts.discard(tag)
-            self._unknown_until = max(self._unknown_until, until)
 
 
 signature_store = SignatureStore()

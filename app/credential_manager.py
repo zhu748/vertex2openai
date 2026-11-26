@@ -8,6 +8,7 @@ is_auth_or_billing_error 已做当轮隔离，这里补齐 Cookie 多账号池�
 """
 
 import hashlib
+import math
 import random
 import threading
 import time
@@ -21,6 +22,14 @@ _random = random.SystemRandom()
 COOKIE_AUTH_FAILURE_THRESHOLD = 3
 COOKIE_COOLDOWN_SECONDS = 600
 MAX_COOKIE_HEALTH_ENTRIES = 10_000
+
+
+class CookiePoolCoolingDown(Exception):
+    """Mixed mode has matching Cookie credentials, but they are quarantined."""
+
+    def __init__(self, remaining: float):
+        self.retry_after = math.ceil(remaining)
+        super().__init__("所有可用的 Cookie 账号因上游鉴权失败正在冷却。请稍后重试，或更新 Cookie / 启用 Express Key。")
 
 
 class CredentialManager:
@@ -138,14 +147,17 @@ class CredentialManager:
                 for account_id, entry in self._cookie_health.items() if account_id in visible
             }
 
-    def has_cookie_record(self) -> bool:
+    def has_cookie_record(self, *, require_project: bool = False) -> bool:
         """Can Cookie dispatch select a row, without reserving a round-robin/random turn?
 
         get_cookie_record prefers a complete, healthy row, but its existing
         all-incomplete and all-cooling fallbacks both keep the enabled pool.
-        Only actual dispatch should rank the rows or update selector state.
+        By default include incomplete rows so dispatch can issue its diagnostic.
+        Callers advertising model capabilities can require a populated Project ID.
+        Neither view ranks rows or updates selector state.
         """
-        return any(record["enabled"] for record in app_state.get_cookie_accounts(committed=True))
+        return any(record["enabled"] and (not require_project or record["project_id"])
+                   for record in app_state.get_cookie_accounts(committed=True))
 
     def get_cookie_record(self):
         # 优先选 project_id 完整的账号：凭证接口允许保存空 project_id 的启用账号
@@ -166,15 +178,26 @@ class CredentialManager:
         return self._select(healthy or pool, "cookie")
 
     def get_mixed_record(self, key_manager, *, express_only=False):
+        """Select an eligible credential; distinguish missing routes from a temporary cooldown."""
         records = [dict(r, channel="express") for r in key_manager.get_records()]
-        if not express_only:
+        if express_only:
+            return self._select(records, "mixed-express")
+        with self._lock:
             now = time.time()
-            with self._lock:
-                cookie_records = [dict(r, channel="cookie") for r in self._health_accounts_locked()
-                                  if r["enabled"] and r["project_id"]
-                                  and self._cookie_health.get(r["id"], {}).get("cooldown_until", 0.0) <= now]
-            records += cookie_records
-        return self._select(records, "mixed-express" if express_only else "mixed")
+            next_ready = None
+            for record in self._health_accounts_locked():
+                if not record["enabled"] or not record["project_id"]:
+                    continue
+                until = self._cookie_health.get(record["id"], {}).get("cooldown_until", 0.0)
+                if until <= now:
+                    records.append(dict(record, channel="cookie"))
+                elif next_ready is None or until < next_ready:
+                    next_ready = until
+            if not records and next_ready is not None:
+                # Do not start another upstream attempt or send a false API-key
+                # error. The earliest eligible account can rejoin after this wait.
+                raise CookiePoolCoolingDown(next_ready - now)
+        return self._select(records, "mixed")
 
 
 credential_manager = CredentialManager()

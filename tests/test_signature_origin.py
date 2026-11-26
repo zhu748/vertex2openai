@@ -98,8 +98,7 @@ def test_indistinguishable_and_expired_origins_never_restore_another_signature(s
 
 def test_unrepresentable_choices_do_not_publish_and_budgets_never_truncate(store):
     p = request()._signature_output_prefix
-    for c in ({"content": [{"type": "image_url"}]}, {"reasoning_content": "![Image](inline data)"},
-              {"extra_content": {"google": {"ordinary_parts": [{"kind": "signature_only"}]}}}):
+    for c in ({"content": [{"type": "image_url"}]}, {"reasoning_content": "![Image](inline data)"}):
         publish(p, [call("a", sig=b"ineligible")], **c)
     origin.publish_completed_origins(p, [{"finish_reason": "length", "message": {"tool_calls": [call("a", sig=b"short")]}}])
     publish(p, [call("same", sig=b"one"), call("same", arguments="{}", sig=b"two")])
@@ -121,6 +120,18 @@ def test_unrepresentable_choices_do_not_publish_and_budgets_never_truncate(store
     assert "_signature" not in obj.model_dump_json()
 
 
+def test_accepted_unrestorable_origin_is_remembered_even_if_the_signed_variant_arrives_later(store):
+    p = request()._signature_output_prefix
+    turn = [call("same")]
+    completed_but_too_big = call("same", sig=b"b" * (origin._MAX_SIGNATURE_BYTES + 1))
+    publish(p, [completed_but_too_big])
+    key = origin.origin_slot(request(calls=turn).messages[-1], 0)
+    assert store.get_record(key).state is SignatureState.AMBIGUOUS
+    publish(p, [call("same", sig=b"another genuine emission")])
+    assert store.get_record(key).state is SignatureState.AMBIGUOUS
+    assert replay(request(calls=turn)) == [None]
+
+
 def test_stream_needs_normal_terminal_and_cannot_publish_text_or_partial_subset(store):
     prefix = request()._signature_output_prefix
     batches = {}
@@ -134,6 +145,8 @@ def test_stream_needs_normal_terminal_and_cannot_publish_text_or_partial_subset(
     event(0, {"tool_calls": [call("b", sig=b"sibling")]})
     assert not store._data
     event(0, {}, "tool_calls")
+    assert not store._data
+    origin.publish_stream_origins(batches)
     assert replay(request(calls=[call("a"), call("b")])) == [b"first", b"sibling"]
     short = request(calls=[call("a")])
     assert store.get_record(origin.origin_slot(short.messages[-1], 0)) is None
@@ -231,6 +244,7 @@ def test_visible_digests_match_across_chunks_and_refuse_images_and_oversize(stor
     for text in ("w", "hy?"):
         event({"reasoning_content": text})
     event({"tool_calls": [call("mixed", sig=b"mine")]}, "tool_calls")
+    origin.publish_stream_origins(batches)
     claude = anthropic_to_openai_request({"model": MODEL, "max_tokens": 64, "system": PREFIX[0]["content"],
         "messages": [PREFIX[1], {"role": "assistant", "content": [
             {"type": "thinking", "thinking": mixed["reasoning_content"], "signature": "not-a-Google-signature"},

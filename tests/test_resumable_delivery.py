@@ -170,7 +170,8 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
 
                         if reclaim == "capacity":
                             unrelated = OpenAIRequest(model="another-test", messages=[], stream=True)
-                            pressure = await chat_api.chat_completions(request(), unrelated, self.key)
+                            pressure = await chat_api.chat_completions(
+                                request({"x-resumable": "true"}), unrelated, self.key)
                             self.assertEqual(pressure.status_code, 503)
                         else:
                             old.finished_monotonic -= 3600
