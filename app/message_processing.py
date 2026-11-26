@@ -3,6 +3,7 @@
 import base64
 import html
 import json
+import math
 import re
 import time
 import uuid
@@ -11,29 +12,40 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import config as app_config
 from google.genai import types
+from image_history import ManagedImageHistory
 from image_processing import (
     decode_data_url_image,
     fetch_remote_image,
     optimize_image_bytes,
 )
 from tool_arguments import parse_tool_arguments
+from tool_history import gemini_history_with_ids
 from models import OpenAIMessage, file_data_markdown, message_text, normalize_content_part
-from response_validation import map_finish_reason_to_openai, complete_function_arguments
+from response_validation import (
+    complete_function_arguments,
+    map_finish_reason_to_openai,
+    require_unique_tool_call_ids,
+    sdk_function_call,
+    sdk_media_payload,
+)
 from schema_validation import SchemaValidationError
 from runtime_state import app_state
-from signature_store import SignatureState
+from signature_origin import origin_slot
 from thought_signatures import (
-    LEGACY_THOUGHT_SEP,
+    replay_tool_call_id,
     attach_signature_extra,
-    build_tool_call_id,
+    PendingCallSignatures,
+    publish_tool_call_signatures,
+    stage_tool_call_id,
     google_metadata,
-    merge_by_order,
+    merge_replayed_parts,
     ordinary_part_metadata,
     ordinary_parts_from_extra,
     requires_signature,
     resolve_tool_call_signature,
     signature_bytes,
     signature_from_extra,
+    standalone_message_signature,
     sdk_thought_signature_field,
     thought_signature_extra,
 )
@@ -104,34 +116,29 @@ def logprobs_payload_from_candidate(candidate: Any) -> Optional[Dict[str, Any]]:
         return None
     tops = list(getattr(result, "top_candidates", None) or [])
 
-    def _entry(item: Any) -> Dict[str, Any]:
+    def _entry(item: Any) -> Optional[Dict[str, Any]]:
         token = getattr(item, "token", None)
-        logprob = getattr(item, "log_probability", None)
-        if token is None and logprob is None:
-            return {}
-        entry: Dict[str, Any] = {"token": token or ""}
-        if logprob is not None:
-            entry["logprob"] = float(logprob)
+        score = getattr(item, "log_probability", None)
+        if not isinstance(token, str) or isinstance(score, bool) or not isinstance(score, (int, float)):
+            return None
         try:
-            entry["bytes"] = list((token or "").encode("utf-8"))
-        except (UnicodeError, ValueError):
-            pass
-        return entry
+            score = float(score)
+            if not math.isfinite(score):
+                return None
+            return {"token": token, "logprob": score, "bytes": list(token.encode("utf-8"))}
+        except (UnicodeError, OverflowError):
+            return None
 
     content = []
     for i, item in enumerate(chosen):
         entry = _entry(item)
-        if not entry:
-            continue
-        top_list = None
-        if i < len(tops):
-            top_list = [_entry(c) for c in (getattr(tops[i], "candidates", None) or [])]
-            top_list = [t for t in top_list if t]
-        if top_list:
-            entry["top_logprobs"] = top_list
+        if entry is None:
+            # Dropping a chosen position would shift every later score; the
+            # whole optional logprobs block is then unrepresentable.
+            return None
+        alternatives = (getattr(tops[i], "candidates", None) or []) if i < len(tops) else ()
+        entry["top_logprobs"] = [top for option in alternatives if (top := _entry(option)) is not None]
         content.append(entry)
-    if not content:
-        return None
     return {"content": content}
 
 
@@ -185,6 +192,43 @@ def _extract_markdown_images_to_parts(text: str) -> Tuple[List[types.Part], str]
     return parts, remaining_text
 
 
+def _finite_result_number(token: str) -> float:
+    """Tool output remains text if a numeric token cannot travel as a finite float."""
+    number = float(token)
+    if not math.isfinite(number):
+        raise ValueError("non-finite tool result number")
+    return number
+
+
+def _text_media_segments(text: str, history: ManagedImageHistory | None = None, *,
+                      parse_inline: bool = True) -> Iterator[str | types.Part]:
+    """Keep canonical local references in position; leave legacy inline handling intact."""
+    segments = history.segments(text) if history else ((text, None),)
+    for fragment, name in segments:
+        if name is not None:
+            raw, mime = history.read(name)
+            yield types.Part.from_bytes(data=raw, mime_type=mime)
+        elif fragment and parse_inline:
+            images, visible = _extract_markdown_images_to_parts(fragment)
+            if visible:
+                yield visible
+            yield from images
+        elif fragment:
+            yield fragment
+
+
+def _text_media_parts(text: str, history: ManagedImageHistory | None = None, *,
+                      parse_inline: bool = True) -> Iterator[types.Part]:
+    for item in _text_media_segments(text, history, parse_inline=parse_inline):
+        yield types.Part.from_text(text=item) if isinstance(item, str) else item
+
+
+def _thought_media_parts(text: str, history: ManagedImageHistory | None) -> Iterator[types.Part]:
+    for part in _text_media_parts(text, history, parse_inline=False):
+        part.thought = True
+        yield part
+
+
 def _coerce_tool_response(content: Any) -> Dict[str, Any]:
     """把 OpenAI 工具结果安全地转成 function_response 需要的对象。
 
@@ -213,15 +257,17 @@ def _coerce_tool_response(content: Any) -> Dict[str, Any]:
         s.startswith("[") and s.endswith("]")
     ):
         try:
-            parsed = json.loads(s)
+            # Python accepts NaN/Infinity and overflows ordinary tokens such as
+            # 1e999. Keep the original text if either would create an invalid wire number.
+            parsed = json.loads(s, parse_float=_finite_result_number, parse_constant=_finite_result_number)
             # function_response 的 response 需要是对象；数组则包一层
             return parsed if isinstance(parsed, dict) else {"result": parsed}
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
             return {"result": content}
     return {"result": content}
 
 
-def tool_response_with_media(content: Any, model_name: str = "", *, error_content: bool=False) -> tuple[dict, list]:
+def tool_response_with_media(content: Any, model_name: str = "", *, error_content: bool | None = None) -> tuple[dict, list]:
     """Replace tool image blocks with references to bounded native image blobs.
 
     Both Anthropic image blocks and OpenAI image_url blocks are accepted.
@@ -229,6 +275,12 @@ def tool_response_with_media(content: Any, model_name: str = "", *, error_conten
     Gemini 3+ supports these blobs inside FunctionResponse.parts.
     """
     response = _coerce_tool_response(content)
+    # In Gemini, top-level 'error'/'output' are execution status/value fields.
+    # A successful Claude tool may return either as ordinary application data.
+    # Preserve the complete value (including siblings); unmarked OpenAI input
+    # can already be a native envelope and must not be reinterpreted.
+    if error_content is False and ("error" in response or "output" in response):
+        response = {"output": response}
     media = []
     total_bytes = 0
 
@@ -298,33 +350,39 @@ def tool_response_with_media(content: Any, model_name: str = "", *, error_conten
     return response, media
 
 
-def is_multimodal_tool_error(message: OpenAIMessage) -> bool:
+def anthropic_tool_result_is_error(message: OpenAIMessage) -> bool | None:
     metadata = (message.extra_content or {}).get("anthropic")
-    return isinstance(metadata, dict) and metadata.get("tool_result_is_error") is True
+    flag = metadata.get("tool_result_is_error") if isinstance(metadata, dict) else None
+    return flag if isinstance(flag, bool) else None
+
+
+def tool_observation_json(response: dict, media: list, error_content: bool | None) -> str | None:
+    """Text compatibility must also keep image references and wrapped domain objects."""
+    if media or (error_content is False and "output" in response):
+        return json.dumps(response, ensure_ascii=False)
+    return None
 
 
 def _tool_result_parts(
-    message: OpenAIMessage, tool_name_by_id: dict, model_name: str = ""
+    message: OpenAIMessage, tool_name_by_id: dict, model_name: str = "", *, literal_ids: frozenset[str] = frozenset()
 ) -> list[types.Part]:
     """Restore tool results as user Parts; function responses never carry signatures."""
     parts = []
     tool_call_id_str = message.tool_call_id or ""
-    real_tool_id = tool_call_id_str.partition(LEGACY_THOUGHT_SEP)[0]
+    real_tool_id = replay_tool_call_id(tool_call_id_str, literal_ids)
     function_name = (
         message.name
         or tool_name_by_id.get(tool_call_id_str)
         or tool_name_by_id.get(real_tool_id)
     )
-    tool_output_data, media = tool_response_with_media(
-        message.content, model_name, error_content=is_multimodal_tool_error(message))
+    error_content = anthropic_tool_result_is_error(message)
+    tool_output_data, media = tool_response_with_media(message.content, model_name, error_content=error_content)
 
     if not function_name:
         # 既没有显式 name，也无法从前面的 assistant.tool_calls 关联时才降级。
         # content 可能是 str / 分段 list / dict：统一归一成文本，避免
         # list 直接被 f-string 嵌成 Python repr。
-        fallback_text = message_text(message.content)
-        if media:
-            fallback_text = json.dumps(tool_output_data, ensure_ascii=False)
+        fallback_text = tool_observation_json(tool_output_data, media, error_content) or message_text(message.content)
         if (
             not fallback_text
             and message.content is not None
@@ -365,7 +423,7 @@ def _tool_result_parts(
 
 
 def _assistant_tool_parts(
-    message: OpenAIMessage, require_sig: bool
+    message: OpenAIMessage, require_sig: bool, history: ManagedImageHistory | None = None, *, literal_ids: frozenset[str] = frozenset()
 ) -> list[types.Part]:
     """Restore parallel calls, their signatures and the original ordinary-part order."""
     parts = []
@@ -387,6 +445,8 @@ def _assistant_tool_parts(
             require_signature=require_sig and tool_index == 0,
             explicit_signature=explicit_sig,
             explicit_unsigned=tool_index > 0,
+            origin_key=origin_slot(message, tool_index),
+            literal_id=tool_call_id_str in literal_ids,
         )
 
         fc_kwargs = {"name": function_name, "args": parsed_arguments}
@@ -408,12 +468,16 @@ def _assistant_tool_parts(
             )
         tool_parts.append(fc_part)
 
-    ordinary_parts = _restored_ordinary_parts(message)
+    ordinary_parts = _restored_ordinary_parts(message, history)
+    exact_history = ordinary_parts is not None
+    if ordinary_parts is None and message.has_assistant_refusal():
+        # The new ordered refusal form may interleave ordinary text or images.
+        ordinary_parts = _ordinary_message_parts(message, history)[1]
     if ordinary_parts is None:
         ordinary_parts = []
         reasoning = getattr(message, "reasoning_content", None)
         if reasoning:
-            ordinary_parts.append(types.Part(text=reasoning, thought=True))
+            ordinary_parts.extend(_thought_media_parts(reasoning, history))
         # content 为分段 list 时旧实现经 message_text 只提取文本，
         # image_url 分段被静默丢弃：多轮修图 agent 把上一轮 assistant
         # 的图片以分段形式回传（OpenAI 协议合法形态）时，带工具调用的
@@ -429,33 +493,25 @@ def _assistant_tool_parts(
             _iter_content_segments(
                 message.content,
                 text_pieces.append,
-                lambda url: _ingest_image_part(
-                    url,
-                    lambda raw, mime: _append_sdk_image_part(
-                        image_parts_collected, raw, mime
-                    ),
-                ),
+                lambda url: image_parts_collected.append(_sdk_image_part(url, history)),
             )
             content_text = "".join(text_pieces)
         else:
             content_text = message.content
             image_parts_collected = []
         if isinstance(content_text, str) and content_text:
-            image_parts, clean_text = _extract_markdown_images_to_parts(content_text)
-            if clean_text:
-                ordinary_parts.append(types.Part.from_text(text=clean_text))
-            ordinary_parts.extend(image_parts)
+            ordinary_parts.extend(_text_media_parts(content_text, history))
         ordinary_parts.extend(image_parts_collected)
 
-        message_sig, signature_kind = signature_from_extra(message)
+        message_sig, signature_kind = standalone_message_signature(message)
         if message_sig:
             _attach_message_signature(ordinary_parts, message_sig, signature_kind)
 
     google_extra = google_metadata(message)
     # QUA-P2-3：part_order 交错重组收敛到 thought_signatures.merge_by_order
     #（剩余块兕底顺序保留 SDK 通道既有行为：普通块在前）。
-    merged = merge_by_order(google_extra.get("part_order"), tool_parts, ordinary_parts,
-                            remainder_calls_first=False)
+    merged = merge_replayed_parts(google_extra, tool_parts, ordinary_parts,
+                                  exact_history=exact_history, remainder_calls_first=False)
     if merged is not None:
         parts.extend(merged)
     else:
@@ -466,23 +522,24 @@ def _assistant_tool_parts(
     return parts
 
 
-def _restored_ordinary_parts(message: OpenAIMessage):
-    def images(thought: bool=False):
-        # Use the normal media conversion once, without replaying metadata.
-        plain = message.model_copy(update={"extra_content": None, "reasoning_content": None,
-                                           "content": message.reasoning_content if thought else message.content})
-        return [part for part in _ordinary_message_parts(plain)[1]
-                if part.inline_data is not None or part.file_data is not None]
-    return ordinary_parts_from_extra(message, images)
+def _restored_ordinary_parts(message: OpenAIMessage, history: ManagedImageHistory | None = None):
+    def image(block: dict) -> types.Part | None:
+        if block["type"] == "image_url":
+            return _sdk_image_part(_image_part_url(block), history)
+        return next((p for p in _text_media_parts(block["text"], history)
+                     if p.inline_data is not None or p.file_data is not None), None)
+
+    return ordinary_parts_from_extra(message, image, history)
 
 
-def _ordinary_message_parts(message: OpenAIMessage) -> tuple[str, list[types.Part]]:
+def _ordinary_message_parts(message: OpenAIMessage, history: ManagedImageHistory | None = None) -> tuple[str, list[types.Part]]:
     """Convert text/images/thoughts and attach an ordinary-part signature once."""
+    content = message.replay_content()
     role = message.role
     parts = []
-    message_sig, signature_kind = signature_from_extra(message)
-    reasoning = getattr(message, "reasoning_content", None)
-    if message.content is None and not reasoning and not message_sig:
+    message_sig, signature_kind = standalone_message_signature(message)
+    reasoning = message.reasoning_content if role in ("assistant", "model") else None
+    if content is None and not reasoning and not message_sig and "ordinary_parts" not in google_metadata(message):
         return role, []
 
     current_gemini_role = role
@@ -491,37 +548,27 @@ def _ordinary_message_parts(message: OpenAIMessage) -> tuple[str, list[types.Par
     if current_gemini_role not in SUPPORTED_ROLES:
         current_gemini_role = "user"
 
-    exact_ordinary_parts = _restored_ordinary_parts(message)
+    exact_ordinary_parts = _restored_ordinary_parts(message, history)
     if exact_ordinary_parts is not None:
         parts.extend(exact_ordinary_parts)
 
     if reasoning and exact_ordinary_parts is None:
-        parts.append(types.Part(text=reasoning, thought=True))
+        parts.extend(_thought_media_parts(reasoning, history))
 
-    if exact_ordinary_parts is None and isinstance(message.content, str):
-        image_parts, clean_text = _extract_markdown_images_to_parts(message.content)
-        if clean_text:
-            parts.append(types.Part.from_text(text=clean_text))
-        parts.extend(image_parts)
+    if exact_ordinary_parts is None and isinstance(content, str):
+        parts.extend(_text_media_parts(content, history))
 
-    elif exact_ordinary_parts is None and isinstance(message.content, list):
+    elif exact_ordinary_parts is None and isinstance(content, list):
         def _emit_text(text_content: str):
             # F-1：pydantic 会把标准 part 解析成 ContentPartText / ContentPartImage 实例，
             # 归一成 dict 后只保留一条处理路径（原先 dict 与实例两套分支已出现行为分歧：
             # 实例分支直接 from_text，跳过了 markdown 内联图片抽取）。
-            image_parts, clean_text = _extract_markdown_images_to_parts(
-                text_content
-            )
-            if clean_text:
-                parts.append(types.Part.from_text(text=clean_text))
-            parts.extend(image_parts)
+            parts.extend(_text_media_parts(text_content, history))
 
         _iter_content_segments(
-            message.content,
+            content,
             _emit_text,
-            lambda url: _ingest_image_part(
-                url, lambda raw, mime: _append_sdk_image_part(parts, raw, mime)
-            ),
+            lambda url: parts.append(_sdk_image_part(url, history)),
         )
 
     if message_sig and exact_ordinary_parts is None:
@@ -534,41 +581,39 @@ def _merge_gemini_turns(
 ) -> list[types.Content]:
     """Merge compatible consecutive turns without merging tool results into a new user turn."""
 
-    def _is_text_only(content: types.Content) -> bool:
-        """该 Content 是否只含文本 part（没有 function_call / function_response / inline_data）。"""
-        for p in content.parts or []:
-            if getattr(p, "function_call", None) is not None:
-                return False
-            if getattr(p, "function_response", None) is not None:
-                return False
-            if getattr(p, "inline_data", None) is not None:
-                return False
-            if getattr(p, "text", None) is None:
-                return False
-        return True
-
-    def _is_function_response_only(content: types.Content) -> bool:
-        return bool(content.parts) and all(
-            getattr(p, "function_response", None) is not None for p in content.parts
-        )
+    def kind(content: types.Content) -> str:
+        parts = content.parts or ()
+        if parts and all(getattr(p, "function_response", None) is not None for p in parts):
+            return "results"
+        if all(getattr(p, "function_call", None) is None
+               and getattr(p, "function_response", None) is None
+               and getattr(p, "inline_data", None) is None
+               and getattr(p, "text", None) is not None for p in parts):
+            return "text"
+        return "other"
 
     merged_messages = []
+    previous_kind = None
     for msg in raw_gemini_messages:
-        if merged_messages and merged_messages[-1].role == msg.role:
-            previous = merged_messages[-1]
-            previous_is_results = _is_function_response_only(previous)
-            current_is_results = _is_function_response_only(msg)
-            # Parallel tool results are contiguous user Parts. A later fresh
-            # user turn must remain a new Content because it starts a new turn
-            # for Gemini's signature validator.
-            if previous_is_results != current_is_results:
-                merged_messages.append(msg)
-                continue
-            if _is_text_only(previous) and _is_text_only(msg):
-                previous.parts.append(types.Part.from_text(text="\n\n"))
-            previous.parts.extend(msg.parts)
-        else:
+        if not merged_messages or merged_messages[-1].role != msg.role:
             merged_messages.append(msg)
+            previous_kind = None  # Alternating roles never need classification.
+            continue
+        previous = merged_messages[-1]
+        if previous_kind is None:
+            previous_kind = kind(previous)
+        current_kind = kind(msg)
+        if (previous_kind == "results") != (current_kind == "results"):
+            # A fresh user turn after parallel results is a new Content for
+            # Gemini's signature validator, despite having the same role.
+            merged_messages.append(msg)
+            previous_kind = current_kind
+            continue
+        if previous_kind == current_kind == "text":
+            previous.parts.append(types.Part.from_text(text="\n\n"))
+        elif previous_kind != current_kind:
+            previous_kind = "other"  # No separator anywhere after a non-text part.
+        previous.parts.extend(msg.parts)
 
     if not merged_messages:
         merged_messages.append(
@@ -583,24 +628,25 @@ def create_gemini_prompt(
 ) -> List[types.Content]:
     """Convert OpenAI messages to Gemini contents, preserving tool/signature boundaries."""
     print("🔄 [消息转换] 正在将 OpenAI 格式消息转换为 Gemini contents。")
+    history = ManagedImageHistory.for_request()
     require_sig = requires_signature(model_name)
     tool_name_by_id = {}
     contents = []
-    for message in messages:
+    for message, literal_ids in gemini_history_with_ids(messages):
         if message.role in ("system", "developer"):
             continue  # These instructions are sent in system_instruction.
         if message.role in ("tool", "function"):
-            role, parts = "user", _tool_result_parts(message, tool_name_by_id, model_name)
+            role, parts = "user", _tool_result_parts(message, tool_name_by_id, model_name, literal_ids=literal_ids)
         elif message.role in ("assistant", "model") and message.tool_calls:
             for call in message.tool_calls:
                 call_id = str(call.get("id") or "")
                 call_name = str((call.get("function") or {}).get("name") or "")
                 if call_id and call_name:
                     tool_name_by_id[call_id] = call_name
-                    tool_name_by_id[call_id.partition(LEGACY_THOUGHT_SEP)[0]] = call_name
-            role, parts = "model", _assistant_tool_parts(message, require_sig)
+                    tool_name_by_id[replay_tool_call_id(call_id, literal_ids)] = call_name
+            role, parts = "model", _assistant_tool_parts(message, require_sig, history, literal_ids=literal_ids)
         else:
-            role, parts = _ordinary_message_parts(message)
+            role, parts = _ordinary_message_parts(message, history if message.role in ("assistant", "model") else None)
         if parts:
             contents.append(types.Content(role=role, parts=parts))
     return _merge_gemini_turns(contents)
@@ -698,59 +744,54 @@ def _image_part_url(part_item: dict) -> str:
     return getattr(img_url_data, "url", "") or ""
 
 
-def _ingest_image_part(image_url: str, append_part: Callable) -> None:
-    """摄取一张 image_url（data: 或 http(s):）并交给 append_part 构造通道专属 part。
+def _required_image_bytes(image_url: str, history: ManagedImageHistory | None = None) -> tuple[bytes, str]:
+    """Resolve one explicit attachment, never degrade it to a text-only prompt.
 
-    Express（SDK Part）与 Cookie（wire dict）两条消息转换管线共用：
-      - data: URL 用 re.DOTALL 匹配 base64（RFC 2045 允许折行，
-        旧实现缺 DOTALL 会静默丢图）；
-      - 远程图片统一走加固后的 fetch_remote_image（SSRF 与体积防护都在那里）；
-      - 解码/压缩失败只打日志跳过该图，不炸整个请求（两通道行为一致）。
-    append_part(raw_bytes, mime_type) 负责压缩与目标形态构造，
-    其抛出的 ValueError 按「远程图片超出处理限制」处理。
+    Client-facing errors exclude source URLs, inline payloads and decoder
+    details. Only expected data/size rejections are translated here; internal
+    media-worker or Part-construction failures are not malformed input.
     """
-    if not isinstance(image_url, str) or not image_url:
-        # wire 路径的输入未经 pydantic 校验：image_url.url 为 None / 非字符串
-        # 时按“无法识别的地址”静默跳过（与该函数“失败只跳过不炸请求”的
-        # 契约一致；此前 wire 侧靠调用点各自防御，SDK 侧则可能抛
-        # AttributeError，2026-11 收敛到跳过口径）。
-        return
+    source_help = "image_url 需要非空的 HTTP(S) 图片地址，或 data:image/...;base64,... 图片 URL。"
+    if not isinstance(image_url, str):
+        raise SchemaValidationError(source_help)
+    if history and (name := history.name_from_url(image_url)) is not None:
+        return history.read(name)
     if image_url.startswith("data:"):
-        mime_match = _DATA_URL_RE.fullmatch(image_url)
-        if not mime_match:
-            return
-        mime_type, b64_data = mime_match.groups()
+        match = _DATA_URL_RE.fullmatch(image_url)
+        if not match or not re.fullmatch(r"image/[a-z0-9.+-]+", match[1], re.I | re.ASCII):
+            raise SchemaValidationError(source_help)
+        mime = match[1]
         try:
-            append_part(decode_data_url_image(b64_data), mime_type)
-        except Exception as e:
-            print(f"⚠️ [图片处理] 解析内联图片失败，已跳过：{e}")
+            raw = decode_data_url_image(match[2])
+        except ValueError:
+            raise SchemaValidationError("image_url 的 data: 图片无法解码。请使用有效且符合大小限制的 Base64 图片。") from None
     elif image_url.startswith(("http://", "https://")):
         fetched = fetch_remote_image(image_url)
-        if fetched:
-            try:
-                append_part(*fetched)
-            except ValueError as e:
-                print(f"⚠️ [图片处理] 远程图片超出处理限制，已跳过：{e}")
+        if not fetched or not fetched[0]:
+            raise SchemaValidationError(
+                "无法读取 image_url 中的图片。请提供服务可访问的图片地址，或使用 data: 图片 URL。"
+            )
+        raw, mime = fetched
+    else:
+        raise SchemaValidationError(source_help)
+    try:
+        return optimize_image_bytes(raw, mime)
+    except ValueError:
+        raise SchemaValidationError("image_url 的图片无法处理。请检查图片格式、大小及像素限制后重新提供地址或 data: 图片。") from None
 
 
-def _append_sdk_image_part(parts: list, raw_bytes: bytes, mime_type: str) -> None:
-    """压缩后构造 SDK types.Part（Express 通道的 append_part 实现）。"""
-    opt_bytes, opt_mime = optimize_image_bytes(raw_bytes, mime_type)
-    parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
+def _sdk_image_part(image_url: str, history: ManagedImageHistory | None = None) -> types.Part:
+    raw, mime = _required_image_bytes(image_url, history)
+    return types.Part.from_bytes(data=raw, mime_type=mime)
 
 
-def _wire_image_part(raw_bytes: bytes, mime_type: str) -> Dict[str, Any]:
-    """压缩后转成 batchGraphql 的 inlineData part（camelCase）。"""
-    opt_bytes, opt_mime = optimize_image_bytes(raw_bytes, mime_type)
-    return {
-        "inlineData": {
-            "mimeType": opt_mime,
-            "data": base64.b64encode(opt_bytes).decode("utf-8"),
-        }
-    }
+def _wire_image_part(image_url: str, history: ManagedImageHistory | None = None) -> Dict[str, Any]:
+    raw, mime = _required_image_bytes(image_url, history)
+    return {"inlineData": {"mimeType": mime, "data": base64.b64encode(raw).decode("ascii")}}
 
 
-def openai_content_to_wire_parts(content: Any) -> List[Dict[str, Any]]:
+def openai_content_to_wire_parts(content: Any, history: ManagedImageHistory | None = None, *,
+                                 thought: bool = False) -> List[Dict[str, Any]]:
     """OpenAI 的 message.content → batchGraphql 的 parts 列表（P1-2）。
 
     与 Express 通道行为对齐：
@@ -765,23 +806,16 @@ def openai_content_to_wire_parts(content: Any) -> List[Dict[str, Any]]:
     def _add_text_with_inline_images(text: str):
         if not text:
             return
-        img_parts, clean_text = _extract_markdown_images_to_parts(text)
-        if clean_text:
-            parts.append({"text": clean_text})
-        for ip in img_parts:
-            blob = getattr(ip, "inline_data", None)
-            if blob is not None and getattr(blob, "data", None):
-                data = blob.data
-                if isinstance(data, bytes):
-                    data = base64.b64encode(data).decode("utf-8")
-                parts.append(
-                    {
-                        "inlineData": {
-                            "mimeType": getattr(blob, "mime_type", "image/jpeg"),
-                            "data": data,
-                        }
-                    }
-                )
+        for item in _text_media_segments(text, history, parse_inline=not thought):
+            if isinstance(item, str):
+                wire = {"text": item}
+            elif (blob := item.inline_data) is not None and blob.data:
+                wire = {"inlineData": {"mimeType": blob.mime_type, "data": base64.b64encode(blob.data).decode("ascii")}}
+            else:
+                continue
+            if thought:
+                wire["thought"] = True
+            parts.append(wire)
 
     if isinstance(content, str):
         _add_text_with_inline_images(content)
@@ -791,9 +825,7 @@ def openai_content_to_wire_parts(content: Any) -> List[Dict[str, Any]]:
         _iter_content_segments(
             content,
             _add_text_with_inline_images,
-            lambda url: _ingest_image_part(
-                url, lambda raw, mime: parts.append(_wire_image_part(raw, mime))
-            ),
+            lambda url: parts.append(_wire_image_part(url, history)),
         )
     return parts
 
@@ -869,6 +901,17 @@ def _create_safety_ratings_html(safety_ratings: list) -> str:
     return html_output
 
 
+def safety_ratings_presentation(ratings: Any, *, structured_output: bool) -> str:
+    """Decorate ordinary chat only; machine-readable payloads must stay intact."""
+    if structured_output or not ratings:
+        return ""
+    try:
+        enabled = app_state.get_setting("safety_score", app_config.SAFETY_SCORE)
+    except Exception:
+        enabled = app_config.SAFETY_SCORE
+    return _create_safety_ratings_html(ratings) if enabled else ""
+
+
 def _convert_image_to_markdown(image_data: bytes, mime_type: str) -> str:
     from image_delivery import image_base_url, image_markdown
     if image_base_url.get():
@@ -884,6 +927,20 @@ def _convert_image_to_markdown(image_data: bytes, mime_type: str) -> str:
     except Exception as e:
         print(f"⚠️ [图片处理] 将 Gemini 图片转换为 Markdown 失败：{e}")
         return "[Image could not be displayed]"
+
+
+def sdk_ordinary_part_fields(part: Any, signature: Optional[bytes]) -> Optional[tuple[str, str]]:
+    """Use the same topology for completed and streamed SDK replies."""
+    if sdk_media_payload(part) is not None:
+        return "image", ""  # Wire content already carries the actual media.
+    text = getattr(part, "text", None)
+    if text is None and (getattr(part, "inline_data", None) is not None
+                         or getattr(part, "file_data", None) is not None):
+        return ("signature_only", "") if signature else None
+    text = "" if text is None else str(text)
+    if getattr(part, "thought", None) is True:
+        return "thought", text
+    return ("signature_only" if not text and signature else "text"), text
 
 
 def parse_gemini_response_for_reasoning_and_content(
@@ -908,28 +965,18 @@ def parse_gemini_response_for_reasoning_and_content(
         and gemini_candidate_content.parts
     ):
         for part_item in gemini_candidate_content.parts:
-            if (
-                hasattr(part_item, "function_call")
-                and part_item.function_call is not None
-            ):
+            if sdk_function_call(part_item) is not None:
                 continue
 
             part_text = ""
             if hasattr(part_item, "text") and part_item.text is not None:
                 part_text = str(part_item.text)
-            elif (
-                hasattr(part_item, "inline_data") and part_item.inline_data is not None
-            ):
-                inline_data = part_item.inline_data
-                if hasattr(inline_data, "data") and hasattr(inline_data, "mime_type"):
-                    image_bytes = inline_data.data
-                    mime_type = inline_data.mime_type
-                    part_text = _convert_image_to_markdown(image_bytes, mime_type)
-            elif hasattr(part_item, "file_data") and part_item.file_data is not None:
-                file_data = part_item.file_data
-                if hasattr(file_data, "file_uri"):
-                    file_uri = file_data.file_uri
-                    part_text = file_data_markdown(file_uri, getattr(file_data, "mime_type", None))
+            elif (media := sdk_media_payload(part_item)) is not None:
+                source, payload = media
+                if source == "inline":
+                    part_text = _convert_image_to_markdown(payload.data, getattr(payload, "mime_type", None))
+                else:
+                    part_text = file_data_markdown(payload.file_uri, getattr(payload, "mime_type", None))
 
             part_is_thought = (
                 hasattr(part_item, "thought") and part_item.thought is True
@@ -959,9 +1006,10 @@ def parse_gemini_response_for_reasoning_and_content(
 
 
 def process_gemini_response_to_openai_dict(
-    gemini_response_obj: Any, request_model_str: str
+    gemini_response_obj: Any, request_model_str: str, *, structured_output: bool = False
 ) -> Dict[str, Any]:
     choices = []
+    pending_signatures: PendingCallSignatures = []
     response_timestamp = int(time.time())
     base_id = f"chatcmpl-{response_timestamp}-{uuid.uuid4().hex[:12]}"
 
@@ -977,17 +1025,16 @@ def process_gemini_response_to_openai_dict(
             parts_in_order = list(
                 getattr(getattr(candidate, "content", None), "parts", None) or []
             )
+            if openai_finish_reason in ("stop", "tool_calls"):
+                # A complete executable candidate must have unambiguous result IDs.
+                require_unique_tool_call_ids(
+                    getattr(fc, "id", None) for p in parts_in_order
+                    if (fc := sdk_function_call(p)) is not None)
             reasoning_str, normal_content_str = (
                 parse_gemini_response_for_reasoning_and_content(candidate)
             )
-            if (
-                app_state.get_setting("safety_score", app_config.SAFETY_SCORE)
-                and hasattr(candidate, "safety_ratings")
-                and candidate.safety_ratings
-            ):
-                normal_content_str += _create_safety_ratings_html(
-                    candidate.safety_ratings
-                )
+            normal_content_str += safety_ratings_presentation(
+                getattr(candidate, "safety_ratings", None), structured_output=structured_output)
 
             tool_index = 0
             ordinary_metadata = []
@@ -995,17 +1042,12 @@ def process_gemini_response_to_openai_dict(
             message_signature = None
             message_signature_kind = None
             for part in parts_in_order:
-                fc = getattr(part, "function_call", None)
+                fc = sdk_function_call(part)
                 sig = signature_bytes(part, fc)
                 if fc is not None:
                     arguments = complete_function_arguments(fc)
-                    missing_state = (
-                        SignatureState.UNSIGNED_FOLLOWER
-                        if tool_index > 0
-                        else SignatureState.UNKNOWN
-                    )
-                    tool_call_id = build_tool_call_id(
-                        fc, part, missing_state=missing_state
+                    tool_call_id = stage_tool_call_id(
+                        pending_signatures, fc, sig, unsigned_follower=tool_index > 0
                     )
                     tool_payload = {
                         "id": tool_call_id,
@@ -1024,28 +1066,11 @@ def process_gemini_response_to_openai_dict(
                     )
                     continue
 
+                fields = sdk_ordinary_part_fields(part, sig)
+                if fields is None:
+                    continue
+                ordinary_kind, text_value = fields
                 is_thought = getattr(part, "thought", None) is True
-                text_value = getattr(part, "text", None)
-                if (
-                    text_value is None
-                    and getattr(part, "inline_data", None) is not None
-                ):
-                    # The image is stored in content; metadata only records its slot.
-                    text_value = ""
-                elif (
-                    text_value is None and getattr(part, "file_data", None) is not None
-                ):
-                    text_value = file_data_markdown(part.file_data.file_uri, getattr(part.file_data, "mime_type", None))
-                text_value = "" if text_value is None else str(text_value)
-                if getattr(part, "inline_data", None) is not None or getattr(part, "file_data", None) is not None:
-                    ordinary_kind = "image"
-                    text_value = ""
-                elif is_thought:
-                    ordinary_kind = "thought"
-                elif text_value == "" and sig:
-                    ordinary_kind = "signature_only"
-                else:
-                    ordinary_kind = "text"
                 ordinary_index = len(ordinary_metadata)
                 ordinary_metadata.append(
                     ordinary_part_metadata(ordinary_kind, text_value, sig, thought=is_thought)
@@ -1106,7 +1131,9 @@ def process_gemini_response_to_openai_dict(
         )
 
     usage_data = map_usage(getattr(gemini_response_obj, "usage_metadata", None))
-
+    # A later invalid part or candidate rejects the whole reply, including its IDs.
+    if pending_signatures:
+        publish_tool_call_signatures(pending_signatures)
     return {
         "id": base_id,
         "object": "chat.completion",
@@ -1117,5 +1144,5 @@ def process_gemini_response_to_openai_dict(
     }
 
 
-def convert_to_openai_format(gemini_response: Any, model: str) -> Dict[str, Any]:
-    return process_gemini_response_to_openai_dict(gemini_response, model)
+def convert_to_openai_format(gemini_response: Any, model: str, *, structured_output: bool = False) -> Dict[str, Any]:
+    return process_gemini_response_to_openai_dict(gemini_response, model, structured_output=structured_output)

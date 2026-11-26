@@ -14,21 +14,29 @@ from cookie_auth import (
     get_client_version,
     get_stream_query_signature,
 )
-from media_tasks import run_media_task
+from image_history import ManagedImageHistory
+from media_tasks import prompt_needs_media_pool, run_media_task
 from tool_arguments import parse_tool_arguments
-from message_processing import is_multimodal_tool_error, openai_content_to_wire_parts, tool_response_with_media
+from tool_history import gemini_history_with_ids, has_tool_history
+from message_processing import (
+    anthropic_tool_result_is_error, openai_content_to_wire_parts, tool_observation_json, tool_response_with_media,
+)
 from models import OpenAIRequest, normalize_content_part
+from ordinary_history import exact_ordinary_slots
 from runtime_state import app_state
 from schema_validation import SchemaValidationError, sanitize_for_gemini
+from signature_origin import origin_slot
 from thought_signatures import (
-    LEGACY_THOUGHT_SEP,
+    canonical_wire_signature,
+    replay_tool_call_id,
     encode_thought_signature,
     google_metadata,
     is_thought_part,
-    merge_by_order,
+    merge_replayed_parts,
     requires_signature,
     resolve_tool_call_signature,
     signature_from_extra,
+    standalone_message_signature,
 )
 from tool_policy import (
     has_search_suffix,
@@ -184,15 +192,9 @@ def classify_tool_traffic(messages: list, tools: Any = None) -> dict:
         elif name:
             custom_names.append(name)
 
-    history = False
-    for m in messages or []:
-        if getattr(m, "role", None) in ("tool", "function") or getattr(m, "tool_calls", None):
-            history = True
-            break
-
     return {
         "declared": declared,
-        "history": history,
+        "history": has_tool_history(messages or ()),
         "builtin_search": builtin_search,
         "custom_names": custom_names,
     }
@@ -327,47 +329,31 @@ def _parse_function_args(value: Any) -> dict:
     return parse_tool_arguments(value, label="tool_call.function.arguments")
 
 
-def _ordinary_wire_parts_from_extra(message: Any) -> Optional[list[dict]]:
-    google = google_metadata(message)
-    raw = google.get("ordinary_parts")
-    if not isinstance(raw, list):
+def _ordinary_wire_parts_from_extra(message: Any, history: ManagedImageHistory | None = None) -> Optional[list[dict]]:
+    slots = exact_ordinary_slots(message, google_metadata(message).get("ordinary_parts"), history)
+    if slots is None:
         return None
     parts = []
-    images = {}
-    image_indices = {False: 0, True: 0}
-    for item in raw:
-        if (not isinstance(item, dict) or not isinstance(item.get("kind"), str)
-                or item["kind"] not in {"text", "thought", "signature_only", "image"}):
-            return None
-        text = item.get("text")
-        if not isinstance(text, str) or (item["kind"] == "text" and "data:image/" in text):
-            return None
-        part = {"text": text}
-        if item["kind"] == "image" or (item["kind"] in {"text", "thought"} and text == "[image]"):
-            thought = item["kind"] == "thought" or item.get("thought") is True
-            if thought not in images:
-                field = "reasoning_content" if thought else "content"
-                content = message.get(field) if isinstance(message, dict) else getattr(message, field, None)
-                images[thought] = [p for p in openai_content_to_wire_parts(content)
-                                   if "inlineData" in p or "fileData" in p]
-            index = image_indices[thought]
-            if index < len(images[thought]):
-                part = dict(images[thought][index])
-                image_indices[thought] += 1
-                if thought:
-                    part["thought"] = True
-            elif item["kind"] == "image":
+    for item, media in slots:
+        if media is not None:
+            part = next((p for p in openai_content_to_wire_parts([media], history)
+                         if "inlineData" in p or "fileData" in p), None)
+            if part is None:
                 return None
-        if item["kind"] == "thought":
-            part["thought"] = True
+            if item["kind"] == "thought" or item.get("thought") is True:
+                part["thought"] = True
+        else:
+            part = {"text": item["text"]}
+            if item["kind"] == "thought":
+                part["thought"] = True
         if item.get("thought_signature"):
-            part["thoughtSignature"] = item["thought_signature"]
+            part["thoughtSignature"] = canonical_wire_signature(item["thought_signature"])
         parts.append(part)
     return parts
 
 
 def _attach_message_signature(parts: list[dict], message: Any) -> None:
-    signature, kind = signature_from_extra(message)
+    signature, kind = standalone_message_signature(message)
     # thoughtSignature 是 GraphQL Bytes 标量：哨兵与真实签名一样 base64 编码
     #（字面量会被校验层拒绝，2026-11-16 真机验证，见 signature_store 说明）。
     encoded = encode_thought_signature(signature)
@@ -386,6 +372,30 @@ def _attach_message_signature(parts: list[dict], message: Any) -> None:
     target["thoughtSignature"] = encoded
 
 
+def _merge_cookie_turns(contents: list[dict]) -> list[dict]:
+    """Merge an adjacent compatible run without ever rescanning its accumulated Parts."""
+    merged = []
+    previous_results = None
+    for turn in contents:
+        if not merged or merged[-1]["role"] != turn["role"]:
+            merged.append(turn)
+            previous_results = None
+            continue
+        previous_parts, parts = merged[-1]["parts"], turn["parts"]
+        if previous_results is None:
+            previous_results = bool(previous_parts) and all("functionResponse" in p for p in previous_parts)
+        current_results = bool(parts) and all("functionResponse" in p for p in parts)
+        if previous_results != current_results:
+            # A fresh user message after parallel tool results is its own turn.
+            merged.append(turn)
+        else:
+            if not current_results:
+                previous_parts.append({"text": "\n\n"})
+            previous_parts.extend(parts)
+        previous_results = current_results
+    return merged
+
+
 def _convert_messages_to_contents(messages: list, model_name: str = "", native_tools: bool = True) -> tuple:
     """OpenAI messages → batchGraphql contents.
 
@@ -393,13 +403,14 @@ def _convert_messages_to_contents(messages: list, model_name: str = "", native_t
     ``native_tools=False`` is the controlled compatibility fallback used only
     after a clear schema/model rejection from the upstream.
     """
+    history = ManagedImageHistory.for_request()
     contents = []
     system_parts = []
     require_sig = requires_signature(model_name)
     call_names = {}
-    for msg in messages:
+    for msg, literal_ids in gemini_history_with_ids(messages, native=native_tools):
         role = msg.role
-        content = msg.content
+        content = msg.replay_content()
         # Resolve against preceding calls only. A later turn may reuse a
         # client-generated id and must not rename an earlier tool result.
         if role in ("assistant", "model"):
@@ -408,7 +419,7 @@ def _convert_messages_to_contents(messages: list, model_name: str = "", native_t
                 fn_name = str((tc.get("function") or {}).get("name") or "")
                 if tc_id and fn_name:
                     call_names[tc_id] = fn_name
-                    call_names[tc_id.partition(LEGACY_THOUGHT_SEP)[0]] = fn_name
+                    call_names[replay_tool_call_id(tc_id, literal_ids)] = fn_name
 
         # developer 与 system 同语义（OpenAI 新约定的最高优先级指令）：
         # 统一收集进 system_parts，不降级为 user 轮混进对话。
@@ -427,9 +438,10 @@ def _convert_messages_to_contents(messages: list, model_name: str = "", native_t
         # 旧版 functions 协议的结果消息是 role="function"（与 Express 通道的
         # message_processing 保持同一兼容口径），漏掉会被当成 model 自述文本。
         if role in ("tool", "function"):
-            call_id = (msg.tool_call_id or "").partition(LEGACY_THOUGHT_SEP)[0]
+            call_id = replay_tool_call_id(msg.tool_call_id or "", literal_ids)
             name = msg.name or call_names.get(msg.tool_call_id or "") or call_names.get(call_id)
-            output, media = tool_response_with_media(content, model_name, error_content=is_multimodal_tool_error(msg))
+            error_content = anthropic_tool_result_is_error(msg)
+            output, media = tool_response_with_media(content, model_name, error_content=error_content)
             media_parts = [{"inlineData": {"mimeType": mime,
                            "data": base64.b64encode(raw).decode("ascii"), "displayName": display}}
                            for raw, mime, display in media]
@@ -446,7 +458,7 @@ def _convert_messages_to_contents(messages: list, model_name: str = "", native_t
                     }
                 )
             else:
-                body = json.dumps(output, ensure_ascii=False) if media else _plain_text_of(content)
+                body = tool_observation_json(output, media, error_content) or _plain_text_of(content)
                 contents.append(
                     {"role": "user", "parts": [{"text": f"[工具执行结果 · {name or 'tool'}]\n{body}"},
                         *media_parts]}
@@ -463,20 +475,32 @@ def _convert_messages_to_contents(messages: list, model_name: str = "", native_t
                         f"[请求调用工具 · {fn.get('name', 'unknown')}] 参数：{fn.get('arguments', '{}')}"
                     )
                 said = _plain_text_of(content)
-                if said:
-                    lines.insert(0, said)
-                contents.append({"role": "model", "parts": [{"text": "\n".join(lines)}]})
+                if history and history.pattern.search(said):
+                    # The compatibility transcript can omit native function
+                    # calls, but must not convert image history back to text.
+                    ordinary = _ordinary_wire_parts_from_extra(msg, history)
+                    if ordinary is None:
+                        ordinary = openai_content_to_wire_parts(content, history)
+                        _attach_message_signature(ordinary, msg)
+                    contents.append({"role": "model", "parts": [*ordinary, {"text": "\n".join(lines)}]})
+                else:
+                    if said:
+                        lines.insert(0, said)
+                    contents.append({"role": "model", "parts": [{"text": "\n".join(lines)}]})
                 continue
 
             call_parts = []
             for tool_index, tc in enumerate(tool_calls):
                 fn = (tc or {}).get("function") or {}
                 explicit_sig, _ = signature_from_extra(tc)
+                public_id = str((tc or {}).get("id") or "")
                 call_id, signature = resolve_tool_call_signature(
-                    str((tc or {}).get("id") or ""),
+                    public_id,
                     require_signature=require_sig and tool_index == 0,
                     explicit_signature=explicit_sig,
                     explicit_unsigned=tool_index > 0,
+                    origin_key=origin_slot(msg, tool_index),
+                    literal_id=public_id in literal_ids,
                 )
                 part = {
                     "functionCall": {
@@ -494,55 +518,41 @@ def _convert_messages_to_contents(messages: list, model_name: str = "", native_t
                     part["thoughtSignature"] = encoded
                 call_parts.append(part)
 
-            ordinary_parts = _ordinary_wire_parts_from_extra(msg)
+            ordinary_parts = _ordinary_wire_parts_from_extra(msg, history)
+            exact_history = ordinary_parts is not None
             if ordinary_parts is None:
                 ordinary_parts = []
                 reasoning = getattr(msg, "reasoning_content", None)
                 if reasoning:
-                    ordinary_parts.append({"text": reasoning, "thought": True})
-                ordinary_parts.extend(openai_content_to_wire_parts(content))
+                    ordinary_parts.extend(openai_content_to_wire_parts(reasoning, history, thought=True))
+                ordinary_parts.extend(openai_content_to_wire_parts(content, history))
                 _attach_message_signature(ordinary_parts, msg)
 
             google = google_metadata(msg)
             # QUA-P2-3：part_order 交错重组收敛到 thought_signatures.merge_by_order
             #（剩余块兕底顺序保留 Cookie 通道既有行为：调用块在前）。
-            parts = merge_by_order(google.get("part_order"), call_parts, ordinary_parts,
-                                   remainder_calls_first=True)
+            parts = merge_replayed_parts(google, call_parts, ordinary_parts,
+                                         exact_history=exact_history, remainder_calls_first=True)
             if parts is None:
                 parts = call_parts + ordinary_parts
             contents.append({"role": "model", "parts": parts})
             continue
 
         gemini_role = "user" if role == "user" else "model"
-        parts = _ordinary_wire_parts_from_extra(msg) if role in ("assistant", "model") else None
+        parts = _ordinary_wire_parts_from_extra(msg, history) if role in ("assistant", "model") else None
         if parts is None:
-            parts = openai_content_to_wire_parts(content)
-            if role in ("assistant", "model"):
+            assistant = role in ("assistant", "model")
+            parts = openai_content_to_wire_parts(content, history if assistant else None)
+            if assistant:
+                reasoning = msg.reasoning_content
+                if reasoning and ("ordinary_parts" in google_metadata(msg) or history and history.pattern.search(reasoning)):
+                    parts = openai_content_to_wire_parts(reasoning, history, thought=True) + parts
                 _attach_message_signature(parts, msg)
         if parts:
             contents.append({"role": gemini_role, "parts": parts})
 
-    # Keep parallel FunctionResponses adjacent and unsigned: FC1, FC2 then FR1, FR2.
-    merged: list = []
-    for c in contents:
-        if merged and merged[-1]["role"] == c["role"]:
-            previous_fr = bool(merged[-1]["parts"]) and all(
-                "functionResponse" in p for p in merged[-1]["parts"]
-            )
-            current_fr = bool(c["parts"]) and all("functionResponse" in p for p in c["parts"])
-            # Only adjacent FunctionResponse messages belong to the same parallel
-            # result turn. Never merge a later fresh user message into that turn.
-            if previous_fr != current_fr:
-                merged.append(c)
-                continue
-            if not (previous_fr and current_fr):
-                merged[-1]["parts"].append({"text": "\n\n"})
-            merged[-1]["parts"].extend(c["parts"])
-        else:
-            merged.append(c)
-
     system_text = "\n".join(t for t in system_parts if t) if system_parts else None
-    return merged, system_text
+    return _merge_cookie_turns(contents), system_text
 
 
 async def build_request_body_async(
@@ -555,7 +565,8 @@ async def build_request_body_async(
 ) -> dict:
     """在线程里构建请求体：内部有远程图片下载与 PIL 压缩，不能阻塞事件循环（P1-2）。"""
     return await run_media_task(
-        build_request_body, project_id, model_name, request, prefill_active, force_search, native_tools
+        build_request_body, project_id, model_name, request, prefill_active, force_search, native_tools,
+        heavy=bool(request.tools or request.response_format) or prompt_needs_media_pool(request.messages, plain_only=True),
     )
 
 

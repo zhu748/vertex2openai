@@ -8,6 +8,7 @@ from fastapi.responses import StreamingResponse
 from runtime_state import app_state
 from proxy_resolver import ProxyUsage, current_proxy_usage
 from request_tracking import PayloadObserver, current_trace
+from stream_cleanup import await_owned_close
 
 # setup 任务的「快窗口」：窗口内完成的异常/错误响应保留真实 HTTP 状态码
 # （middleware 能看到），窗口后才建立 SSE 连接（chat_api._resumable_stream
@@ -72,7 +73,7 @@ class GenerationLimiter:
         with self._lock:
             # limit 的读取必须在临界区内：控制台热调 upstream_max_concurrency
             # 的瞬间，锁外读取会让并发 reserve 沿用旧值（TOCTOU，2026-10 修复）。
-            limit = max(1, int(app_state.get_setting(self.setting_key, self.default_limit)))
+            limit = max(1, int(app_state.get_committed_setting(self.setting_key, self.default_limit)))
             if self.active >= limit:
                 raise GenerationCapacityError(self.full_message)
             self.active += 1
@@ -122,9 +123,12 @@ image_limiter = GenerationLimiter(
 
 
 class LeasedIterator:
-    def __init__(self, source, lease, *, sse=True, observe=True):
+    def __init__(self, source, lease, *, sse=True, observe=True, owner=None):
         self.source = source.__aiter__()
         self.lease = lease
+        self.owner = owner
+        if owner is not None:
+            owner.leases.append(lease)
         # An auxiliary memory gate owns no trace counters, but its upstream
         # iterator still runs in the request's diagnostic context. Capture it
         # here so reading/closing from another task preserves that identity.
@@ -149,44 +153,153 @@ class LeasedIterator:
         except StopAsyncIteration:
             if self.observer:
                 self.observer.feed(b"", final=True)
-            self.lease.release()
+            await self._finish("succeeded")
             raise
         except BaseException as exc:
-            self.lease.release("cancelled" if isinstance(exc, (GeneratorExit, asyncio.CancelledError)) else "error", str(exc))
+            await self._finish("cancelled" if isinstance(exc, (GeneratorExit, asyncio.CancelledError)) else "error", str(exc))
             raise
         finally:
             current_trace.reset(trace_token)
             current_proxy_usage.reset(token)
 
+    async def _finish(self, outcome, message=None):
+        if self.owner is None:
+            self.lease.release(outcome, message)
+        else:
+            await self.owner.finish(outcome, message)
+
     async def aclose(self):
+        await self._close("cancelled")
+
+    async def aclose_terminal(self, outcome):
+        """A protocol-level terminal is conclusive without reading through to EOF."""
+        await self._close(outcome)
+
+    async def _close(self, outcome):
         token = current_trace.set(self.trace)
+        proxy_token = current_proxy_usage.set(self.lease.usage)
         try:
-            close = getattr(self.source, "aclose", None)
-            if close:
+            if outcome != "cancelled" and self.observer:
+                self.observer.feed(b"", final=True)
+            if isinstance(self.source, LeasedIterator):
+                await self.source._close(outcome)
+            elif self.owner is None and (close := getattr(self.source, "aclose", None)):
                 await close()
         finally:
-            self.lease.release("cancelled")
-            current_trace.reset(token)
+            try:
+                await self._finish(outcome)
+            finally:
+                current_proxy_usage.reset(proxy_token)
+                current_trace.reset(token)
+
+
+class _StreamCleanup:
+    """One owner for the original body, its extra transport cleanup and attached leases.
+
+    A body can be drained or closed without calling the ASGI response (e.g. a
+    replay pump). Conversely, a send can fail before the first pull. Both paths
+    join the same close; cancellation of a waiter cannot release a lease early.
+    """
+    def __init__(self, body, cleanup):
+        self.body = body
+        self.cleanup = cleanup
+        self.task = None
+        self.leases = []
+        self.result = None
+
+    async def _close(self):
+        try:
+            try:
+                if close := getattr(self.body, "aclose", None):
+                    await close()
+            finally:
+                await self.cleanup()
+        finally:
+            for lease in self.leases:
+                lease.release(*(self.result or ("cancelled", None)))
+            self.leases.clear()
+
+    async def aclose(self):
+        if self.task is None:
+            self.task = asyncio.create_task(self._close())
+            # A cancelled waiter may be the last one. Always retrieve the error.
+            self.task.add_done_callback(lambda task: None if task.cancelled() else task.exception())
+        with anyio.CancelScope(shield=True):
+            await asyncio.shield(self.task)
+
+    async def finish(self, outcome, message):
+        if self.result is None:
+            self.result = (outcome, message)
+        await self.aclose()
 
 
 class ManagedStreamingResponse(StreamingResponse):
     def __init__(self, *args, cleanup=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.cleanup = cleanup
+        self.cleanup_owner = None
+
+    # Bound only by direct routes: detached pumps iterate the body independently.
+    client_connection = None
+
+    async def stream_response(self, send):
+        connection = self.client_connection
+        if connection is None:
+            return await super().stream_response(send)
+        # ASGI >=2.4 normally stops on a failed send. A quiet upstream might
+        # never send again; some servers also silently discard writes. Reuse
+        # the middleware's physical disconnect notification, not raw receive.
+        owner = asyncio.current_task()
+        cancellations = owner.cancelling()
+        with anyio.CancelScope() as scope:
+            def stop(gone):
+                if gone:
+                    scope.cancel()
+            connection.listen(stop)
+            try:
+                if not connection.disconnected:
+                    await super().stream_response(send)
+            finally:
+                if stop in connection.listeners:
+                    connection.listeners.remove(stop)
+        # AnyIO withdraws its own cancellation on exit. An independent server
+        # cancellation during shielded transport cleanup must still propagate.
+        if owner.cancelling() > cancellations:
+            raise asyncio.CancelledError()
+
+    def admission_owner(self):
+        if self.cleanup is not None and self.cleanup_owner is None:
+            self.cleanup_owner = _StreamCleanup(self.body_iterator, self.cleanup)
+        return self.cleanup_owner
 
     async def aclose(self):
         with anyio.CancelScope(shield=True):
             try:
-                await self.body_iterator.aclose()
+                if close := getattr(self.body_iterator, "aclose", None):
+                    await close()
             finally:
-                if self.cleanup:
+                # Unleased response: the existing ASGI/detached caller owns this
+                # inline cleanup. Leased iterators instead share their close owner.
+                if self.cleanup is not None and self.cleanup_owner is None:
                     await self.cleanup()
 
     async def __call__(self, scope, receive, send):
         try:
             await super().__call__(scope, receive, send)
         finally:
-            await self.aclose()
+            if self.client_connection is not None and self.client_connection.disconnected:
+                # A direct sender can already be unwinding due to peer loss.
+                # Let a second, independent server cancellation interrupt this
+                # waiter, not an adapter's best-effort physical close.
+                await await_owned_close(self.aclose())
+            else:
+                await self.aclose()
+
+
+def _lease_body(response, lease, *, observe=True):
+    owner = response.admission_owner() if isinstance(response, ManagedStreamingResponse) else None
+    return LeasedIterator(response.body_iterator, lease, owner=owner, observe=observe,
+                          sse="text/event-stream" in response.headers.get("content-type", ""))
 
 
 async def run_with_image_limit(model, operation):
@@ -202,11 +315,7 @@ async def run_with_image_limit(model, operation):
         lease.release("cancelled" if isinstance(exc, (asyncio.CancelledError, GeneratorExit)) else "error", str(exc))
         raise
     if isinstance(response, StreamingResponse):
-        response.body_iterator = LeasedIterator(
-            response.body_iterator, lease,
-            sse="text/event-stream" in response.headers.get("content-type", ""),
-            observe=False,
-        )
+        response.body_iterator = _lease_body(response, lease, observe=False)
     else:
         lease.release("succeeded" if response.status_code < 400 else "error")
     return response
@@ -232,7 +341,7 @@ def limit_generation(function):
                     lease.trace.fail(f"上游返回 HTTP {response.status_code}", response.status_code)
             lease.release("succeeded" if response.status_code < 400 else "error")
             return response
-        iterator = LeasedIterator(response.body_iterator, lease, sse="text/event-stream" in response.headers.get("content-type", ""))
+        iterator = _lease_body(response, lease)
         if hasattr(response, "aclose"):
             response.body_iterator = iterator
             return response

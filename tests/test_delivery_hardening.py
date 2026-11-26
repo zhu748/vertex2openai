@@ -27,7 +27,12 @@ def request(headers=None, query=None):
 
 
 async def collect(response):
-    return "".join([x.decode() if isinstance(x, bytes) else x async for x in response.body_iterator])
+    chunks = []
+    async def send(message):
+        if message["type"] == "http.response.body":
+            chunks.append(message["body"])
+    await response({"type": "http", "asgi": {"spec_version": "2.4"}}, None, send)
+    return b"".join(chunks).decode()
 
 
 class GenerationTests(unittest.IsolatedAsyncioTestCase):
@@ -297,8 +302,10 @@ class BudgetTests(unittest.IsolatedAsyncioTestCase):
         buf, _ = await self.store.create_if_absent("hung-reader")
         buf.deadline_monotonic -= 100000
         buf.readers = 1
-        self.assertEqual(await self.store.sweep(), 1)
+        self.assertEqual(await self.store.sweep(), 0)
+        self.assertIs(await self.store.get_exact(buf.id), buf)
         self.assertTrue(buf.done)
+        self.assertEqual(buf.status_code, 504)
 
     async def test_stream_pump_deadline_emits_504_and_terminal_frame(self):
         buf, _ = await self.store.create_if_absent("stream-timeout")
@@ -339,7 +346,7 @@ class AdmissionTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.Event().wait()
             return StreamingResponse(source())
         with mock.patch.object(admission, "generation_limiter", limiter), \
-             mock.patch.object(admission.app_state, "get_setting", return_value=1):
+             mock.patch.object(admission.app_state, "get_committed_setting", return_value=1):
             response = await call()
             self.assertEqual(limiter.active, 1)
             with self.assertRaises(admission.GenerationCapacityError):
@@ -466,11 +473,11 @@ class NativeRecoveryTests(unittest.IsolatedAsyncioTestCase):
             return StreamingResponse(frames())
         with mock.patch.object(native_passthrough, "resumable_store", store), \
              mock.patch.object(native_passthrough, "_passthrough_request", side_effect=upstream) as call:
-            first = await gemini_native._resumable_native(request(), "k", "m", "streamGenerateContent", "alt=sse", b'{}', {})
+            first = await gemini_native._resumable_native(request(), "k", "m", "streamGenerateContent", "alt=sse", b'{}')
             body = await collect(first)
             again = await gemini_native._resumable_native(
                 request({"x-resume-id": first.headers["x-resume-id"], "last-event-id": "0"}),
-                "k", "m", "streamGenerateContent", "alt=sse", b'{}', {})
+                "k", "m", "streamGenerateContent", "alt=sse", b'{}')
             replay = await collect(again)
         self.assertEqual(call.await_count, 1)
         self.assertNotIn("[DONE]", body)

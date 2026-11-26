@@ -90,6 +90,15 @@ EXPERIMENT_FLAGS = _settings.EXPERIMENT_FLAGS
 ENV_COOKIE_ACCOUNTS = parse_cookie_records(
     _settings.GOOGLE_COOKIES if _settings.GOOGLE_COOKIES is not None else GOOGLE_COOKIE,
     GOOGLE_PROJECT_ID or "", _settings.GOOGLE_PROJECT_IDS or "")
+
+
+def initial_cookie_accounts(legacy_default_project: str) -> list:
+    """Use the persisted default only for legacy singular input without positional IDs."""
+    if GOOGLE_COOKIES is None and GOOGLE_COOKIE and not _settings.GOOGLE_PROJECT_IDS:
+        return parse_cookie_records(GOOGLE_COOKIE, legacy_default_project)
+    return ENV_COOKIE_ACCOUNTS
+
+
 UPSTREAM_MODE = _settings.UPSTREAM_MODE or (
     "mixed" if ENV_EXPRESS_KEYS and ENV_COOKIE_ACCOUNTS else
     "web_proxy" if ENV_COOKIE_ACCOUNTS else "api_key")
@@ -127,8 +136,8 @@ DEFAULT_SETTINGS = {
     #  retry_backoff_seconds + retry_jitter_seconds/2] 内均匀采样；
     # 上游 Retry-After 更短时采纳其提示，更长时钳位到该窗口上限。
     "retry_max": 10,
-    "retry_backoff_seconds": 5,
-    "retry_jitter_seconds": 1,
+    "retry_backoff_seconds": 5.0,
+    "retry_jitter_seconds": 1.0,
     # 重试间隔模式：fixed（默认）= 固定间隔 + 抖动，与「每次重试换凭证」语义匹配；
     # exponential = 按 2^attempt 放大并封顶 120 秒——单凭证场景配额按分钟窗口限流时，
     # 长蹲守的成功率更高（对齐旧版行为，按需开启）。

@@ -2,6 +2,7 @@
 import asyncio
 import io
 import json
+import threading
 
 from fastapi.responses import JSONResponse
 
@@ -33,22 +34,25 @@ async def json_response_offloop(content, *, status_code: int = 200,
                                 headers=None, background=None) -> JSONResponse:
     """JSON 响应构造：小负载直路；超过阈值移到线程池（REQ-P2-2）。
 
-    线程内直接构造 JSONResponse（render + init_headers 全部纯 CPU、
-    无 IO / 锁），保证与直路字节级一致——不是自写 dumps 参数去逼近
-    starlette 的渲染口径，而是复用同一个渲染器。
+    大响应复用按片段编码的渲染器，避免同时持有整份 JSON 文本和编码后的字节。
+    两条路径返回相同的 JSONResponse 线格式，并保留交付完成后的回调。
     """
     if estimate_json_chars(content) <= LARGE_RESPONSE_CHARS:
         return JSONResponse(status_code=status_code, content=content,
                             headers=headers, background=background)
 
-    def _build() -> JSONResponse:
-        return JSONResponse(status_code=status_code, content=content,
-                            headers=headers, background=background)
+    # Cancelling the awaiting task alone cannot interrupt an already-running
+    # worker. Stop its abandoned per-reader copy at the next encoded chunk.
+    cancel_render = threading.Event()
+    try:
+        return await asyncio.to_thread(LargeJSONResponse, status_code=status_code, content=content,
+                                       headers=headers, background=background, cancel_render=cancel_render)
+    except asyncio.CancelledError:
+        cancel_render.set()
+        raise
 
-    return await asyncio.to_thread(_build)
 
-
-def iter_json_bytes(value, *, compact=False, allow_nan=True):
+def iter_json_bytes(value, *, compact=False, allow_nan=True, sort_keys=False):
     """Match json.dumps(ensure_ascii=False), with bounded string encoding.
 
     JSONEncoder.iterencode alone still materializes each entire quoted string.
@@ -79,7 +83,8 @@ def iter_json_bytes(value, *, compact=False, allow_nan=True):
             try:
                 is_dict = isinstance(node, dict)
                 yield b"{" if is_dict else b"["
-                for index, item in enumerate(node.items() if is_dict else node):
+                items = (sorted(node.items()) if sort_keys else node.items()) if is_dict else node
+                for index, item in enumerate(items):
                     if index:
                         yield item_sep
                     if is_dict:
@@ -106,11 +111,73 @@ def encoded_json_size(value) -> int:
     return sum(len(chunk) for chunk in iter_json_bytes(value))
 
 
-async def json_size_offloop(value) -> int:
-    """Keep large reply accounting out of the event loop and bound temporaries."""
-    if estimate_json_chars(value) <= LARGE_RESPONSE_CHARS:
+# A dense logprob tree can have tens of thousands of small scalars but few
+# string characters. Admission for inline accounting must bound node work too.
+_SIZE_WORKERS = threading.BoundedSemaphore(4)
+_INLINE_SIZE_NODES = 256
+_INLINE_SIZE_CHARS = 64 * 1024
+
+
+def _small_size_job(value) -> bool:
+    nodes_left, chars_left = _INLINE_SIZE_NODES, _INLINE_SIZE_CHARS
+
+    def visit(node):
+        nonlocal nodes_left, chars_left
+        nodes_left -= 1
+        if nodes_left < 0:
+            return False
+        if isinstance(node, str):
+            chars_left -= len(node)
+            return chars_left >= 0
+        if isinstance(node, dict):
+            return len(node) * 2 <= nodes_left and all(visit(k) and visit(v) for k, v in node.items())
+        if isinstance(node, (list, tuple)):
+            return len(node) <= nodes_left and all(visit(v) for v in node)
+        return True
+
+    return visit(value)
+
+
+def _size_worker(value, reservation):
+    try:
         return encoded_json_size(value)
-    return await asyncio.to_thread(encoded_json_size, value)
+    finally:
+        reservation.release()  # physical completion, not cancellation of its reader
+
+
+async def _size_cooperatively(value):
+    """Saturated: do not submit or retain another worker job. Yield in bounded batches."""
+    total = fragments = since_yield = 0
+    for fragment in iter_json_bytes(value):
+        length = len(fragment)
+        total += length
+        since_yield += length
+        fragments += 1
+        if fragments >= 256 or since_yield >= JSON_STRING_CHARS:
+            await asyncio.sleep(0)
+            fragments = since_yield = 0
+    return total
+
+
+async def json_size_offloop(value) -> int:
+    """Exact accounting with bounded loop preflight and physically capped submissions."""
+    if _small_size_job(value):
+        return encoded_json_size(value)
+    slots = _SIZE_WORKERS
+    if not slots.acquire(blocking=False):
+        return await _size_cooperatively(value)
+    try:
+        work = asyncio.get_running_loop().run_in_executor(None, _size_worker, value, slots)
+    except BaseException:
+        slots.release()
+        raise
+    try:
+        return await asyncio.shield(work)
+    except asyncio.CancelledError:
+        # Do not cancel a queued/active physical owner. A late encoder failure
+        # must be retrieved even though the request already published its timeout.
+        work.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        raise
 
 
 class LargeJSONResponse(JSONResponse):
@@ -127,8 +194,14 @@ class LargeJSONResponse(JSONResponse):
     直接 json.loads(result.body)，改造需连同消费方一起迁移，列入后续
     迭代（benchmark 见 scripts/measure_join_peak.py）。
     """
+    def __init__(self, *args, cancel_render=None, **kwargs):
+        self._cancel_render = cancel_render
+        super().__init__(*args, **kwargs)
+
     def render(self, content):
         with io.BytesIO() as output:
             for chunk in iter_json_bytes(content, compact=True, allow_nan=False):
+                if self._cancel_render is not None and self._cancel_render.is_set():
+                    raise asyncio.CancelledError()
                 output.write(chunk)
             return output.getvalue()

@@ -1,5 +1,6 @@
 """共享错误处理、异常重试配置和 SDK 拦截响应的离线回归。"""
 
+from settings_fixture import saved_settings
 import json
 from types import SimpleNamespace
 import unittest
@@ -26,7 +27,7 @@ class RetrySettingsTests(unittest.TestCase):
             "retry_backoff_seconds": 10**400,
             "retry_jitter_seconds": -(10**400),
         }
-        with mock.patch.object(app_state, "get_setting", side_effect=legacy.get):
+        with saved_settings(app_state, legacy):
             self.assertEqual(retry_policy.get_retry_settings(), (50, 5.0, 1.0))
 
     def test_retryable_status_whitelist_excludes_deterministic_5xx(self):
@@ -42,8 +43,7 @@ class RetrySettingsTests(unittest.TestCase):
         # 有约束力（30s 提示 → 等 30s，不再压到 5.5s 窗口）；换身份重试
         # （Express 通道）维持旧钳位语义；两种模式都保留 120s 绝对上限。
         settings = {"retry_backoff_mode": "fixed"}
-        with mock.patch.object(app_state, "get_setting",
-                               side_effect=lambda key, default=None: settings.get(key, default)):
+        with saved_settings(app_state, settings):
             same = retry_policy._retry_delay_value("30", 5.0, 0, 1.0, identity_rotates=False)
             rotate = retry_policy._retry_delay_value("30", 5.0, 0, 1.0, identity_rotates=True)
             self.assertEqual(same, 30.0)
@@ -95,7 +95,7 @@ class BlockedResponseTests(unittest.IsolatedAsyncioTestCase):
                 )
                 client = SimpleNamespace(aio=SimpleNamespace(models=models))
                 obj = OpenAIRequest(model="gemini-3.6-flash", messages=[], stream=mode != "json")
-                with mock.patch.object(app_state, "get_setting", side_effect=settings.get):
+                with saved_settings(app_state, settings):
                     result = await api_helpers.execute_gemini_call(client, obj.model, lambda _: [], {}, obj)
                     body = ("".join([frame async for frame in result.body_iterator])
                             if mode != "json" else result.body.decode())
@@ -131,7 +131,7 @@ class BlockedResponseTests(unittest.IsolatedAsyncioTestCase):
                 client = SimpleNamespace(aio=SimpleNamespace(models=models))
                 obj = OpenAIRequest(model="gemini-3.6-flash", messages=[], stream=mode != "json")
                 with (
-                    mock.patch.object(app_state, "get_setting", side_effect=settings.get),
+                    saved_settings(app_state, settings),
                     mock.patch.object(api_helpers, "stats", stats),
                 ):
                     if mode == "json":

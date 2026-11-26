@@ -1,8 +1,11 @@
 """ASGI middleware which does not buffer or acknowledge streaming responses."""
 import asyncio
+from functools import partial
+import re
 
 import anyio
 import console_auth
+from generation_policy import generation_settings_scope
 from request_connection import BodyTooLargeError, ClientConnection, ConnectionReceiver
 from request_errors import (MAX_GENERATION_BODY_BYTES, body_too_large_response,
                             declared_body_exceeds, ingress_error_response)
@@ -191,6 +194,25 @@ def _csrf_origin_denied(scope) -> bool:
     return bool(allowed) and origin_host not in allowed
 
 
+_POLL_PATH = re.compile(r"/v1/resumable/[^/]+")
+
+
+async def _serve_poll(app, scope, receive, send):
+    # The endpoint activates the sole raw receiver only after validating the
+    # API key, owner and resume window. Polling is not a new generation/trace.
+    connection = ClientConnection()
+    receiver = ConnectionReceiver(receive, connection)
+    state = scope.setdefault("state", {})
+    state["client_connection"] = connection
+    state["watch_resumable_poll"] = receiver.start_watching
+    try:
+        await app(scope, receiver, partial(receiver.forward_send, send))
+    finally:
+        connection.finish(not receiver.completed)
+        with anyio.CancelScope(shield=True):
+            await receiver.aclose()
+
+
 class StatsMiddleware:
     def __init__(self, app, stats):
         self.app = app
@@ -236,6 +258,8 @@ class StatsMiddleware:
                     current_ingress.reset(ingress_token)
             return
         if not tracked:
+            if scope["type"] == "http" and method == "GET" and _POLL_PATH.fullmatch(path):
+                return await _serve_poll(self.app, scope, receive, send)
             return await self.app(scope, receive, send)
         stats.increment_total()
         if declared_body_exceeds(declared_length, MAX_CHAT_BODY_BYTES):
@@ -245,7 +269,6 @@ class StatsMiddleware:
         trace = request_registry.create(path)
         token = current_trace.set(trace)
         started = False
-        completed = False
         observer = None
         send_failed = False
         error_counted = False
@@ -255,10 +278,10 @@ class StatsMiddleware:
         connection = ClientConnection()
         scope.setdefault("state", {})["client_connection"] = connection
         receiver = ConnectionReceiver(receive, connection, lambda: trace.end_connection(disconnected=True),
-                                      lambda: completed, max_body_bytes=MAX_CHAT_BODY_BYTES)
+                                      max_body_bytes=MAX_CHAT_BODY_BYTES)
 
         async def relay(message):
-            nonlocal started, observer, completed, send_failed, error_counted
+            nonlocal started, observer, send_failed, error_counted
             if message["type"] == "http.response.start":
                 started = True
                 trace.data["http_status"] = message["status"]
@@ -272,24 +295,15 @@ class StatsMiddleware:
                     stats.add_error()
                     error_counted = True
                     trace.fail(f"HTTP {message['status']}", message["status"])
-            # Await the real server send, including the stream's DONE frame.
-            final_body = message["type"] == "http.response.body" and not message.get("more_body", False)
-            if final_body:
-                receiver.final_send_started = True
             try:
-                await send(message)
+                await receiver.forward_send(send, message)
             except BaseException:
                 send_failed = True
-                receiver.disconnect()
                 raise
-            finally:
-                if final_body:
-                    # completed is assigned below before this task next yields.
-                    receiver.final_send_done.set()
-            if message["type"] == "http.response.body":
-                completed = not message.get("more_body", False)
-                if observer:
-                    observer.feed(message.get("body", b""), final=completed)
+            # A silently discarded or ambiguous final ASGI write is not
+            # evidence that these bytes went out. Prior confirmed sends stand.
+            if observer and message["type"] == "http.response.body" and connection.delivery_possible:
+                observer.feed(message.get("body", b""), final=receiver.completed)
 
         try:
             denied = await early_generation_auth(scope)
@@ -311,7 +325,8 @@ class StatsMiddleware:
                 MAX_CHAT_BODY_BYTES)
             ingress_token = current_ingress.set(ingress)
             receiver.receive = ingress
-            await self.app(scope, receiver, relay)
+            with generation_settings_scope():
+                await self.app(scope, receiver, relay)
         except IngressError as exc:
             if started or send_failed:
                 raise
@@ -350,8 +365,8 @@ class StatsMiddleware:
                 ingress.close()
             if ingress_token is not None:
                 current_ingress.reset(ingress_token)
-            connection.finish(send_failed or not completed)
-            trace.end_connection(disconnected=send_failed or not completed)
+            connection.finish(send_failed or not receiver.completed)
+            trace.end_connection(disconnected=send_failed or not receiver.completed)
             try:
                 with anyio.CancelScope(shield=True):
                     await receiver.aclose()

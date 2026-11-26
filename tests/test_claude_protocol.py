@@ -371,8 +371,10 @@ class NonStreamResponseTests(unittest.TestCase):
             "type": "function", "function": {"name": "f", "arguments": "{}"}}]), "m", "msg_5")
         self.assertTrue(out["content"][0]["id"].startswith("toolu_"))
 
-    def test_empty_text_block_when_no_content_and_no_tools(self):
-        out = openai_completion_to_anthropic(self.completion(content=None), "m", "msg_5")
+    def test_empty_text_block_when_filtered_without_content_or_tools(self):
+        payload = self.completion(content=None)
+        payload["choices"][0]["finish_reason"] = "content_filter"
+        out = openai_completion_to_anthropic(payload, "m", "msg_5")
         self.assertEqual(out["content"], [{"type": "text", "text": ""}])
 
     def test_stop_reason_mapping(self):

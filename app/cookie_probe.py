@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+from functools import partial
 
 import httpx
 
@@ -23,7 +24,20 @@ MAX_PROBE_RESPONSE_BYTES = 256 * 1024
 _probe_semaphore = asyncio.Semaphore(MAX_CONCURRENT_PROBES)
 
 
-async def probe_account(record: dict) -> dict:
+async def probe_account(record: dict, *, resolve=None) -> dict:
+    # Queues from overlapping test requests share this same slot. Resolve an
+    # admitted identity only after it has its slot, not when a worker was spawned.
+    async with _probe_semaphore:
+        if resolve is not None:
+            current = resolve(record["id"])
+            if current is None:
+                return {"id": record["id"], "label": record.get("note") or record["id"],
+                        "status": "skipped", "detail": "账号已移除、停用或正在变更；未发送测试请求。", "elapsed_ms": 0}
+            record = current
+        return await _probe_current_account(record)
+
+
+async def _probe_current_account(record: dict) -> dict:
     """Use a nonexistent model; reject ambiguous responses without quarantining."""
     from upstreams.cookie_transport import grpc_status_code, is_cookie_expired_error
 
@@ -53,20 +67,20 @@ async def probe_account(record: dict) -> dict:
         options["verify"] = config.SSL_CERT_FILE
     try:
         # The outer deadline includes every proxy attempt and the entire body.
-        async with _probe_semaphore:
-            async with asyncio.timeout(PROBE_TOTAL_TIMEOUT_SECONDS):
-                async with open_upstream_client(options) as client:
-                    async with client.stream("POST", BATCH_GRAPHQL_URL, headers=headers,
-                                             json=build_probe_body(project)) as response:
-                        status_code = response.status_code
-                        if status_code in (401, 403):
-                            return done("invalid", f"HTTP {status_code}：会话已失效或无权访问该 Project。")
-                        data = await read_limited_bytes(response, MAX_PROBE_RESPONSE_BYTES)
+        async with asyncio.timeout(PROBE_TOTAL_TIMEOUT_SECONDS):
+            async with open_upstream_client(options) as client:
+                async with client.stream("POST", BATCH_GRAPHQL_URL, headers=headers,
+                                         json=build_probe_body(project)) as response:
+                    status_code = response.status_code
+                    if status_code in (401, 403):
+                        return done("invalid", f"HTTP {status_code}：会话已失效或无权访问该 Project。")
+                    if status_code >= 500 or status_code == 429 or 300 <= status_code < 400:
+                        # The body cannot change this classification; close without occupying a probe slot
+                        # until a slow/error-page tail or the total deadline arrives.
+                        return done("error", f"上游暂时不可用（HTTP {status_code}），请稍后重试。")
+                    data = await read_limited_bytes(response, MAX_PROBE_RESPONSE_BYTES)
     except Exception as exc:
         return done("error", f"网络/代理或响应读取错误：{type(exc).__name__}: {exc}")
-
-    if status_code >= 500 or status_code == 429 or 300 <= status_code < 400:
-        return done("error", f"上游暂时不可用（HTTP {status_code}），请稍后重试。")
 
     try:
         parser = JsonObjects(limit=MAX_PROBE_RESPONSE_BYTES)
@@ -100,15 +114,16 @@ async def probe_account(record: dict) -> dict:
         return done("error", f"上游探测响应格式无效：{exc}")
 
 
-async def probe_all(records: list) -> list:
+async def probe_all(records: list, *, resolve=None) -> list:
     """A fixed worker set preserves order and isolates per-account failures."""
+    probe = partial(probe_account, resolve=resolve) if resolve is not None else probe_account
     pending = iter(enumerate(records))
     results = [None] * len(records)
 
     async def worker():
         for index, record in pending:
             try:
-                results[index] = await probe_account(record)
+                results[index] = await probe(record)
             except Exception as exc:
                 results[index] = {"id": record.get("id", ""),
                                   "label": record.get("note", "") or record.get("id", ""),

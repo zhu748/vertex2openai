@@ -1,4 +1,5 @@
 """First model reply deadlines and reconnect windows, without upstream traffic."""
+from settings_fixture import saved_settings
 import asyncio
 import json
 from types import SimpleNamespace
@@ -45,7 +46,7 @@ class FirstReplyTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(cookie_transport, "timeout_seconds",
                               side_effect=lambda model: first_reply.timeout_seconds(model)),
             mock.patch.object(api_helpers, "stats", self.stats),
-            mock.patch.object(api_helpers.app_state, "get_setting", side_effect=lambda k, d=None: self.settings.get(k, d)),
+            saved_settings(api_helpers.app_state, self.settings),
         ):
             patch.start()
             self.addCleanup(patch.stop)
@@ -56,7 +57,7 @@ class FirstReplyTests(unittest.IsolatedAsyncioTestCase):
         response = await api_helpers.execute_gemini_call(client, obj.model, lambda messages: [], {}, obj)
         return ''.join([chunk async for chunk in response.body_iterator])
 
-    async def native_request(self, respond):
+    async def native_request(self, respond, query="?alt=sse"):
         manager = SimpleNamespace(get_total_keys=lambda: 1, get_express_record=lambda **kwargs: {"key": "fake", "project_id": "p"})
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as upstream:
             with mock.patch.object(main.app.state, "express_key_manager", manager), \
@@ -64,7 +65,7 @@ class FirstReplyTests(unittest.IsolatedAsyncioTestCase):
                  mock.patch.object(native_passthrough, "passthrough_client_pool", SimpleNamespace(get=lambda *args: upstream)), \
                  mock.patch.object(gemini_native.app_state, "get_settings", return_value=self.settings):
                 async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://test") as client:
-                    return await asyncio.wait_for(client.post('/v1beta/models/gemini-test:streamGenerateContent?alt=sse',
+                    return await asyncio.wait_for(client.post('/v1beta/models/gemini-test:streamGenerateContent' + query,
                         headers={"x-goog-api-key": "test-client"}, json={"contents": []}), 1)
 
     async def test_inner_network_timeout_is_not_misreported_as_first_reply_deadline(self):
@@ -252,6 +253,48 @@ class FirstReplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('thinking', response.text)
         self.assertIn('answer', response.text)
 
+    async def test_native_terminal_prompt_block_is_not_replayed_waiting_for_eof(self):
+        payload = b'{"promptFeedback":{"blockReason":"SAFETY","blockReasonMessage":"Original decision"}}'
+        for query, content_type, head, tail in (
+                ("?alt=sse", "text/event-stream", b"data: " + payload + b"\n\n", b""),
+                ("", "application/json", b"[" + payload, b"]")):
+            with self.subTest(query=query):
+                calls = []
+                class Blocked(httpx.AsyncByteStream):
+                    async def __aiter__(self):
+                        yield head
+                        # EOF/array closure arrives after the first-token deadline.
+                        await asyncio.sleep(.08)
+                        if tail:
+                            yield tail
+
+                def respond(request):
+                    calls.append(request)
+                    return httpx.Response(200, stream=Blocked(), headers={"content-type": content_type})
+
+                response = await self.native_request(respond, query=query)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(len(calls), 1)
+                if query:
+                    self.assertIn(head, response.content)
+                    self.assertNotIn(b'"error"', response.content)
+                else:
+                    self.assertEqual(response.content, head + tail)
+
+    def test_native_prompt_block_releases_only_the_gate_not_first_token_telemetry(self):
+        trace = request_tracking.RequestTrace("/native")
+        token = request_tracking.current_trace.set(trace)
+        self.addCleanup(request_tracking.current_trace.reset, token)
+        guard = first_reply.FirstReplyGuard("test", seconds=1)
+        state = native_passthrough._NativeStreamState(guard)
+        for unconfirmed in (None, {}, "BLOCKED_REASON_UNSPECIFIED", "UNRECOGNIZED", 1):
+            state.inspect({"promptFeedback": {"blockReason": unconfirmed}})
+            self.assertFalse(guard.ready)
+        state.inspect({"promptFeedback": {"blockReason": "SAFETY"}})
+        self.assertTrue(guard.ready)
+        self.assertIsNone(trace.data["first_reply_deadline"])
+        self.assertNotIn("first_reply", trace.timings)
+
     async def test_native_error_before_first_reply_keeps_status_payload_and_retry_after(self):
         for timeout in (0, .02):
             for code in (400, 429):
@@ -356,8 +399,9 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(closed.is_set())
         self.assertIs(first, second)
         self.assertNotEqual(first.id, buf.id)
-        self.assertIsNone(await self.store.get_exact(buf.id))
-        self.assertEqual(buf.status, 'error')
+        self.assertIs(await self.store.get_exact(buf.id), buf)  # bounded receipt remains gone (410)
+        self.assertTrue(buf.resume_expired())
+        self.assertEqual(buf.status_code, 410)
 
     async def test_zero_grace_replaces_immediately_and_delivered_idempotency_is_retained(self):
         buf = await self.buffer()
@@ -402,19 +446,75 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(incoming.data['outcome'])
         self.assertEqual(len(incoming.logs), 0)
 
-    async def test_explicit_expired_cursor_returns_410_without_starting_new_generation(self):
+    async def test_explicit_expiry_is_repeatable_and_blocks_overlapping_replacement(self):
         connection = ClientConnection()
-        request = SimpleNamespace(headers={}, query_params={}, scope={"state": {"client_connection": connection}})
-        buf, _, _, _ = await resumable.resolve_buffer(self.store, request, 'key', 'body', model='m', kind='stream')
-        connection.finish(True)
-        buf.last_disconnect_monotonic -= 11
-        request.headers = {"x-resume-id": buf.id, "last-event-id": "0"}
-        with self.assertRaises(resumable.ResumeRequestError) as error:
-            await resumable.resolve_buffer(self.store, request, 'key', 'body', model='m', kind='stream')
-        self.assertEqual(error.exception.code, 410)
-        self.assertEqual(await self.store.list_meta(), [])
 
-    async def test_replacement_cancellation_cleans_new_placeholder(self):
+        async def resolve(headers=None, *, owner="key", body="body", client=None):
+            request = SimpleNamespace(headers=headers or {}, query_params={},
+                                      scope={"state": {"client_connection": client}})
+            return await resumable.resolve_buffer(self.store, request, owner, body, model="m", kind="stream")
+
+        old, _, _, _ = await resolve(client=connection)
+        closed, draining, release, started = (asyncio.Event() for _ in range(4))
+
+        async def upstream():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                draining.set()
+                await release.wait()
+                closed.set()
+
+        task = asyncio.create_task(upstream())
+        self.store.register_pump(old.id, task, buffer=old)
+        await started.wait()
+        connection.finish(True)
+        old.last_disconnect_monotonic -= 11
+        cursor = {"x-resume-id": old.id, "last-event-id": "0"}
+
+        async def stale_status(expected, **kwargs):
+            with self.assertRaises(resumable.ResumeRequestError) as error:
+                await resolve(cursor, **kwargs)
+            self.assertEqual(error.exception.code, expected)
+
+        try:
+            await stale_status(410)
+            await asyncio.wait_for(draining.wait(), 1)
+            await stale_status(410)
+            await stale_status(404, owner="different")
+            await stale_status(409, body="different")
+            old.mark_delivered()  # A delayed delivery acknowledgement cannot revive the receipt.
+            await stale_status(410)
+            # A timed-out waiter, unrelated capacity pressure and a TTL sweep
+            # must not unlink the draining owner, even after its normal lifetime.
+            with mock.patch.object(resumable, "SETUP_CLOSE_TIMEOUT_SECONDS", 0.02), \
+                    mock.patch.object(resumable, "max_streams", return_value=1):
+                with self.assertRaises(resumable.BufferCapacityError):
+                    await resolve()
+                old.finished_monotonic -= 3600
+                self.assertEqual(await self.store.sweep(), 0)
+                with self.assertRaises(resumable.BufferCapacityError):
+                    await resolve(body="unrelated")
+            first = asyncio.create_task(resolve())
+            second = asyncio.create_task(resolve())
+            await asyncio.sleep(0)  # both reached the old pump before we release it
+            self.assertFalse(first.done() or second.done())
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+        results = await asyncio.gather(first, second)
+        self.assertTrue(closed.is_set())
+        self.assertEqual(sum(new for _, new, _, _ in results), 1)
+        self.assertIs(results[0][0], results[1][0])
+        self.assertNotEqual(results[0][0].id, old.id)
+        await stale_status(410)
+        await stale_status(404, owner="different")
+        self.assertEqual(await self.store.sweep(), 1)
+        await stale_status(404)
+        self.assertIs((await resolve())[0], results[0][0])  # old eviction preserves the new mapping
+
+    async def test_cancelled_replacement_waiter_does_not_remove_old_guard(self):
         buf = await self.buffer()
         connection = ClientConnection()
         buf.attach_client(connection)
@@ -437,10 +537,14 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await replace
         try:
-            self.assertEqual(await self.store.list_meta(), [])
+            self.assertEqual([meta["id"] for meta in await self.store.list_meta()], [buf.id])
+            next_attempt = asyncio.create_task(self.buffer())
+            await asyncio.sleep(0)
+            self.assertFalse(next_attempt.done())
         finally:
             cleanup_release.set()
             await asyncio.gather(task, return_exceptions=True)
+        self.assertNotEqual((await next_attempt).id, buf.id)
 
 
 class ConnectionAndSettingsTests(unittest.IsolatedAsyncioTestCase):
@@ -449,7 +553,7 @@ class ConnectionAndSettingsTests(unittest.IsolatedAsyncioTestCase):
         callback = mock.Mock()
         async def receive():
             raise OSError('socket closed')
-        receiver = middleware.ConnectionReceiver(receive, connection, callback, lambda: False)
+        receiver = middleware.ConnectionReceiver(receive, connection, callback)
         await receiver.watch()
         self.assertTrue(connection.disconnected)
         callback.assert_called_once()

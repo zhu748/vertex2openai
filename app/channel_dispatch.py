@@ -14,15 +14,20 @@ from typing import Optional
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.requests import ClientDisconnect
 
 from admission import SETUP_FAST_WINDOW_SECONDS, ManagedStreamingResponse
 from channel_capabilities import cookie_feature_error
 from credential_manager import credential_manager
 from logger import stats
 from models import OpenAIRequest
-from resumable import DONE_FRAME, request_timeout_seconds
+from retry_policy import note_retry_deadline, response_requests_delay, response_retry_after, retry_after_seconds
+from request_connection import ClientConnection
+from stream_cleanup import await_owned_close
+from resumable import DONE_FRAME, DetachedRequest, request_timeout_seconds
 from runtime_state import app_state
-from streaming import SSE_NO_BUFFER_HEADERS, close_setup_task, keepalive_sse
+from streaming import (SSE_NO_BUFFER_HEADERS, StreamDeadlineExceeded, close_setup_task, close_stream_response,
+                       keepalive_sse, reads_before_deadline, response_before_deadline)
 from upstream_errors import create_openai_error_response, extract_upstream_error
 from upstreams.cookie_proxy import CookieProxyUpstream
 from upstreams.express_sdk import ExpressSDKUpstream
@@ -31,6 +36,9 @@ from upstreams.express_sdk import ExpressSDKUpstream
 # 测试经任一模块名 patch 实例方法都指向这里）
 express_upstream = ExpressSDKUpstream()
 cookie_upstream = CookieProxyUpstream()
+
+_DONE_FRAME_BYTES = DONE_FRAME.encode("ascii")
+_TERMINAL_FINALIZE_TIMEOUT_SECONDS = 0.25
 
 # ============================================================
 # 跨通道兜底重试（对齐上游 bad-woman/vertex2openai 的 Key ↔ Cookie 互备）
@@ -51,6 +59,11 @@ def _fallback_eligible_code(code) -> bool:
     if not isinstance(code, int):
         return False
     return code in (401, 403, 429) or 500 <= code <= 599
+
+
+def _fallback_eligible_response(response, default_code: int) -> bool:
+    return (_fallback_eligible_code(getattr(response, "status_code", default_code))
+            and not response_requests_delay(response))
 
 
 def _structured_locks_express(request_obj: OpenAIRequest) -> bool:
@@ -78,7 +91,7 @@ def _other_channel(fastapi_request: Request, primary: str, request_obj: OpenAIRe
         # 结构化输出锁定 Express：没有可用的 Cookie 备用
         if _structured_locks_express(request_obj):
             return None
-        return "cookie" if credential_manager.get_cookie_record() is not None else None
+        return "cookie" if credential_manager.has_cookie_record() else None
     if primary == "cookie":
         manager = _express_manager(fastapi_request)
         if manager is None or manager.get_total_keys() == 0:
@@ -141,6 +154,10 @@ def _sse_frame_kind(frame: str) -> tuple[str, Optional[int]]:
     err = payload.get("error")
     if isinstance(err, dict):
         code = err.get("code")
+        # Already-committed SDK streams carry the upstream Retry-After in the
+        # error event. Do not replace that advisory with another generation.
+        if retry_after_seconds(err.get("retry_after")):
+            return ("advisory_error", code if isinstance(code, int) else None)
         return ("error", code if isinstance(code, int) else None)
     choices = payload.get("choices")
     if isinstance(choices, list) and choices and isinstance(choices[0], dict):
@@ -168,14 +185,16 @@ async def _try_channel_fallback(
     deadline: float,
 ):
     """启动备用通道调用；失败返回 None（由调用方回退主通道错误）。"""
-    print(
-        f"🔁 [跨通道兜底] 主通道[{primary_label}]{reason}，"
-        f"自动切换至[{_channel_label(fallback_channel)}]接力完成回复。"
-    )
+    async def attempt():
+        print(
+            f"🔁 [跨通道兜底] 主通道[{primary_label}]{reason}，"
+            f"自动切换至[{_channel_label(fallback_channel)}]接力完成回复。"
+        )
+        return await _invoke_channel(request_obj, fastapi_request, fallback_channel)
+
     try:
-        async with asyncio.timeout(max(0.001, deadline - time.monotonic())):
-            return await _invoke_channel(request_obj, fastapi_request, fallback_channel)
-    except asyncio.CancelledError:
+        return await response_before_deadline(attempt, deadline, clock=time.monotonic)
+    except (asyncio.CancelledError, StreamDeadlineExceeded):
         raise
     except Exception as exc:
         code, msg = extract_upstream_error(exc)
@@ -187,6 +206,19 @@ async def _try_channel_fallback(
         return None
 
 
+def _stream_closer(response):
+    """A fallback wrapper and its body share one joinable primary close."""
+    task = None
+
+    async def close():
+        nonlocal task
+        if task is None:
+            task = asyncio.create_task(close_stream_response(response))
+        await await_owned_close(task)
+
+    return close
+
+
 async def _stream_with_fallback_frames(
     primary_response: StreamingResponse,
     request_obj: OpenAIRequest,
@@ -194,6 +226,7 @@ async def _stream_with_fallback_frames(
     fallback_channel: str,
     primary_channel: str,
     deadline: float,
+    *, close_primary=None,
 ):
     """主通道流式帧转发：在首个真实内容帧之前以可兜底错误终止时，切换备用通道。
 
@@ -206,9 +239,9 @@ async def _stream_with_fallback_frames(
     fallback_started = False
     pending_error_frame: Optional[str] = None
     pending_error_code: Optional[int] = None
-    iterator = primary_response.body_iterator
+    close_primary = close_primary or _stream_closer(primary_response)
     try:
-        async for frame in iterator:
+        async for frame in primary_response.body_iterator:
             kind, code = _sse_frame_kind(frame)
             if kind == "content" and not fallback_started:
                 # REQ-P2-7（2026-11 收敛）：主通道 error 帧之后迟到的
@@ -230,10 +263,7 @@ async def _stream_with_fallback_frames(
                 continue
             yield frame
     finally:
-        close = getattr(iterator, "aclose", None)
-        if close:
-            with suppress(Exception):
-                await close()
+        await close_primary()
 
     # 互斥不变量：fallback_started=True 蕴含 saw_content=False（上方守卫）。
     # 未触发兜底时主通道全部帧已原样转发（含自身的 [DONE]），直接结束。
@@ -249,15 +279,13 @@ async def _stream_with_fallback_frames(
         yield DONE_FRAME
         return
     if isinstance(alt, StreamingResponse):
-        alt_iter = alt.body_iterator
         try:
-            async for frame in alt_iter:
+            async for frame in alt.body_iterator:
                 yield frame
         finally:
-            close = getattr(alt_iter, "aclose", None)
-            if close:
-                with suppress(Exception):
-                    await close()
+            # Managed transports can own more than their iterator (also when
+            # cancelled before the first token). Hold this generation until both close.
+            await await_owned_close(close_stream_response(alt))
         return
     # 备用通道返回了非流式响应（配置/鉴权错误等）：保留主通道错误，不误导排查方向
     alt_code = getattr(alt, "status_code", 502)
@@ -275,9 +303,8 @@ def _stream_fallback_candidate(result, fastapi_request, primary_channel, request
     """
     if isinstance(result, StreamingResponse):
         return False
-    fallback_channel = _other_channel(fastapi_request, primary_channel, request_obj)
-    return fallback_channel is not None and _fallback_eligible_code(
-        getattr(result, "status_code", 502))
+    return (_fallback_eligible_response(result, 502)
+            and _other_channel(fastapi_request, primary_channel, request_obj) is not None)
 
 
 async def _apply_stream_fallback(
@@ -294,17 +321,18 @@ async def _apply_stream_fallback(
     if isinstance(result, StreamingResponse):
         headers = dict(result.headers)
         headers.pop("content-length", None)
-        return StreamingResponse(
+        close_primary = _stream_closer(result)
+        return ManagedStreamingResponse(
             _stream_with_fallback_frames(
-                result, request_obj, fastapi_request, fallback_channel, primary_channel, deadline),
-            media_type="text/event-stream",
-            headers=headers,
-            background=result.background,
+                result, request_obj, fastapi_request, fallback_channel, primary_channel,
+                deadline, close_primary=close_primary),
+            media_type="text/event-stream", headers=headers, background=result.background,
+            cleanup=close_primary,  # covers a consumer that never even starts our generator
         )
     # 主通道 prepare 阶段快速失败（鉴权/配置错误）：先试备用通道再报错
-    code = getattr(result, "status_code", 502)
-    if not _fallback_eligible_code(code):
+    if not _fallback_eligible_response(result, 502):
         return result
+    code = getattr(result, "status_code", 502)
     alt = await _try_channel_fallback(
         request_obj, fastapi_request, fallback_channel, _channel_label(primary_channel),
         f"请求初始化失败（HTTP {code}）", deadline)
@@ -326,9 +354,9 @@ async def _apply_json_fallback(
     deadline: float,
 ):
     """非流式请求：主通道返回可兜底错误时，用另一通道再试一次。"""
-    code = getattr(result, "status_code", 200)
-    if not _fallback_eligible_code(code):
+    if not _fallback_eligible_response(result, 200):
         return result
+    code = getattr(result, "status_code", 200)
     fallback_channel = _other_channel(fastapi_request, primary_channel, request_obj)
     if fallback_channel is None:
         return result
@@ -346,7 +374,7 @@ async def _apply_json_fallback(
 
 async def _dispatch_upstream(request_obj: OpenAIRequest, fastapi_request: Request):
     """Select an enabled upstream credential using the saved channel mode."""
-    deadline = time.monotonic() + request_timeout_seconds()
+    deadline = note_retry_deadline(fastapi_request, time.monotonic() + request_timeout_seconds())
     # 本次请求选中的主通道（express / cookie）：跨通道兜底按它决定备用方向。
     selected_channel: list[str] = []
 
@@ -354,26 +382,30 @@ async def _dispatch_upstream(request_obj: OpenAIRequest, fastapi_request: Reques
         selected_channel.clear()
         selected_channel.append(channel)
 
+    async def invoke_primary():
+        kwargs = {}
+        if app_state.get_channel_mode() == "mixed":
+            # 结构化输出默认只选 Express（Cookie 私有协议未验证）；控制台
+            # 打开 cookie_structured_output 后 Cookie 记录同样参与选择。
+            structured = _structured_locks_express(request_obj)
+            record = credential_manager.get_mixed_record(
+                fastapi_request.app.state.express_key_manager, express_only=structured)
+            if record is None:
+                return JSONResponse(status_code=401, content=create_openai_error_response(
+                    401, "没有可用的上游账号。请启用 Express Key 或填写完整的 Cookie 与 Project ID；结构化输出（未开启 Cookie 支持）、多候选与 logprobs 请求需要 Express Key。",
+                    "authentication_error"))
+            channel = record["channel"]
+            kwargs["credential_record"] = record
+        else:
+            channel = "cookie" if app_state.is_web_proxy_enabled() else "express"
+        _note_channel(channel)
+        if time.monotonic() >= deadline:  # even credential selection consumes the same budget
+            raise StreamDeadlineExceeded()
+        upstream = cookie_upstream if channel == "cookie" else express_upstream
+        return await upstream.chat_completions(request_obj, fastapi_request, **kwargs)
+
     async def prepare():
-        async with asyncio.timeout(max(0.001, deadline - time.monotonic())):
-            if app_state.get_channel_mode() == "mixed":
-                # 结构化输出默认只选 Express（Cookie 私有协议未验证）；控制台
-                # 打开 cookie_structured_output 后 Cookie 记录同样参与选择。
-                structured = _structured_locks_express(request_obj)
-                record = credential_manager.get_mixed_record(
-                    fastapi_request.app.state.express_key_manager, express_only=structured)
-                if record is None:
-                    return JSONResponse(status_code=401, content=create_openai_error_response(
-                        401, "没有可用的上游账号。请启用 Express Key 或填写完整的 Cookie 与 Project ID；结构化输出（未开启 Cookie 支持）、多候选与 logprobs 请求需要 Express Key。",
-                        "authentication_error"))
-                upstream = cookie_upstream if record["channel"] == "cookie" else express_upstream
-                _note_channel(record["channel"])
-                return await upstream.chat_completions(request_obj, fastapi_request, credential_record=record)
-            if app_state.is_web_proxy_enabled():
-                _note_channel("cookie")
-                return await cookie_upstream.chat_completions(request_obj, fastapi_request)
-            _note_channel("express")
-            return await express_upstream.chat_completions(request_obj, fastapi_request)
+        return await response_before_deadline(invoke_primary, deadline, clock=time.monotonic)
 
     def _primary_channel() -> str:
         # prepare() 异常或尚未执行时无主通道信息，返回空串禁用兜底
@@ -384,56 +416,40 @@ async def _dispatch_upstream(request_obj: OpenAIRequest, fastapi_request: Reques
         # slow. Fast validation errors can still keep their HTTP status.
         setup = asyncio.create_task(prepare())
 
-        async def close_setup():
-            await close_setup_task(setup)
-
         try:
             done, _ = await asyncio.wait({setup}, timeout=SETUP_FAST_WINDOW_SECONDS)
         except BaseException:
-            await close_setup()
+            await close_setup_task(setup)
             raise
-        if done:
-            primary = setup.result()
-            if not _stream_fallback_candidate(
-                    primary, fastapi_request, _primary_channel(), request_obj):
-                # 流式响应（兜底在流内懒触发）或不可兜底的快错误（保持
-                # HTTP 状态码）：同步路径，无额外等待。
-                response = await _apply_stream_fallback(
-                    primary, request_obj, fastapi_request, _primary_channel(), deadline)
-            else:
-                # 可兜底的快错误：兜底统一移入带心跳的生成器路径（2026-11
-                # C-5）。旧实现在此同步 await 备用通道（含最长 30 秒媒体
-                # 下载），客户端 SSE 尚未建立、零字节无心跳——同一失败落在
-                # 50ms 窗口前后体验完全不同；现在与慢路径一致：等待期间
-                # keepalive 心跳照发，错误以 SSE 错误帧交付（流式客户端本
-                # 就要处理该形态，慢路径一直是这么交付的）。
-                async def fast_prepared_frames():
-                    result = await _apply_stream_fallback(
-                        primary, request_obj, fastapi_request, _primary_channel(), deadline)
-                    if isinstance(result, StreamingResponse):
+        primary = setup.result() if done else None
+        if done and not _stream_fallback_candidate(
+                primary, fastapi_request, _primary_channel(), request_obj):
+            # Fast streams and non-retryable errors keep their real HTTP status.
+            response = await _apply_stream_fallback(
+                primary, request_obj, fastapi_request, _primary_channel(), deadline)
+        else:
+            # Slow setup and quick retryable errors both get heartbeats while
+            # preparing their alternative. Until a body is adopted, setup owns
+            # any response arriving even after cancellation.
+            adopted = False
+
+            async def close_setup():
+                if not adopted:
+                    await close_setup_task(setup, join=True)
+
+            async def prepared_frames():
+                nonlocal adopted
+                result = await _apply_stream_fallback(
+                    await setup, request_obj, fastapi_request, _primary_channel(), deadline)
+                if isinstance(result, StreamingResponse):
+                    adopted = True
+                    try:
                         async for frame in result.body_iterator:
                             yield frame
-                    else:
-                        stats.add_error()
-                        try:
-                            payload = json.loads(result.body)
-                        except (ValueError, TypeError, AttributeError):
-                            payload = None
-                        if not isinstance(payload, dict) or not payload.get("error"):
-                            payload = create_openai_error_response(
-                                result.status_code if result.status_code >= 400 else 502,
-                                "上游未返回流式响应。", "upstream_error")
-                        yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-                        yield DONE_FRAME
-                response = ManagedStreamingResponse(fast_prepared_frames(), media_type="text/event-stream", cleanup=close_setup)
-        else:
-            async def prepared_frames():
-                result = await setup
-                result = await _apply_stream_fallback(
-                    result, request_obj, fastapi_request, _primary_channel(), deadline)
-                if isinstance(result, StreamingResponse):
-                    async for frame in result.body_iterator:
-                        yield frame
+                    finally:
+                        # The result may be a *different* upstream response than
+                        # setup.result(). async for alone does not close its owner.
+                        await await_owned_close(close_stream_response(result))
                 else:
                     stats.add_error()
                     try:
@@ -444,21 +460,47 @@ async def _dispatch_upstream(request_obj: OpenAIRequest, fastapi_request: Reques
                         payload = create_openai_error_response(
                             result.status_code if result.status_code >= 400 else 502,
                             "上游未返回流式响应。", "upstream_error")
+                    hint = response_retry_after(result)
+                    if hint is not None and isinstance(payload["error"], dict):
+                        payload["error"]["retry_after"] = hint
                     yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
                     yield DONE_FRAME
             response = ManagedStreamingResponse(prepared_frames(), media_type="text/event-stream", cleanup=close_setup)
     else:
-        response = await _apply_json_fallback(
-            await prepare(), request_obj, fastapi_request, _primary_channel(), deadline)
+        async def generate_json():
+            return await _apply_json_fallback(
+                await prepare(), request_obj, fastapi_request, _primary_channel(), deadline)
+
+        # DetachedRequest forwards .scope and thus exposes the original
+        # connection too. Its buffer, not this request, owns cancellation.
+        connection = getattr(fastapi_request, "scope", {}).get("state", {}).get("client_connection")
+        if isinstance(connection, ClientConnection) and not isinstance(fastapi_request, DetachedRequest):
+            try:
+                response = await connection.while_connected(generate_json, discard=close_stream_response)
+            except ClientDisconnect:
+                return JSONResponse(status_code=499, content=create_openai_error_response(
+                    499, "客户端已断开连接，请求已取消。", "client_closed_request"))
+        else:
+            response = await generate_json()
     if isinstance(response, StreamingResponse):
         original = response.body_iterator
 
         async def relay():
             stream = keepalive_sse(original, fastapi_request)
+            error = terminal = None
             try:
-                async with asyncio.timeout(max(0.001, deadline - time.monotonic())):
-                    async for frame in stream:
-                        yield frame
+                async for frame in reads_before_deadline(stream, deadline):
+                    if frame == DONE_FRAME or frame == _DONE_FRAME_BYTES:
+                        # Complete the producer's normal bookkeeping before handing
+                        # off [DONE]: downstream adapters may stop reading there.
+                        # The result is final, so do not apply the generation
+                        # deadline to this single cleanup pull or forward a trailer.
+                        with suppress(Exception):
+                            async with asyncio.timeout(_TERMINAL_FINALIZE_TIMEOUT_SECONDS):
+                                await anext(stream, None)
+                        terminal = frame
+                        break
+                    yield frame
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -470,10 +512,13 @@ async def _dispatch_upstream(request_obj: OpenAIRequest, fastapi_request: Reques
                     message = "本轮请求超过总执行期限。"
                 print(f"❌ [流式转发] {request_obj.model} | HTTP {code} | {message[:200]}")
                 error = create_openai_error_response(code, message[:1024], "upstream_error")
-                yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
-                yield DONE_FRAME
+                terminal = DONE_FRAME
             finally:
                 await stream.aclose()
+            if error is not None:
+                yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
+            if terminal is not None:
+                yield terminal
         headers = dict(response.headers)
         headers.pop("content-length", None)
         headers.update(SSE_NO_BUFFER_HEADERS)

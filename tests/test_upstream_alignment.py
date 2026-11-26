@@ -9,6 +9,7 @@
 import asyncio
 import json
 import sys
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -282,11 +283,9 @@ class OtherChannelTests(unittest.TestCase):
 
     def test_express_primary_needs_cookie_record(self):
         app_state.update_settings({"cross_channel_fallback": True})
-        with mock.patch.object(chat_api.credential_manager, "get_cookie_record", return_value=None):
+        with mock.patch.object(chat_api.credential_manager, "has_cookie_record", return_value=False):
             self.assertIsNone(chat_api._other_channel(self.request_stub, "express", self.plain))
-        cookie_rec = {"cookie": "SAPISID=x", "project_id": "p", "enabled": True, "id": "c1"}
-        with mock.patch.object(chat_api.credential_manager, "get_cookie_record",
-                               return_value=cookie_rec):
+        with mock.patch.object(chat_api.credential_manager, "has_cookie_record", return_value=True):
             self.assertEqual(chat_api._other_channel(self.request_stub, "express", self.plain), "cookie")
 
     def test_cookie_primary_needs_express_keys(self):
@@ -298,9 +297,7 @@ class OtherChannelTests(unittest.TestCase):
 
     def test_switch_disables_fallback(self):
         app_state.update_settings({"cross_channel_fallback": False})
-        cookie_rec = {"cookie": "SAPISID=x", "project_id": "p", "enabled": True, "id": "c1"}
-        with mock.patch.object(chat_api.credential_manager, "get_cookie_record",
-                               return_value=cookie_rec):
+        with mock.patch.object(chat_api.credential_manager, "has_cookie_record", return_value=True):
             self.assertIsNone(chat_api._other_channel(self.request_stub, "express", self.plain))
 
     def test_structured_output_locks_express(self):
@@ -308,17 +305,14 @@ class OtherChannelTests(unittest.TestCase):
         structured_req = OpenAIRequest(
             model="gemini-3.6-flash", messages=[], stream=True,
             response_format={"type": "json_schema"})
-        cookie_rec = {"cookie": "SAPISID=x", "project_id": "p", "enabled": True, "id": "c1"}
-        with mock.patch.object(chat_api.credential_manager, "get_cookie_record",
-                               return_value=cookie_rec):
+        with mock.patch.object(chat_api.credential_manager, "has_cookie_record", return_value=True):
             # Express 主通道 + 结构化输出 → 不允许切 Cookie
             self.assertIsNone(chat_api._other_channel(self.request_stub, "express", structured_req))
             # Cookie 主通道 + 结构化输出 → 仍可切回 Express（Cookie 侧已放开）
             self.assertEqual(chat_api._other_channel(self.request_stub, "cookie", structured_req), "express")
         # 打开 cookie_structured_output 后 Express 也可兜底到 Cookie
         app_state.update_settings({"cookie_structured_output": True})
-        with mock.patch.object(chat_api.credential_manager, "get_cookie_record",
-                               return_value=cookie_rec):
+        with mock.patch.object(chat_api.credential_manager, "has_cookie_record", return_value=True):
             self.assertEqual(chat_api._other_channel(self.request_stub, "express", structured_req), "cookie")
 
     def test_unknown_primary_disables_fallback(self):
@@ -344,12 +338,12 @@ class StreamFallbackTests(unittest.TestCase):
         self.req_stub = SimpleNamespace(state=SimpleNamespace(
             express_key_manager=SimpleNamespace(get_total_keys=lambda: 1)))
 
-    def _run(self, response, deadline=30.0):
+    def _run(self, response):
         frames = []
         # 场景：主通道 cookie 失败 → 兜底切换 express
         gen = chat_api._stream_with_fallback_frames(
             response, self.request_obj, self.req_stub,
-            fallback_channel="express", primary_channel="cookie", deadline=deadline)
+            fallback_channel="express", primary_channel="cookie", deadline=time.monotonic() + 30)
 
         async def collect():
             async for f in gen:
@@ -466,7 +460,7 @@ class JsonFallbackTests(unittest.TestCase):
 
         with mock.patch.object(channel_dispatch, "_invoke_channel", fake_invoke):
             result = asyncio.run(chat_api._apply_json_fallback(
-                primary, self.request_obj, self.req_stub, "cookie", 30.0))
+                primary, self.request_obj, self.req_stub, "cookie", time.monotonic() + 30))
         self.assertIs(result, success)
 
     def test_fallback_failure_keeps_primary_error(self):
@@ -477,20 +471,20 @@ class JsonFallbackTests(unittest.TestCase):
 
         with mock.patch.object(channel_dispatch, "_invoke_channel", failing_invoke):
             result = asyncio.run(chat_api._apply_json_fallback(
-                primary, self.request_obj, self.req_stub, "cookie", 30.0))
+                primary, self.request_obj, self.req_stub, "cookie", time.monotonic() + 30))
         self.assertIs(result, primary)
 
     def test_ineligible_error_returns_asis(self):
         primary = JSONResponse(status_code=400, content={"error": {"message": "bad request"}})
         result = asyncio.run(chat_api._apply_json_fallback(
-            primary, self.request_obj, self.req_stub, "express", 30.0))
+            primary, self.request_obj, self.req_stub, "express", time.monotonic() + 30))
         self.assertIs(result, primary)
 
     def test_no_fallback_channel_returns_asis(self):
         app_state.update_settings({"cross_channel_fallback": False})
         primary = JSONResponse(status_code=500, content={"error": {"message": "oops"}})
         result = asyncio.run(chat_api._apply_json_fallback(
-            primary, self.request_obj, self.req_stub, "cookie", 30.0))
+            primary, self.request_obj, self.req_stub, "cookie", time.monotonic() + 30))
         self.assertIs(result, primary)
 
 

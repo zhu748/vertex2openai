@@ -1,15 +1,18 @@
 """Per-attempt deadline until real model output, independent of SSE keepalives."""
 import asyncio
+import inspect
 import math
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from contextvars import ContextVar
 from typing import Any, AsyncIterable, AsyncIterator, Awaitable, Callable, Optional
+
+from stream_cleanup import await_owned_close
 
 import config as app_config
 from runtime_state import app_state
 from request_tracking import current_trace
-from response_validation import IncompleteResponseError
+from response_validation import IncompleteResponseError, native_other_part_has_reply, sdk_function_call, sdk_media_payload
 
 _active_wait = ContextVar("first_reply_wait", default=None)
 
@@ -26,52 +29,27 @@ _active_wait = ContextVar("first_reply_wait", default=None)
 # 1800s）+ 断连检测照常生效。
 
 
+def _check_active_budget(guard: Optional["FirstReplyGuard"] = None) -> None:
+    active = _active_wait.get()
+    if active is None:
+        return
+    current, owner, cancellations = active
+    if guard is not None and guard is not current:
+        return
+    if owner.cancelling() > cancellations:
+        # A transport may translate CancelledError to a network error. Do not
+        # open a second route or mark first output when cancellation is pending.
+        raise asyncio.CancelledError()
+    if not current.ready and time.monotonic() >= current.deadline:
+        raise current._timeout_error()
+
+
 @asynccontextmanager
 async def proxy_attempt(enabled: bool) -> AsyncIterator[None]:
-    """Give each configured proxy its own first-reply window within the total deadline."""
-    active = _active_wait.get() if enabled else None
-    if active is None:
-        yield
-        return
-    guard, parent = active
-    parent.reschedule(None)
-    # 每个出口有自己的窗口，但总等待不得超出自首次等待起的原始预算：
-    # 旧实现每换一个出口就把 deadline 重置为满窗口，3 个慢出口 × 15s = 45s
-    # 才轮到换 Key 重试，且监控面板的截止时间一直在往后漂（2026-10 修复）。
-    # remaining <= 0（前一出口的传输错误恰好落在 deadline 之后的事件循环计时
-    # 竞态）同样必须钳到极小窗口：漏掉这一分支会重新发放整个满窗口，
-    # 总预算不变量在最需要的路径上失效（2026-10 复核修复）。
-    remaining = guard.initial_deadline - time.monotonic()
-    window = max(0.001, min(guard.seconds, remaining))
-    guard.deadline = time.monotonic() + window
-    if guard.trace:
-        with guard.trace._lock:
-            guard.trace.data["first_reply_deadline"] = time.time() + window
-    attempt = asyncio.timeout_at(guard.deadline)
-    completed = False
-    try:
-        async with attempt:
-            yield
-            completed = True
-    except TimeoutError as exc:
-        if not attempt.expired():
-            raise
-        # 与 FirstReplyGuard.wait 的超时分支逐字对齐：异常 message 是外层重试
-        # 日志、最终 504 错误响应与 cookie 通道共用的文案源，多出口路径不能
-        # 另造一套说法；trace 事件补回旧版"超过 N 秒"说明并预告自动重试。
-        # N 报配置窗口 guard.seconds（契约由 test_first_reply_timeout_carries_
-        # window_seconds 锚定：多/单出口文案与 seconds 字段逐字一致）；被总
-        # 预算裁剪的实际生效窗口通常与之相差毫秒级，不影响排障口径。
-        if guard.trace:
-            guard.trace.event(
-                "first_reply_timeout",
-                f"等待模型首回复超过 {guard.seconds:g} 秒（思考、正文、工具调用"
-                "或图片均算回复），本次上游读取已中断，稍后自动重试。")
-        raise FirstReplyTimeout(
-            f"等待模型首回复超过 {guard.seconds:g} 秒（思考、正文、工具调用或图片均算回复）。",
-            seconds=guard.seconds) from exc
-    finally:
-        parent.reschedule(guard.deadline if completed else None)
+    """Each candidate shares the outer wait's deadline; never start one after expiry."""
+    if enabled:
+        _check_active_budget()
+    yield
 
 
 class FirstReplyTimeout(TimeoutError):
@@ -93,6 +71,36 @@ def timeout_seconds(model: str) -> float:
         return 0.0
 
 
+async def _close_unused(value: Any) -> None:
+    """Close rejected coroutine objects, generators or HTTP responses if owned."""
+    close = getattr(value, "aclose", None) or getattr(value, "close", None)
+    if close:
+        # Keep the deadline (or external cancellation) as the primary outcome.
+        with suppress(Exception):
+            result = close()
+            if inspect.isawaitable(result):
+                await await_owned_close(result)
+
+
+async def _discard_unstarted(operation: Awaitable) -> None:
+    if not asyncio.isfuture(operation):
+        await _close_unused(operation)
+        return
+    # A Task/Future is already scheduled and can own a resource even if its
+    # cancellation is suppressed, or it finished before this first await.
+    owner = asyncio.current_task()
+    cancellations = owner.cancelling()
+    operation.cancel()
+    try:
+        result = await operation
+    except (asyncio.CancelledError, Exception):
+        pass
+    else:
+        await _close_unused(result)
+    if owner.cancelling() > cancellations:
+        raise asyncio.CancelledError()
+
+
 class FirstReplyGuard:
     def __init__(self, model: str, *, seconds: Optional[float] = None) -> None:
         # seconds：调用方预先算好的窗口。同一请求的重试循环共享一次设置
@@ -101,9 +109,6 @@ class FirstReplyGuard:
         self.seconds = timeout_seconds(model) if seconds is None else max(0.0, float(seconds))
         self.started = time.monotonic()
         self.deadline = self.started + self.seconds
-        # 原始预算终点：proxy_attempt 每次换出口都会重置 deadline，不记
-        # 原始值的话 N 个出口可以把首回复窗口放大成 N×（见 proxy_attempt）。
-        self.initial_deadline = self.deadline
         self.ready = False
         self.trace = current_trace.get()
         if self.trace:
@@ -111,33 +116,58 @@ class FirstReplyGuard:
                 self.trace.data["first_reply_timeout_seconds"] = self.seconds
                 self.trace.data["first_reply_deadline"] = time.time() + self.seconds if self.seconds else None
 
+    def _timeout_error(self) -> FirstReplyTimeout:
+        message = f"等待模型首回复超过 {self.seconds:g} 秒（思考、正文、工具调用或图片均算回复）"
+        if self.trace:
+            self.trace.event("first_reply_timeout", message + "，本次上游读取已中断，稍后自动重试。")
+        return FirstReplyTimeout(message + "。", seconds=self.seconds)
+
     async def wait(self, operation: Awaitable) -> Any:
         if self.ready or not self.seconds:
             return await operation
-        deadline = asyncio.timeout(max(0.001, self.deadline - time.monotonic()))
-        token = _active_wait.set((self, deadline))
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            await _discard_unstarted(operation)
+            raise self._timeout_error()
+
+        timer = asyncio.timeout(remaining)
+        owner = asyncio.current_task()
+        cancellations = owner.cancelling()
+        token = _active_wait.set((self, owner, cancellations))
         try:
-            async with deadline:
-                return await operation
-        except TimeoutError as exc:
-            if not deadline.expired():
+            async with timer:
+                result = await operation
+        except Exception as exc:
+            if owner.cancelling() > cancellations:
+                raise asyncio.CancelledError() from exc
+            if isinstance(exc, FirstReplyTimeout):
                 raise
-            if self.trace:
-                self.trace.event("first_reply_timeout", f"等待模型首回复超过 {self.seconds:g} 秒，本次上游读取已中断。")
-            raise FirstReplyTimeout(
-                f"等待模型首回复超过 {self.seconds:g} 秒（思考、正文、工具调用或图片均算回复）。",
-                seconds=self.seconds) from exc
+            if timer.expired() or time.monotonic() >= self.deadline:
+                raise self._timeout_error() from exc
+            raise  # preserve an early operation error or genuine EOF
         finally:
             _active_wait.reset(token)
 
-    def accept(self) -> None:
+        # asyncio.timeout is cooperative: a ready awaitable can finish without
+        # a loop tick, or code can catch CancelledError and return late.
+        if owner.cancelling() > cancellations or timer.expired() or time.monotonic() >= self.deadline:
+            await _close_unused(result)
+            if owner.cancelling() > cancellations:
+                raise asyncio.CancelledError()
+            raise self._timeout_error()
+        return result
+
+    def accept(self, *, generated: bool=True) -> None:
+        """Release the delivery gate; only real model output is a first-token sample."""
         if self.ready:
             return
+        _check_active_budget(self)
         self.ready = True
         if self.trace:
             with self.trace._lock:
                 self.trace.data["first_reply_deadline"] = None
-            self.trace.milestone("first_reply", "收到模型首个有效回复，首回复计时结束。")
+            if generated:
+                self.trace.milestone("first_reply", "收到模型首个有效回复，首回复计时结束。")
 
     async def iterate(self, source: AsyncIterable, predicate: Callable) -> AsyncIterator[Any]:
         # 注意：这里**不能**加 try/finally 去 aclose(iterator)——prefetch 在
@@ -154,6 +184,7 @@ class FirstReplyGuard:
             if not self.ready and predicate(item):
                 self.accept()
             yield item
+            del item  # the next pull may wait indefinitely
 
     async def prefetch(self, source: AsyncIterable, predicate: Callable, *, max_prefix_bytes: int=2 * 1024 * 1024) -> "PrefetchedStream":
         prefix = []
@@ -174,29 +205,37 @@ class FirstReplyGuard:
 
 class PrefetchedStream:
     def __init__(self, prefix: list, source: AsyncIterable) -> None:
-        self.prefix = iter(prefix)
+        # Take the prefetcher's list without copying it or any wire chunks.
+        self.prefix = prefix
+        self._position = 0
         self.source = source
 
     def __aiter__(self):
         return self
 
     async def __anext__(self):
-        try:
-            return next(self.prefix)
-        except StopIteration:
-            return await anext(self.source)
+        if self._position < len(self.prefix):
+            index = self._position
+            self._position += 1
+            item, self.prefix[index] = self.prefix[index], None
+            if self._position == len(self.prefix):
+                self.prefix.clear()
+            return item
+        return await anext(self.source)
 
     async def aclose(self) -> None:
+        # A slow physical close should not pin even the unconsumed prefix.
+        self.prefix.clear()
         await self.source.aclose()
 
 
 def sdk_has_reply(chunk: Any) -> bool:
     for candidate in getattr(chunk, "candidates", None) or []:
         for part in getattr(getattr(candidate, "content", None), "parts", None) or []:
-            call = getattr(part, "function_call", None)
+            call = sdk_function_call(part)
             if (getattr(part, "text", None)
                     or (call and (getattr(call, "name", None) or getattr(call, "partial_args", None)))
-                    or getattr(part, "inline_data", None) or getattr(part, "file_data", None)):
+                    or sdk_media_payload(part) is not None):
                 return True
     return False
 
@@ -211,7 +250,9 @@ def native_has_reply(payload: Any) -> bool:
             if not isinstance(content, dict):
                 continue
             for part in content.get("parts") or []:
-                if isinstance(part, dict) and any(part.get(k) for k in ("text", "functionCall", "inlineData", "fileData")):
+                if isinstance(part, dict) and (
+                        part.get("text") or part.get("functionCall")
+                        or native_other_part_has_reply(part)):
                     return True
     return False
 

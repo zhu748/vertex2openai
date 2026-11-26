@@ -13,7 +13,7 @@ import hashlib
 import json
 import time
 from functools import partial
-from typing import Any, AsyncIterator, Callable, Optional
+from typing import Any, AsyncIterator, Iterable, Optional
 
 from urllib.parse import parse_qs
 
@@ -21,22 +21,28 @@ import anyio
 import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from google.genai.types import BlockedReason
+from starlette.background import BackgroundTasks
+from request_connection import ClientConnection
 from request_ingress import hold_ingress
+from replay_event import ReplayEvent
 
 import config as app_config
-from retry_policy import get_retry_settings, is_retryable_exception, is_retryable_status
-from retry_policy import retry_delay as _retry_delay, wait_for_retry as _wait_for_retry
+from retry_policy import advisory_fits, get_retry_settings, is_retryable_exception, is_retryable_status, note_retry_deadline
+from retry_policy import response_requests_delay, response_retry_after, retry_delay as _retry_delay, wait_for_retry as _wait_for_retry
 from upstream_errors import extract_upstream_error, google_status_detail
 from usage import merge_usage_metadata
-from response_validation import IncompleteResponseError, has_finish_reason
-from admission import (count_slow_setup_failure, limit_generation, run_with_image_limit,
+from protojson import int32_value
+from response_validation import FINISH_CONTENT_FILTER, IncompleteResponseError, has_finish_reason
+from admission import (count_slow_setup_failure, limit_generation, ManagedStreamingResponse, run_with_image_limit,
                        SETUP_FAST_WINDOW_SECONDS)
 from logger import stats
 from request_tracking import upstream_attempt, upstream_chunk
 import first_reply as first_reply_module
 from first_reply import FirstReplyGuard, native_has_reply
 from json_stream import MAX_JSON_OBJECT_BYTES, JsonObjects
-from http_io import buffer_upstream_response, read_upstream_bytes
+from http_io import (buffer_upstream_response, close_httpx_response as _close_upstream,
+                     own_httpx_response, read_upstream_bytes)
 from runtime_state import app_state
 from express_endpoint import is_location_pin_failure
 from express_fingerprint import build_direct_headers
@@ -44,15 +50,19 @@ from client_pool import passthrough_client_pool
 from proxy_resolver import ProxyResolveError, resolve_proxy_uri
 from proxy_failover import ProxyChain
 from proxy_tls import build_httpx_proxy
-from streaming import SSE_NO_BUFFER_HEADERS, sse_frames, with_heartbeats, HEARTBEAT, HEARTBEAT_FRAME
-from resumable import (resumable_store, resolve_buffer, ResumeRequestError, BufferCapacityError,
-                       DetachedRequest, sse_from_buffer, within_request_deadline,
-                       request_timeout_seconds)
+from streaming import (SSE_NO_BUFFER_HEADERS, sse_frames, with_heartbeats, HEARTBEAT, HEARTBEAT_FRAME,
+                       StreamDeadlineExceeded, reads_before_deadline)
+from resumable import (resumable_store, resolve_buffer, ResumableBuffer, ResumeRequestError, BufferCapacityError,
+                       DetachedRequest, ReplayStreamResponse, within_request_deadline, buffered_setup_result,
+                       fast_setup_completed, request_timeout_seconds, resume_cursor)
 from upstreams.native_catalog import (
     _build_upstream_url,
     _resolve_upstream_model_path,
 )
 
+# A concrete prompt block is a deliverable terminal response, not model output.
+_PROMPT_BLOCK_REASONS = frozenset(reason.value for reason in BlockedReason
+                                  if reason is not BlockedReason.BLOCKED_REASON_UNSPECIFIED)
 _UPSTREAM_TIMEOUT = httpx.Timeout(connect=30.0, read=600.0, write=60.0, pool=10.0)
 
 
@@ -78,17 +88,12 @@ def _looks_like_pin_failure(status_code: int, body: bytes) -> bool:
     return status_code in (403, 404) and is_location_pin_failure(body.decode("utf-8", "ignore"))
 
 
-async def _close_upstream(upstream: httpx.Response) -> None:
-    # Starlette 用取消作用域终止断连请求；清理需要屏蔽该作用域的持续取消。
-    with anyio.CancelScope(shield=True):
-        await upstream.aclose()
-
-
 async def _passthrough_once(client: httpx.AsyncClient, express_key: str,
                             model_path: str, action: str, query: str,
                             payload: bytes, *, stream: bool) -> httpx.Response:
     """向上游发一次请求。stream=True 时返回**未消费**的响应
-    （供 aiter_bytes 逐块转发）；stream=False 时返回已缓冲的响应。
+    （供 aiter_bytes 逐块转发）；非流式成功响应在传输边界缓冲。已知 HTTP
+    错误交给按状态码处理的调用方限量读取，即使诊断正文损坏也保留状态与退避头。
 
     指纹保真三要点（MockTransport 与官方 SDK 抓包逐字节对照得出）：
     1. 头集合与线序 = build_direct_headers(express_key)，即 SDK 原生形态；
@@ -107,7 +112,13 @@ async def _passthrough_once(client: httpx.AsyncClient, express_key: str,
         headers=build_direct_headers(express_key),
     )
     response = await client.send(req, stream=True)
-    if stream:
+    # HTTPX also closes implicitly at EOF while buffering a 2xx body. Install
+    # the same owner before the first read, not only before relaying streams.
+    own_httpx_response(response)
+    if stream or response.is_error:
+        # The status and Retry-After are authoritative as soon as headers arrive.
+        # A broken diagnostic body must not turn a known 400 into a retryable
+        # connection error (or send a known 429 back without its retry hint).
         return response
     try:
         return await buffer_upstream_response(response)
@@ -119,7 +130,7 @@ async def _passthrough_once(client: httpx.AsyncClient, express_key: str,
 async def _passthrough_request(fastapi_request: Request, model: str, action: str,
                                query: str, payload: bytes):
     return await run_with_image_limit(
-        model if action in ("generateContent", "streamGenerateContent") else "",
+        model.rpartition("/")[2] if action in ("generateContent", "streamGenerateContent") else "",
         lambda: _passthrough_request_impl(fastapi_request, model, action, query, payload),
     )
 
@@ -185,6 +196,17 @@ async def _buffered_upstream_result(upstream: httpx.Response) -> tuple:
     return status, ctype, headers, body
 
 
+def native_expects_one_candidate(body: dict) -> bool:
+    """Default is one; never infer a lone terminal for ambiguous config/aliases."""
+    configs = [body[key] for key in ("generationConfig", "generation_config") if key in body]
+    if not configs or configs == [None]:
+        return True
+    if len(configs) != 1 or not isinstance(configs[0], dict):
+        return False
+    values = [configs[0][key] for key in ("candidateCount", "candidate_count") if key in configs[0]]
+    return not values or (len(values) == 1 and (values[0] is None or int32_value(values[0]) == 1))
+
+
 async def _passthrough_request_impl(fastapi_request: Request, model: str, action: str,
                                    query: str, payload: bytes):
     """选 Key → 透传 → 429/5xx 换 Key 重试 → 钉定失败兜底。返回 Response。
@@ -198,14 +220,14 @@ async def _passthrough_request_impl(fastapi_request: Request, model: str, action
     - Key 重选重试（429/5xx/网络异常）：读取控制台 retry_max，每次按策略
       重新选择 Express Key，单 Key 或一轮用完后也继续重试；重试间隔为
       固定值 + 抖动（retry_backoff_seconds / retry_jitter_seconds，不随
-      次数放大），更短的上游 retry-after 会被采纳；
+      次数放大），有效 Retry-After 不缩短，超过本地预算则直接交还原错误；
     - 钉定失败兜底（403/404 且报错像项目/区域问题，见 _looks_like_pin_failure）：
       不换 Key、不占上面的预算，仅把模型路径退回裸模型名再试一次——
       与 SDK 通道（express_pipeline.execute_gemini_call 的 fallback_model）对齐，
       避免「OpenAI 接口能自动兜底、原生透传却把 404 原样抛给客户端」。
     """
     started_at = time.monotonic()
-    deadline = started_at + request_timeout_seconds()
+    deadline = note_retry_deadline(fastapi_request, started_at + request_timeout_seconds())
     manager = fastapi_request.app.state.express_key_manager
     if manager.get_total_keys() == 0:
         return _native_error(
@@ -251,7 +273,15 @@ async def _passthrough_request_impl(fastapi_request: Request, model: str, action
     # 注意经模块属性调用：测试用 mock.patch.object(first_reply, "timeout_seconds")
     # 替换模块属性，直接 from-import 的函数绑定会绕过 patch，把窗口变成
     # 真实默认 0（关闭；回归会直接暴露）。
-    fr_seconds = first_reply_module.timeout_seconds(model)
+    model_id = model.rpartition("/")[2]
+    fr_seconds = first_reply_module.timeout_seconds(model_id)
+    single_candidate = False
+    if fr_seconds and is_stream:
+        # The route has already parsed the (possibly image-sized) request.
+        # Standalone callers without route state can derive the same policy.
+        single_candidate = getattr(fastapi_request, "scope", {}).get("state", {}).get("native_single_candidate")
+        if single_candidate is None:
+            single_candidate = native_expects_one_candidate(json.loads(payload))
     record = None
     previous_key = None
     key_attempts = 0           # 上游错误已重试次数（不含首次）
@@ -296,6 +326,15 @@ async def _passthrough_request_impl(fastapi_request: Request, model: str, action
                 record = None
                 continue
 
+            # A new logical (Key) attempt owns one absolute first-reply window.
+            # Switching transport candidates, even after HTTP headers, does not reset it.
+            # 非流式透传是整取路径：不参与首回复计时（2026-11 语义，见
+            # first_reply.timed_call）——窗口置 0 后 wait 直接放行，挂起由
+            # 传输层读超时（read=600s）与整轮期限兜底；真流式保持窗口语义
+            # （响应头到达 + prefetch 首个有效帧都在窗口内）。
+            first_reply = FirstReplyGuard(
+                model_id, seconds=fr_seconds if is_stream else 0.0)
+
         if pin_fallback_used:
             # 钉定兜底轮：复用同一把 Key（换的是模型路径，不是 Key）
             model_path = model
@@ -307,12 +346,6 @@ async def _passthrough_request_impl(fastapi_request: Request, model: str, action
         prefetched = None
         try:
             upstream_attempt()
-            # 非流式透传是整取路径：不参与首回复计时（2026-11 语义，见
-            # first_reply.timed_call）——窗口置 0 后 wait 直接放行，挂起由
-            # 传输层读超时（read=600s）与整轮期限兜底；真流式保持窗口语义
-            # （响应头到达 + prefetch 首个有效帧都在窗口内）。
-            first_reply = FirstReplyGuard(
-                model, seconds=fr_seconds if is_stream else 0.0)
             async def send(raw: dict, resolved: Any,
                            _key: str = express_key, _path: str = model_path):  # B023：默认参数绑定重试循环变量
                 return await _passthrough_once(
@@ -328,7 +361,7 @@ async def _passthrough_request_impl(fastapi_request: Request, model: str, action
                 # 契约校验（含首回复 guard 的 accept），收尾时从同一 state
                 # 读 usageMetadata 打 💰 日志。reply_guard 必须传入：帧源
                 # 收到首个有效回复时通过它结束首回复计时。
-                stream_state = _NativeStreamState(reply_guard=first_reply)
+                stream_state = _NativeStreamState(reply_guard=first_reply, single_candidate=single_candidate)
                 prefetched = await _prefetch_stream_reply(
                     upstream, first_reply, stream_state, is_sse_request)
         except asyncio.CancelledError:
@@ -342,13 +375,15 @@ async def _passthrough_request_impl(fastapi_request: Request, model: str, action
             # The HTTP handshake can succeed and the body then fail before
             # prefetch has exposed any output. Try the same account's next
             # proxy before consuming model retry budget or selecting a Key.
-            if proxy_chain.advance(e):
+            prefetch_hint = response_retry_after(upstream) if isinstance(e, NativeStreamError) else None
+            if proxy_chain.advance(e, retry_after=prefetch_hint):
                 continue
             last_error_status, last_error_body, last_error_headers = _classify_attempt_error(e, upstream)
-            if key_attempts >= retry_max or not is_retryable_exception(e):
+            if (key_attempts >= retry_max or not is_retryable_exception(e)
+                    or not advisory_fits(last_error_headers.get("retry-after"), fastapi_request, deadline=deadline)):
                 break
             wait = _retry_delay(last_error_headers.get("retry-after"), backoff_seconds, key_attempts,
-                                jitter_seconds, error=e)
+                                jitter_seconds, error=e, identity_rotates=False)
             print(f"⚠️ [Gemini 透传] 上游请求失败（HTTP {last_error_status}，{type(e).__name__}），"
                   f"{wait:.1f}s 后重试（{key_attempts + 1}/{retry_max}）。")
             if not await _wait_for_retry(fastapi_request, wait):
@@ -380,18 +415,14 @@ async def _passthrough_request_impl(fastapi_request: Request, model: str, action
         # 429/5xx：按控制台预算重选 Key，不能因单 Key / 池已用遍而提前退出。
         retryable_status = is_retryable_status(upstream.status_code)
         if retryable_status and key_attempts < retry_max:
-            last_error_status = upstream.status_code
-            last_error_headers = {k: v for k, v in upstream.headers.items()
-                                  if k.lower() == "retry-after"}
-            # 读错误正文供重试诊断；取消和读取失败也必须释放响应。
-            try:
-                last_error_body = await read_upstream_bytes(upstream)
-            except Exception:
-                last_error_body = _native_error(
-                    upstream.status_code, "上游错误响应未完整传输。").body
-            finally:
-                await _close_upstream(upstream)
-            wait = _retry_delay(upstream.headers.get("retry-after"), backoff_seconds, key_attempts, jitter_seconds)
+            last_error_status, ctype, last_error_headers, last_error_body = await _buffered_upstream_result(upstream)
+            hint = last_error_headers.get("retry-after")
+            if not advisory_fits(hint, fastapi_request, deadline=deadline):
+                # Recheck after the diagnostic read and close: all of it spends
+                # the same budget. Preserve the actual status/body/advisory.
+                return Response(content=last_error_body, status_code=last_error_status, media_type=ctype,
+                                headers=last_error_headers)
+            wait = _retry_delay(hint, backoff_seconds, key_attempts, jitter_seconds, identity_rotates=False)
             print(f"⚠️ [Gemini 透传] 上游 HTTP {upstream.status_code}，"
                   f"{wait:.1f}s 后重试（{key_attempts + 1}/{retry_max}，单 Key 同样适用）。")
             if not await _wait_for_retry(fastapi_request, wait):
@@ -413,7 +444,7 @@ async def _passthrough_request_impl(fastapi_request: Request, model: str, action
 
         # 钉定路径失败 → 退回裸模型名再试一次（不占 Key 轮换预算）
         if (not pin_fallback_used and model_path != model
-                and _looks_like_pin_failure(status, body)):
+                and _looks_like_pin_failure(status, body) and not response_requests_delay(upstream)):
             pin_fallback_used = True
             last_error_status, last_error_body = status, body
             last_error_headers = headers
@@ -453,8 +484,9 @@ class NativeStreamError(RuntimeError):
 
 class _NativeStreamState:
     """One completion/error contract for native SSE and JSON array streams."""
-    def __init__(self, reply_guard: Optional[FirstReplyGuard]=None):
+    def __init__(self, reply_guard: Optional[FirstReplyGuard]=None, *, single_candidate: bool=True):
         self.reply_guard = reply_guard
+        self.single_candidate = single_candidate
         self.seen, self.finished = set(), set()
         self.received = False
         self.blocked = False
@@ -462,7 +494,14 @@ class _NativeStreamState:
         self.usage: Optional[dict] = None
 
     def inspect(self, payload: dict):
-        for obj in payload if isinstance(payload, list) else [payload]:
+        self.inspect_batch(payload if isinstance(payload, list) else (payload,))
+
+    def inspect_batch(self, objects: Iterable[dict]) -> None:
+        # A single outbound frame/chunk can contain several upstream objects.
+        # Do not release the shared gate for a batch later rejected before delivery.
+        generated = None
+        refusal_terminal = False
+        for obj in objects:
             if not isinstance(obj, dict):
                 raise IncompleteResponseError("上游事件不是 Gemini 响应对象。")
             self.received = True
@@ -472,11 +511,15 @@ class _NativeStreamState:
             if isinstance(usage, dict):
                 self.usage = merge_usage_metadata(self.usage, usage)
             feedback = obj.get("promptFeedback")
-            if isinstance(feedback, dict) and has_finish_reason(feedback.get("blockReason")):
+            reason = feedback.get("blockReason") if isinstance(feedback, dict) else None
+            if has_finish_reason(reason):
                 self.blocked = True
             if not isinstance(obj.get("candidates", []), list):
                 raise IncompleteResponseError("上游 candidates 格式错误。")
-            for index, candidate in enumerate(obj.get("candidates") or []):
+            candidates = obj.get("candidates") or []
+            if len(candidates) > 1:
+                self.single_candidate = False
+            for index, candidate in enumerate(candidates):
                 if not isinstance(candidate, dict):
                     raise IncompleteResponseError("上游候选格式错误。")
                 content = candidate.get("content") or {}
@@ -488,14 +531,29 @@ class _NativeStreamState:
                 index = candidate.get("index", index)
                 if not isinstance(index, int) or index < 0:
                     raise IncompleteResponseError("上游候选 index 格式错误。")
+                if type(index) is not int or index != 0:
+                    self.single_candidate = False
+                if candidate.get("finishReason") in FINISH_CONTENT_FILTER:
+                    refusal_terminal = True
                 if index in self.finished and parts:
                     raise IncompleteResponseError("上游候选已结束，却继续返回内容。")
                 if parts:
                     self.seen.add(index)
                 if has_finish_reason(candidate.get("finishReason")):
                     self.finished.add(index)
-            if self.reply_guard and native_has_reply(obj):
-                self.reply_guard.accept()
+            if self.reply_guard and not self.reply_guard.ready and generated is not True:
+                if native_has_reply(obj):
+                    generated = True
+                elif isinstance(reason, str) and reason in _PROMPT_BLOCK_REASONS:
+                    # An explicit prompt block is deliverable but not a first-token sample.
+                    generated = False
+        if self.reply_guard and not self.reply_guard.ready:
+            if generated is not None:
+                self.reply_guard.accept(generated=generated)
+            elif self.single_candidate and refusal_terminal:
+                # A conclusive model refusal is deliverable as-is. Never count
+                # it as a first token or stop checking/forwarding later usage.
+                self.reply_guard.accept(generated=False)
 
     def finish(self):
         if not self.received:
@@ -515,15 +573,24 @@ async def _native_json_chunks(upstream: httpx.Response, reply_guard: Optional[Fi
         async for chunk in upstream.aiter_bytes():
             if chunk:
                 upstream_chunk()
-            for obj in parser.feed(decoder.decode(chunk)):
-                state.inspect(obj)
+            state.inspect_batch(parser.feed(decoder.decode(chunk)))
             yield chunk
-        for obj in parser.feed(decoder.decode(b"", final=True)):
-            state.inspect(obj)
+        state.inspect_batch(parser.feed(decoder.decode(b"", final=True)))
     except UnicodeError as exc:
         raise IncompleteResponseError("上游 JSON 流包含无效 UTF-8。") from exc
     parser.finish()
     state.finish()
+
+
+def _inspect_sse_frame(frame: bytes, state: _NativeStreamState) -> None:
+    """Release decoded data before yielding the untouched wire frame to a slow client."""
+    data = b"\n".join(line[5:].lstrip() for line in frame.splitlines() if line.startswith(b"data:"))
+    if data and data != b"[DONE]":
+        try:
+            payload = json.loads(data)
+        except (ValueError, UnicodeError):
+            raise IncompleteResponseError("上游 SSE 包含无效 JSON 事件。") from None
+        state.inspect(payload)
 
 
 async def _native_sse_frames(upstream: httpx.Response, reply_guard: Optional[FirstReplyGuard]=None, state: Optional[_NativeStreamState]=None):
@@ -536,13 +603,7 @@ async def _native_sse_frames(upstream: httpx.Response, reply_guard: Optional[Fir
     frames = sse_frames(observed_bytes())
     try:
         async for frame in frames:
-            data = b"\n".join(line[5:].lstrip() for line in frame.splitlines() if line.startswith(b"data:"))
-            if data and data != b"[DONE]":
-                try:
-                    payload = json.loads(data)
-                except (ValueError, UnicodeError):
-                    raise IncompleteResponseError("上游 SSE 包含无效 JSON 事件。") from None
-                state.inspect(payload)
+            _inspect_sse_frame(frame, state)
             yield frame
         state.finish()
     finally:
@@ -605,37 +666,32 @@ async def _relay_stream(upstream: httpx.Response, *, keepalive: bool=False, dead
         total = 0
         completed = False
         events = None
+        error_frame = None
         try:
-            remaining = (deadline or time.monotonic() + request_timeout_seconds()) - time.monotonic()
-            async with asyncio.timeout(max(0.001, remaining)):
-                if keepalive:
-                    events = with_heartbeats(source if source is not None else _native_sse_frames(upstream))
+            end = deadline if deadline is not None else time.monotonic() + request_timeout_seconds()
+            if source is not None:
+                events = source
+            elif keepalive or "text/event-stream" in upstream.headers.get("content-type", "").lower():
+                events = _native_sse_frames(upstream)
+            else:
+                events = _native_json_chunks(upstream)
+            if keepalive:
+                events = with_heartbeats(events)
+                yield HEARTBEAT_FRAME.encode()
+            async for item in reads_before_deadline(events, end):
+                if item is HEARTBEAT:
                     yield HEARTBEAT_FRAME.encode()
-                    async for item in events:
-                        if item is HEARTBEAT:
-                            yield HEARTBEAT_FRAME.encode()
-                        else:
-                            total += len(item)
-                            yield item
-                else:
-                    if source is not None:
-                        events = source
-                    elif "text/event-stream" in upstream.headers.get("content-type", "").lower():
-                        events = _native_sse_frames(upstream)
-                    else:
-                        events = _native_json_chunks(upstream)
-                    async for chunk in events:
-                        if chunk:
-                            total += len(chunk)
-                            yield chunk
+                elif item:
+                    total += len(item)
+                    yield item
             completed = True
         except Exception as exc:
             if not keepalive:
                 raise
             code, _ = extract_upstream_error(exc)
-            body = (exc.payload if isinstance(exc, NativeStreamError) else
-                    _native_error(code, "上游流未完整传输，请重新生成或检查网络。").body)
-            yield b"data: " + body + b"\n\n"
+            message = str(exc) if isinstance(exc, StreamDeadlineExceeded) else "上游流未完整传输，请重新生成或检查网络。"
+            body = (exc.payload if isinstance(exc, NativeStreamError) else _native_error(code, message).body)
+            error_frame = b"data: " + body + b"\n\n"
         finally:
             if events:
                 with anyio.CancelScope(shield=True):
@@ -656,38 +712,67 @@ async def _relay_stream(upstream: httpx.Response, *, keepalive: bool=False, dead
                       f"已转发 {total} 字节 | 耗时 {elapsed:.1f}s"
                       "（客户端断开或上游/网络异常）。")
             await _close_upstream(upstream)
+        if error_frame is not None:
+            yield error_frame
 
-    class NativeStreamingResponse(StreamingResponse):
-        async def aclose(self):
-            with anyio.CancelScope(shield=True):
-                try:
-                    await self.body_iterator.aclose()
-                finally:
-                    if source is not None:
-                        await source.aclose()
-                    await _close_upstream(upstream)
-
-        async def __call__(self, scope: dict, receive: Callable, send: Callable):
-            try:
-                await super().__call__(scope, receive, send)
-            finally:
-                # send() 可能在生成器第一次执行前或暂停于 yield 时失败；
-                # 两种情况下都由响应外层负责关闭，不能仅依赖生成器 finally。
-                with anyio.CancelScope(shield=True):
-                    if not started:
-                        stats.add_error()
-                    await self.aclose()
+    async def cleanup():
+        try:
+            # A prefetched source already owns a read even before relay starts.
+            if not started:
+                stats.add_error()
+                if source is not None:
+                    await source.aclose()
+        finally:
+            await _close_upstream(upstream)
 
     media_type = upstream.headers.get("content-type", "text/event-stream")
     passthrough = {k: v for k, v in upstream.headers.items()
                    if k.lower() == "retry-after"}
     if keepalive:
         passthrough.update(SSE_NO_BUFFER_HEADERS)
-    return NativeStreamingResponse(_relay(), status_code=upstream.status_code,
-                                   media_type=media_type, headers=passthrough or None)
+    return ManagedStreamingResponse(_relay(), status_code=upstream.status_code, cleanup=cleanup,
+                                    media_type=media_type, headers=passthrough or None)
 
 
-async def _resumable_native(request: Request, api_key: str, model: str, action: str, query: str, payload: dict, parsed: dict):
+# Error terminals must fit even when the normal replay event budget is exhausted.
+_MAX_REPLAY_DIAGNOSTIC_BYTES = 8192
+
+
+def _native_setup_payload(response: Response) -> dict:
+    code = response.status_code
+    fallback = {"message": f"上游返回 HTTP {code}，错误详情不可用。", "status": google_status_detail(code), "code": code}
+    if len(response.body) <= _MAX_REPLAY_DIAGNOSTIC_BYTES:
+        try:
+            error = json.loads(response.body)["error"]
+            if isinstance(error, dict):
+                # Keep Google's details and status; HTTP is authoritative for code.
+                error = {**fallback, **error, "code": code}
+                for key in ("message", "status"):
+                    if not isinstance(error[key], str):
+                        error[key] = fallback[key]
+                payload = {"error": error}
+                # Also rejects NaN, invalid Unicode, etc. before committing a receipt
+                # that could not later be rendered to either HTTP JSON or SSE.
+                if len(JSONResponse(payload).body) <= _MAX_REPLAY_DIAGNOSTIC_BYTES:
+                    return payload
+        except (KeyError, ValueError, TypeError, RecursionError):
+            pass
+    return {"error": fallback}
+
+
+def _acknowledge_native_http(response: Response, request: Request, buf: ResumableBuffer) -> Response:
+    # The response is prepared independently of the frontend. Do not consume it
+    # at construction, on a failed send, or on an observed silently dropped send.
+    response.headers["X-Resume-Id"] = buf.id
+    background = BackgroundTasks()
+    background.add_task(buf.acknowledge_http_send, ClientConnection.for_request(request))
+    if response.background is not None:
+        background.tasks.append(response.background)
+    response.background = background
+    return response
+
+
+async def _resumable_native(request: Request, api_key: str, model: str, action: str, query: str, payload: bytes):
     # 指纹用原始请求体的 sha256：旧实现把已解析的 payload（可达 32MiB，
     # 含 base64 图片）重新 json.dumps 一遍，大请求数百毫秒纯 CPU。
     # 语义同步收窄为「原样重发命中同一缓冲」（与 chat_api 指纹的注释口径
@@ -710,34 +795,25 @@ async def _resumable_native(request: Request, api_key: str, model: str, action: 
             await close()
 
     async def pump(response: Response):
-        failed = False
         try:
             async for frame in response.body_iterator:
                 text = frame.decode("utf-8") if isinstance(frame, bytes) else frame
-                if text.lstrip().startswith(":"):
+                event = ReplayEvent(text)
+                if not event.has_data:
                     continue
-                for line in text.splitlines():
-                    if line.startswith("data:"):
-                        try:
-                            obj = json.loads(line[5:])
-                        except ValueError:
-                            continue
-                        if isinstance(obj, dict) and obj.get("error"):
-                            error = obj["error"]
-                            await buf.append(buf.event_frame(text))
-                            code = error.get("code") if isinstance(error, dict) else None
-                            await buf.finish("error", error=str(error), status_code=(
-                                code if isinstance(code, int) and 400 <= code <= 599 else 502))
-                            failed = True
-                            return
-                if await buf.append(buf.event_frame(text)) is None:
+                if await buf.append(buf.event_frame(event)) is None:
                     return
-            if not failed:
-                await buf.finish()
-        except asyncio.CancelledError:
-            raise
+                error = event.error()
+                if error:
+                    code = error.get("code") if isinstance(error, dict) else None
+                    await buf.finish("error", error=error, status_code=(
+                        code if isinstance(code, int) and 400 <= code <= 599 else 502))
+                    return
+            await buf.finish()
+        except (asyncio.CancelledError, TimeoutError):
+            raise  # the deadline owner preserves upstream vs total timeout
         except Exception as exc:
-            await buf.fail(str(exc), getattr(exc, "code", 502))
+            await buf.fail(str(exc), getattr(exc, "code", 502), within_deadline=True)
         finally:
             with anyio.CancelScope(shield=True):
                 await response.body_iterator.aclose()
@@ -748,33 +824,48 @@ async def _resumable_native(request: Request, api_key: str, model: str, action: 
                 response = await _passthrough_request(
                     DetachedRequest(request), model, action, query, payload)
                 if not isinstance(response, StreamingResponse):
-                    message = response.body.decode("utf-8", "replace")[:1024]
-                    await buf.fail(message, response.status_code)
+                    if 400 <= response.status_code <= 599:
+                        hint = response_retry_after(response)
+                        if hint is None and "retry-after" in response.headers:
+                            del response.headers["retry-after"]
+                        await buf.fail_native_setup(_native_setup_payload(response), hint)
+                    else:
+                        message = response.body.decode("utf-8", "replace")[:1024]
+                        await buf.fail(message, response.status_code, within_deadline=True)
                     return response
                 if buf.done:
                     await close_response(response)
                     return _native_error(buf.status_code, buf.error or "响应缓冲已释放。")
                 task = hold_ingress(asyncio.create_task(within_request_deadline(buf, lambda: pump(response))))
-                task.add_done_callback(lambda _task: resumable_store.schedule_cleanup(lambda: close_response(response)))
-                resumable_store.register_pump(buf.id, task, buffer=buf)
+                resumable_store.register_pump(buf.id, task, buffer=buf, close=lambda: close_response(response))
                 return response
+            except TimeoutError:
+                raise  # within_request_deadline classifies this before publishing
             except Exception as exc:
-                await buf.fail(str(exc), getattr(exc, "code", 502))
+                await buf.fail(str(exc), getattr(exc, "code", 502), within_deadline=True)
                 raise
         task = hold_ingress(asyncio.create_task(within_request_deadline(buf, setup)))
         resumable_store.register_pump(buf.id, task, buffer=buf)
-        done, _ = await asyncio.wait({task}, timeout=SETUP_FAST_WINDOW_SECONDS)
-        if done:
-            response = task.result()
+        if await fast_setup_completed(buf, task, SETUP_FAST_WINDOW_SECONDS):
+            response = buffered_setup_result(buf, task)
             if not isinstance(response, StreamingResponse):
+                if buf.status_code == response.status_code and buf.done:
+                    return _acknowledge_native_http(response, request, buf)
                 return response
         else:
             # 慢路径统计补记（2026-11 P2-8 修复；单一实现见
             # admission.count_slow_setup_failure，与 chat_api 共用）。
             task.add_done_callback(partial(count_slow_setup_failure, on_error=stats.add_error))
-    return StreamingResponse(
-        sse_from_buffer(buf, start), media_type="text/event-stream",
-        headers={"X-Resume-Id": buf.id, **SSE_NO_BUFFER_HEADERS,
-                 **({"X-Resumable-Replay": "1"} if not new else {})})
+    headers = {"X-Resume-Id": buf.id, **SSE_NO_BUFFER_HEADERS,
+               **({"X-Resumable-Replay": "1"} if not new else {})}
+    if buf.native_setup_headers is not None:
+        headers.update(buf.native_setup_headers)
+        if not new and not resume_cursor(request)[2]:
+            # No stream has started on this connection. Preserve the HTTP result
+            # for an undelivered retry or explicit Idempotency-Key. A real cursor
+            # still addresses the numbered SSE event, not a brand-new HTTP result.
+            return _acknowledge_native_http(
+                JSONResponse(buf.payload, status_code=buf.status_code, headers=headers), request, buf)
+    return ReplayStreamResponse(request, buf, start, headers=headers)
 
 

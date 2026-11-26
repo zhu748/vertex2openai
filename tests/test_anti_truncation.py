@@ -1,4 +1,5 @@
 """Offline transport tests: native incremental delivery, real tools, both channels."""
+from settings_fixture import saved_settings
 import asyncio
 from contextlib import asynccontextmanager
 import json
@@ -67,7 +68,7 @@ class PrepareTests(unittest.TestCase):
     def isolated_state(self, settings=None):
         state = AppState()
         state._state = {"settings": settings or {}}
-        patch = mock.patch.object(state, "_save")
+        patch = mock.patch.object(state, "_write_snapshot")
         patch.start()
         self.addCleanup(patch.stop)
         return state
@@ -219,7 +220,7 @@ class CatalogHTTPTests(unittest.IsolatedAsyncioTestCase):
                     "gemini-3.1-flash-image", "gemini-live", "text-embedding-005",
                     MODEL + "-antitruncation-stream"]
         for patch in (
-            mock.patch.object(self.state, "_save"),
+            mock.patch.object(self.state, "_write_snapshot"),
             mock.patch.object(settings_api, "app_state", self.state),
             mock.patch.object(models_api, "app_state", self.state),
             mock.patch.object(models_api, "get_express_models", mock.AsyncMock(return_value=self.raw)),
@@ -354,7 +355,7 @@ class DecoderTests(unittest.TestCase):
         self.assertFalse(retry_policy.is_retryable_exception(at.AntiTruncationError("bad JSON")))
 
     def test_length_and_content_filter_are_preserved(self):
-        for finish in ("MAX_TOKENS", "SAFETY", "PROHIBITED_CONTENT"):
+        for finish in ("MAX_TOKENS", "CONTINUATION", "SAFETY", "PROHIBITED_CONTENT"):
             decoder = at.TextDecoder("owned")
             restored = decoder.restore_sdk(response(function("owned", partial_args=[types.PartialArg(
                 json_path="$.content", string_value="partial", will_continue=True)], will_continue=True), finish=finish))
@@ -372,7 +373,7 @@ class ChannelTests(unittest.IsolatedAsyncioTestCase):
         for patch in (
             mock.patch.object(app_state, "get_settings", side_effect=lambda: dict(self.settings)),
             mock.patch.object(app_state, "get_effective_settings", side_effect=lambda model, base=None: (dict(self.settings) if base is None else dict(base))),
-            mock.patch.object(app_state, "get_setting", side_effect=lambda key, default=None: self.settings.get(key, default)),
+            saved_settings(app_state, self.settings),
         ):
             patch.start()
             self.addCleanup(patch.stop)

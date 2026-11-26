@@ -1,6 +1,9 @@
 """Client-safe chat delivery: small URLs, exact original bytes, bounded decoding."""
 import asyncio
 import base64
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+import threading
 import os
 import tempfile
 import time
@@ -65,6 +68,32 @@ class ImageDeliveryTests(unittest.TestCase):
             delivery.image_markdown("!!!!", "image/png", encoded=True)
         self.assertEqual(list(delivery.store_directory().iterdir()), [])
 
+    def test_download_cache_expires_no_later_than_the_asset_for_get_head_and_range(self):
+        asyncio.run(self._ttl_cache_roundtrip())
+
+    async def _ttl_cache_roundtrip(self):
+        app = FastAPI()
+        app.include_router(router)
+        name = delivery.image_markdown(b"hello", "image/png").rsplit("/", 1)[1][:-1]
+        path = delivery.resolve_image(name)
+        url = f"/v1/generated-images/{name}"
+        now = time.time()
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://local") as client:
+            for ttl, age, expected in ((7200, 0, 3600), (60, 55.25, 4), (60, 59.5, 0)):
+                os.utime(path, (now - age, now - age))
+                with mock.patch.object(delivery, "TTL_SECONDS", ttl), mock.patch.object(delivery.time, "time", return_value=now):
+                    for method, headers, code in (("GET", {}, 200), ("HEAD", {}, 200),
+                                                  ("GET", {"Range": "bytes=0-1"}, 206)):
+                        with self.subTest(ttl=ttl, age=age, method=method, code=code):
+                            reply = await client.request(method, url, headers=headers)
+                            self.assertEqual(reply.status_code, code)
+                            self.assertEqual(reply.headers["Cache-Control"], f"private, max-age={expected}")
+                            self.assertEqual(reply.content, b"" if method == "HEAD" else b"he" if code == 206 else b"hello")
+            os.utime(path, (now - 61, now - 61))
+            with mock.patch.object(delivery, "TTL_SECONDS", 60):
+                self.assertEqual((await client.get(url)).status_code, 404)
+            self.assertFalse(path.exists())
+
     def test_expiry_and_path_validation(self):
         md = delivery.image_markdown(b"png", "image/png")
         name = md.rsplit("/", 1)[1][:-1]
@@ -74,6 +103,65 @@ class ImageDeliveryTests(unittest.TestCase):
         self.assertIsNone(delivery.resolve_image(name))
         self.assertFalse(path.exists())
         self.assertIsNone(delivery.resolve_image("../web_state.json"))
+
+    def test_failed_stage_or_publish_never_evicts_an_existing_link(self):
+        with mock.patch.object(delivery, "MAX_STORE_BYTES", 9), \
+                mock.patch.object(delivery, "_PRUNE_INTERVAL_SECONDS", 0):
+            for operation in ("decode", "write", "publish", "cannot_fit"):
+                with self.subTest(operation=operation), tempfile.TemporaryDirectory() as tmp, \
+                        mock.patch.object(delivery, "store_directory", return_value=Path(tmp)):
+                    name = delivery.image_markdown(b"cached", "image/png").rsplit("/", 1)[1][:-1]
+                    old = delivery.resolve_image(name)
+                    if operation == "decode":
+                        with mock.patch.object(delivery, "CHUNK", 4), self.assertRaises(ValueError):
+                            delivery.image_markdown("bmV3@@@@", "image/png", encoded=True)
+                    elif operation == "cannot_fit":
+                        with self.assertRaises(ValueError):
+                            delivery.image_markdown(b"too-large-for-store", "image/png")
+                    elif operation == "write":
+                        open_file = Path.open
+                        def partial_write(path, *args):
+                            file = open_file(path, *args)
+                            output = mock.MagicMock()
+                            def fail(data):
+                                file.write(data[:1])
+                                raise OSError("fixture write failure")
+                            output.write.side_effect = fail
+                            output.__exit__.side_effect = lambda *args: file.close()
+                            return output
+                        with mock.patch.object(Path, "open", partial_write), self.assertRaises(OSError):
+                            delivery.image_markdown(b"new-image", "image/png")
+                    else:
+                        with mock.patch.object(Path, "replace", side_effect=OSError("rename")), self.assertRaises(OSError):
+                            delivery.image_markdown(b"new-image", "image/png")
+                    self.assertEqual(old.read_bytes(), b"cached")
+                    self.assertEqual(list(old.parent.iterdir()), [old])
+
+    def test_small_concurrent_publications_respect_quota_within_one_scan_window(self):
+        workers = 8
+        barrier = threading.Barrier(workers)
+
+        def write(n):
+            token = delivery.image_base_url.set("https://fixture.test")
+            try:
+                barrier.wait(timeout=5)
+                return delivery.image_markdown(bytes([n]) * 4, "image/png").rsplit("/", 1)[1][:-1]
+            finally:
+                delivery.image_base_url.reset(token)
+
+        with mock.patch.object(delivery, "MAX_STORE_BYTES", 12):
+            # Existing data may have been published in a previous service run.
+            directory = delivery.store_directory()
+            directory.mkdir(parents=True)
+            previous = directory / ("a" * 48 + ".png")
+            previous.write_bytes(b"old!")
+            os.utime(previous, (time.time() - 5, time.time() - 5))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                names = list(pool.map(write, range(workers)))
+            files = list(directory.iterdir())
+            self.assertLessEqual(sum(p.stat().st_size for p in files), 12)
+            self.assertGreater(len(files), 0)
+            self.assertTrue(all(p.name in names and len(p.read_bytes()) == 4 for p in files))
 
     def test_disk_budget_evicts_oldest_and_file_limit_rejects(self):
         # PRF-P2-4 摊销后配额扫描按 60 秒窗口摊销；本测试验证**淘汰逻辑**，
@@ -90,7 +178,7 @@ class ImageDeliveryTests(unittest.TestCase):
     def test_prune_is_amortized_and_big_images_force_a_scan(self):
         # PRF-P2-4：60 秒窗口内的小图不再每次全目录扫描（生图突发下的
         # 重复 iterdir+stat 消除）；大图（≥4MiB）始终强制扫描。
-        delivery._last_prune_monotonic = time.monotonic()  # 刚扫描过
+        delivery.image_markdown(b"existing", "image/png")  # 冷启动已扫描这个目录
         with mock.patch.object(delivery, "_prune", wraps=delivery._prune) as prune:
             delivery.image_markdown(b"small", "image/png")
             self.assertEqual(prune.call_count, 0)  # 窗口内小图：跳过

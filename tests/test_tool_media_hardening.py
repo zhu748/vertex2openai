@@ -23,7 +23,6 @@ import logger
 import main
 import message_processing as mp
 from claude_protocol import anthropic_to_openai_request
-from credential_manager import credential_manager
 from generation_config import create_generation_config
 from models import OpenAIRequest
 from response_validation import IncompleteResponseError
@@ -287,8 +286,16 @@ class ResponseBudgetTests(unittest.IsolatedAsyncioTestCase):
             with mock.patch.object(http_io, "MAX_UPSTREAM_RESPONSE_BYTES", 15), \
                  mock.patch.object(http_io, "MAX_UPSTREAM_ERROR_BYTES", 15):
                 async with http_io.BoundedAsyncClient(transport=transport) as client:
-                    with self.assertRaises(IncompleteResponseError):
-                        await client.post("https://upstream.test", json={})
+                    if status == 200:
+                        with self.assertRaises(IncompleteResponseError):
+                            await client.post("https://upstream.test", json={})
+                    else:
+                        # Dropping oversized diagnostic text must not undo the
+                        # HTTP error headers, but the original read budget holds.
+                        result = await client.post("https://upstream.test", json={})
+                        self.assertEqual(result.status_code, status)
+                        self.assertLessEqual(len(result.content), 15)
+                        self.assertNotIn(b"012345", result.content)
             self.assertTrue(body.closed)
             self.assertEqual(body.reads, 2)
 
@@ -340,10 +347,9 @@ class NativeCounterTests(unittest.IsolatedAsyncioTestCase):
         for action in ("generateContent", "streamGenerateContent"):
             counters = logger.ProxyStats()
             with mock.patch.object(main, "stats", counters), mock.patch.object(cookie_native, "stats", counters), \
-                 mock.patch.object(credential_manager, "get_cookie_record", return_value=record), \
+                 mock.patch.object(app_state, "get_cookie_accounts", return_value=[record]), \
                  mock.patch.object(app_state, "get_channel_mode", return_value="web_proxy"), \
-                 mock.patch.object(cookie_native, "_timed_events", failed), \
-                 mock.patch.object(cookie_native, "build_native_body", return_value={}):
+                 mock.patch.object(cookie_native, "_timed_events", failed):
                 async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://local") as client:
                     response = await client.post(f"/v1beta/models/{MODEL}:{action}?alt=sse",
                         headers={"x-goog-api-key": config.API_KEY}, json={"contents": []})

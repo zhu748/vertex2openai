@@ -1,8 +1,7 @@
 """消息注入、预填充兼容、思维链标签守卫与输出去重。"""
 
 import re
-import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 from models import OpenAIMessage, message_text, normalize_content_part
 
@@ -14,7 +13,7 @@ def _is_empty_message(msg: OpenAIMessage) -> bool:
     说明、纯图片」的用户轮会被当成空消息，末尾图片轮随后被预填充兼容
     逻辑整条删除，上一条 assistant 历史回复被误当预填充（2026-10 修复）。
     """
-    if getattr(msg, "tool_calls", None):
+    if getattr(msg, "tool_calls", None) or msg.has_assistant_refusal():
         return False
     content = msg.content
     if content is None:
@@ -201,7 +200,7 @@ def apply_prefill_compat(
         return messages, "", False
 
     last = messages[idx]
-    if last.role != "assistant" or getattr(last, "tool_calls", None):
+    if last.role != "assistant" or getattr(last, "tool_calls", None) or last.has_assistant_refusal():
         return messages, "", False  # 已是 user 结尾 / 末尾是工具调用 → 无需处理
 
     prefill = message_text(last.content).strip()
@@ -250,12 +249,10 @@ def apply_prefill_compat(
 # 超过几千字符。无上限时长预填充（角色扮演预设可达数十 KB）的循环比对
 # 是 O(n²) 字符操作且在事件循环上（实测 100KB 预填充 ~237ms 纯 CPU）。
 _OVERLAP_SEARCH_CAP = 4096
-# 复述检测窗口上限：与重叠搜索同帽（完整复述由 startswith 全长判定，
-# 不受此帽影响；超长预填充的尾部重叠本就不做平方级搜索）。
-_RESTATE_CAP = _OVERLAP_SEARCH_CAP
+_MIN_OVERLAP = 8
 
 
-def strip_prefill_overlap(prefill: str, output: str, min_overlap: int = 8) -> str:
+def strip_prefill_overlap(prefill: str, output: str, min_overlap: int = _MIN_OVERLAP) -> str:
     """预填充去重：若模型无视指令、把预填充的结尾复述在输出开头，裁掉重叠部分。
 
     - 输出以整段预填充开头（完整复述）→ 裁掉整段；
@@ -273,95 +270,62 @@ def strip_prefill_overlap(prefill: str, output: str, min_overlap: int = 8) -> st
     return output
 
 
-def first_frames(
-    response_id: str, model: str, prefill_text: Optional[str], n: int
-) -> List[Dict[str, Any]]:
-    """预填充先行帧（QUA-P1-1：自 express_pipeline.stream_frames 移入）。
-
-    把预填充文本作为回复开头先发出；n>1 时为每个候选都发一份，与非
-    流式 _prepend_prefill 的全 choice 行为一致（旧实现只发 choice 0，
-    stream 与非 stream 同请求输出分叉）。无预填充返回空表。
-    """
-    if not prefill_text:
-        return []
-    return [
-        {
-            "id": response_id,
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": model,
-            "choices": [
-                {
-                    "index": ci,
-                    "delta": {"role": "assistant", "content": prefill_text},
-                    "finish_reason": None,
-                }
-            ],
-        }
-        for ci in range(max(1, n))
-    ]
-
-
 class PrefillDeduper:
-    """流式版预填充去重器。
-
-    预填充文本由代理先行发给客户端；若模型复述了预填充开头，需要在
-    流式输出的起始处裁掉重叠。做法：先攒下输出开头的一小段（窗口 =
-    min(len(prefill)+32, 600) 字符），做一次去重判定后放行，之后的
-    文本原样透传（不再增加任何延迟）。
-
-    用法：out = deduper.feed(chunk_text)（可能返回空串表示还在攒）；
-    流结束时调用 deduper.flush() 取回剩余文本。
-    """
+    """流式复用整取去重规则：完整复述只记位置，尾部重叠只暂存有歧义的小窗口。"""
 
     def __init__(self, prefill: str, window_cap: int = 600):
         self.prefill = prefill or ""
-        self.window = min(len(self.prefill) + 32, window_cap) if self.prefill else 0
+        self.done = not self.prefill or window_cap == 0
+        # 已匹配的文本就在 prefill 中，不另存一份。None 表示完整复述已被排除。
+        self._matched: Optional[int] = 0
         self.buffer = ""
-        self.done = self.window == 0
 
     def feed(self, text: str) -> str:
-        if self.done:
+        if self.done or not text:
             return text
-        self.buffer += text
-        # P2-4：只要已经能判定「不可能是预填充的重复」，立刻放行，不必攒满窗口。
-        # 旧实现固定攒到 min(len(prefill)+32, 600) 字符才放行，首 token 延迟明显，
-        # 与注释里的“零额外延迟”不符。
-        # 复述进行中（buffer 仍是 prefill 的前缀）时窗口放宽到
-        # min(len(prefill), _RESTATE_CAP)：酒馆预填充普遍 >600 字符，固定
-        # 600 上限会在复述未完时强制判定，整段复述漏裁（与非流式路径行为
-        # 分叉，2026-10 修复）；未在复述状态则维持 600 快窗口（延迟优先）。
-        ambiguous = self._still_ambiguous()
-        if not ambiguous or len(self.buffer) >= (
-                min(len(self.prefill), _RESTATE_CAP) if ambiguous else self.window):
-            return self._resolve()
-        return ""
-
-    def _still_ambiguous(self) -> bool:
-        """当前缓冲是否还不足以判定去重量。
-
-        strip_prefill_overlap 只看输出的前 len(prefill) 个字符，因此：
-          - 缓冲长度已达 len(prefill) → 信息完备，重叠量已确定，立即放行；
-          - 否则只有当缓冲仍是预填充的某个子串时，才可能延展成更长的重叠，需要继续等。
-        """
-        buf, pre = self.buffer, self.prefill
-        if not buf or not pre:
-            return False
-        if len(buf) >= len(pre):
-            return False
-        return buf in pre
+        pos, pre = self._matched, self.prefill
+        if pos is not None:
+            remaining = len(pre) - pos
+            if len(text) <= remaining:
+                matches = pre.startswith(text, pos)
+            elif pos == 0:
+                matches = text.startswith(pre)
+            else:
+                # 当前块横跨复述终点：不要切出可能很长的 pre[pos:] 副本。
+                matches = all(text.startswith(pre[i:i + _OVERLAP_SEARCH_CAP], i - pos)
+                              for i in range(pos, len(pre), _OVERLAP_SEARCH_CAP))
+            if matches:
+                if len(text) < remaining:
+                    self._matched = pos + len(text)
+                    return ""
+                self.done = True
+                return text[remaining:]
+        return self._suffix(text)
 
     def flush(self) -> str:
-        if self.done:
-            return ""
-        return self._resolve()
+        return "" if self.done else self._suffix("", eof=True)
 
-    def _resolve(self) -> str:
-        out, self.buffer, self.done = self.buffer, "", True
+    def _suffix(self, text: str, *, eof: bool = False) -> str:
+        # held[:end] 是前序未定文本。长的完整前缀直接引用 prefill；
+        # 一旦排除完整复述，只需看开头至多 4K 就能确定最终裁去多少字符。
+        pre = self.prefill
+        held, end = (self.buffer, len(self.buffer)) if self._matched is None else (pre, self._matched)
+        limit = min(len(pre), _OVERLAP_SEARCH_CAP)
+        probe = held[:min(end, limit)] + text[:max(0, limit - end)]
+        if not eof and len(probe) < limit:
+            # 只有可能扩展成合法的更长后缀才继续等待；模板中间无关的匹配不应延迟首帧。
+            start = pre.find(probe, -limit, -1)
+            if start >= 0 and len(pre) - start >= _MIN_OVERLAP:
+                self.buffer, self._matched = probe, None
+                return ""
+
+        self.done, self.buffer = True, ""
         try:
-            return strip_prefill_overlap(self.prefill, out)
+            cut = len(probe) - len(strip_prefill_overlap(pre, probe))
         except Exception as e:
-            # 裁剪失败必须保底放行原文：此刻 buffer 已清空，若连原文也丢，
-            # 客户端会看到响应开头缺一段字。宁可重复，不可丢字。
+            # 裁剪失败必须保底放行原文。
             print(f"⚠️ [预填充去重] 重叠裁剪失败（{e}），本段按原文放行。")
-            return out
+            cut = 0
+        if cut >= end:
+            return text[cut - end:]
+        return held[cut:end] + text

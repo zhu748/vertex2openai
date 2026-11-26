@@ -1,5 +1,6 @@
 """Offline regressions for state upgrades, log races and protocol boundaries."""
 
+from settings_fixture import saved_settings
 import asyncio
 from contextlib import asynccontextmanager
 import json
@@ -294,7 +295,7 @@ class CookieImageTests(unittest.IsolatedAsyncioTestCase):
         ])
         request = SimpleNamespace(is_disconnected=mock.AsyncMock(return_value=False))
         with mock.patch.object(runtime_state.app_state, "get_settings", return_value=settings), \
-             mock.patch.object(runtime_state.app_state, "get_setting", side_effect=lambda k, d=None: settings.get(k, d)), \
+             saved_settings(runtime_state.app_state, settings), \
              mock.patch.object(cookie_delivery, "open_upstream_client", client):
             response = await cookie_proxy.CookieProxyUpstream().chat_completions(obj, request,
                 credential_record={"cookie": "SAPISID=offline; SID=offline", "project_id": "project"})

@@ -123,6 +123,28 @@
       });
       if (r.ok) {
         const saved = await r.json().catch(() => null);
+        // A successful HTTP status can still carry an incomplete receipt, or a
+        // superseding reload's values. Never turn that into a clean form or a
+        // false CAS baseline. Proxy lists can be expanded/canonicalized server-side.
+        const fields = Object.entries(payload).filter(
+          ([key]) => key !== '_expected' && key !== '_inherit'
+        );
+        if (
+          !saved ||
+          typeof saved !== 'object' ||
+          Array.isArray(saved) ||
+          fields.some(([key, value]) => {
+            if (!Object.hasOwn(saved, key)) return true;
+            if (key === 'proxy_urls' && Array.isArray(value))
+              return (
+                !Array.isArray(saved[key]) || saved[key].some((url) => typeof url !== 'string')
+              );
+            return saved[key] !== value;
+          })
+        ) {
+          toast('保存响应未确认提交的设置；请重新加载并核对草稿。');
+          return false;
+        }
         if (onSaved) onSaved(saved);
         return true;
       }
@@ -266,9 +288,6 @@
       toast('通道状态尚未加载，请先重新加载配置');
       return;
     }
-    const pill = $('mode-pill'),
-      prev = pill.textContent,
-      previousMode = currentMode;
     const radios = document.querySelectorAll('input[name=mode]');
     radios.forEach((r) => (r.disabled = true));
     // 先乐观切显示，请求失败则弹提示并回滚（旧版无错误处理，后端 500 时 UI 与实际状态脱节）
@@ -280,17 +299,19 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mode: m })
       });
-      if (!r.ok) {
-        throw new Error('HTTP ' + r.status);
-      }
-      currentMode = m;
+      const receipt = await r.json().catch(() => null);
+      const valid = ['api_key', 'web_proxy', 'mixed'].includes(receipt?.mode);
+      if (valid && (r.ok || r.status === 409)) currentMode = receipt.mode;
+      if (!r.ok) throw new Error(receipt?.error || 'HTTP ' + r.status);
+      if (!valid) throw new Error('服务器未返回有效通道模式');
     } catch (e) {
-      pill.textContent = prev;
-      document.querySelector(`input[name=mode][value=${previousMode}]`).checked = true;
-      renderMode(previousMode);
-      toast('❌ 通道切换失败，已回滚：' + e.message);
+      toast('❌ 通道切换失败：' + e.message);
     } finally {
-      radios.forEach((r) => (r.disabled = false));
+      renderMode(currentMode);
+      radios.forEach((r) => {
+        r.checked = r.value === currentMode;
+        r.disabled = false;
+      });
     }
   }
   async function loadRuntime() {
@@ -309,10 +330,18 @@
   /* ---------- Express Key 列表（多账号，热编辑） ---------- */
   let KEYS = [],
     SAVED_KEYS = [];
+  // Client-only provenance. Row indices and editable key text are not identities;
+  // the marker is set only on newly added rows and is never serialized.
+  const newKeyDraft = Symbol('newKeyDraft');
+  // Unlike a row index, this association survives deletion/reordering of siblings.
+  // Nothing here is sent to the server or carried to a newly loaded credential.
+  const keyOrigins = new WeakMap();
   function keySrcPill(rec) {
-    if (rec.project_source === 'auto') return '<span class="pill">来源 auto</span>';
-    if (rec.project_source === 'manual') return '<span class="pill">来源 manual</span>';
-    return '<span class="pill" style="color:#b45309">未探测</span>';
+    if (rec.project_source === 'auto')
+      return '<span data-project-source class="pill">来源 auto</span>';
+    if (rec.project_source === 'manual')
+      return '<span data-project-source class="pill">来源 manual</span>';
+    return '<span data-project-source class="pill" style="color:#b45309">未探测</span>';
   }
   function keyProxyPill(rec) {
     const proxies = proxyDraft(rec.proxies ?? rec.proxy),
@@ -343,7 +372,7 @@
         <div><label for="project-${i}">Project ID</label><input id="project-${i}" class="inp log k-project" placeholder="留空 = 等待自动探测" spellcheck="false" value="${esc(rec.project_id)}"><label class="note-label" for="key-note-${i}">备注</label><input id="key-note-${i}" class="inp k-note" placeholder="便于区分账号" value="${esc(rec.note)}"></div>
         ${accountProxyFields('key', i, rec)}
       </div>
-      ${rec.detected_at ? `<div class="key-meta">上次探测：${esc(new Date(rec.detected_at * 1000).toLocaleString('zh-CN', { hour12: false }))}</div>` : ''}
+      <div class="key-meta" data-detected ${rec.detected_at ? '' : 'hidden'}>${keyDetectionText(rec)}</div>
       ${rec._msg ? `<div class="key-meta ${rec._msg_ok === false ? 'error-message' : ''}" role="status">${esc(rec._msg)}</div>` : ''}
     </div>`
     ).join('');
@@ -351,17 +380,66 @@
     $('keys-count').textContent = KEYS.length + ' 个';
     $('keys-empty').classList.toggle('hidden', KEYS.length > 0);
   }
+  function keyDetectionText(rec) {
+    return rec.detected_at
+      ? '上次探测：' + new Date(rec.detected_at * 1000).toLocaleString('zh-CN', { hour12: false })
+      : '';
+  }
+  function collectKeyIdentity(row, rec) {
+    const key = row.querySelector('.k-key').value.trim();
+    const projectInput = row.querySelector('.k-project');
+    const pid = projectFromInput(projectInput.value);
+    const projectChanged = pid !== (rec.project_id || '');
+    if (key === rec.key && !projectChanged) return;
+    let origin = keyOrigins.get(rec);
+    if (!origin) {
+      origin = { key: rec.key, clearedAuto: false };
+      keyOrigins.set(rec, origin);
+    }
+    const saved = key === origin.key && SAVED_KEYS.find((item) => item.key === key);
+    if (
+      saved &&
+      (pid === (saved.project_id || '') || (origin.clearedAuto && !pid && !projectChanged))
+    ) {
+      // Reverting the key (or its project edit) restores its own saved provenance.
+      rec.project_id = saved.project_id || '';
+      rec.project_source = saved.project_source || '';
+      rec.detected_at = saved.detected_at || 0;
+      origin.clearedAuto = false;
+    } else if (projectChanged) {
+      rec.project_id = pid;
+      rec.project_source = pid ? 'manual' : '';
+      rec.detected_at = 0;
+      origin.clearedAuto = false;
+    } else if (key !== rec.key) {
+      if (rec.project_source === 'auto') {
+        rec.project_id = '';
+        rec.project_source = '';
+        origin.clearedAuto = true;
+      }
+      rec.detected_at = 0;
+    }
+    rec.key = key;
+    if ((rec.project_id || '') !== pid) projectInput.value = rec.project_id || '';
+    const badge = row.querySelector('[data-project-source]');
+    if (badge) badge.outerHTML = keySrcPill(rec);
+    const detected = row.querySelector('[data-detected]');
+    if (detected) {
+      detected.hidden = !rec.detected_at;
+      detected.textContent = keyDetectionText(rec);
+    }
+  }
+  $('keys-list').addEventListener('input', (event) => {
+    if (!event.target.matches('.k-key, .k-project')) return;
+    const row = event.target.closest('[data-i]');
+    if (row && KEYS[row.dataset.i]) collectKeyIdentity(row, KEYS[row.dataset.i]);
+  });
   function collectKeys() {
     // 以输入框的当前内容为准（用户可能改了还没保存）
     [...document.querySelectorAll('#keys-list [data-i]')].forEach((row) => {
       const i = Number(row.dataset.i);
       if (!KEYS[i]) return;
-      KEYS[i].key = row.querySelector('.k-key').value.trim();
-      const pid = projectFromInput(row.querySelector('.k-project').value);
-      if (pid !== (KEYS[i].project_id || '')) {
-        KEYS[i].project_id = pid;
-        KEYS[i].project_source = pid ? 'manual' : '';
-      }
+      collectKeyIdentity(row, KEYS[i]);
       const kProxy = row.querySelector('.k-proxy');
       if (kProxy) {
         KEYS[i].proxies = proxyDraft(kProxy.value);
@@ -371,7 +449,27 @@
       KEYS[i].note = row.querySelector('.k-note').value.trim();
       KEYS[i].enabled = row.querySelector('.k-enabled').checked;
     });
-    return KEYS.filter((r) => r.key);
+    return KEYS;
+  }
+  function keysForSave(rows) {
+    return rows.filter((row, i) => {
+      if (row.key) return true;
+      if (
+        row[newKeyDraft] &&
+        !row.project_id &&
+        !row.note &&
+        !row.proxies.length &&
+        row.enabled &&
+        row.proxy_fallback
+      )
+        return false; // pristine new placeholder; not a saved row or partial draft
+      const input = $('key-' + i);
+      const message = '第 ' + (i + 1) + ' 个 Key 不能为空；如需删除该行，请使用“删除”。';
+      window.consoleForms?.openAccount('key', i);
+      window.consoleForms?.fieldError(input, message);
+      input.focus();
+      throw new Error(message);
+    });
   }
   /* Express Key 列表：load/save/add/remove 编排由 credential-list.js 的共享
    * 骨架持有（2026-11 P2-6），此处只描述 Key 侧差异。 */
@@ -389,7 +487,6 @@
       confirm(
         '将保存为“空 Key 列表”。\n保存后即使环境变量 VERTEX_EXPRESS_API_KEY 有值，重启也不会再导入。\n确定吗？'
       ),
-    responseItems: (d) => d.keys || [],
     getItems: () => KEYS,
     setItems: (v) => {
       KEYS = v;
@@ -408,7 +505,9 @@
     },
     render: renderKeys,
     collect: collectKeys,
+    prepareSave: keysForSave,
     blankRecord: () => ({
+      [newKeyDraft]: true,
       key: '',
       project_id: '',
       project_source: '',
@@ -575,8 +674,7 @@
   }
   async function saveProxy() {
     const proxies = proxyDraft($('proxy-input').value);
-    await postSettings({ proxy_urls: proxies }, (saved) => {
-      GLOBAL_SETTINGS.proxy_urls = saved.proxy_urls;
+    await postFormSettings({ proxy_urls: proxies }, (saved) => {
       GLOBAL_SETTINGS.proxy_url = saved.proxy_url;
       $('proxy-input').value = saved.proxy_urls.join('\n');
       updateProxyPill(saved.proxy_urls.length);
@@ -638,8 +736,7 @@
   }
   async function saveFingerprint() {
     const v = $('cookie-impersonate').value;
-    await postSettings({ cookie_impersonate: v }, () => {
-      GLOBAL_SETTINGS.cookie_impersonate = v;
+    await postFormSettings({ cookie_impersonate: v }, () => {
       updateFpPill(v);
       window.consoleForms?.saved('fingerprint');
       toast(
@@ -674,9 +771,7 @@
   async function saveExpressUa() {
     const v = $('express-ua-profile').value;
     const c = $('express-ua-custom').value.trim();
-    await postSettings({ express_ua_profile: v, express_ua_custom: c }, () => {
-      GLOBAL_SETTINGS.express_ua_profile = v;
-      GLOBAL_SETTINGS.express_ua_custom = c;
+    await postFormSettings({ express_ua_profile: v, express_ua_custom: c }, () => {
       updateExpressPill(v, c);
       updateExpressCustomVis();
       window.consoleForms?.saved('express-fingerprint');

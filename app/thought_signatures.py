@@ -1,11 +1,15 @@
 """思考签名元数据、工具调用标识与签名拓扑恢复。"""
 
 import base64
+import binascii
+import hashlib
 import uuid
 from typing import Any, List, Optional, Tuple
 
 import model_capabilities as mc
 from google.genai import types
+from ordinary_history import exact_ordinary_slots
+from schema_validation import SchemaValidationError
 from signature_store import (
     SKIP_VALIDATOR_SENTINEL,
     SKIP_VALIDATOR_SENTINELS,
@@ -14,6 +18,47 @@ from signature_store import (
 )
 
 LEGACY_THOUGHT_SEP = "__thought__"
+_LITERAL_ID_KEY = "literal_call_id_sha256_v1"
+
+
+_URL_TO_STANDARD = str.maketrans("-_", "+/")
+_SIGNATURE_LITERALS = frozenset(s.decode("ascii") for s in SKIP_VALIDATOR_SENTINELS)
+
+
+def _protojson_signature(value: str) -> Optional[bytes]:
+    """Strict ProtoJSON bytes, in either alphabet, with optional complete padding."""
+    if not value or value in _SIGNATURE_LITERALS:
+        return None
+    normalized = value
+    if "-" in value or "_" in value:
+        if "+" in value or "/" in value:
+            return None
+        normalized = value.translate(_URL_TO_STANDARD)
+    if "=" not in normalized:
+        normalized += "=" * (-len(normalized) % 4)
+    try:
+        raw = base64.b64decode(normalized, validate=True)
+    except (ValueError, binascii.Error):
+        return None
+    # Reject excess/misplaced pad and nonzero unused bits instead of interpreting
+    # an arbitrary literal as a different opaque byte sequence.
+    return raw if base64.b64encode(raw).decode("ascii") == normalized else None
+
+
+def decode_thought_signature(value: Any) -> Optional[bytes]:
+    """SDK bytes are already decoded; retain historical literal fallback for text."""
+    if isinstance(value, bytes):
+        return value or None
+    if not isinstance(value, str) or not value:
+        return None
+    raw = _protojson_signature(value)
+    return raw if raw is not None else value.encode("utf-8")
+
+
+def canonical_wire_signature(value: Any):
+    """Normalize actual bytes for Cookie's Bytes field; leave legacy wire literals alone."""
+    raw = _protojson_signature(value) if isinstance(value, str) else value
+    return encode_thought_signature(raw) if isinstance(raw, bytes) else value
 
 
 def signature_bytes(part: Any, fc: Any) -> Optional[bytes]:
@@ -21,17 +66,7 @@ def signature_bytes(part: Any, fc: Any) -> Optional[bytes]:
     sig = getattr(part, "thought_signature", None)
     if sig is None:
         sig = getattr(fc, "thought_signature", None)
-    if isinstance(sig, bytes):
-        return sig or None
-    if isinstance(sig, str) and sig:
-        try:
-            # validate=True 与 signature_from_extra 同口径：非 base64 字符串
-            # （占位符/被截断的值）直接走 UTF-8 回退，而不是被宽松解码成
-            # 乱码字节回传 Google 导致上游 400（两侧解码策略必须一致）。
-            return base64.b64decode(sig, validate=True)
-        except Exception:
-            return sig.encode("utf-8")
-    return None
+    return decode_thought_signature(sig)
 
 
 def encode_thought_signature(signature: Optional[bytes]) -> Optional[str]:
@@ -84,12 +119,16 @@ def thought_signature_extra(signature: Optional[bytes], part_kind: Optional[str]
 
 
 def attach_signature_extra(payload: dict, signature: Optional[bytes]) -> None:
-    """把思考签名扩展挂到工具调用载荷上（无签名时保持载荷不变）。
+    """Attach real Google bytes and disambiguate only literal IDs that need it.
 
-    Express 流式/非流式与 Cookie 通道三处工具调用组包共用，
-    保证 extra_content 的挂载口径只有这一个实现点。
+    This per-call OpenAI extension is an encoding hint, not proof of a signing
+    identity. Binding its fixed-size value to the *exact* ID prevents ordinary
+    client edits from silently reinterpreting a different historical carrier.
     """
-    extra = thought_signature_extra(signature)
+    extra = thought_signature_extra(signature) or {}
+    ident = payload.get("id")
+    if isinstance(ident, str) and _legacy_components(ident)[1] is not None:
+        extra["vertex2openai"] = {_LITERAL_ID_KEY: _literal_id_digest(ident)}
     if extra:
         payload["extra_content"] = extra
 
@@ -106,15 +145,17 @@ def google_metadata(value: Any) -> dict:
 def signature_from_extra(value: Any) -> Tuple[Optional[bytes], Optional[str]]:
     google = google_metadata(value)
     encoded = google.get("thought_signature")
-    if not encoded:
-        return None, google.get("thought_signature_part")
-    if isinstance(encoded, bytes):
-        return encoded, google.get("thought_signature_part")
-    try:
-        return base64.b64decode(str(encoded), validate=True), google.get("thought_signature_part")
-    except Exception:
-        # Preserve non-base64 callers rather than silently discarding their explicit carrier.
-        return str(encoded).encode("utf-8"), google.get("thought_signature_part")
+    # Preserve explicit non-string legacy values through their historic string form.
+    raw = encoded if isinstance(encoded, (str, bytes)) else str(encoded) if encoded else None
+    return decode_thought_signature(raw), google.get("thought_signature_part")
+
+
+def standalone_message_signature(message: Any) -> Tuple[Optional[bytes], Optional[str]]:
+    """A standalone assistant signature is usable; a rejected topology's duplicate is not."""
+    role = message.get("role") if isinstance(message, dict) else getattr(message, "role", None)
+    if role not in ("assistant", "model") or "ordinary_parts" in google_metadata(message):
+        return None, None
+    return signature_from_extra(message)
 
 
 def ordinary_part_metadata(kind: str, text: str, signature: Optional[bytes], *, thought=False) -> dict:
@@ -127,59 +168,27 @@ def ordinary_part_metadata(kind: str, text: str, signature: Optional[bytes], *, 
     return item
 
 
-def ordinary_parts_from_extra(value: Any, image_loader=None) -> Optional[List[types.Part]]:
-    """Restore exact flattened ordinary Part boundaries from bridge metadata."""
-    raw = google_metadata(value).get("ordinary_parts")
-    if not isinstance(raw, list):
+def ordinary_parts_from_extra(value: Any, image_loader=None, history=None) -> Optional[List[types.Part]]:
+    """Restore exact ordinary boundaries only from matching assistant history."""
+    slots = exact_ordinary_slots(value, google_metadata(value).get("ordinary_parts"), history)
+    if slots is None:
         return None
-    parts: List[types.Part] = []
-    images = {}
-    image_indices = {False: 0, True: 0}
-    for item in raw:
-        if not isinstance(item, dict):
-            return None
-        kind = item.get("kind")
-        text = item.get("text")
-        if (not isinstance(kind, str) or kind not in {"text", "thought", "signature_only", "image"}
-                or not isinstance(text, str)):
-            return None
-        # Generated images are flattened to markdown in OpenAI content. Let the
-        # normal content path parse them back into inline_data rather than
-        # replaying the data URL as ordinary text.
-        if kind == "text" and "data:image/" in text:
-            return None
-        encoded = item.get("thought_signature")
-        signature = None
-        if encoded:
-            try:
-                signature = base64.b64decode(str(encoded), validate=True)
-            except Exception:
-                signature = str(encoded).encode("utf-8")
-        # Images live in content exactly once. Metadata carries their position
-        # and signature, including compatibility with older [image] carriers.
-        if kind == "image" or (kind in {"text", "thought"} and text == "[image]"):
-            thought = kind == "thought" or item.get("thought") is True
-            if thought not in images:
-                images[thought] = image_loader(thought) if image_loader else []
-            index = image_indices[thought]
-            if index < len(images[thought]):
-                part = images[thought][index].model_copy(deep=True)
-                # 哨兵以 str 赋值：SDK 出站时 str 原样落 JSON，保持官方字面量
-                #（属性赋值不经 pydantic 验证，bytes 哨兵会被 base64 破坏）。
-                part.thought_signature = sdk_thought_signature_field(signature)
-                part.thought = True if thought else None
-                parts.append(part)
-                image_indices[thought] += 1
-                continue
-            if kind == "image":
+    parts = []
+    for item, media in slots:
+        kind = item["kind"]
+        signature = sdk_thought_signature_field(decode_thought_signature(item.get("thought_signature")))
+        if media is not None:
+            part = image_loader(media) if image_loader else None
+            if part is None:
                 return None
-        parts.append(
-            types.Part(
-                text=text,
-                thought=(True if kind == "thought" else None),
-                thought_signature=sdk_thought_signature_field(signature),
-            )
-        )
+            if signature is not None:
+                part.thought_signature = signature
+            if kind == "thought" or item.get("thought") is True:
+                part.thought = True
+        else:
+            part = types.Part(text=item["text"], thought=True if kind == "thought" else None,
+                              thought_signature=signature)
+        parts.append(part)
     return parts
 
 
@@ -225,19 +234,78 @@ def merge_by_order(part_order: Any, call_parts, ordinary_parts, *, remainder_cal
     return ordered
 
 
-def build_tool_call_id(fc: Any, part: Any, missing_state: SignatureState = SignatureState.UNKNOWN) -> str:
-    """Return a short OpenAI call id and cache signed/unsigned topology fallback."""
+def merge_replayed_parts(google, calls, ordinary, *, exact_history, remainder_calls_first):
+    """Invalid ordinary positions say nothing about the order of explicit calls.
+
+    Keep the tool-only projection used by gemini_history_order to correlate a
+    complete result batch. Place new public content outside the rejected order.
+    """
+    order = google.get("part_order")
+    if not exact_history and "ordinary_parts" in google:
+        sorted_calls = merge_by_order(order, calls, ())
+        return None if sorted_calls is None else sorted_calls + ordinary
+    return merge_by_order(order, calls, ordinary, remainder_calls_first=remainder_calls_first)
+
+
+PendingCallSignatures = list[tuple[str, bytes | None, bool]]
+
+
+def stage_tool_call_id(pending: PendingCallSignatures, fc: Any, signature: bytes | None,
+                       *, unsigned_follower: bool) -> str:
+    """Allocate the emitted ID without making a partially converted reply replayable."""
     real_id = getattr(fc, "id", None) or ""
     if not isinstance(real_id, str):
         real_id = str(real_id)
     if not real_id:
         real_id = "call_" + uuid.uuid4().hex[:16]
 
-    sig = signature_bytes(part, fc)
-    signature_store.register_call_signature(
-        real_id, sig,
-        unsigned_follower=missing_state is SignatureState.UNSIGNED_FOLLOWER)
+    pending.append((real_id, signature, unsigned_follower))
     return real_id
+
+
+def publish_tool_call_signatures(pending: PendingCallSignatures) -> None:
+    for call_id, signature, unsigned_follower in pending:
+        signature_store.register_call_signature(call_id, signature, unsigned_follower=unsigned_follower)
+
+
+def _legacy_components(call_id: str) -> tuple[str, bytes | None]:
+    """Parse the old format without consulting observation/cache state."""
+    base, marker, encoded = call_id.partition(LEGACY_THOUGHT_SEP)
+    if not marker or not base or not encoded:
+        return call_id, None
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error):
+        return call_id, None
+    if not raw or base64.b64encode(raw).decode("ascii") != encoded:
+        return call_id, None
+    return base, raw
+
+
+def _split_legacy_call_id(call_id: str) -> tuple[str, bytes | None]:
+    if LEGACY_THOUGHT_SEP in call_id and signature_store.get_record(call_id) is not None:
+        return call_id, None  # Warm unmarked echoes of IDs actually emitted by the bridge.
+    return _legacy_components(call_id)
+
+
+def _literal_id_digest(call_id: str) -> str:
+    return hashlib.sha256(call_id.encode("utf-8", errors="surrogatepass")).hexdigest()
+
+
+def marked_literal_call_id(call: dict) -> str | None:
+    """Only accept the bridge's exact ID-format hint, never the signature as an ID hint."""
+    extra = call.get("extra_content")
+    bridge = extra.get("vertex2openai") if isinstance(extra, dict) else None
+    marker = bridge.get(_LITERAL_ID_KEY) if isinstance(bridge, dict) else None
+    ident = call.get("id")
+    if (isinstance(marker, str) and len(marker) == 64 and isinstance(ident, str)
+            and _legacy_components(ident)[1] is not None and marker == _literal_id_digest(ident)):
+        return ident
+    return None
+
+
+def replay_tool_call_id(call_id: str, literal_ids=frozenset()) -> str:
+    return call_id if call_id in literal_ids else _split_legacy_call_id(call_id)[0]
 
 
 def resolve_tool_call_signature(
@@ -245,6 +313,8 @@ def resolve_tool_call_signature(
     require_signature: bool = False,
     explicit_signature: Optional[bytes] = None,
     explicit_unsigned: bool = False,
+    origin_key: bytes | None = None,
+    *, literal_id: bool = False,
 ) -> Tuple[str, Optional[bytes]]:
     """Restore ``(real id, signature)`` with explicit OpenAI metadata first.
 
@@ -252,18 +322,29 @@ def resolve_tool_call_signature(
     step when neither explicit metadata, the legacy id, nor the fallback store
     can recover a signature. Explicitly unsigned parallel followers stay bare.
     """
-    real_id = str(tool_call_id or "")
-    sig: Optional[bytes] = explicit_signature
+    ident = str(tool_call_id or "")
+    real_id, legacy_sig = (ident, None) if literal_id else _split_legacy_call_id(ident)
+    sig = explicit_signature if explicit_signature is not None else legacy_sig
 
-    if LEGACY_THOUGHT_SEP in real_id:
-        real_id, _, encoded = real_id.partition(LEGACY_THOUGHT_SEP)
-        if sig is None:
-            try:
-                sig = base64.b64decode(encoded) or None
-            except Exception:
-                sig = None
+    if sig is None and origin_key is not None:
+        exact = signature_store.get_record(origin_key) if origin_key else None
+        if exact is not None:
+            if exact.state is SignatureState.SIGNED:
+                return real_id, exact.signature
+            if exact.state in (SignatureState.UNSIGNED_FOLLOWER, SignatureState.AMBIGUOUS):
+                return real_id, None
+        else:
+            # A bare ID from another prefix, tenant or batch is not evidence
+            # for this one. In particular it cannot sign a later sibling.
+            bare = signature_store.get_record(real_id)
+            if bare and bare.state is not SignatureState.UNKNOWN:
+                return real_id, None
 
-    record = signature_store.get_record(real_id) if sig is None and not explicit_unsigned else None
+    record = signature_store.get_record(real_id) if sig is None and not explicit_unsigned and origin_key is None else None
+    if record and record.state is SignatureState.AMBIGUOUS:
+        # Two turns claimed incompatible topology. An omitted signature may
+        # be rejected upstream; a different turn's bytes or a new bypass are worse.
+        return real_id, None
     if sig is None and record and record.state is SignatureState.SIGNED:
         sig = record.signature
     is_unsigned_follower = explicit_unsigned or bool(
@@ -271,6 +352,11 @@ def resolve_tool_call_signature(
     )
 
     if sig is None and require_signature and not is_unsigned_follower:
+        if literal_id:
+            raise SchemaValidationError(
+                "Required signature missing for a literal tool call ID; preserve the original "
+                "tool_calls[].extra_content.google.thought_signature."
+            )
         sig = SKIP_VALIDATOR_SENTINEL
         print(
             "⚠️ [工具调用] 必需的思考签名无法恢复，已使用官方跳过校验哨兵。请求不会失败，但模型表现可能下降。"

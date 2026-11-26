@@ -154,6 +154,25 @@ class ConsoleRoutesTests(unittest.TestCase):
             # Browsers that still have old HTML also revalidate bare URLs.
             self.assertIn("must-revalidate", self.client.get('/static/dashboard.js').headers["cache-control"])
 
+    def test_only_the_current_unambiguous_asset_version_is_immutable(self):
+        html = self.client.get("/").text
+        version = re.search(r'/static/[^"?]+\?v=([0-9a-f]{16})"', html)[1]
+        path = "/static/dashboard.js"
+        # Hashing the entire asset bundle is a deployment operation, not a
+        # per-request operation, even for a stale version sent by an old tab.
+        with mock.patch.object(Path, "read_bytes", side_effect=AssertionError("rehashing static assets")):
+            for query in ("", "rev=editor", "v=", "v=previous", f"rev={version}",
+                          f"v=previous&v={version}", f"v={version}&v=previous"):
+                with self.subTest(query=query):
+                    response = self.client.get(f"{path}?{query}")
+                    self.assertEqual(response.status_code, 200)
+                    self.assertIn("must-revalidate", response.headers["cache-control"])
+            for query in (f"v={version}", f"lang=zh&v={version}"):
+                with self.subTest(query=query):
+                    response = self.client.get(f"{path}?{query}")
+                    self.assertEqual(response.status_code, 200)
+                    self.assertIn("immutable", response.headers["cache-control"])
+
     def test_changing_any_console_module_changes_the_shared_asset_version(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(console_assets, "STATIC_DIR", Path(directory)):
             module = Path(directory) / "channel-config.js"
@@ -161,6 +180,7 @@ class ConsoleRoutesTests(unittest.TestCase):
             template = '<script src="/static/channel-config.js"></script><script src="/static/dashboard.js"></script>'
             before = console_assets.versioned_assets(template)
             module.write_text("new component", encoding="utf-8")
+            console_assets._asset_manifest.cache_clear()  # simulate a new deployment
             after = console_assets.versioned_assets(template)
             self.assertNotEqual(before, after)
             versions = re.findall(r'\?v=([a-f0-9]{16})', after)

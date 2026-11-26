@@ -4,7 +4,7 @@ import json
 import re
 
 from proxy_config import (BRIDGE_PROXY_SCHEMES, DIRECT_TOKENS, FORM_PROXY_SCHEMES,
-                          SHARE_PROXY_SCHEMES)
+                          SHARE_PROXY_SCHEMES, parse_proxy_list)
 
 # 内联代理识别（key,代理 / cookie,代理 写法）：scheme:// 前缀必须命中项目支持的
 # 代理协议（http/socks/vless/vmess/trojan/ss/hysteria2/tuic/turn/sstp，见
@@ -52,17 +52,6 @@ def split_credential_proxy(value):
     return text.strip(), proxies
 
 
-def _attach_inline_proxy(record, proxy):
-    """把一个内联代理挂到前一条 Key 记录上，保留它已有的 proxies 字段。"""
-    existing = record.get("proxies")
-    if isinstance(existing, list):
-        record["proxies"] = [*existing, proxy]
-    elif existing:
-        record["proxies"] = [existing, proxy]
-    else:
-        record["proxies"] = [proxy]
-
-
 def parse_key_records(value):
     if not value:
         return []
@@ -71,7 +60,7 @@ def parse_key_records(value):
         value = json.loads(value) if value.startswith("[") else re.split(r"[,\r\n]+", value)
     if not isinstance(value, list):
         raise ValueError("VERTEX_EXPRESS_API_KEYS 必须是 JSON 数组或逗号 / 换行分隔的 Key。")
-    records = []
+    records, appended = [], {}
     for item in value:
         if isinstance(item, dict):
             records.append(dict(item))
@@ -93,13 +82,18 @@ def parse_key_records(value):
                     records.append({"key": key_text})
                     continue
                 raise ValueError("VERTEX_EXPRESS_API_KEYS 的内联代理必须跟在 Key 之后（key,代理）。")
-            for proxy in [*inline, key_text]:
-                _attach_inline_proxy(records[-1], proxy)
+            appended.setdefault(len(records) - 1, []).extend([key_text, *inline])
             continue
         record = {"key": key_text}
         if inline:
             record["proxies"] = inline
         records.append(record)
+    for index, additions in appended.items():
+        record = records[index]
+        # Match runtime account precedence, including an explicitly empty modern
+        # list. Normalize the primary once before appending all ordered fallbacks.
+        current = record.get("proxies", record.get("proxy"))
+        record["proxies"] = [*parse_proxy_list(current), *additions]
     return records
 
 

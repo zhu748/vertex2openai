@@ -12,6 +12,7 @@ from typing import Optional
 import config as app_config
 from express_endpoint import resolve_express_model_path
 from runtime_state import app_state
+from schema_validation import SchemaValidationError
 from model_catalog import native_catalog_ids as _native_catalog_ids  # noqa: F401
 from model_catalog import search_variant_available
 
@@ -21,7 +22,7 @@ EXPRESS_BASE = app_config.VERTEX_BASE_URL or "https://aiplatform.googleapis.com"
 EXPRESS_API_VERSION = "v1beta1"
 
 
-def _native_model_entry(model_id: str) -> dict:
+def _native_model_entry(model_id: str, *, can_count_tokens: bool = True) -> dict:
     """Gemini 原生 models.list / models.get 共用的目录条目。"""
     lowered = model_id.lower()
     if lowered.endswith("-search"):
@@ -32,13 +33,16 @@ def _native_model_entry(model_id: str) -> dict:
         from model_capabilities import image_resolution_suffix
         tier = image_resolution_suffix(model_id)[1]
         variant_note = f"（生图分辨率变体：等价 imageConfig.imageSize={tier}）" if tier else ""
+    methods = ["generateContent", "streamGenerateContent"]
+    if can_count_tokens:
+        methods.append("countTokens")
     return {
         "name": f"models/{model_id}",
         "displayName": model_id,
         "description": f"Vertex Express 模型（经 vertex2openai 透传）：{model_id}{variant_note}",
         "inputTokenLimit": 1048576,
         "outputTokenLimit": 65536,
-        "supportedGenerationMethods": ["generateContent", "streamGenerateContent", "countTokens"],
+        "supportedGenerationMethods": methods,
     }
 
 
@@ -93,6 +97,14 @@ def _strip_search_variant(model: str, action: str, parsed: dict) -> tuple[str, O
     return base, body
 
 
+def _variant_field(obj: dict, camel: str, snake: str, *, prefer_snake: bool = False) -> str:
+    if camel in obj and snake in obj:
+        raise SchemaValidationError(f"不能同时声明 {camel} 与 {snake}。")
+    if snake in obj or (camel not in obj and prefer_snake):
+        return snake
+    return camel
+
+
 def _strip_image_size_variant(model: str, action: str, parsed: dict) -> tuple[str, Optional[bytes]]:
     """生图分辨率后缀变体的最小改写：返回 (基础模型名, 重组后的请求体或 None)。
 
@@ -113,20 +125,24 @@ def _strip_image_size_variant(model: str, action: str, parsed: dict) -> tuple[st
         return model, None
     if action not in ("generateContent", "streamGenerateContent"):
         return base, None
-    gen = parsed.get("generationConfig")
+    gen_key = _variant_field(parsed, "generationConfig", "generation_config")
+    gen = parsed.get(gen_key)
     if gen is None:
-        # 极简调用可以不带 generationConfig：创建后再注入，否则档位意图
-        # 会随剥后缀一起丢失（-search 对 tools 缺失同样创建）。
-        gen = parsed["generationConfig"] = {}
+        gen = parsed[gen_key] = {}
     if not isinstance(gen, dict):
         return base, None
-    img_cfg = gen.get("imageConfig")
+    image_key = _variant_field(gen, "imageConfig", "image_config", prefer_snake=gen_key == "generation_config")
+    img_cfg = gen.get(image_key)
     if img_cfg is None:
-        img_cfg = gen["imageConfig"] = {}
-    if not isinstance(img_cfg, dict) or img_cfg.get("imageSize"):
-        # 非法结构 → 原样透传报真实错误；已有档位 → 尊重请求级显式设置。
+        img_cfg = gen[image_key] = {}
+    if not isinstance(img_cfg, dict):
         return base, None
-    img_cfg["imageSize"] = tier
+    size_key = _variant_field(img_cfg, "imageSize", "image_size", prefer_snake=image_key == "image_config")
+    if size_key in img_cfg:
+        # Even an invalid explicitly supplied size belongs to the client; do
+        # not silently replace it or reserialize a perfectly valid raw body.
+        return base, None
+    img_cfg[size_key] = tier
     body = json.dumps(parsed, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return base, body
 

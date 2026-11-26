@@ -1,4 +1,6 @@
-from pydantic import BaseModel, ConfigDict, Field
+from collections.abc import Callable
+
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 from typing import Any, Literal
 
 # Define data models
@@ -31,19 +33,59 @@ def normalize_content_part(part: Any) -> Any:
 
 
 class OpenAIMessage(BaseModel):
+    _signature_slots: tuple[bytes, ...] = PrivateAttr(default=())
+    _signature_scoped: bool = PrivateAttr(default=False)
+    _signature_observed_reasoning: tuple[int, bytes] | None = PrivateAttr(default=None)
     role: str
     content: str | list[ContentPartText | ContentPartImage | dict[str, Any]] | None = None
     name: str | None = None
     tool_calls: list[dict[str, Any]] | None = None
     tool_call_id: str | None = None
     reasoning_content: str | None = None
+    refusal: str | None = None
     # Google documents this OpenAI-compatible extension as the primary carrier
     # for thought signatures on messages and individual tool calls.
     extra_content: dict[str, Any] | None = None
 
     model_config = ConfigDict(extra='allow')
 
+    def has_assistant_refusal(self) -> bool:
+        # Refusal is an assistant content type, not a general text alias.
+        return self.role in ("assistant", "model") and (
+            bool(self.refusal) or isinstance(self.content, list) and any(
+                isinstance(p, dict) and p.get("type") == "refusal" and isinstance(p.get("refusal"), str)
+                and p["refusal"] for p in self.content
+            )
+        )
+
+    def replay_content(self):
+        """Represent OpenAI refusal history in Gemini's ordinary model parts, without mutating it."""
+        if not self.has_assistant_refusal():
+            return self.content
+        if isinstance(self.content, list):
+            parts = []
+            refusals = []
+            for p in self.content:
+                if isinstance(p, dict) and p.get("type") == "refusal" and isinstance(p.get("refusal"), str):
+                    parts.append({"type": "text", "text": p["refusal"]})
+                    refusals.append(p["refusal"])
+                else:
+                    parts.append(p)
+            # SDKs can mirror the same refusal in a scalar, one part, or a
+            # sequence of parts. Keep genuinely different text exactly once.
+            if (not self.refusal or self.refusal in refusals or self.refusal == "".join(refusals)
+                    or any(message_text([p]) == self.refusal for p in parts)
+                    or self.refusal == message_text(parts)):
+                return parts
+        elif not self.content or self.content == self.refusal:
+            return self.refusal
+        else:
+            parts = [{"type": "text", "text": self.content}]
+        return [*parts, {"type": "text", "text": self.refusal}]
+
 class OpenAIRequest(BaseModel):
+    _signature_output_prefix: bytes | None = PrivateAttr(default=None)
+    _signature_origin_cutoff: int | None = PrivateAttr(default=None)
     model: str
     messages: list[OpenAIMessage]
     # Legacy field accepted for compatibility; only an enabled model suffix
@@ -70,10 +112,19 @@ class OpenAIRequest(BaseModel):
     n: int | None = Field(default=None, ge=1, le=MAX_CANDIDATES, strict=True)
     tools: list[dict[str, Any]] | None = None
     tool_choice: str | dict[str, Any] | None = None
+    # Keep absent controls out of existing resumable request fingerprints.
+    parallel_tool_calls: bool | None = Field(default=None, strict=True, exclude_if=lambda v: v is None)
     # 流式用量开关（OpenAI: {"include_usage": true}）
     stream_options: dict[str, Any] | None = None
 
+    # The server supplies this private callable; JSON extras cannot set or invoke it.
+    _select_buffered_order: Callable[[dict], bool] | None = PrivateAttr(default=None)
+
     model_config = ConfigDict(extra='allow', allow_inf_nan=False)
+
+
+def wants_json_output(request: OpenAIRequest) -> bool:
+    return (request.response_format or {}).get("type") in ("json_object", "json_schema")
 
 
 def message_text(content: Any) -> str:

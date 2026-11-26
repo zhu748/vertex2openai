@@ -1,6 +1,5 @@
 """Cookie batchGraphql 响应解析、签名还原、诊断与 OpenAI 帧格式。"""
 
-import base64
 import hashlib
 import json
 import re
@@ -8,32 +7,26 @@ import time
 from typing import Any, AsyncGenerator, AsyncIterator, Callable, Iterator, Optional
 
 import httpx
+from image_delivery import has_inline_image
 from models import file_data_markdown
 from message_processing import iter_giant_content
 
-from response_validation import IncompleteResponseError, complete_function_arguments, validate_generation_finish_reason
+from response_validation import IncompleteResponseError, complete_function_arguments, has_finish_reason, validate_generation_finish_reason
 from json_stream import MAX_JSON_OBJECT_BYTES, JsonObjects as _JsonObjects
 from signature_store import signature_store
+from upstreams.cookie_candidate_metadata import native_candidate_metadata, native_prompt_feedback
 from thought_signatures import (
     attach_signature_extra,
+    decode_thought_signature as signature_bytes_from_wire,
     encode_thought_signature,
     is_thought_part,
     ordinary_part_metadata,
 )
 
 
-# PRF-P3-3：created 时间戳秒级缓存——同秒内的全部帧复用一次取值
-#（免去每帧一次时钟系统调用）；输出值与逐帧 time.time() 完全一致
-#（秒粒度下本就同值），OpenAI 语义上同响应各帧共用创建时刻。
-_created_cache = (0, 0)
-
-
 def _current_created() -> int:
-    global _created_cache
-    now = int(time.time())
-    if now != _created_cache[0]:
-        _created_cache = (now, now)
-    return _created_cache[1]
+    """Default for standalone encoders; delivery passes the request's timestamp."""
+    return int(time.time())
 
 
 def _stable_cookie_tool_call_id(response_id: str, call_index: int, name: str, args: Any) -> str:
@@ -46,36 +39,25 @@ def _stable_cookie_tool_call_id(response_id: str, call_index: int, name: str, ar
     return f"call_{digest}"
 
 
-def signature_bytes_from_wire(value: Any) -> Optional[bytes]:
-    if isinstance(value, bytes):
-        return value or None
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        return base64.b64decode(value, validate=True) or None
-    except Exception:
-        return value.encode("utf-8")
-
-
 def apply_wire_signature(data: dict, ordinary_metadata: list, part_order: list) -> Optional[bytes]:
     """把 batchGraphql 的 thoughtSignature 事件并入 ordinary 元数据（流式/非流式共用）。
 
-    已有普通块时签名挂到最后一块；尚无普通块且上游标注 signature_only 时
-    补一条零长度签名块；否则丢弃（无承载位置）。返回原始签名字节，
+    上游独立的 signature_only part 始终占自己的位置，不覆盖前一块；
+    伴随文本或媒体的签名才挂到相应块上。返回原始签名字节，
     空签名返回 None 且不做任何修改。
     """
     signature = signature_bytes_from_wire(data.get("value"))
     if not signature:
         return None
-    if ordinary_metadata:
+    if data.get("part_kind") == "signature_only":
+        part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
+        ordinary_metadata.append(ordinary_part_metadata("signature_only", "", signature))
+    elif ordinary_metadata:
         ordinary_metadata[-1]["thought_signature"] = encode_thought_signature(signature)
         if data.get("part_kind") == "image":
             # The media already lives in content; metadata retains its exact
             # slot/signature instead of duplicating the base64 as plain text.
             ordinary_metadata[-1].update(kind="image", text="")
-    elif data.get("part_kind") == "signature_only":
-        part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
-        ordinary_metadata.append(ordinary_part_metadata("signature_only", "", signature))
     return signature
 
 
@@ -98,20 +80,24 @@ def openai_tool_call(response_id: str, call_index: int, call: dict, *, include_a
 
 
 async def iter_json_objects(
-    response: "httpx.Response", max_object_bytes: int = MAX_JSON_OBJECT_BYTES, *, on_text_chunk: Optional[Callable]=None
+    response: "httpx.Response", max_object_bytes: Optional[int] = None, *, on_text_chunk: Optional[Callable]=None
 ) -> AsyncGenerator[dict, None]:
     """解析 batchGraphql 的连续对象，忽略数组分隔符及防 XSSI 前缀。
 
     正则在 C 层跳过普通文本，只在引号、转义符和花括号处更新状态。
     对象边界只扫描一遍，避免对大图片的每个小块重复解析整个未完成对象。
     """
-    if isinstance(response, TextSource):
+    if isinstance(response, TextSource) and max_object_bytes is None:
         # 非流式正文已完整驻留：交由拉取式游标解析（limit 语义见其注释）。
-        cursor = CompleteTextObjectCursor(response.text, max_object_bytes)
+        cursor = CompleteTextObjectCursor(response.text)
         while (obj := cursor.next_object()) is not None:
             yield obj
+            del obj
         return
-    parser = _JsonObjects(max_object_bytes)
+    # A caller asking for an explicit per-object cap gets the strict byte
+    # parser even for a synthetic buffered source. Ordinary wire streams
+    # always retain their transport-independent per-object budget.
+    parser = _JsonObjects(MAX_JSON_OBJECT_BYTES if max_object_bytes is None else max_object_bytes)
     # 提前退出（消费方错误分支 return / 异常 / 取消）时显式关闭底层文本
     # 迭代器：httpx 的 aiter_text 与 curl shim 的 _gen 均无内部 finally，
     # 此前仅靠外层 async with client.stream 的 CM 与 asyncgen GC finalization
@@ -124,6 +110,8 @@ async def iter_json_objects(
                     on_text_chunk(chunk)
                 for obj in parser.feed(chunk):
                     yield obj
+                    del obj
+            del chunk  # do not retain a completed raw read while waiting for another
     finally:
         close = getattr(aiter, "aclose", None)
         if close is not None:
@@ -134,7 +122,7 @@ async def iter_json_objects(
 # 非流式正文里这些事件类型说明响应已有正文/工具内容：诊断采样器应停止留存
 # （「无正文」样本只对失败路径有价值，正文已到则 dump 永不触发；生图响应
 # 的单个对象可达 30-90MB inlineData，留存即钉住整份 base64 到函数返回）。
-BODY_EVENT_TYPES = frozenset({"text", "image", "function_call", "native_part"})
+BODY_EVENT_TYPES = frozenset({"text", "image", "thought_image", "hidden_thought", "function_call", "native_part"})
 
 
 class CompleteTextObjectCursor:
@@ -147,20 +135,16 @@ class CompleteTextObjectCursor:
     dict（含整份 base64）在事件消费（markdown 拼接/SSE 分帧）前释放，
     生图整取的收集期峰值全量驻留从 3 份降到 2 份。
 
-    单对象上限：流式解析器（json_stream.JsonObjects）用它防止解析缓冲
-    无界增长；完整正文早已整体驻留内存，上限在此不设防任何东西，却会把
-    4K 高细节 PNG（base64 可达 53-93MB，超过 64MB 上限）的合法响应整单
-    误拒为 IncompleteResponseError。因此取 max(limit, len(text))。
-    解析语义与旧 _complete_json_objects 完全一致（含 ASCII 字符差零拷贝
-    快路径与非 ASCII 精确编码计数）。
+    完整体已经由 HTTP 传输层在接收时按字节限流；流式解析器的单对象上限
+    只约束尚在增长的缓冲。不要在此用正文字符数充当 UTF-8 字节预算，
+    也不需要为逐个对象的再次计量而复制整段文本。
     """
 
     def __init__(self, text: str, limit: int = MAX_JSON_OBJECT_BYTES):
         self._text = text
-        self._limit = max(int(limit), len(text))
+        # limit remains accepted for compatibility with previously buffered callers.
         self._position = 0
         self._decoder = json.JSONDecoder()
-        self._ascii = text.isascii()
 
     def next_object(self) -> Optional[dict]:
         """返回下一个对象；没有更多对象时返回 None；无效 JSON 抛 IncompleteResponseError。"""
@@ -172,16 +156,6 @@ class CompleteTextObjectCursor:
             obj, self._position = self._decoder.raw_decode(text, start)
         except (json.JSONDecodeError, RecursionError) as exc:
             raise IncompleteResponseError("上游返回无效或不完整的 JSON 对象。") from exc
-        # 整串 ASCII 标志是 O(1)（CPython 的 str 内部位标志）：纯 ASCII 响应
-        # （JSON 结构 + base64，最常见形态）下字符差即字节差；
-        # 非 ASCII 文本退回逐对象切片 + 精确编码，上限语义不变。
-        span_bytes = (
-            (self._position - start)
-            if self._ascii
-            else len(text[start : self._position].encode("utf-8"))
-        )
-        if span_bytes > self._limit:
-            raise IncompleteResponseError("上游单个 JSON 对象超过字节上限。")
         return obj
 
 
@@ -275,15 +249,79 @@ def _wire_list(value: Any, label: str):
     return value
 
 
-def extract_events(obj: dict, *, preserve_parts: bool = False) -> Iterator[tuple]:
+def _complete_wire_call(raw: Any) -> Optional[dict]:
+    """Ignore proto defaults on ordinary Parts, but never drop an incomplete call."""
+    call = _wire_object(raw, "functionCall")
+    if not call:
+        return None
+    name, call_id = call.get("name"), call.get("id")
+    if name is not None and not isinstance(name, str):
+        raise IncompleteResponseError("上游 functionCall.name 必须是字符串。")
+    if call_id is not None and not isinstance(call_id, str):
+        raise IncompleteResponseError("上游 functionCall.id 必须是字符串。")
+    args = _wire_object(call.get("args"), "functionCall.args")
+    if not (name and name.strip() or call_id or args or call.get("partialArgs")
+            or call.get("partial_args") or call.get("willContinue") or call.get("will_continue")):
+        return None
+    complete_function_arguments(call)
+    return {"name": name, "args": args, **({"id": call_id} if call_id else {})}
+
+
+def _prompt_block_message(feedback: Any) -> Optional[str]:
+    if isinstance(feedback, dict):
+        reason = str(feedback.get("blockReason") or "")
+        if reason and not reason.upper().endswith("UNSPECIFIED"):
+            message = feedback.get("blockReasonMessage")
+            return f"{reason}（{message}）" if message else reason
+    return None
+
+
+def envelope_errors(obj: dict) -> list:
+    """Only protocol fields, never 'error' keys in generated model content."""
+    # Proto defaults such as error: null or {} are not real errors.
+    error = obj.get("error")
+    return [error] if error else _wire_list(obj.get("errors"), "errors")
+
+
+def has_pending_inline_image(obj: dict) -> bool:
+    """Only media preceding an authoritative error could need the media worker."""
+    # The parser below owns validation; this is only a cheap scheduling hint.
+    if not isinstance(obj, dict) or obj.get("error") or obj.get("errors"):
+        return False
+    results = obj.get("results")
+    if not isinstance(results, list):
+        return False
+    for result in results:
+        if not isinstance(result, dict) or result.get("errors"):
+            break
+        if has_inline_image(result.get("data"), depth=3):
+            return True
+    return False
+
+
+class CookieCandidateBoundary:
+    """A Cookie attempt has exactly one candidate; remember only its first finish."""
+    def __init__(self) -> None:
+        self.finish: str | None = None
+
+    def observe(self, reason: Any, parts: list) -> None:
+        finish = str(reason) if has_finish_reason(reason) else None
+        if self.finish is not None:
+            if parts:
+                raise IncompleteResponseError("上游候选已结束，却继续返回内容。")
+            if finish is not None and finish != self.finish:
+                raise IncompleteResponseError("上游候选返回了相互矛盾的结束原因。")
+        elif finish is not None:
+            self.finish = finish
+
+
+def extract_events(obj: dict, *, preserve_parts: bool = False, strip_thoughts: bool = False,
+                   boundary: CookieCandidateBoundary | None = None) -> Iterator[tuple]:
+    boundary = boundary or CookieCandidateBoundary()
     obj = _wire_object(obj, "响应", allow_null=False)
-    # 真值判断而非 "error" in obj：该端点的 Proto JSON 会序列化默认空值
-    # （同文件 thoughtSignature/functionCall 的空值过滤同理），若某个块
-    # 带出 "error": null / {}，旧实现会把它当真实错误，整个回合以 502
-    # "None"/"{}" 终结。真实错误对象恒为真值，此改动对其无影响。
-    err = obj.get("error")
-    if err:
-        yield ("error", err)
+    errors = envelope_errors(obj)
+    if errors:
+        yield "error", errors[0]
         return
 
     results = _wire_list(obj.get("results"), "results")
@@ -291,9 +329,10 @@ def extract_events(obj: dict, *, preserve_parts: bool = False) -> Iterator[tuple
         result = _wire_object(result, "result", allow_null=False)
         errors = _wire_list(result.get("errors"), "errors")
         if errors:
-            for err in errors:
-                yield ("error", err)
-            continue
+            # All delivery modes terminate on the first proven provider error.
+            # Do not validate or materialize discarded results after it.
+            yield "error", errors[0]
+            return
 
         data = _wire_object(result.get("data"), "data")
         if not data:
@@ -302,14 +341,17 @@ def extract_events(obj: dict, *, preserve_parts: bool = False) -> Iterator[tuple
         # 提示词级拦截（promptFeedback.blockReason）：无候选、直接被挡。
         # 注意：batchGraphql 每个流式块都会带 blockReason=BLOCKED_REASON_UNSPECIFIED
         # （proto 枚举默认值 = 未拦截），必须过滤掉，只透出真实拦截。
-        pf = data.get("promptFeedback")
-        if isinstance(pf, dict):
-            br = str(pf.get("blockReason") or "")
-            if br and not br.upper().endswith("UNSPECIFIED"):
-                msg = br
-                if pf.get("blockReasonMessage"):
-                    msg += f"（{pf['blockReasonMessage']}）"
-                yield ("blocked", msg)
+        usage = data.get("usageMetadata")
+        feedback = data.get("promptFeedback")
+        blocked = native_prompt_feedback(feedback) if preserve_parts else _prompt_block_message(feedback)
+        if blocked:
+            # The transport ends as soon as it sees the prompt block. Deliver
+            # this response's real usage first; never generate contents for it.
+            if preserve_parts and isinstance(usage, dict) and usage:
+                yield ("usage", usage)
+            yield ("blocked", blocked)
+            if preserve_parts:
+                continue
 
         candidates = _wire_list(data.get("candidates"), "candidates")
         if len(candidates) > 1:
@@ -318,12 +360,23 @@ def extract_events(obj: dict, *, preserve_parts: bool = False) -> Iterator[tuple
             if isinstance(candidate, dict) and candidate.get("index", 0) not in (None, 0):
                 raise IncompleteResponseError("Cookie 上游返回非零候选索引，当前桥接无法无损转换。")
             candidate = _wire_object(candidate, "candidate", allow_null=False)
-            if not preserve_parts:
+            content_obj = _wire_object(candidate.get("content"), "content")
+            parts = _wire_list(content_obj.get("parts"), "parts")
+            boundary.observe(candidate.get("finishReason"), parts)
+            if preserve_parts:
+                if (candidate.get("finishReason") == "CONTINUATION"
+                        or candidate.get("continuationToken") or candidate.get("continuation_token")):
+                    # A token from this private envelope cannot be replayed via
+                    # the public bridge. Do not falsely promise resumable output
+                    # or emit candidate parts from this known-incomplete record.
+                    raise IncompleteResponseError("Cookie 原生通道无法保留上游的 continuationToken 续写契约。")
+                metadata = native_candidate_metadata(candidate)
+                if metadata:
+                    yield "candidate_metadata", metadata
+            else:
                 # Validate before yielding calls from the same failing chunk.
                 # Gemini-native consumers retain their original finishReason.
                 validate_generation_finish_reason(candidate.get("finishReason"))
-            content_obj = _wire_object(candidate.get("content"), "content")
-            parts = _wire_list(content_obj.get("parts"), "parts")
 
             for part in parts:
                 part = _wire_object(part, "part", allow_null=False)
@@ -331,43 +384,22 @@ def extract_events(obj: dict, *, preserve_parts: bool = False) -> Iterator[tuple
                 if text is not None and not isinstance(text, str):
                     raise IncompleteResponseError("上游 part.text 必须是字符串。")
                 native_part = {}
+                ordinary_kind = "signature_only"  # changed only by an ordinary event emitted for this Part
+                thought = is_thought_part(part)
+                hidden = thought and strip_thoughts and not preserve_parts
                 if text:
                     native_part["text"] = text
-                    if is_thought_part(part):
-                        native_part["thought"] = True
-                if text and not preserve_parts:
-                    if is_thought_part(part):
-                        yield ("thought", text)
-                    else:
-                        yield ("text", text)
+                if text and not preserve_parts and not hidden:
+                    ordinary_kind = "thought" if thought else "text"
+                    yield ordinary_kind, text
 
-                # Proto JSON includes empty defaults for functionCall,
-                # functionResponse and thoughtSignature on ordinary Parts.  Only
-                # a named call and a non-empty signature are semantically real.
-                function_call = _wire_object(part.get("functionCall"), "functionCall")
-                name = function_call.get("name")
-                if name is not None and not isinstance(name, str):
-                    raise IncompleteResponseError("上游 functionCall.name 必须是字符串。")
-                if name and name.strip():
-                    call_id = function_call.get("id")
-                    if call_id is not None and not isinstance(call_id, str):
-                        raise IncompleteResponseError("上游 functionCall.id 必须是字符串。")
-                    args = function_call.get("args")
-                    args = _wire_object(args, "functionCall.args")
-                    complete_function_arguments(function_call)
-                    native_part["functionCall"] = {"name": name, "args": args}
-                    if call_id:
-                        native_part["functionCall"]["id"] = call_id
+                function_call = _complete_wire_call(part.get("functionCall"))
+                if function_call is not None:
+                    native_part["functionCall"] = function_call
                     if not preserve_parts:
-                        yield (
-                            "function_call",
-                            {
-                                "name": name,
-                                "args": args,
-                                **({"id": call_id} if call_id else {}),
-                                "thought_signature": part.get("thoughtSignature") or None,
-                            },
-                        )
+                        yield "function_call", {
+                            **function_call, "thought_signature": part.get("thoughtSignature") or None,
+                        }
                 inline_data = _wire_object(part.get("inlineData"), "inlineData")
                 if inline_data:
                     mime_type = inline_data.get("mimeType", "")
@@ -376,10 +408,11 @@ def extract_events(obj: dict, *, preserve_parts: bool = False) -> Iterator[tuple
                         raise IncompleteResponseError("上游 inlineData 的 mimeType / data 必须是字符串。")
                     if mime_type and b64:
                         native_part["inlineData"] = {"mimeType": mime_type, "data": b64}
-                        if not preserve_parts:
+                        if not preserve_parts and not hidden:
                             from image_delivery import image_markdown
                             image_md = image_markdown(b64, mime_type, encoded=True, label="Generated Image")
-                            yield ("image", image_md)
+                            ordinary_kind = "image"
+                            yield "thought_image" if thought else ordinary_kind, image_md
 
                 file_data = _wire_object(part.get("fileData"), "fileData")
                 if file_data:
@@ -390,20 +423,20 @@ def extract_events(obj: dict, *, preserve_parts: bool = False) -> Iterator[tuple
                         raise IncompleteResponseError("上游 fileData 的 fileUri / mimeType 必须是字符串。")
                     if uri:
                         native_part["fileData"] = dict(file_data)
-                        if not preserve_parts:
-                            kind = "image" if not mime_type or mime_type.startswith("image/") else "text"
-                            yield kind, file_data_markdown(uri, mime_type)
+                        if not preserve_parts and not hidden:
+                            is_image = not mime_type or mime_type.startswith("image/")
+                            ordinary_kind = "image" if is_image else ("thought" if thought else "text")
+                            yield "thought_image" if thought and is_image else ordinary_kind, file_data_markdown(uri, mime_type)
 
-                if part.get("thoughtSignature") and not (name and name.strip()) and not preserve_parts:
+                if hidden and any(key in native_part for key in ("text", "inlineData", "fileData")):
+                    # Count real upstream activity without retaining or rendering
+                    # its payload. If signed, the next event owns an opaque slot.
+                    yield "hidden_thought", True
+
+                if part.get("thoughtSignature") and function_call is None and not preserve_parts:
                     # Signatures describe this Part. Emit them after its media
                     # event, so consumers cannot attach them to preceding text.
-                    media = "inlineData" in native_part or ("fileData" in native_part
-                        and (not mime_type or mime_type.startswith("image/")))
-                    yield "thought_signature", {
-                        "value": part["thoughtSignature"],
-                        "part_kind": "thought" if is_thought_part(part)
-                        else "image" if media else "text" if text else "signature_only",
-                    }
+                    yield "thought_signature", {"value": part["thoughtSignature"], "part_kind": ordinary_kind}
 
                 if preserve_parts:
                     signature = part.get("thoughtSignature")
@@ -412,6 +445,8 @@ def extract_events(obj: dict, *, preserve_parts: bool = False) -> Iterator[tuple
                             raise IncompleteResponseError("上游 thoughtSignature 必须是字符串。")
                         native_part["thoughtSignature"] = signature
                     if native_part:
+                        if thought:
+                            native_part["thought"] = True
                         yield "native_part", native_part
 
             # finishReason 全量透出（含 SAFETY/PROHIBITED_CONTENT 等），由消费方统一映射；
@@ -427,7 +462,6 @@ def extract_events(obj: dict, *, preserve_parts: bool = False) -> Iterator[tuple
                 yield ("finish", str(finish_reason))
 
         # 尽力解析 token 用量（私有接口通常不回传；保留解析以防未来补上）
-        usage = data.get("usageMetadata")
         if isinstance(usage, dict) and usage:
             yield ("usage", usage)
 
@@ -441,6 +475,7 @@ def make_openai_chunk(
     role: str = None,
     tool_calls: Optional[list[dict]] = None,
     extra_content: Optional[dict] = None,
+    *, created: Optional[int] = None,
 ) -> str:
     delta = {}
     if role:
@@ -457,7 +492,7 @@ def make_openai_chunk(
     chunk = {
         "id": response_id,
         "object": "chat.completion.chunk",
-        "created": _current_created(),
+        "created": _current_created() if created is None else created,
         "model": model,
         "choices": [
             {
@@ -475,6 +510,7 @@ def iter_openai_content_chunks(
     model: str,
     content: str,
     role: "str | None" = None,
+    *, created: Optional[int] = None,
 ) -> Iterator[str]:
     """超大 content（4K 生图 base64）→ 按需产出的多帧 SSE 生成器。
 
@@ -487,6 +523,8 @@ def iter_openai_content_chunks(
     """
     if not content:
         return
+    if created is None:
+        created = _current_created()
     first = True
     for piece in iter_giant_content(content):
         yield make_openai_chunk(
@@ -494,5 +532,6 @@ def iter_openai_content_chunks(
             model,
             content=piece,
             role=role if first else None,
+            created=created,
         )
         first = False

@@ -8,7 +8,7 @@ import unittest
 from unittest import mock
 
 import json_encoding
-from resumable import ResumableBuffer
+from resumable import BufferCapacityError, ResumableBuffer
 
 
 class JSONSizeTests(unittest.IsolatedAsyncioTestCase):
@@ -36,6 +36,39 @@ class JSONSizeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class BufferAccountingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sse_frame_budget_is_exact_for_ascii_and_multilingual_boundaries(self):
+        for text in ("", "x" * 150_000, "café", "中😀", "x" * 65535 + "😀中" + "y" * 65536):
+            frame = 'data: {"text":"' + text + '"}\n\n'
+            expected = len(frame.encode("utf-8"))
+            for capacity in (expected, expected - 1):
+                with self.subTest(chars=len(text), capacity=capacity):
+                    buf = ResumableBuffer("frame-budget")
+                    buf.max_buffer_bytes = capacity
+                    charges = []
+                    buf._account_bytes = lambda n, force: charges.append(n) or True
+                    if capacity == expected:
+                        self.assertEqual(await buf.append(frame), 0)
+                        self.assertIs(buf.events[0], frame)
+                        self.assertEqual(charges, [expected])
+                        self.assertEqual(buf.bytes_stored, expected)
+                    else:
+                        with self.assertRaises(BufferCapacityError):
+                            await buf.append(frame)
+                        self.assertEqual((buf.events, charges, buf.bytes_stored), ([], [], 0))
+
+    async def test_large_multilingual_sse_frame_is_charged_without_full_utf8_copy(self):
+        frame = "中" * (2 * 1024 * 1024) + "😀"
+        buf = ResumableBuffer("frame-memory")
+        buf.max_buffer_bytes = 8 * 1024 * 1024
+        tracemalloc.start()
+        try:
+            await buf.append(frame)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(buf.bytes_stored, 6 * 1024 * 1024 + 4)
+        self.assertLess(peak, 1024 * 1024)
+
     async def test_exact_byte_boundary_is_enforced_for_multibyte_payloads(self):
         payload = {"text": "中文😀" * 100}
         size = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))

@@ -8,6 +8,8 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
+from settings_fixture import saved_settings
+
 
 import httpx
 from fastapi.testclient import TestClient
@@ -111,7 +113,7 @@ class SDKTests(unittest.IsolatedAsyncioTestCase):
                      mock.patch.object(express_sdk, "_log_resolved_endpoint"), \
                      mock.patch.object(express_sdk, "create_gemini_prompt", return_value=[]), \
                      mock.patch.object(runtime_state.app_state, "get_effective_settings", return_value=settings), \
-                     mock.patch.object(runtime_state.app_state, "get_setting", side_effect=lambda key, default=None: settings.get(key, default)):
+                     saved_settings(runtime_state.app_state, settings):
                     obj = OpenAIRequest(model="gemini-3.6-flash", messages=[], stream=mode != "json")
                     response = await express_sdk.ExpressSDKUpstream().chat_completions(obj, request)
                     if mode != "json":

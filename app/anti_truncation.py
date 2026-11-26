@@ -21,6 +21,7 @@ from response_validation import (
     AntiTruncationError,
     FINISH_KNOWN,
     FINISH_TRUNCATING,
+    sdk_function_call,
 )
 
 
@@ -243,7 +244,7 @@ class TextDecoder:
             for part in getattr(candidate.content, "parts", None) or []:
                 if self.finish_reason:
                     raise AntiTruncationError("抗截断：结束标记之后仍有输出。")
-                call = part.function_call
+                call = sdk_function_call(part, active=self.seen and not self.closed)
                 if call is not None:
                     text = self.call(call.name, call.args, getattr(call, "partial_args", None),
                                      getattr(call, "will_continue", None))
@@ -273,8 +274,12 @@ class TextDecoder:
         return response.model_copy(update={"candidates": candidates})
 
     def cookie_event(self, status, data):
-        if self.finish_reason and status in ("function_call", "text", "thought", "image"):
+        if self.finish_reason and status in ("function_call", "text", "thought", "image", "thought_image", "hidden_thought"):
             raise AntiTruncationError("抗截断：结束标记之后仍有输出。")
+        if status in ("thought_image", "hidden_thought"):
+            # A subsequent opaque signature belongs to this real source part,
+            # not a private transport call from earlier in the response.
+            self.last_call_owned = False
         if status == "function_call":
             text = self.call(data.get("name"), data.get("args"))
             if text is None:

@@ -1,20 +1,96 @@
 """Keep quiet SSE connections alive without cancelling or restarting reads."""
 import asyncio
+import codecs
 import re
+import time
 from contextlib import suppress
 from typing import Any, AsyncIterable, AsyncIterator, Callable, Optional
 
 from fastapi.responses import StreamingResponse
+from stream_cleanup import await_owned_close
 
 
 SETUP_CLOSE_TIMEOUT_SECONDS = 5.0
 
 
-async def _close_setup_result(setup: asyncio.Task):
+class StreamDeadlineExceeded(TimeoutError):
+    """The wall-clock budget for the whole stream was exhausted."""
+
+    def __init__(self) -> None:
+        super().__init__("本轮请求超过总执行期限。")
+
+
+async def reads_before_deadline(iterator: AsyncIterator, deadline: float) -> AsyncIterator:
+    """Bound each upstream pull, never the consumer's work between pulls.
+
+    Keepalive wrappers may request each item from a different task. A timeout
+    spanning a yield would cancel the *previous* reader rather than the current
+    one (or cancel the ASGI sender). The caller owns and closes the iterator.
+    """
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise StreamDeadlineExceeded()
+        # Each pull may run in a different task. An adapter can swallow its
+        # cancellation, or decode/finalize synchronously past the deadline
+        # before the timer gets a turn. Check all outcomes, including EOF.
+        owner = asyncio.current_task()
+        cancellations = owner.cancelling()
+        timer = asyncio.timeout(remaining)
+        try:
+            async with timer:
+                item = await anext(iterator)
+        except Exception as exc:
+            if owner.cancelling() > cancellations:
+                raise asyncio.CancelledError() from exc
+            if timer.expired() or time.monotonic() >= deadline:
+                raise StreamDeadlineExceeded() from exc
+            if isinstance(exc, StopAsyncIteration):
+                return
+            raise
+        if owner.cancelling() > cancellations:
+            raise asyncio.CancelledError()
+        if timer.expired() or time.monotonic() >= deadline:
+            raise StreamDeadlineExceeded()
+        yield item
+
+
+async def response_before_deadline(operation: Callable, deadline: float, *,
+                                   clock: Callable[[], float] = time.monotonic) -> Any:
+    """Transfer a prepared response only if its *whole* setup finished on time.
+
+    Start from a factory: an expired budget must not dispatch another request.
+    Timers are cooperative; a transport can translate cancellation into a result,
+    or finish synchronous decoding after the cutoff before its timer gets a turn.
+    """
+    remaining = deadline - clock()
+    if remaining <= 0:
+        raise StreamDeadlineExceeded()
+    task = asyncio.current_task()
+    cancellations = task.cancelling()
+    timer = asyncio.timeout(remaining)
     try:
-        response = setup.result()
-    except (asyncio.CancelledError, Exception):
-        return
+        async with timer:
+            result = await operation()
+    except Exception as exc:
+        # A handler may translate cancellation into a transport exception too.
+        if task.cancelling() > cancellations:
+            raise asyncio.CancelledError() from exc
+        if timer.expired() or clock() >= deadline:
+            raise StreamDeadlineExceeded() from exc
+        raise
+    cancelled = task.cancelling() > cancellations
+    if cancelled or timer.expired() or clock() >= deadline:
+        if isinstance(result, StreamingResponse):
+            await await_owned_close(close_stream_response(result))
+        if cancelled:
+            raise asyncio.CancelledError()
+        raise StreamDeadlineExceeded()
+    return result
+
+
+async def close_stream_response(response: Any) -> None:
+    """Dispose a stream that was acquired but not transferred to its consumer."""
     if isinstance(response, StreamingResponse):
         close = getattr(response, "aclose", None) or getattr(response.body_iterator, "aclose", None)
         if close:
@@ -22,12 +98,20 @@ async def _close_setup_result(setup: asyncio.Task):
                 await close()
 
 
+async def _close_setup_result(setup: asyncio.Task):
+    try:
+        response = setup.result()
+    except (asyncio.CancelledError, Exception):
+        return
+    await close_stream_response(response)
+
+
 def _close_late_setup(setup: asyncio.Task):
     from lifecycle import start_background_task
     start_background_task(_close_setup_result(setup))
 
 
-async def close_setup_task(setup: asyncio.Task) -> None:
+async def close_setup_task(setup: asyncio.Task, *, join: bool = False) -> None:
     """等待/取消快窗口 setup 任务，并关闭其持有的流式结果。
 
     chat_api._call_upstream 与 prepare_sse 的快窗口包装共用：
@@ -39,11 +123,13 @@ async def close_setup_task(setup: asyncio.Task) -> None:
     # bounded wait：operation() 若吞掉 CancelledError 不退出，无界 gather 会让
     # cleanup（在 shield 里被调用）永久挂死、连接滞留；5 秒足够任何合理的
     # 取消路径收尾，超时后放弃等待但仍然尝试关闭结果（2026-10 加固）。
+    # A managed response already owns a separately cancellable close waiter:
+    # do not tell its admission lease that a still-running late setup is gone.
     # wait_for waits for cancellation to finish, so it is not a hard bound
     # when the producer suppresses CancelledError. wait leaves that task alone;
     # a late result is still closed and its exception is always retrieved.
     try:
-        done, _ = await asyncio.wait({setup}, timeout=SETUP_CLOSE_TIMEOUT_SECONDS)
+        done, _ = await asyncio.wait({setup}, timeout=None if join else SETUP_CLOSE_TIMEOUT_SECONDS)
     except asyncio.CancelledError:
         setup.add_done_callback(_close_late_setup)
         raise
@@ -68,13 +154,29 @@ DONE_FRAME = "data: [DONE]\n\n"
 # 两套口径无业务差异，纯漂移；2026-11 审查收敛）。
 MAX_ERROR_MESSAGE_CHARS = 1024
 
-# 事件分隔符预编译（re.search 的模块级缓存对直接传 pattern 串也有，但这里
-# 主要收益是配合 Pattern.search(buffer, pos) 免去 buffer[scan:] 的切片拷贝：
-# 单个网络块含大量小事件时，旧实现每匹配一次就复制一次剩余字节）。
-# 公开导出：request_tracking.PayloadObserver 的渐进扫描共用同一份定义
-# （两套实现已用注释互指，2026-11 审查收敛为单一常量）。
-FRAME_SEP_RE = re.compile(rb"\r\n\r\n|\n\n|\r\r")
-_FRAME_SEP_RE = FRAME_SEP_RE
+# SSE lines may independently end in CRLF, CR or LF. A CRLF is one
+# logical line ending, never two. Defer a trailing CR at a chunk boundary
+# until the next byte (or EOF) to preserve the exact wire bytes in the frame.
+FRAME_SEP_RE = re.compile(rb"(?:\r\n|\r(?!\n)|\n)(?:\r\n?|\n)")
+
+
+def sse_separator(buffer: bytes | bytearray, start: int, *, final: bool = False) -> Optional[re.Match[bytes]]:
+    match = FRAME_SEP_RE.search(buffer, start)
+    if match and not final and match.end() == len(buffer) and buffer[-1] == 13:
+        return None
+    return match
+
+
+def _frame_bytes(buffer: bytearray, start: int, end: int) -> bytes:
+    """Return owned bytes so the producer can immediately resize its buffer."""
+    if not start and end == len(buffer):
+        return bytes(buffer)
+    if end - start < 16 * 1024:
+        return bytes(buffer[start:end])
+    # Slicing a bytearray would create a second event-sized temporary. Keep
+    # this view entirely inside the copy, including when the consumer closes.
+    with memoryview(buffer) as view, view[start:end] as frame:
+        return frame.tobytes()
 
 
 class ByteBoundedQueue:
@@ -88,6 +190,9 @@ class ByteBoundedQueue:
         self._max_bytes = max_bytes
         self._bytes = 0
         self._changed = asyncio.Condition()
+
+    def empty(self) -> bool:
+        return self._queue.empty()
 
     async def put(self, item: Any) -> None:
         size = len(item) if isinstance(item, (bytes, bytearray)) else 0
@@ -121,13 +226,40 @@ async def sse_frames(source: AsyncIterable, max_frame_bytes: int=64 * 1024 * 102
     buffer = bytearray()
     # 已消费起点：延迟压实（仅当已消费过半才 del），避免每帧都把剩余
     # 字节整体 memmove 一次——单块含大量小事件时旧实现是平方级搬运。
-    start = 0
-    scan = 0
+    start = scan = 0
+    stream_start = True
     try:
         async for chunk in source:
+            # An immutable transport chunk that is exactly one complete event
+            # already owns the result. Preserve it through backpressure. A
+            # trailing CR is intentionally excluded: it may acquire an LF.
+            if (not buffer and type(chunk) is bytes and chunk.endswith(b"\n")
+                    and not (stream_start and chunk.startswith(codecs.BOM_UTF8))):
+                first = sse_separator(chunk, 0)
+                if first is not None and first.end() == len(chunk):
+                    if len(chunk) > max_frame_bytes:
+                        raise IncompleteResponseError("上游 SSE 事件超过字节上限。")
+                    stream_start = False
+                    del first
+                    yield chunk
+                    del chunk
+                    continue
+                # The prefix has already been scanned on this source; the
+                # buffer fallback needs only the actual boundary or its overlap.
+                scan = first.start() if first is not None else max(0, len(chunk) - 3)
+                del first
             buffer.extend(chunk)
+            if stream_start:
+                # SSE ignores one leading UTF-8 BOM, including across reads.
+                # Strip it before inspecting fields or attaching a replay ID;
+                # all other BOMs are ordinary data, even in later frames.
+                if len(buffer) < len(codecs.BOM_UTF8) and codecs.BOM_UTF8.startswith(buffer):
+                    continue
+                if buffer.startswith(codecs.BOM_UTF8):
+                    start = scan = len(codecs.BOM_UTF8)
+                stream_start = False
             while True:
-                match = _FRAME_SEP_RE.search(buffer, scan)
+                match = sse_separator(buffer, scan)
                 if match is None:
                     if len(buffer) - start > max_frame_bytes:
                         raise IncompleteResponseError("上游 SSE 事件超过字节上限。")
@@ -136,13 +268,18 @@ async def sse_frames(source: AsyncIterable, max_frame_bytes: int=64 * 1024 * 102
                 end = match.end()
                 if end - start > max_frame_bytes:
                     raise IncompleteResponseError("上游 SSE 事件超过字节上限。")
-                yield bytes(buffer[start:end])
+                yield _frame_bytes(buffer, start, end)
                 start = end
                 scan = start
             if start and start * 2 >= len(buffer):
                 del buffer[:start]
                 scan -= start
                 start = 0
+        # A terminal bare CR is unambiguous at EOF. All other complete
+        # boundaries have already been delivered inside the loop.
+        if match := sse_separator(buffer, scan, final=True):
+            yield _frame_bytes(buffer, start, match.end())
+            start = match.end()
         if buffer[start:].strip():
             raise IncompleteResponseError("上游 SSE 在事件完整结束前断开。")
     finally:
@@ -177,22 +314,28 @@ async def with_heartbeats(source: AsyncIterable, request: Optional[Any]=None, in
     loop = asyncio.get_running_loop()
     try:
         while True:
-            if await disconnected(request):
+            if request is not None and await disconnected(request):
                 return
             pending = asyncio.ensure_future(anext(iterator))
             deadline = loop.time() + interval
             while True:
-                done, _ = await asyncio.wait(
-                    {pending}, timeout=min(0.5, max(0, deadline - loop.time())))
-                if done:
+                remaining = max(0, deadline - loop.time())
+                # Detached producers have no disconnect observer to poll. A
+                # ready upstream still wakes asyncio.wait immediately.
+                timeout = remaining if request is None else min(0.5, remaining)
+                # Do not retain either wait set: a finished Task owns its result.
+                if (await asyncio.wait({pending}, timeout=timeout))[0]:
                     try:
                         item = pending.result()
                     except StopAsyncIteration:
                         return
                     pending = None
-                    yield item
+                    try:
+                        yield item
+                    finally:
+                        del item  # also release before a possibly slow close
                     break
-                if await disconnected(request):
+                if request is not None and await disconnected(request):
                     return
                 if loop.time() >= deadline:
                     yield HEARTBEAT
@@ -219,7 +362,10 @@ async def keepalive_sse(source: AsyncIterable, request: Optional[Any] = None,
         yield HEARTBEAT_FRAME
         started = True
         async for item in events:
-            yield HEARTBEAT_FRAME if item is HEARTBEAT else item
+            try:
+                yield HEARTBEAT_FRAME if item is HEARTBEAT else item
+            finally:
+                del item  # the upstream read or disconnect check may now stall
     finally:
         await events.aclose()
         if not started:
@@ -241,20 +387,21 @@ async def prepare_sse(operation: Callable, request: Optional[Any],
     # ManagedStreamingResponse 依赖 admission → proxy_resolver 链，保持惰性
     # 导入让 streaming 维持轻量（close_setup_task 只需要 fastapi 的类）。
     from admission import ManagedStreamingResponse
+    from retry_policy import bounded_sse_advisory
 
     _FAST_ERROR_WINDOW = 0.25
 
     setup = asyncio.create_task(operation())
 
     async def cleanup():
-        await close_setup_task(setup)
+        await close_setup_task(setup, join=True)
 
     try:
         done, _ = await asyncio.wait({setup}, timeout=_FAST_ERROR_WINDOW)
         if done:
             return setup.result()
     except BaseException:
-        await cleanup()
+        await close_setup_task(setup)
         raise
 
     async def frames():
@@ -268,13 +415,8 @@ async def prepare_sse(operation: Callable, request: Optional[Any],
                 # 状态头已按 200 提交：把真实状态码与 Retry-After 以 SSE 注释行
                 # 透出（协议合法，data 解析器会忽略注释，排障与旁路可读）。
                 status = getattr(response, "status_code", 0) or 0
-                retry_after = ""
-                headers = getattr(response, "headers", None)
-                if headers is not None:
-                    try:
-                        retry_after = str(headers.get("retry-after") or "")
-                    except Exception:
-                        retry_after = ""
+                headers = getattr(response, "headers", None) or {}
+                retry_after = bounded_sse_advisory(headers.get("retry-after"))
                 if status:
                     yield f": upstream-status {status}\n".encode("ascii")
                 if retry_after:

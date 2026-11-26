@@ -29,12 +29,10 @@ from pathlib import Path
 import httpx
 
 import config
-import credential_manager
 from runtime_state import app_state
 from routes import gemini_native
 from upstreams import cookie_native
 
-COOKIE = "SAPISID=abc; SID=def; __Secure-1PSIDTS=t1"
 BRIDGE_SENTINEL = object()
 
 
@@ -64,34 +62,12 @@ def _bridge_patches():
 class GeminiNativeChannelModeTests(unittest.TestCase):
     """Bug A：通道模式必须决定 Gemini 原生格式的通道归属。"""
 
-    def setUp(self):
-        # 全局单例必须逐项还原：本套件运行前后的 cookie 账号与通道模式
-        # 都不能泄漏给同进程的其它测试（测试隔离硬性要求）。
-        self._saved_accounts = app_state.get_cookie_accounts()
-        self._saved_mode = app_state.get_channel_mode()
-        self.addCleanup(self._restore)
-
-    def _restore(self):
-        app_state.set_cookie_accounts(self._saved_accounts)
-        app_state.set_channel_mode(self._saved_mode)
-
     def _run(self, with_cookie, with_keys, mode, action="generateContent"):
-        app_state.set_cookie_accounts(
-            [{"cookie": COOKIE, "project_id": "proj", "note": "n", "enabled": True}]
-            if with_cookie
-            else []
-        )
         manager = types.SimpleNamespace(get_total_keys=lambda: 1 if with_keys else 0)
         (bridge_patch, bridge), (pt_patch, passthrough) = _bridge_patches()
         with (
             mock.patch.object(app_state, "get_channel_mode", return_value=mode),
-            mock.patch.object(
-                credential_manager.credential_manager,
-                "get_cookie_record",
-                return_value={"cookie": COOKIE, "project_id": "proj", "id": "a1"}
-                if with_cookie
-                else None,
-            ),
+            mock.patch.object(app_state, "get_cookie_accounts", return_value=[{"enabled": True}] if with_cookie else []),
             bridge_patch,
             pt_patch,
         ):

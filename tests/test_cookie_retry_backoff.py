@@ -12,6 +12,7 @@ import io
 import os
 from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -29,6 +30,32 @@ class _Request:
 
 
 class CookieRetryBackoffTests(unittest.IsolatedAsyncioTestCase):
+    async def test_heartbeat_backoff_counts_slow_consumer_time(self):
+        now, waits = [10.0], []
+        async def wait(_request, delay):
+            waits.append(delay)
+            now[0] += delay
+            return True
+
+        with (mock.patch.object(cookie_transport, "time", SimpleNamespace(monotonic=lambda: now[0])),
+              mock.patch.object(cookie_transport, "wait_for_retry", side_effect=wait)):
+            stream = cookie_transport.retry_heartbeats(.75, hb_interval=.5)
+            self.assertEqual(await anext(stream), cookie_transport.HEARTBEAT_FRAME)
+            now[0] += .5  # slow ASGI send took us past the retry deadline
+            self.assertEqual([frame async for frame in stream], [])
+            self.assertEqual(waits, [.5])
+
+            waits.clear()
+            frames = [frame async for frame in cookie_transport.retry_heartbeats(1.25, hb_interval=.5)]
+            self.assertEqual(frames, [cookie_transport.HEARTBEAT_FRAME] * 2)
+            self.assertEqual(waits, [.5, .5, .25])  # not early, no obsolete final frame
+
+    async def test_heartbeat_backoff_stops_on_disconnect_and_zero_delay(self):
+        with mock.patch.object(cookie_transport, "wait_for_retry", return_value=False) as wait:
+            for delay in (0, 1):
+                self.assertEqual([f async for f in cookie_transport.retry_heartbeats(delay)], [])
+            wait.assert_awaited_once()
+
     async def test_retry_after_longer_than_window_is_honored(self):
         # 同一 Cookie 身份：上游提示 8s > 窗口 5s → 采纳 8s，不钳位
         request = _Request()

@@ -9,7 +9,12 @@
  * 运行期状态：编辑器一次只开一个对话框；测试结果仅在内存（不落
  * localStorage）。 */
 (() => {
-  if (window.proxyEditorKit) return;
+  if (
+    typeof window.proxyEditorKit?.mount === 'function' &&
+    typeof window.proxyEditorKit.init === 'function' &&
+    typeof window.proxyEditorKit.open === 'function'
+  )
+    return;
   let proxyEditor = null;
   let proxyEditorInitialized = false;
   let cookieDeps = null;
@@ -49,6 +54,15 @@
       index,
       proxies: [...source],
       initial: [...source],
+      // A dialog can outlive a page-settings reload. Keep the comparison from
+      // when the user began editing, for both direct Save and Apply-to-page.
+      origin:
+        scope === 'global'
+          ? window.consoleForms?.settingOrigin?.('proxy-input') || {
+              base: source.join('\n'),
+              expected: settingsExpectation(GLOBAL_SETTINGS, ['proxy_urls']).proxy_urls
+            }
+          : null,
       editing: null,
       opener: document.activeElement,
       view,
@@ -516,7 +530,10 @@
             method: 'POST',
             signal: AbortSignal.timeout(30000),
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ proxy_urls: normalized })
+            body: JSON.stringify({
+              proxy_urls: normalized,
+              _expected: { proxy_urls: editor.origin.expected }
+            })
           });
           const saved = await response.json();
           if (!response.ok) throw new Error(await responseError(response, '保存失败', saved));
@@ -525,7 +542,9 @@
           GLOBAL_SETTINGS.proxy_url = saved.proxy_url;
           updateProxyPill(saved.proxy_urls.length);
         }
-        $('proxy-input').value = normalized.join('\n');
+        if (!persist && window.consoleForms?.restoreSetting) {
+          window.consoleForms.restoreSetting('proxy-input', normalized.join('\n'), editor.origin);
+        } else $('proxy-input').value = normalized.join('\n');
         updateProxyDraft();
         if (persist) window.consoleForms?.saved('proxy');
         else window.consoleForms?.refresh();
@@ -983,9 +1002,16 @@
   function initProxyEditor() {
     if (proxyEditorInitialized) return;
     if (
-      !['proxy-dialog-close', 'proxy-dialog-cancel', 'proxy-dialog', 'proxy-paste'].every((id) =>
-        $(id)
-      )
+      ![
+        'proxy-dialog-close',
+        'proxy-dialog-cancel',
+        'proxy-dialog',
+        'proxy-paste',
+        'proxy-import-text',
+        'proxy-import-type',
+        'proxy-import-list'
+      ].every((id) => $(id)) ||
+      !document.querySelector('.proxy-nav')
     )
       throw new Error('代理编辑器页面版本不一致，请刷新面板');
     $('proxy-dialog-close').addEventListener('click', () => closeProxyEditor());

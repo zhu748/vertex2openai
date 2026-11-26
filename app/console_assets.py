@@ -1,39 +1,45 @@
 """Keep console HTML and its scripts on the same deployment version."""
 
+from functools import lru_cache
 import hashlib
 from pathlib import Path
 import re
 
 from fastapi.staticfiles import StaticFiles
+from starlette.datastructures import QueryParams
 
 STATIC_DIR = Path(__file__).parent / "static"
 
 
-def versioned_assets(template: str) -> str:
+@lru_cache(maxsize=1)
+def _asset_manifest(directory: Path) -> tuple[str, frozenset[str]]:
+    """Packaged assets, like the HTML templates, stay fixed for the process lifetime."""
     digest = hashlib.sha256()
-    for path in sorted(STATIC_DIR.iterdir()):
-        if path.suffix in (".js", ".css"):
+    names = set()
+    for path in sorted(directory.iterdir()):
+        if path.suffix in (".js", ".css") and path.is_file():
             digest.update(path.name.encode())
             digest.update(path.read_bytes())
-    version = digest.hexdigest()[:16]
+            names.add(path.name)
+    return digest.hexdigest()[:16], frozenset(names)
+
+
+def versioned_assets(template: str) -> str:
+    version, _ = _asset_manifest(STATIC_DIR)
     return re.sub(r'((?:src|href)="/static/[^"?]+\.(?:js|css))"',
                   lambda match: f'{match[1]}?v={version}"', template)
 
 
-# ?v=<内容哈希> 的 URL 可以永久缓存：内容一变哈希就变，URL 随之改变。
 _IMMUTABLE_CACHE = "public, max-age=31536000, immutable"
+_REVALIDATE = "no-cache, max-age=0, must-revalidate"
 
 
 class ConsoleStaticFiles(StaticFiles):
     async def get_response(self, path, scope):
         response = await super().get_response(path, scope)
-        if b"v=" in scope.get("query_string", b""):
-            # 版本化 URL：浏览器一年内不再回源，弱网下控制台首屏省掉
-            # 全部静态资源的 revalidate 往返（内容变更时哈希/URL 一起变，
-            # 不存在旧缓存命中问题）。
-            response.headers["Cache-Control"] = _IMMUTABLE_CACHE
-        else:
-            # 旧的无版本 URL（书签/外部引用）仍要求 revalidate，
-            # 否则浏览器会长期持有上一个部署的 JS。
-            response.headers["Cache-Control"] = "no-cache, max-age=0, must-revalidate"
+        version, names = _asset_manifest(STATIC_DIR)
+        versions = QueryParams(scope.get("query_string", b"")).getlist("v")
+        # Stale/ambiguous version URLs address the current bytes on disk, not
+        # the historical bytes the client requested. Never pin those responses.
+        response.headers["Cache-Control"] = _IMMUTABLE_CACHE if path in names and versions == [version] else _REVALIDATE
         return response

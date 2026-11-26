@@ -4,7 +4,7 @@ Owns upstream error classification, raw event reads, tool-protocol fallback and
 first-reply/proxy handling. It does not construct downstream API responses.
 """
 
-import re
+import json
 import time
 from typing import Any, AsyncGenerator, AsyncIterator, Callable, Optional
 
@@ -12,10 +12,9 @@ import httpx
 from fastapi import Request
 
 from cookie_auth import BATCH_GRAPHQL_URL
-import image_delivery
 from json_encoding import estimate_json_chars
 from media_tasks import run_media_task
-from http_io import read_upstream_bytes
+from http_io import UNAVAILABLE_DIAGNOSTIC, read_status_body
 from first_reply import FirstReplyGuard, FirstReplyTimeout, native_has_reply, timeout_seconds
 from request_tracking import upstream_attempt, upstream_chunk
 from response_validation import (
@@ -28,6 +27,8 @@ from retry_policy import (
     is_retryable_exception,
     is_retryable_message,
     is_retryable_status,
+    response_retry_after,
+    retry_after_seconds,
     retry_delay,
     wait_for_retry,
 )
@@ -36,7 +37,10 @@ from upstream_errors import extract_upstream_error
 from upstreams.cookie_response import (
     BODY_EVENT_TYPES,
     RawSampler,
+    envelope_errors,
+    CookieCandidateBoundary,
     extract_events,
+    has_pending_inline_image,
     iter_json_objects,
 )
 
@@ -109,7 +113,7 @@ def is_cookie_expired_error(error_msg: str) -> bool:
 
 def is_native_tool_error(error_msg: str) -> bool:
     """Narrow detector for schema/model rejection eligible for one safe degrade."""
-    lower = (error_msg or "").lower()
+    lower = (error_msg or "")[:4096].lower()
     tool_terms = (
         "functiondeclaration",
         "function declaration",
@@ -137,19 +141,51 @@ def is_native_tool_error(error_msg: str) -> bool:
     )
 
 
-def is_native_tool_error_response(status_code: int, payload: str) -> bool:
-    """Avoid mistaking ordinary model text about tools for a protocol error."""
-    if status_code != 200:
-        return is_native_tool_error(payload)
-    has_error_envelope = bool(re.search(r'"errors?"\s*:', payload or ""))
-    return has_error_envelope and is_native_tool_error(payload)
+def is_native_tool_rejection(error: Any) -> bool:
+    """A documented error message, not a stringified dictionary of arbitrary data."""
+    if isinstance(error, dict):
+        code = error.get("code")
+        if isinstance(code, int) and 400 <= code <= 599 and code not in (400, 422):
+            return False
+        grpc = grpc_status_code(error)
+        if grpc in _GRPC_TO_HTTP and _GRPC_TO_HTTP[grpc] != 400:
+            return False
+        error = error.get("message")
+    return isinstance(error, str) and is_native_tool_error(error)
+
+
+def is_native_tool_error_response(status_code: int, payload: str | bytes) -> bool:
+    """Only inspect bounded HTTP validation diagnostics. HTTP 200 uses parsed events."""
+    if status_code not in (400, 422) or len(payload) > 16 * 1024:
+        return False
+    text = (payload.decode("utf-8", errors="replace") if isinstance(payload, bytes) else payload).strip()
+    text = text.removeprefix(")]}'").lstrip()
+    if not text.startswith(("{", "[")):
+        # Some older Studio endpoints return the validation message as plain text.
+        return not (text.startswith(("<", '"')) or "{" in text) and is_native_tool_error(text)
+    try:
+        value = json.loads(text)
+        for obj in value if isinstance(value, list) else [value]:
+            if not isinstance(obj, dict):
+                continue
+            if any(is_native_tool_rejection(err) for err in envelope_errors(obj)):
+                return True
+            results = obj.get("results")
+            if isinstance(results, list):
+                for result in results:
+                    errors = result.get("errors") if isinstance(result, dict) else None
+                    if isinstance(errors, list) and any(is_native_tool_rejection(err) for err in errors):
+                        return True
+    except (ValueError, RecursionError, IncompleteResponseError):
+        pass
+    return False
 
 
 def _event_has_reply(event: tuple):
     kind, data = event
     if kind == "native_part":
         return native_has_reply({"candidates": [{"content": {"parts": [data]}}]})
-    return kind in ("text", "thought", "image", "function_call") and bool(data)
+    return kind in ("text", "thought", "image", "thought_image", "hidden_thought", "function_call") and bool(data)
 
 
 # gRPC 状态码 → HTTP：batchGraphql 的 GraphQL 错误块带 extensions.status.code
@@ -213,14 +249,14 @@ def api_error_details(data: Any) -> tuple[int, str]:
 
 
 async def retry_heartbeats(total_sec: float, hb_interval: float = 3.0, request: Request=None) -> AsyncIterator[str]:
-    """边等待边吐心跳的异步生成器：每 hb_interval 秒 yield 一次心跳，直到累计 total_sec。"""
-    waited = 0.0
-    step = max(0.5, min(hb_interval, total_sec)) if total_sec > 0 else 0
-    while waited < total_sec:
-        if not await wait_for_retry(request, min(step, total_sec - waited)):
+    """Keep the connection alive only while the monotonic retry window is open."""
+    deadline = time.monotonic() + total_sec
+    step = max(0.5, hb_interval)
+    while (remaining := deadline - time.monotonic()) > 0:
+        if not await wait_for_retry(request, min(step, remaining)):
             return
-        waited += step
-        yield HEARTBEAT_FRAME
+        if time.monotonic() < deadline:
+            yield HEARTBEAT_FRAME
 
 
 # Cookie 通道重试退避的统一入口（2026-11 P2 重试执行器收敛）：此前同一
@@ -288,15 +324,17 @@ async def _execute_stream_request_generator_once(
     sampler: "RawSampler | None" = None,
     *,
     preserve_parts: bool = False,
+    strip_thoughts: bool = False,
 ) -> AsyncGenerator[tuple[str, Any], None]:
     """
     异步生成器：真正实时地拉取数据，抛出**原始事件**（不做 SSE 格式化）：
     ("text"|"thought"|"image", str)、("finish", 原始finishReason)、("usage", dict)、
-    ("blocked", str)、("api_error_text", str)、("cookie_error"|"retryable_error"|"fatal_error", str)。
+    ("blocked", str；原生模式为已校验的 promptFeedback 对象)、("api_error_text", str)、("cookie_error"|"retryable_error"|"fatal_error", str)。
     由消费方负责格式化成 OpenAI chunk（便于预填充去重与无正文诊断）。
     """
     has_content = False
     got_finish = False
+    boundary = CookieCandidateBoundary()
     try:
         upstream_attempt()
         async with client.stream(
@@ -304,16 +342,19 @@ async def _execute_stream_request_generator_once(
         ) as response:
             # 1. 拦截 HTTP 状态码错误
             if response.status_code != 200:
-                error_text = await read_upstream_bytes(response)
-                error_msg = error_text.decode("utf-8", errors="replace")[:1000]
+                error_text = await read_status_body(response)
+                if error_text is None:
+                    error_text = UNAVAILABLE_DIAGNOSTIC
+                error_msg = error_text[:4000].decode("utf-8", errors="replace")[:1000]
+                hint_value = response_retry_after(response)
 
                 # 原生函数 Schema 被拒优先于 Cookie/项目分类（与事件流分支
                 # 的判定顺序一致；旧实现反序，且 "invalid argument" 被归进
                 # 项目关键词，导致可降级的协议拒绝永远走不到降级重试）。
-                if is_native_tool_error(error_msg):
+                if is_native_tool_error_response(response.status_code, error_text):
                     yield (
                         "native_tool_unsupported",
-                        StreamRequestError(error_msg, status_code=response.status_code),
+                        StreamRequestError(error_msg, hint_value, response.status_code),
                     )
                     return
 
@@ -330,14 +371,14 @@ async def _execute_stream_request_generator_once(
                     yield (
                         "cookie_error",
                         StreamRequestError(
-                            error_msg + hint, status_code=response.status_code
+                            error_msg + hint, hint_value, response.status_code
                         ),
                     )
                     return
                 is_retryable = is_retryable_status(response.status_code)
                 error = StreamRequestError(
                     error_msg,
-                    getattr(response, "headers", {}).get("retry-after"),
+                    hint_value,
                     response.status_code,
                 )
                 yield "retryable_error" if is_retryable else "fatal_error", error
@@ -352,18 +393,17 @@ async def _execute_stream_request_generator_once(
                 try:
                     # PRF-P1-1：含内联图片的对象在媒体线程解析（base64 解码 +
                     # 落盘不能停在事件循环上）；纯文本对象原地零开销解析。
-                    if image_delivery.has_inline_image(obj):
+                    if has_pending_inline_image(obj):
                         events = await run_media_task(
-                            list, extract_events(obj, preserve_parts=preserve_parts), heavy=True)
+                            list, extract_events(obj, preserve_parts=preserve_parts, strip_thoughts=strip_thoughts, boundary=boundary), heavy=True)
                     else:
-                        events = list(extract_events(obj, preserve_parts=preserve_parts))
+                        events = list(extract_events(obj, preserve_parts=preserve_parts, strip_thoughts=strip_thoughts, boundary=boundary))
                 except IncompleteResponseError as error:
                     raise ToolStreamError(str(error)) from error
-                # 正文/工具内容已到即停止留存诊断样本（样本只服务「无正文」
-                # 日志，正文已到则 dump 永不触发）：留存会把含巨型
-                # inlineData 的流式块钉到流结束。注意这里与两条整取路径
-                # 不同，不 del obj——流式解析器是生成器，挂起期间其帧局部
-                # 仍持本对象引用，del 只掉消费方一侧（无效）。
+                # Events now own the payloads they need. Keep raw diagnostic
+                # samples only until genuine content arrives, never across a
+                # subsequent read once the consumer is finished with them.
+                del obj
                 if sampler is not None and any(
                     et in BODY_EVENT_TYPES for et, _ in events
                 ):
@@ -378,6 +418,8 @@ async def _execute_stream_request_generator_once(
                         "text",
                         "thought",
                         "image",
+                        "thought_image",
+                        "hidden_thought",
                         "function_call",
                         "thought_signature",
                         "native_part",
@@ -385,20 +427,20 @@ async def _execute_stream_request_generator_once(
                         has_content = True
                         yield event_type, data
 
-                    elif event_type in ("finish", "usage", "blocked", "safety"):
+                    elif event_type in ("finish", "usage", "blocked", "safety", "candidate_metadata"):
                         if event_type == "finish" and has_finish_reason(data):
                             got_finish = True
                         yield event_type, data
 
                     elif event_type == "error":
                         code, err_msg = api_error_details(data)
-                        error = StreamRequestError(err_msg, status_code=code)
+                        error = StreamRequestError(err_msg, response_retry_after(response), code)
                         explicit_code = (
                             data.get("code") if isinstance(data, dict) else None
                         )
 
                         # 在还没发送任何有效数据前遇到错误，尝试走顶层重试
-                        if is_native_tool_error(err_msg) and not has_content:
+                        if not has_content and not got_finish and is_native_tool_rejection(data):
                             yield "native_tool_unsupported", error
                             return
                         # 鉴权失效判定收敛进 api_error_details（2026-11）：
@@ -413,7 +455,7 @@ async def _execute_stream_request_generator_once(
                             )
                             yield (
                                 "cookie_error",
-                                StreamRequestError(err_msg + hint, status_code=code),
+                                StreamRequestError(err_msg + hint, error.retry_after, code),
                             )
                             return
                         # Numeric HTTP status wins over message keywords. The
@@ -428,6 +470,8 @@ async def _execute_stream_request_generator_once(
                         )
                         yield "retryable_error" if retryable else "fatal_error", error
                         return
+                    del data
+                del events
 
             if not got_finish:
                 yield (
@@ -458,18 +502,20 @@ async def _execute_stream_request_generator_raw(
     fallback_body: Any = None,
     *,
     preserve_parts: bool = False,
+    strip_thoughts: bool = False,
 ) -> AsyncGenerator[tuple[str, Any], None]:
     """Execute native tools, lazily degrading after one clear protocol rejection."""
     while True:
         events = _execute_stream_request_generator_once(
-            client, headers, body, sampler, preserve_parts=preserve_parts
+            client, headers, body, sampler, preserve_parts=preserve_parts, strip_thoughts=strip_thoughts
         )
         try:
             async for status, data in events:
                 if status != "native_tool_unsupported":
                     yield status, data
+                    del data
                     continue
-                if fallback_body is None:
+                if fallback_body is None or retry_after_seconds(getattr(data, "retry_after", None)):
                     yield "fatal_error", data
                     return
                 break
@@ -488,11 +534,12 @@ async def _execute_stream_request_generator_raw(
         "⚠️ [Studio] 当前模型/协议拒绝原生工具字段；本次及后续重试固定降级为文本工具观测，图片保留为视觉输入。"
     )
     events = _execute_stream_request_generator_once(
-        client, headers, resolved_fallback, sampler, preserve_parts=preserve_parts
+        client, headers, resolved_fallback, sampler, preserve_parts=preserve_parts, strip_thoughts=strip_thoughts
     )
     try:
         async for fallback_status, fallback_data in events:
-            yield fallback_status, fallback_data
+            yield ("fatal_error" if fallback_status == "native_tool_unsupported" else fallback_status), fallback_data
+            del fallback_data
     finally:
         await events.aclose()
 
@@ -506,30 +553,17 @@ async def stream_events(
     *,
     model: str="",
     preserve_parts: bool=False,
+    strip_thoughts: bool=False,
 ) -> AsyncIterator[tuple]:
     chain = getattr(client, "chain", None)
     # 首回复窗口每请求只读一次设置（while 循环里换出口/重试会反复新建 Guard）。
     fr_seconds = timeout_seconds(model)
-    # Guard 在循环外创建一次：initial_deadline 记录原始预算终点。旧实现每轮
-    # 换出口都新建 Guard（initial_deadline 重置为满窗口），流式路径的首回复
-    # 总预算不变量失效——N 个候选出口 × 满窗口（默认 3×15s=45s）才轮到外层
-    # 重试，与非流式 timed_call+proxy_attempt 的钳制语义不一致（2026-10 修复）。
+    # Candidates share one fixed first-reply budget, including time spent on
+    # earlier failures. Never extend an elapsed window by even a timer tick.
     guard = FirstReplyGuard(model, seconds=fr_seconds)
     while True:
-        # 每轮把 deadline 钳到「满窗口 与 原始预算剩余」的较小值（首轮=满窗口），
-        # 与 proxy_attempt 对同一 Guard 的重写公式逐字一致；guard.ready 在换出口
-        # 前提下恒为 False（switch 分支要求 not guard.ready），复用无状态残留。
-        # seconds=0（禁用超时）时 wait 直接放行，deadline 不参与计时。
-        if guard.seconds:
-            window = max(
-                0.001, min(guard.seconds, guard.initial_deadline - time.monotonic())
-            )
-            guard.deadline = time.monotonic() + window
-            if guard.trace:
-                with guard.trace._lock:
-                    guard.trace.data["first_reply_deadline"] = time.time() + window
         source = _execute_stream_request_generator_raw(
-            client, headers, body, sampler, fallback_body, preserve_parts=preserve_parts
+            client, headers, body, sampler, fallback_body, preserve_parts=preserve_parts, strip_thoughts=strip_thoughts
         )
         pending = PendingMetadataGate()
         switch_proxy = False
@@ -554,7 +588,8 @@ async def stream_events(
                         # not an HTTP 502 returned by the selected proxy.
                         cause = getattr(data, "cause", None)
                         switch_proxy = chain.advance(cause,
-                            status=getattr(data, "status_code", None) if cause is None else None)
+                            status=getattr(data, "status_code", None) if cause is None else None,
+                            retry_after=getattr(data, "retry_after", None))
                         if switch_proxy:
                             break
                     # 错误前已缓冲的元数据（finish/usage/safety）先冲刷再报错，
@@ -578,7 +613,9 @@ async def stream_events(
                     continue
                 for prefix in pending.drain():
                     yield prefix
+                    del prefix
                 yield item
+                del item, data
             if not switch_proxy:
                 for prefix in pending.drain():
                     yield prefix

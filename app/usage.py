@@ -1,8 +1,8 @@
 """统一 SDK 与原生 usageMetadata 的 OpenAI 用量映射。"""
 
+from collections.abc import Iterable
 import json
 import re
-import time
 from typing import Any
 
 from models import normalize_content_part
@@ -13,17 +13,35 @@ from models import normalize_content_part
 # claude_protocol 的平行正则不含部首、本表不含谚文，同一文本估算不同）。
 CJK_CHAR_RE = re.compile(r"[\u2e80-\u9fff\uac00-\ud7af\uf900-\ufaff\uff00-\uffef]")
 _CJK_RE = CJK_CHAR_RE
+_CJK_WINDOW = 4096
 
 
-def estimate_token_count(text: str) -> int:
-    """字符级粗估（无分词器依赖）：CJK 字符逐字计，其余 4 字符折 1 token。"""
+def _cjk_count(text: str) -> int:
+    if text.isascii():
+        return 0
+    size = len(text)
+    if size <= _CJK_WINDOW:
+        return len(_CJK_RE.findall(text))
+    # Bound the match list without copying input slices.
+    return sum(len(_CJK_RE.findall(text, pos, pos + _CJK_WINDOW))
+               for pos in range(0, size, _CJK_WINDOW))
+
+
+def estimate_token_count(text: str | Iterable[str]) -> int:
+    """字符级粗估。片段等同于无分隔拼接：只对总非 CJK 字符数取整一次。"""
     if not text:
         return 0
-    cjk = len(_CJK_RE.findall(text))
-    return cjk + max(0, (len(text) - cjk + 3) // 4)
+    if isinstance(text, str):
+        size, cjk = len(text), _cjk_count(text)
+    else:
+        size = cjk = 0
+        for piece in text:
+            size += len(piece)
+            cjk += _cjk_count(piece)
+    return cjk + (size - cjk + 3) // 4
 
 
-def estimate_usage(prompt_text: str, completion_text: str) -> dict[str, Any]:
+def estimate_usage(prompt_text: str, completion_text: str | Iterable[str]) -> dict[str, Any]:
     """上游未回传 usageMetadata 时的粗估（usage_estimation 开关控制启用）。
 
     返回值携带 "estimated": true，客户端可区分真实计量与估算。
@@ -100,6 +118,16 @@ def map_usage(metadata: Any) -> dict[str, int]:
     return usage
 
 
+NATIVE_USAGE_COUNTERS = {
+    "prompt_token_count": "promptTokenCount",
+    "tool_use_prompt_token_count": "toolUsePromptTokenCount",
+    "candidates_token_count": "candidatesTokenCount",
+    "thoughts_token_count": "thoughtsTokenCount",
+    "cached_content_token_count": "cachedContentTokenCount",
+    "total_token_count": "totalTokenCount",
+}
+
+
 def usage_snapshot_unchanged(previous: dict | None, metadata: Any) -> bool:
     """六个计数器与已合并快照完全一致 → 调用方可跳过 merge（2026-11 O-5）。
 
@@ -109,14 +137,7 @@ def usage_snapshot_unchanged(previous: dict | None, metadata: Any) -> bool:
     """
     if not previous:
         return False
-    for snake, camel in (
-        ("prompt_token_count", "promptTokenCount"),
-        ("tool_use_prompt_token_count", "toolUsePromptTokenCount"),
-        ("candidates_token_count", "candidatesTokenCount"),
-        ("thoughts_token_count", "thoughtsTokenCount"),
-        ("cached_content_token_count", "cachedContentTokenCount"),
-        ("total_token_count", "totalTokenCount"),
-    ):
+    for snake, camel in NATIVE_USAGE_COUNTERS.items():
         if isinstance(metadata, dict):
             value = metadata.get(camel, metadata.get(snake))
         else:
@@ -143,20 +164,12 @@ def merge_usage_metadata(previous: dict | None, metadata: Any) -> dict:
     else:
         incoming = {}
     merged = dict(previous or {})
-    counters = {
-        "prompt_token_count": "promptTokenCount",
-        "tool_use_prompt_token_count": "toolUsePromptTokenCount",
-        "candidates_token_count": "candidatesTokenCount",
-        "thoughts_token_count": "thoughtsTokenCount",
-        "cached_content_token_count": "cachedContentTokenCount",
-        "total_token_count": "totalTokenCount",
-    }
     # Preserve native-only details (e.g. modality breakdowns), also as snapshots.
     merged.update({key: value for key, value in incoming.items()
-                   if key not in counters and key not in counters.values() and value is not None})
+                   if key not in NATIVE_USAGE_COUNTERS and key not in NATIVE_USAGE_COUNTERS.values() and value is not None})
     updated = set()
     changed = set()
-    for snake, camel in counters.items():
+    for snake, camel in NATIVE_USAGE_COUNTERS.items():
         value = incoming.get(camel, incoming.get(snake))
         if value is None or isinstance(value, bool):
             continue
@@ -187,12 +200,12 @@ def wants_usage(request_obj: Any) -> bool:
     return False
 
 
-def make_usage_chunk(response_id: str, model: str, usage: dict) -> str:
+def make_usage_chunk(response_id: str, model: str, usage: dict, *, created: int) -> str:
     """OpenAI 风格的用量尾块（choices 为空，仅携带 usage）。"""
     chunk = {
         "id": response_id,
         "object": "chat.completion.chunk",
-        "created": int(time.time()),
+        "created": created,
         "model": model,
         "choices": [],
         "usage": usage,

@@ -4,6 +4,7 @@ The private batchGraphql endpoint never emits partialArgs fragments (verified
 2026-10-30), so the Cookie channel parses complete function calls directly.
 Fragment assembly remains a Key/Express capability tested elsewhere.
 """
+from settings_fixture import saved_settings
 import asyncio
 from contextlib import asynccontextmanager
 import json
@@ -81,6 +82,28 @@ class DirectWireParsingTests(unittest.TestCase):
         self.assertEqual((calls[0]["name"], calls[0]["args"], calls[0]["id"]),
                          ("reply", {"text": "hello"}, "private-call"))
 
+    def test_nameless_call_with_data_cannot_report_success_in_either_mode(self):
+        for preserve in (False, True):
+            for fields in ({"id": "call_a"}, {"name": "  ", "args": {"city": "Oslo"}},
+                           {"partialArgs": [{"jsonPath": "$.city", "stringValue": "Oslo"}]},
+                           {"willContinue": True}):
+                with self.subTest(fields=fields, preserve=preserve):
+                    events = []
+                    with self.assertRaises(IncompleteResponseError):
+                        for event in cookie_response.extract_events(
+                                wire({"text": "checking"}, fc(**fields), finish="STOP"),
+                                preserve_parts=preserve):
+                            events.append(event)
+                    self.assertFalse(any(kind in ("finish", "function_call") for kind, _ in events))
+
+    def test_default_function_call_projection_on_text_is_not_a_real_call(self):
+        placeholder = private_fc(name="", args={}, id="", partialArgs=[], willContinue=False)
+        for preserve, expected in ((False, ("text", "hello")), (True, ("native_part", {"text": "hello"}))):
+            with self.subTest(preserve=preserve):
+                self.assertEqual(list(cookie_response.extract_events(
+                    wire({**placeholder, "text": "hello"}, finish="STOP"), preserve_parts=preserve)),
+                    [expected, ("finish", "STOP")])
+
     def test_fragment_wire_fails_explicitly_as_incomplete(self):
         for fields in ({"willContinue": True}, {"partialArgs": [{"jsonPath": "$.text", "stringValue": "x"}]}):
             with self.subTest(fields=fields), self.assertRaises(IncompleteResponseError):
@@ -109,7 +132,7 @@ class CookieStreamTests(unittest.IsolatedAsyncioTestCase):
         self.closed = []
         for patch in (
             mock.patch.object(app_state, "get_effective_settings", side_effect=lambda *a, **k: dict(self.settings)),
-            mock.patch.object(app_state, "get_setting", side_effect=lambda k, d=None: self.settings.get(k, d)),
+            saved_settings(app_state, self.settings),
             mock.patch.object(cookie_transport, "timeout_seconds", return_value=.04),
             mock.patch.object(cookie_delivery, "stats", self.stats),
             mock.patch.object(cookie_native, "stats", self.stats),

@@ -28,13 +28,13 @@ class SignatureExpiryTests(unittest.TestCase):
             self.assertIsNotNone(store.get_record("live"))
             self.assertIsNotNone(store.get_record("new"))
 
-    def test_overwrite_refreshes_expiry_and_preserves_new_signature(self):
+    def test_consistent_overwrite_refreshes_expiry_and_preserves_signature(self):
         store = SignatureStore(ttl_seconds=10, max_entries=2)
         with mock.patch("signature_store.time.monotonic") as clock:
             clock.return_value = 0
-            store.put_unknown("call")
+            record = SignatureRecord(SignatureState.SIGNED, b"same-signature")
+            store.put_record("call", record)
             clock.return_value = 5
-            record = SignatureRecord(SignatureState.SIGNED, b"new-signature")
             store.put_record("call", record)
             clock.return_value = 11
             store.put_unknown("new")

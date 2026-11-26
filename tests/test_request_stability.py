@@ -225,6 +225,62 @@ class UploadBudgetTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 guard.close()
 
+    async def test_utf8_spans_internal_slice_and_asgi_message(self):
+        # One code point spans both the internal slice and the HTTP message
+        # boundary; a final empty or ASCII-only message must not hide truncation.
+        prefix = b'"' + b'a' * (ingress._UTF8_BLOCK_BYTES - 2)
+        emoji = '🌱'.encode()
+        lead = prefix + emoji[:2]
+        for chunks, valid in (
+            ([lead, emoji[2:] + b'"'], True),
+            ([lead, b''], False),
+            ([lead, b'z"'], False),
+            ([prefix + emoji[:1] + b'z"'], False),
+            ([lead], False),
+        ):
+            with self.subTest(valid=valid, tail=chunks[-1][-4:]):
+                messages = [{'type': 'http.request', 'body': chunk, 'more_body': i + 1 < len(chunks)}
+                            for i, chunk in enumerate(chunks)]
+                total = sum(map(len, chunks))
+                budget = ingress.IngressBudget()
+                guard = ingress.IngressReceive(mock.AsyncMock(side_effect=messages), total, budget)
+                try:
+                    if valid:
+                        for msg in messages:
+                            self.assertIs(await guard(), msg)
+                        self.assertEqual(budget.used, [0, total, 1])
+                    else:
+                        with self.assertRaises(ingress.IngressError) as caught:
+                            for _ in chunks:
+                                await guard()
+                        self.assertEqual(caught.exception.status_code, 400)
+                finally:
+                    guard.close()
+                self.assertEqual(budget.used, [0, 0, 0])
+
+    async def test_large_utf8_checks_bounded_views_and_skips_plain_ascii(self):
+        block = ingress._UTF8_BLOCK_BYTES
+        ascii_body = b'{"image":"' + b'A' * (3 * block)
+        mixed_body = b'","text":"' + '文'.encode() + b'a' * (2 * block) + b'"}'
+        messages = [{'type': 'http.request', 'body': ascii_body, 'more_body': True},
+                    {'type': 'http.request', 'body': mixed_body, 'more_body': False}]
+        guard = ingress.IngressReceive(mock.AsyncMock(side_effect=messages), len(ascii_body) + len(mixed_body),
+                                      ingress.IngressBudget())
+        guard.utf8 = mock.Mock(wraps=guard.utf8)
+        try:
+            self.assertIs(await guard(), messages[0])
+            guard.utf8.decode.assert_not_called()
+            self.assertIs(await guard(), messages[1])
+            calls = guard.utf8.decode.call_args_list
+            self.assertEqual([call.kwargs['final'] for call in calls], [False, False, True])
+            for call in calls:
+                view, = call.args
+                self.assertIsInstance(view, memoryview)
+                self.assertIs(view.obj, mixed_body)
+                self.assertLessEqual(len(view), block)
+        finally:
+            guard.close()
+
 
 class IngressASGITests(unittest.IsolatedAsyncioTestCase):
     def scope(self, path, headers=(), query=b''):

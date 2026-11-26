@@ -12,13 +12,13 @@ import inspect
 import json
 import time
 import uuid
-from contextlib import suppress
+from contextlib import aclosing, suppress
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
 import config as app_config
 import model_capabilities as mc
-from anti_truncation import TextTransport, supports_argument_stream
+from anti_truncation import TextTransport, buffered_sse, supports_argument_stream
 from express_endpoint import is_location_pin_failure
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from first_reply import (
@@ -33,13 +33,13 @@ from google.genai import types
 # 引入报错重试统计器
 from logger import stats
 from json_encoding import LargeJSONResponse
-from media_tasks import run_media_task
+from media_tasks import prompt_needs_media_pool, run_media_task
 from message_processing import (
     GIANT_CONTENT_THRESHOLD,
     convert_to_openai_format,
 )
-from models import OpenAIMessage, OpenAIRequest
-from prefill import PrefillDeduper, first_frames
+from models import OpenAIMessage, OpenAIRequest, wants_json_output
+from signature_origin import observe_stream_origin, publish_completed_origins
 from request_tracking import (
     attempt_started_at,
     record_usage,
@@ -55,15 +55,21 @@ from response_validation import (
     has_finish_reason,
     require_complete_response,
     require_unblocked_response,
+    validate_generation_finish_reason,
 )
 from retry_policy import (
+    advisory_fits,
+    advisory_headers,
+    exception_retry_after,
     exception_retry_delay,
     get_retry_settings,
     is_auth_or_billing_error,
     is_retryable_exception,
+    response_requests_delay,
     wait_for_retry,
 )
 from runtime_state import app_state
+from schema_validation import SchemaValidationError
 from tool_stream import ToolStreamAssembler
 from streaming import DONE_FRAME, HEARTBEAT_FRAME, MAX_ERROR_MESSAGE_CHARS
 from streaming import disconnected as _request_disconnected
@@ -77,13 +83,15 @@ from upstream_errors import (
 # api_helpers 访问的再导出面（tests/test_model_retry.py 等），其余为本
 # 文件自用。2026-11 审查收敛：原 8 条独立的 `import X as X` 语句合一。
 from upstreams.express_response import (  # noqa: F401
+    ChoicePrefills,
     ToolCallIndexer,
     _build_chunk_payload,
     _chunk_openai_response_dict_for_sse,
-    _dedup_chunk_payload,
     _prepend_prefill,
+    completed_response_needs_media_pool,
     convert_chunk_to_openai,
     is_gemini_response_valid,
+    iter_giant_chunk_payload,
     split_giant_chunk_payload,
 )
 from usage import make_usage_chunk, map_usage, merge_usage_metadata, usage_snapshot_unchanged, wants_usage
@@ -100,6 +108,11 @@ async def _cancel_attribution(request: Any) -> str:
     if await _request_disconnected(request):
         return "客户端已断开"
     return "任务被服务端取消（非客户端断开：可能为服务停机排空或续传超窗/请求超时取消）"
+
+
+def _can_immediately_unpin(error: Exception) -> bool:
+    # This compatibility fallback is a second generation, not part of setup.
+    return is_location_pin_failure(error) and not response_requests_delay(getattr(error, "response", None))
 
 
 def _pin_failure_fallback(fallback_model: str, error: Exception, get_fallback_client: Optional[Callable]):
@@ -235,13 +248,25 @@ async def _fake_stream_retry_target(
     return client, model, fallback_model
 
 
-def _fake_stream_error_payload(e: Exception) -> str:
+def _sdk_stream_error_payload(e: Exception) -> str:
     """外层异常 → SSE 错误帧 JSON（拆分自 gemini_fake_stream_generator）。"""
     msg = str(e)
     if len(msg) > MAX_ERROR_MESSAGE_CHARS:
         msg = msg[:MAX_ERROR_MESSAGE_CHARS] + "..."
     code, _ = extract_upstream_error(e)
-    return json.dumps(create_openai_error_response(code, msg, "server_error"))
+    payload = create_openai_error_response(code, msg, "server_error")
+    if hint := advisory_headers(e).get("retry-after"):
+        payload["error"]["retry_after"] = hint  # response headers have already been committed
+    return json.dumps(payload)
+
+
+async def _convert_completed_response(response: Any, request: OpenAIRequest) -> dict:
+    # Both paths keep the worker deadline, cancellation and slot-until-done
+    # contract; large, unknown and media shapes still use the media executor.
+    return await run_media_task(
+        convert_to_openai_format, response, request.model,
+        structured_output=wants_json_output(request), heavy=completed_response_needs_media_pool(response),
+    )
 
 
 async def _fake_stream_response_frames(
@@ -254,7 +279,7 @@ async def _fake_stream_response_frames(
 ) -> AsyncIterator[str]:
     """假流式的响应校验、转换与 SSE 发射（拆分自 gemini_fake_stream_generator）。
 
-    转换链（含生图落盘）搬媒体线程；转换完成后立即释放 SDK 响应引用
+    转换链搬工作线程，生图落盘仍在媒体池；转换完成后立即释放 SDK 响应引用
     （4K 生图内存关键点），发射完毕对巨帧触发针对性 GC 回收引用环。
     """
     require_unblocked_response(raw_gemini_response)
@@ -265,12 +290,9 @@ async def _fake_stream_response_frames(
         decoder.validate_end()
     if not is_gemini_response_valid(raw_gemini_response):
         raise ValueError("上游假流式响应无有效内容。")
-    # PRF-P1-1：同非流式路径——转换链含生图落盘，搬进媒体线程。
-    openai_response_dict = await run_media_task(
-        convert_to_openai_format, raw_gemini_response, request_obj.model,
-        heavy=True,
-    )
+    openai_response_dict = await _convert_completed_response(raw_gemini_response, request_obj)
     _prepend_prefill(openai_response_dict, prefill_text)
+    publish_completed_origins(request_obj._signature_output_prefix, openai_response_dict["choices"])
     _record_usage(raw_gemini_response)
     # 4K 生图内存关键点：响应对象持有整张图的原始 bytes（0.75× base64
     # 体积）；转换完成后本参数引用立即断开（调用方的同名局部与
@@ -280,14 +302,20 @@ async def _fake_stream_response_frames(
     raw_gemini_response = None
     # 巨帧标记：发射完成后据此触发针对性 GC（见下）。
     _giant = _response_has_giant_content(openai_response_dict)
-    async for chunk_sse in _chunk_openai_response_dict_for_sse(
-        openai_response_dict=openai_response_dict
-    ):
+    select_order = request_obj._select_buffered_order
+    # Only a small, complete Claude tool turn needs its one authoritative delta.
+    # Standard OpenAI fake streaming and giant/media frame pacing stay unchanged.
+    if select_order is not None and select_order(openai_response_dict):
+        frames = buffered_sse(openai_response_dict).body_iterator
+    else:
+        frames = _chunk_openai_response_dict_for_sse(openai_response_dict=openai_response_dict)
+    async for chunk_sse in frames:
         if chunk_sse.strip() == DONE_FRAME.strip() and wants_usage(request_obj):
             yield make_usage_chunk(
                 openai_response_dict["id"],
                 request_obj.model,
                 openai_response_dict.get("usage", {}),
+                created=openai_response_dict["created"],
             )
         yield chunk_sse
     # 发射完毕先断开本帧对 25MB+ content 的最后一处本地引用（走引用
@@ -411,7 +439,7 @@ async def gemini_fake_stream_generator(
                 if (
                     fallback_model
                     and model_for_api_call != fallback_model
-                    and is_location_pin_failure(e_call)
+                    and _can_immediately_unpin(e_call)
                 ):
                     # REQ-P1-1：记录失败路径，重选到同一把 Key 时上方
                     # retry_pending 分支会直接改用裸模型名，避免重复白烧。
@@ -429,15 +457,17 @@ async def gemini_fake_stream_generator(
                     credential_describer, e_call, warned_credentials
                 )
                 if (
-                    is_retryable_exception(e_call) or bad_credential
-                ) and attempt < max_retries:
-                    if bad_credential:
+                    (is_retryable_exception(e_call) or bad_credential)
+                    and attempt < max_retries
+                    and advisory_fits(exception_retry_after(e_call), fastapi_request)
+                ):
+                    if bad_credential and not advisory_headers(e_call):
                         print(
                             f"⚠️ [凭证隔离] 假流式检测到坏凭证（{e_call.__class__.__name__}），跳过退避等待，立即切换下一个 Express Key。"
                         )
                     else:
                         wait_time = exception_retry_delay(
-                            e_call, backoff_sec, attempt, jitter_sec
+                            e_call, backoff_sec, attempt, jitter_sec, identity_rotates=False
                         )
                         print(
                             f"⚠️ [自动重试] 假流式上游繁忙（{e_call.__class__.__name__}），"
@@ -477,19 +507,21 @@ async def gemini_fake_stream_generator(
         if raw_gemini_response is None:
             raise last_error or ValueError("上游未返回任何响应（重试已耗尽）。")
 
-        # 4K 生图内存关键点：发射前断开本层对 SDK 响应树的最后两处引用
-        # （api_call_task 的结果仍引用着整张图的原始 bytes）。
-        response_arg = raw_gemini_response
-        raw_gemini_response = None
-        api_call_task = None
-        async for frame in _fake_stream_response_frames(
-            response_arg,
+        # Give the converting iterator sole ownership of the SDK response.
+        # A local alias or the completed Task's result would retain the image
+        # even after conversion, for as long as the consumer stalls on SSE.
+        frames = _fake_stream_response_frames(
+            raw_gemini_response,
             request_obj,
             prefill_text=prefill_text,
             text_transport=text_transport,
             fake_stream_started=fake_stream_started,
-        ):
-            yield frame
+        )
+        raw_gemini_response = None
+        api_call_task = None
+        async with aclosing(frames):
+            async for frame in frames:
+                yield frame
 
     except asyncio.CancelledError:
         print(
@@ -506,7 +538,7 @@ async def gemini_fake_stream_generator(
         print(
             f"❌ [API 错误响应] 假流发生器运行崩溃 (Model: {request_obj.model})。错误详情: {err_msg_detail}"
         )
-        json_payload_error = _fake_stream_error_payload(e_outer_gemini)
+        json_payload_error = _sdk_stream_error_payload(e_outer_gemini)
         if not is_auto_attempt:
             # 流式响应已是 200，中间件按状态码计不到这次失败，这里补记
             # （auto 模式抛给外层通道接管，由外层统一计数，避免双计）
@@ -533,7 +565,7 @@ class _StreamMeters:
     __slots__ = (
         "received_chunks", "content_chars", "reasoning_chars", "tool_deltas",
         "usage_metadata", "final_usage", "final_p_tk", "final_c_tk",
-        "final_t_tk", "seen_candidates", "finished_candidates",
+        "final_t_tk", "candidate_finishes",
         "finish_reasons", "deferred_finishes",
     )
 
@@ -552,8 +584,7 @@ class _StreamMeters:
         self.final_p_tk = 0
         self.final_c_tk = 0
         self.final_t_tk = 0
-        self.seen_candidates: set = set()
-        self.finished_candidates: set = set()
+        self.candidate_finishes: dict[int, str | None] = {}
         self.finish_reasons: set = set()
         self.deferred_finishes: list = []
 
@@ -572,13 +603,31 @@ class _StreamMeters:
         self.final_c_tk = self.final_usage["completion_tokens"]
         self.final_t_tk = self.final_usage["total_tokens"]
 
-    def note_candidates(self, chunk: Any) -> None:
-        """n>1：按候选序号登记出现与结束标记。"""
-        for ci, candidate in enumerate(chunk.candidates or []):
+    def check_candidates(self, chunk: Any) -> Any:
+        """Check the raw batch before assemblers or clients consume any of its parts."""
+        candidates = chunk.candidates or ()
+        normalized = None
+        for ci, candidate in enumerate(candidates):
             index = candidate.index if candidate.index is not None else ci
-            self.seen_candidates.add(index)
-            if has_finish_reason(candidate.finish_reason):
-                self.finished_candidates.add(index)
+            reason = candidate.finish_reason
+            finish = str(getattr(reason, "value", reason)).upper() if has_finish_reason(reason) else None
+            if finish is not None:
+                validate_generation_finish_reason(finish)  # surface actual provider failures first
+            previous = self.candidate_finishes.get(index)
+            if previous is None:
+                self.candidate_finishes[index] = finish
+                continue
+            if getattr(getattr(candidate, "content", None), "parts", None):
+                raise IncompleteResponseError("上游候选已结束，却继续返回内容。")
+            if finish is not None:
+                if finish != previous:
+                    raise IncompleteResponseError("上游候选返回了相互矛盾的结束原因。")
+                # An idempotent trailer is not a second finish. Keep its choice
+                # slot and optional metadata; never mutate the original SDK item.
+                if normalized is None:
+                    normalized = list(candidates)
+                normalized[ci] = candidate.model_copy(update={"finish_reason": None})
+        return chunk if normalized is None else chunk.model_copy(update={"candidates": normalized})
 
     def note_delta(self, delta: dict) -> None:
         """正文/思考/工具增量计量（完成日志与空响应校验的数据源）。"""
@@ -598,7 +647,7 @@ def _arg_stream_rejected(exc: Exception, gen_config_dict: Dict[str, Any]) -> boo
     返回 400 且错误文案点名 streamFunctionCallArguments / partialArgs
     （下划线归一后匹配）。字段由调用方摘除，只降级一次。
     """
-    if error_status(exc) != 400:
+    if error_status(exc) != 400 or response_requests_delay(getattr(exc, "response", None)):
         return False
     fcc = gen_config_dict.get("tool_config", {}).get(
         "function_calling_config", {}
@@ -621,7 +670,7 @@ def _retry_wait_time(
     attempt_started: float,
 ) -> float:
     """可重试失败的退避时长（0.0 = 坏凭证立即切换，对齐上游隔离语义）。"""
-    if bad_credential:
+    if bad_credential and not advisory_headers(exc):
         print(
             f"⚠️ [凭证隔离] 检测到坏凭证（{type(exc).__name__}），"
             f"跳过退避等待，立即切换下一个 Express Key。"
@@ -629,7 +678,7 @@ def _retry_wait_time(
         return 0.0
     # F-5：退避时长改读控制台的 retry_backoff_seconds，原先硬编码
     # 2**(attempt%4)，控制台设置对真流式完全没作用。
-    wait_time = exception_retry_delay(exc, backoff_sec, attempt, jitter_sec)
+    wait_time = exception_retry_delay(exc, backoff_sec, attempt, jitter_sec, identity_rotates=False)
     code, _ = extract_upstream_error(exc)
     elapsed = time.monotonic() - attempt_started
     # 首回复超时等有完整中文说明的异常直接展示 message，与 429 重试
@@ -676,6 +725,7 @@ class SDKGeneration:
     # 都新建，id() 不稳定；而钉定路径含 Project ID，天然按键区分。
     failed_pin_paths: set = field(default_factory=set)
     response_id_for_stream: str = ""
+    stream_created: int = field(init=False)
 
     async def response(self) -> Response:
         if not self.request_obj.stream:
@@ -733,8 +783,9 @@ class SDKGeneration:
                 # Native partial arguments and SDK automatic tool execution are
                 # mutually exclusive. Clients own execution in both protocols.
                 self.gen_config_dict["automatic_function_calling"] = {"disable": True}
+            self.stream_created = int(time.time())
             self.response_id_for_stream = (
-                f"chatcmpl-realstream-{int(time.time())}-{uuid.uuid4().hex[:12]}"
+                f"chatcmpl-realstream-{self.stream_created}-{uuid.uuid4().hex[:12]}"
             )
             frames = self.stream_frames()
         return StreamingResponse(frames, media_type="text/event-stream")
@@ -873,7 +924,7 @@ class SDKGeneration:
                     self.fallback_model
                     and self.model_to_call != self.fallback_model
                     and not has_yielded
-                    and is_location_pin_failure(e_stream_call)
+                    and _can_immediately_unpin(e_stream_call)
                 ):
                     self.failed_pin_paths.add(self.model_to_call)
                     self.model_to_call, self.current_client = _pin_failure_fallback(
@@ -889,6 +940,7 @@ class SDKGeneration:
                     and not has_yielded
                     and not target_unavailable
                     and attempt < max_retries
+                    and advisory_fits(exception_retry_after(e_stream_call), self.fastapi_request)
                 ):
                     wait_time = _retry_wait_time(
                         e_stream_call,
@@ -898,22 +950,22 @@ class SDKGeneration:
                         jitter_sec=jitter_sec,
                         attempt_started=attempt_started,
                     )
+                    retry_at = time.monotonic() + wait_time
                     if await _request_disconnected(self.fastapi_request):
                         print(
                             f"ℹ️ [客户端断开] 重试前检测到客户端已断开，停止调用模型 {self.model_to_call}。"
                         )
                         return
-                    # 退避等待期间持续吐 SSE 心跳，保活前端连接
-                    _waited = 0.0
-                    while _waited < wait_time:
-                        step = min(3.0, wait_time - _waited)
-                        if not await wait_for_retry(self.fastapi_request, step):
+                    # Downstream backpressure while yielding a heartbeat spends
+                    # the same wall-clock backoff; never sleep the interval twice.
+                    while (remaining := retry_at - time.monotonic()) > 0:
+                        if not await wait_for_retry(self.fastapi_request, min(3.0, remaining)):
                             print(
                                 f"ℹ️ [客户端断开] 重试等待期间检测到客户端已断开，停止调用模型 {self.model_to_call}。"
                             )
                             return
-                        _waited += step
-                        yield ": keep-alive\n\n"
+                        if time.monotonic() < retry_at:
+                            yield HEARTBEAT_FRAME
                     attempt += 1
                     retry_pending = True
                     continue
@@ -922,18 +974,13 @@ class SDKGeneration:
                 print(
                     f"❌ [API 错误响应] 流式连接异常中断 (Model: {self.model_to_call})。错误详情: {err_msg_detail_stream}"
                 )
-                s_err = str(e_stream_call)
-                s_err = (s_err[:MAX_ERROR_MESSAGE_CHARS] + "..."
-                         if len(s_err) > MAX_ERROR_MESSAGE_CHARS else s_err)
                 if self.is_auto_attempt:
                     raise e_stream_call
                 # 流式响应已是 200，中间件按状态码计不到这次失败，
                 # 这里补记（auto 模式抛给外层通道接管，由外层计数）
                 stats.add_error()
                 # 已有内容时不重试，但必须告知失败，不能把半截答案伪装成正常结束。
-                code, _ = extract_upstream_error(e_stream_call)
-                err_resp = create_openai_error_response(code, s_err, "server_error")
-                yield f"data: {json.dumps(err_resp)}\n\n"
+                yield f"data: {_sdk_stream_error_payload(e_stream_call)}\n\n"
                 yield "data: [DONE]\n\n"
                 return
             finally:
@@ -954,7 +1001,7 @@ class SDKGeneration:
         """
         meters = _StreamMeters()
         # 预填充智能兼容：把预填充文本作为回复开头先发出（仅一次）；
-        # 同时启用流式去重器，模型若复述预填充开头会被自动裁掉（n>1 时不启用）。
+        # 按真实候选 index 独立裁剪模型可能复述的前缀，重试时重建。
         # 每次 attempt 都重置 tool_calls 序号（重试会重发整轮）
         tool_indexer = ToolCallIndexer(
             keep_unsigned_parts=self.text_transport is None
@@ -969,16 +1016,9 @@ class SDKGeneration:
             and self.gen_config_dict.get("tool_config", {}).get("function_calling_config", {}).get("stream_function_call_arguments")
             else None
         )
-        deduper = (
-            PrefillDeduper(self.prefill_text)
-            if (self.prefill_text and (self.request_obj.n or 1) == 1)
-            else None
-        )
-        _pf_frames = first_frames(
-            self.response_id_for_stream,
-            self.request_obj.model,
-            self.prefill_text,
-            self.request_obj.n or 1,
+        prefills = (
+            ChoicePrefills(self.prefill_text, self.response_id_for_stream, self.request_obj.model, self.stream_created)
+            if self.prefill_text else None
         )
         # 按 choice index 追踪首帧：OpenAI 官方帧序的首个 delta
         # 携带 role:"assistant"（Cookie 通道同口径；旧实现缺失，
@@ -1008,7 +1048,7 @@ class SDKGeneration:
 
             # 支持 n>1：按候选序号逐个输出
             require_unblocked_response(chunk_item_call)
-            meters.note_candidates(chunk_item_call)
+            chunk_item_call = meters.check_candidates(chunk_item_call)
             if text_decoder:
                 chunk_item_call = text_decoder.restore_sdk(chunk_item_call)
             if tool_assembler:
@@ -1019,7 +1059,7 @@ class SDKGeneration:
             for ci in range(num_candidates):
                 payload = self._prepare_candidate_payload(
                     chunk_item_call, ci,
-                    tool_indexer=tool_indexer, deduper=deduper,
+                    tool_indexer=tool_indexer, prefills=prefills,
                     roles_sent=roles_sent,
                 )
                 if payload is None:
@@ -1044,10 +1084,13 @@ class SDKGeneration:
                     or delta.get("reasoning_content")
                     or delta.get("tool_calls")
                     or signature
+                    or "logprobs" in choice
                     or choice.get("finish_reason")
                 ):
                     continue
-                if choice.get("finish_reason") and not meters.has_any_output():
+                if choice.get("finish_reason") and not (
+                    meters.has_any_output() or (prefills and prefills.received_text(choice["index"]))
+                ):
                     # 有些前端收到 finish_reason 就结束读取；先校验空响应，
                     # 避免成功结束帧遮住后续的明确错误。
                     meters.deferred_finishes.append(payload)
@@ -1057,7 +1100,7 @@ class SDKGeneration:
                     # （旧实现每个元数据 chunk 序列化两次）；巨帧
                     # （>1MiB delta.content，生图/未来直出路径）先拆
                     # 成 256KiB 增量帧再落缓冲，避免单帧三份全量拷贝。
-                    for _sub in split_giant_chunk_payload(payload):
+                    for _sub in iter_giant_chunk_payload(payload):
                         frame_text = json.dumps(_sub, ensure_ascii=False)
                         pending_metadata.add(
                             frame_text, len(frame_text.encode("utf-8"))
@@ -1065,9 +1108,8 @@ class SDKGeneration:
                     continue
                 for metadata in pending_metadata.drain():
                     yield f"data: {metadata}\n\n"
-                if self.prefill_text and not has_yielded:
-                    for _pf_chunk in _pf_frames:
-                        yield f"data: {json.dumps(_pf_chunk, ensure_ascii=False)}\n\n"
+                if prefills and (prefix := prefills.first(choice["index"])):
+                    yield prefix
                 if not has_yielded:
                     # 对齐上游：首个真实输出帧时明确告知流式已建立
                     print(
@@ -1076,40 +1118,21 @@ class SDKGeneration:
                 has_yielded = True
                 # 巨帧拆分（同上）：单帧 json.dumps + f-string + ASGI
                 # encode 瞬间三份全量拷贝，512MB 容器叠加即 OOMKill。
-                for _sub in split_giant_chunk_payload(payload):
+                for _sub in iter_giant_chunk_payload(payload):
                     yield f"data: {json.dumps(_sub, ensure_ascii=False)}\n\n"
 
         if tool_assembler:
             tool_assembler.validate_end()
         if text_decoder:
             text_decoder.validate_end()
-        if meters.seen_candidates - meters.finished_candidates:
+        if None in meters.candidate_finishes.values():
             raise IncompleteResponseError(
                 "上游流式回复缺少候选结束标记，内容可能不完整。"
             )
-        # 去重器可能还攒着开头文本（上游没发 finish chunk 的场景）
-        if deduper is not None and not deduper.done:
-            tail = deduper.flush()
-            if tail:
-                if self.prefill_text and not has_yielded:
-                    for _pf_chunk in _pf_frames:
-                        yield f"data: {json.dumps(_pf_chunk, ensure_ascii=False)}\n\n"
-                has_yielded = True
-                meters.content_chars += len(tail)
-                _tail = {
-                    "id": self.response_id_for_stream,
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": self.request_obj.model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"content": tail},
-                            "finish_reason": None,
-                        }
-                    ],
-                }
-                yield f"data: {json.dumps(_tail, ensure_ascii=False)}\n\n"
+        if prefills:
+            for frame, chars in prefills.flush():
+                meters.content_chars += chars
+                yield frame
 
         if meters.final_p_tk > 0 or meters.final_c_tk > 0:
             print(
@@ -1123,9 +1146,8 @@ class SDKGeneration:
         # 结束标记或签名单独到达也会设置 has_yielded，但它们不是回复内容。
         # 安全拦截允许空正文；只有思考的合法响应保留，同时明确提示诊断。
         if not (
-            meters.content_chars
-            or meters.reasoning_chars
-            or meters.tool_deltas
+            meters.has_any_output()
+            or (prefills and prefills.received_text())
             or "content_filter" in meters.finish_reasons
         ):
             hint = (
@@ -1168,6 +1190,7 @@ class SDKGeneration:
                     "completion_tokens": meters.final_c_tk,
                     "total_tokens": meters.final_t_tk,
                 },
+                created=self.stream_created,
             )
 
         yield "data: [DONE]\n\n"
@@ -1177,7 +1200,7 @@ class SDKGeneration:
         return
 
     def _prepare_candidate_payload(
-        self, chunk_item_call: Any, ci: int, *, tool_indexer: ToolCallIndexer, deduper: Optional[PrefillDeduper], roles_sent: set
+        self, chunk_item_call: Any, ci: int, *, tool_indexer: ToolCallIndexer, prefills: Optional[ChoicePrefills], roles_sent: set
     ):
         """单候选帧的载荷准备（QUA-P1-1 拆分）：构建 → 去重 → role 注入。
 
@@ -1189,13 +1212,16 @@ class SDKGeneration:
             self.request_obj.model,
             self.response_id_for_stream,
             ci,
-            indexer=tool_indexer,
+            indexer=tool_indexer, structured_output=wants_json_output(self.request_obj),
+            created=self.stream_created,
         )
-        if deduper is not None:
-            chunk_payload = _dedup_chunk_payload(chunk_payload, deduper)
+        if prefills is not None:
+            chunk_payload = prefills.apply(chunk_payload)
             if chunk_payload is None:
                 return None
         choice = (chunk_payload.get("choices") or [{}])[0]
+        if self.request_obj._signature_output_prefix and not self.prefill_text:
+            observe_stream_origin(tool_indexer.signature_origins, self.request_obj._signature_output_prefix, choice)
         delta = choice.get("delta") or {}
         # 首帧补 role（预填充先行帧已自带，不重复注入）。
         if (
@@ -1270,7 +1296,7 @@ class SDKGeneration:
                 if (
                     self.fallback_model
                     and self.model_to_call != self.fallback_model
-                    and is_location_pin_failure(e_call)
+                    and _can_immediately_unpin(e_call)
                 ):
                     # REQ-P1-1：记录失败路径；重选到同一把 Key 时
                     # select_retry_target 会直接改用裸模型名，避免重复白烧。
@@ -1287,15 +1313,16 @@ class SDKGeneration:
                     (is_retryable_exception(e_call) or bad_credential)
                     and not target_unavailable
                     and attempt < max_retries
+                    and advisory_fits(exception_retry_after(e_call), self.fastapi_request)
                 ):
-                    if bad_credential:
+                    if bad_credential and not advisory_headers(e_call):
                         print(
                             f"⚠️ [凭证隔离] 非流式检测到坏凭证（{e_call.__class__.__name__}），"
                             f"跳过退避等待，立即切换下一个 Express Key。"
                         )
                     else:
                         wait_time = exception_retry_delay(
-                            e_call, backoff_sec, attempt, jitter_sec
+                            e_call, backoff_sec, attempt, jitter_sec, identity_rotates=False
                         )
                         detail = (
                             str(e_call).rstrip("。")
@@ -1366,16 +1393,12 @@ class SDKGeneration:
 
         _record_usage(response_obj_call)
 
-        # PRF-P1-1：转换链内含生图 base64 解码 + 落盘（4K 可达数十 MB，
-        # 100-500ms 同步停顿），整体搬进媒体线程，事件循环只等结果。
-        openai_response_content = await run_media_task(
-            convert_to_openai_format, response_obj_call, self.request_obj.model,
-            heavy=True,
-        )
+        openai_response_content = await _convert_completed_response(response_obj_call, self.request_obj)
         # 与假流式路径同因：释放 SDK 响应（持有图片原始 bytes），
         # 避免与 JSON 序列化拷贝叠加驻留。
         response_obj_call = None
         _prepend_prefill(openai_response_content, self.prefill_text)
+        publish_completed_origins(self.request_obj._signature_output_prefix, openai_response_content["choices"])
         # 巨帧（4K 生图）主动回收 SDK/pydantic 引用环（同假流式路径）。
         # Encode giant strings in bounded slices into the final byte buffer;
         # unlike pre-serializing with dumps(), this also avoids its accumulator
@@ -1404,9 +1427,12 @@ async def execute_gemini_call(
     credential_describer: Optional[Callable[[], str]] = None,
 ) -> Response:
     """Prepare the prompt once, then delegate delivery to a request-local context."""
-    # PRF-P1-5：prompt 构建是每请求必经的轻载路径，走 prep 池，
-    # 绝不排在重图片解码（media 池）后面。
-    actual_prompt_for_call = await run_media_task(prompt_func, request_obj.messages, heavy=False)
+    try:
+        actual_prompt_for_call = await run_media_task(
+            prompt_func, request_obj.messages, heavy=prompt_needs_media_pool(request_obj.messages)
+        )
+    except SchemaValidationError as exc:
+        return JSONResponse(status_code=400, content=create_openai_error_response(400, str(exc), "invalid_request_error"))
     print(
         f"🚀 [上游请求] 正在调用 Agent Platform Express Mode 模型 {model_to_call}，客户端请求模型名为 {request_obj.model}。"
     )

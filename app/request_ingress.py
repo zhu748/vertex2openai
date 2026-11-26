@@ -12,6 +12,7 @@ UPLOAD_IDLE_SECONDS = 15.0
 UPLOAD_TOTAL_SECONDS = 120.0
 MAX_JSON_DEPTH = 64
 MAX_JSON_ITEMS = 100_000
+_UTF8_BLOCK_BYTES = 64 * 1024
 _SPECIAL = re.compile(rb'["\\{}\[\],:]')
 _STRING_SPECIAL = re.compile(rb'["\\]')
 
@@ -137,6 +138,23 @@ class JSONPreflight:
         return self.items - before
 
 
+def _validate_utf8(decoder: codecs.IncrementalDecoder, body: bytes, final: bool) -> None:
+    if body.isascii() and not decoder.getstate()[0]:
+        return  # Nothing pending from the preceding ASGI message.
+    try:
+        if len(body) <= _UTF8_BLOCK_BYTES:
+            decoder.decode(body, final=final)
+            return
+        # The decoded text is discarded: bound its transient allocation even
+        # when the server delivers a whole media upload as one ASGI message.
+        view = memoryview(body)
+        for start in range(0, len(view), _UTF8_BLOCK_BYTES):
+            end = start + _UTF8_BLOCK_BYTES
+            decoder.decode(view[start:end], final=final and end >= len(view))
+    except UnicodeDecodeError:
+        raise IngressError(400, "请求体必须包含有效的 UTF-8 文本。") from None
+
+
 class IngressReceive:
     def __init__(self, receive, max_bytes, budget=None):
         self.receive = receive
@@ -144,6 +162,7 @@ class IngressReceive:
         self.budget = budget if budget is not None else ingress_budget
         self.held = [0, 0, 0]
         self._owners = 1
+        self._expanded = 0
         self._closed = False
         self._lock = threading.Lock()
         self.done = False
@@ -170,11 +189,7 @@ class IngressReceive:
                 from request_connection import BodyTooLargeError
                 raise BodyTooLargeError(self.max_bytes)
             final = not message.get("more_body", False)
-            if not body.isascii() or self.utf8.getstate()[0]:
-                try:
-                    self.utf8.decode(body, final=final)
-                except UnicodeDecodeError:
-                    raise IngressError(400, "请求体必须包含有效的 UTF-8 文本。") from None
+            _validate_utf8(self.utf8, body, final)
             items = self.preflight.feed(body, final=final)
             self.budget.reserve((0, len(body), items))
             self.held[1] += len(body)
@@ -188,6 +203,21 @@ class IngressReceive:
                     self.budget.release((self.held[0], 0, 0))
                     self.held[0] = 0
         return message
+
+    def reserve_expansion(self, total):
+        """Charge compact local image references like their expanded request bytes.
+
+        A second preparation (e.g. channel fallback) uses the existing reservation;
+        cancellation/streaming retain and release it with the original input lease.
+        """
+        with self._lock:
+            extra = max(0, total - self._expanded)
+            if extra:
+                if self.held[1] + extra > self.max_bytes:
+                    raise IngressError(413, "历史图片展开后超过请求大小上限。请减少图片数量。")
+                self.budget.reserve((0, extra, 0))
+                self.held[1] += extra
+                self._expanded = total
 
     def close(self):
         with self._lock:

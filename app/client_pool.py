@@ -32,8 +32,7 @@ from proxy_resolver import resolve_proxy_uri, current_proxy_usage
 from express_fingerprint import get_express_ua_profile, get_express_ua_custom
 from http_options import get_http_options
 
-# SDK Client 池基准上限；实际生效上限在 SdkClientPool.get 里随 Key 数动态
-# 上调（PRF-P1-2，见 _sdk_pool_max），控制台增删 Key 后自动跟随。
+# SDK 主缓存的默认下限；未显式钉住时容量跟随控制台的 Key 数量。
 _SDK_POOL_MAX = 6
 # 空闲客户端复用窗口；活跃请求由显式引用保护，不受此时限影响
 _GRACE_CLOSE_SECONDS = 60.0  # idle reuse window; active leases never expire
@@ -46,8 +45,8 @@ def _sdk_pool_max() -> int:
     其客户端几乎必已被淘汰——退化为每请求新建 genai.Client（新 httpx
     连接池 + TCP/TLS 握手 100-300ms）+ 60 秒延迟关闭任务，池化收益在
     最需要它的多 Key 场景完全反转，极端并发下逼近 _max_pending 上限。
-    空闲 SDK 客户端的内存开销极小，跟随 Key 数没有代价。
-    SDK_POOL_MAX 环境变量可显式钉住（≥1），适合内存受限部署。
+    SDK_POOL_MAX 可显式钉住主缓存的容量（≥1）；退役客户端仍由关闭器
+    管理，确保活跃请求不被截断。
     """
     pinned = app_config.env_str("SDK_POOL_MAX")  # QUA-P2-7：环境读取走 config 集中层
     if pinned:
@@ -225,7 +224,7 @@ _closer = _GracefulCloser()
 
 
 class SdkClientPool:
-    """genai.Client 池：api_key → (签名, Client)，LRU 上限随 Key 数动态上调。"""
+    """genai.Client 池：api_key → (签名, Client)，LRU 上限由 Key 数或固定配置决定。"""
 
     def __init__(self, maxsize: int = _SDK_POOL_MAX):
         self._lock = threading.Lock()
@@ -240,25 +239,29 @@ class SdkClientPool:
         None = 跟随全局；"" = 直连；其余 = 该 URI（vless:// 等分享链接
         在签名/构造时统一转本地 socks5）。
 
-        maxsize：PRF-P1-2 动态上限提示（仅上调不收缩）——Express 通道
-        传入跟随 Key 数的上限，多 Key 轮询不再被固定容量误淘汰；
-        不传则维持构造时的容量（测试直连池时行为不变）。
+        maxsize：主缓存的生效容量，可增可减；不传则维持当前容量。
+        收缩时优先保留本次请求的 Key，淘汰项仍受活跃引用保护。
 
         调用方**不要关闭**返回的 Client——它的生命周期由池管理
         （签名变化 / LRU 淘汰时延迟统一回收）。
         """
         api_key = api_key or ""
-        if maxsize is not None and maxsize > self._maxsize:
-            with self._lock:
-                if maxsize > self._maxsize:
-                    self._maxsize = maxsize
         sig = _sdk_signature(key_proxy)
         with self._lock:
-            entry = self._clients.get(api_key)
-            if entry is not None and entry[0] == sig:
-                # LRU 触碰：pop 再放回，保持 dict 插入序 = 最近使用序
-                self._clients.pop(api_key)
+            if maxsize is not None:
+                self._maxsize = max(1, maxsize)
+            # Touch before trimming so even a hit observes a lowered limit.
+            entry = self._clients.pop(api_key, None)
+            if entry is not None:
                 self._clients[api_key] = entry
+            while len(self._clients) > self._maxsize:
+                key, (old_sig, old_client) = next(iter(self._clients.items()))
+                # Reserve retirement before dropping ownership. A full queue
+                # can reject the trim; the next lookup retries the remainder.
+                _closer.schedule(_make_sdk_closer(old_client),
+                                 key=("sdk", id(self), key, old_sig), resource=old_client)
+                del self._clients[key]
+            if entry is not None and entry[0] == sig:
                 return _closer.track(entry[1])
 
         retired_key = ("sdk", id(self), api_key, sig)
@@ -417,7 +420,7 @@ def get_pooled_express_client(api_key: str, key_proxy: Optional[str] = None) -> 
     完成「Key 级优先 / direct / 全局兑底」的裁决后再传入。
     解析失败（如 sing-box 缺失）抛 ProxyResolveError。
 
-    PRF-P1-2：池上限随 Key 数动态上调（SDK_POOL_MAX 可钉住），
+    PRF-P1-2：池上限随 Key 数调整（SDK_POOL_MAX 可钉住），
     多 Key 轮询时客户端不再被固定容量 LRU 误淘汰。
     """
     return express_sdk_pool.get(api_key, key_proxy, maxsize=_sdk_pool_max())

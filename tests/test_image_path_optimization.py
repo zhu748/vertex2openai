@@ -30,6 +30,7 @@
     4K 高细节 PNG）；流式解析器上限语义不变。
 """
 
+from settings_fixture import saved_settings
 import asyncio
 import io
 import json
@@ -213,11 +214,7 @@ class FlattenTransparencyTests(unittest.TestCase):
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         settings = settings or _settings()
-        with mock.patch.object(
-            image_processing.app_state,
-            "get_setting",
-            side_effect=lambda key, default=None: settings.get(key, default),
-        ):
+        with saved_settings(image_processing.app_state, settings):
             return image_processing.optimize_image_bytes(buf.getvalue(), "image/png")
 
     def _open(self, data):
@@ -648,9 +645,9 @@ class CookieCollectMemoryContractTests(unittest.TestCase):
         captured = []
         real_extract = cd.extract_events
 
-        def spying_extract(obj):
+        def spying_extract(obj, **kwargs):
             captured.append(obj)
-            return real_extract(obj)
+            return real_extract(obj, **kwargs)
 
         chunk_checks = []
 

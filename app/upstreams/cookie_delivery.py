@@ -12,10 +12,11 @@ import asyncio
 import json
 import time
 import traceback
+from collections.abc import Iterable, Iterator
+from itertools import chain
 
 from anti_truncation import buffered_sse
 from fastapi.responses import JSONResponse
-import image_delivery
 from media_tasks import run_media_task
 from upstreams.cookie_request import build_request_body_async
 from dataclasses import dataclass, field
@@ -28,29 +29,33 @@ if TYPE_CHECKING:
     from fastapi.responses import Response
     from models import OpenAIRequest
 
-import config as app_config
 from cookie_auth import BATCH_GRAPHQL_URL, build_headers
 from credential_manager import credential_manager
 from first_reply import timed_call
 from impersonate import open_upstream_client
 from logger import stats
 from json_encoding import LargeJSONResponse
-from message_processing import _create_safety_ratings_html
+from message_processing import iter_giant_content, safety_ratings_presentation
+from models import wants_json_output
+from signature_origin import OriginBatch, publish_completed_origins
 from prefill import PrefillDeduper, strip_prefill_overlap
 from request_tracking import (
     upstream_attempt,
     upstream_chunk,
 )
 from response_validation import (
-    FINISH_CONTENT_FILTER,
     AntiTruncationError,
     IncompleteResponseError,
     map_finish_reason_to_openai,
     require_finish_reason,
+    require_unique_tool_call_ids,
 )
-from retry_policy import is_retryable_exception, is_retryable_status
+from retry_policy import (advisory_fits, is_retryable_exception, is_retryable_status,
+                          response_requests_delay, response_retry_after, retry_after_seconds)
 from runtime_state import app_state
+from schema_validation import SchemaValidationError
 from streaming import HEARTBEAT, HEARTBEAT_FRAME, with_heartbeats
+from tool_policy import requires_tool_call
 from thought_signatures import (
     ordinary_part_metadata,
     thought_signature_extra,
@@ -61,7 +66,9 @@ from upstreams.cookie_response import (
     CompleteTextObjectCursor,
     RawSampler,
     apply_wire_signature,
+    CookieCandidateBoundary,
     extract_events,
+    has_pending_inline_image,
     make_openai_chunk,
     iter_openai_content_chunks,
     openai_tool_call,
@@ -71,6 +78,7 @@ from upstreams.cookie_transport import (
     cookie_retry_backoff,
     cookie_retry_backoff_heartbeats,
     is_native_tool_error_response,
+    is_native_tool_rejection,
     stream_events,
 )
 from usage import (
@@ -91,6 +99,10 @@ _THINKING_RUNAWAY_HINT = (
 _NO_BODY_HINT = "可能被安全策略拦截或接口行为变化；原始响应样本已写入运行日志，可到大盘“运行日志”页查看。"
 
 
+
+
+def _choice_frame(gen: "CookieGeneration", **delta: Any) -> str:
+    return make_openai_chunk(gen.response_id, gen.model_display, created=gen.response_created, **delta)
 
 
 def _no_body_detail(finish_raw: Optional[str], blocked_msg: Optional[str]) -> str:
@@ -121,10 +133,9 @@ def _no_body_outcome(
     """
     detail = _no_body_detail(finish_raw, blocked_msg)
     desc, hint = _no_body_desc_hint(has_thought, strip_thoughts)
-    filtered = bool(blocked_msg) or (
-        (finish_raw or "").upper() in FINISH_CONTENT_FILTER
-    )
-    finish = "content_filter" if filtered else "stop"
+    finish = "content_filter" if blocked_msg else map_finish_reason_to_openai(finish_raw)
+    if finish == "tool_calls":
+        raise IncompleteResponseError("上游标记工具调用结束，但未返回任何工具调用。")
     notice = f"[Studio 提示] 上游{desc}（{detail}）。{hint}"
     return desc, detail, notice, finish
 
@@ -196,6 +207,7 @@ async def _attempt_context(gen: "CookieGeneration", body_cache: _RequestBodyCach
     fallback_body = (
         body_cache.degraded
         if gen.native_custom_tools
+        and not requires_tool_call(gen.request_obj.tool_choice)
         and use_native_tools
         and not gen.text_transport
         else None
@@ -240,15 +252,6 @@ class _BackoffPolicy:
         )
 
 
-def _safety_html_if_enabled(ratings: Any) -> str:
-    """开关打开时把 batchGraphql 的 safetyRatings 渲染成附加块，否则空串。"""
-    if not ratings:
-        return ""
-    if not app_state.get_setting("safety_score", app_config.SAFETY_SCORE):
-        return ""
-    return _create_safety_ratings_html(ratings)
-
-
 def _client_gone(message: str = "客户端已断开连接。") -> JSONResponse:
     """499 断连响应（非流式/流式/生图/缓冲交付路径共用同一形态；
     2026-11 审查收敛：此前四处逐字重复同一 JSONResponse 块）。"""
@@ -266,25 +269,34 @@ _CLIENT_GONE_RESULT = {"kind": "error", "code": 499, "message": "客户端已断
 
 
 def _final_usage(
-    usage_meta: Optional[dict], request_obj: "OpenAIRequest", completion_text: str, reasoning_text: str = ""
+    usage_meta: Optional[dict], request_obj: "OpenAIRequest",
+    completion_text: str | Iterable[str], reasoning_text: str = "",
 ) -> dict:
-    """上游真实计量优先；未回传且 usage_estimation 开启时给字符级粗估。
-
-    粗估附带 "estimated": true；生图（正文为 base64 data URL）不适用，调用方不走本函数。
-    思考文本恰好计一次：流式路径把 thought 项并入 completion_text 传入，
-    非流式路径经 reasoning_text 传入——两口径必须给出相同结果（2026-11
-    对齐：reasoning 为空时不再追加换行，否则流式比非流式多计一个字符）。
-    """
-    usage = map_usage(usage_meta)
+    """Prefer provider usage; only consume completion fragments if estimating."""
     if usage_meta is None and app_state.get_setting("usage_estimation", False):
         prompt = messages_prompt_text(getattr(request_obj, "messages", None) or [])
-        combined = completion_text or ""
         if reasoning_text:
-            combined = f"{combined}\n{reasoning_text}"
-        estimated = estimate_usage(prompt, combined)
+            fragments = (completion_text,) if isinstance(completion_text, str) else completion_text
+            completion_text = chain(fragments, ("\n", reasoning_text))
+        estimated = estimate_usage(prompt, completion_text)
         if estimated["total_tokens"]:
             return estimated
-    return usage
+    return map_usage(usage_meta)
+
+
+def _stream_usage_fragments(prefix: str, ordinary: list) -> Iterator[str]:
+    # The character estimator is order-independent: count actual text and
+    # thoughts once, plus the whole-response separator before nonempty reasoning.
+    # Transport/Part boundaries and empty signature or image slots add nothing.
+    yield prefix
+    separated = False
+    for part in ordinary:
+        text = part["text"]
+        if text:
+            if part["kind"] == "thought" and not separated:
+                yield "\n"
+                separated = True
+            yield text
 
 
 async def _collect_full_response(
@@ -300,6 +312,7 @@ async def _collect_full_response(
     *,
     prefill_active: bool=False,
     force_search: bool=False,
+    strip_thoughts: bool=False,
     account_id: str | None = None,
     record: Optional[dict]=None,
 ) -> dict:
@@ -350,10 +363,12 @@ async def _collect_full_response(
                     whole_call=True,
                 )
 
-            if is_retryable_status(response.status_code) and attempt < retry_max:
+            hint = response_retry_after(response)
+            if (is_retryable_status(response.status_code) and attempt < retry_max
+                    and advisory_fits(hint, fastapi_request)):
                 if not await backoff.wait(
                     attempt,
-                    retry_after=getattr(response, "headers", {}).get("retry-after"),
+                    retry_after=hint,
                     error=f"HTTP {response.status_code}: {response.text[:200]}",
                     label=f"HTTP {response.status_code}（生图）",
                 ):
@@ -369,6 +384,7 @@ async def _collect_full_response(
                 return {
                     "kind": "error",
                     "code": response.status_code,
+                    "retry_after": hint,
                     "message": f"HTTP {response.status_code}: {response.text[:300]}",
                 }
 
@@ -391,27 +407,25 @@ async def _collect_full_response(
             # O(n²)）；join 恰好一次拷贝，片段表只持引用。
             text_pieces: list[str] = []
             thought_pieces: list[str] = []
+            ordinary_metadata, part_order, signature_extra = [], [], None
 
             # 拉取式游标：生成器形态在 yield 挂起期间其帧局部会把解析出的
             # 巨型 dict（含整份 base64）钉到本对象消费完之后，del 也无济于事；
             # 游标返回后不持引用，配合 del obj 让解析副本在事件消费前释放。
             cursor = CompleteTextObjectCursor(response_text)
-            while True:
+            boundary = CookieCandidateBoundary()
+            while api_error is None:
                 obj = cursor.next_object()
                 if obj is None:
                     break
                 sampler.add(obj)
-                # 一旦拿到错误事件就停止解析剩余响应：生图响应可达数 MB base64，
-                # 错误分支的返回值不依赖后续对象，继续拼接是纯浪费。
-                if api_error:
-                    break
                 # PRF-P1-1：含内联图片的对象在媒体线程解析（base64 解码 +
                 # 落盘 100-500ms 不能停在事件循环上，多用户生图会停摆全部
                 # 并发 SSE 流）；纯文本对象保持原地零开销解析。
-                if image_delivery.has_inline_image(obj):
-                    events = await run_media_task(list, extract_events(obj), heavy=True)
+                if has_pending_inline_image(obj):
+                    events = await run_media_task(list, extract_events(obj, strip_thoughts=strip_thoughts, boundary=boundary), heavy=True)
                 else:
-                    events = list(extract_events(obj))
+                    events = list(extract_events(obj, strip_thoughts=strip_thoughts, boundary=boundary))
                 # 正文已到即停止留存诊断样本（样本只服务「无正文」日志）：
                 # 留存会把含巨型 inlineData 的本对象钉到函数返回，收集期
                 # 恒多一份全量驻留（2026-11 第五轮）。
@@ -422,14 +436,18 @@ async def _collect_full_response(
                 if any(et != "error" for et, _ in events):
                     upstream_chunk()
                 for et, data in events:
-                    if et == "text" or et == "image":
-                        text_pieces.append(data)
-                    elif et == "thought":
-                        thought_pieces.append(data)
+                    if et in ("text", "image", "thought", "thought_image"):
+                        pieces = thought_pieces if et in ("thought", "thought_image") else text_pieces
+                        pieces.append(data)
+                        _record_output_slot(ordinary_metadata, part_order, et, data)
+                    elif et == "thought_signature":
+                        signature = apply_wire_signature(data, ordinary_metadata, part_order)
+                        if signature:
+                            signature_extra = thought_signature_extra(signature, data.get("part_kind"))
                     elif et == "finish":
                         finish_raw = data
                     elif et == "safety":
-                        safety_html = _safety_html_if_enabled(data)
+                        safety_html = safety_ratings_presentation(data, structured_output=wants_json_output(request_obj))
                     elif et == "blocked":
                         blocked_msg = data
                     elif et == "usage":
@@ -448,21 +466,22 @@ async def _collect_full_response(
             if (
                 api_error
                 and is_retryable_status(api_error_status)
+                and advisory_fits(hint, fastapi_request)
                 and attempt < retry_max
             ):
                 if not await backoff.wait(
-                    attempt, error=api_error, label="生图 429/限流",
+                    attempt, retry_after=hint, error=api_error, label="生图 429/限流",
                 ):
                     return dict(_CLIENT_GONE_RESULT)
                 continue
-            if api_error:
+            if api_error is not None:
                 # 鉴权失败记账：api_error_details 已含文本兜底（权限类文案
                 # → 403），无 code 字段的 GraphQL 错误块同样进健康隔离。
                 if api_error_status in (401, 403) and account_id is not None:
                     credential_manager.record_cookie_auth_failure(
                         account_id, credential=record
                     )
-                return {"kind": "error", "code": api_error_status, "message": api_error}
+                return {"kind": "error", "code": api_error_status, "message": api_error, "retry_after": hint}
 
             if not full_text.strip():
                 # 无正文：给出可见的诊断信息，而不是静默空回复
@@ -476,8 +495,11 @@ async def _collect_full_response(
                 }
 
             require_finish_reason(finish_raw)
+            if signature_extra:
+                signature_extra["google"]["ordinary_parts"] = ordinary_metadata
             return {
                 "kind": "ok",
+                "extra_content": signature_extra,
                 "full_text": full_text + safety_html,
                 "reasoning_text": reasoning_text,
                 "finish_reason": map_finish_reason_to_openai(finish_raw),
@@ -523,6 +545,7 @@ async def deliver_image_frames(gen: "CookieGeneration") -> AsyncIterator[str]:
             gen.fastapi_request,
             prefill_active=gen.prefill_active,
             force_search=gen.force_builtin_search,
+            strip_thoughts=gen.strip_thoughts,
             account_id=gen.account_id,
             record=gen.record,
         )
@@ -540,22 +563,21 @@ async def deliver_image_frames(gen: "CookieGeneration") -> AsyncIterator[str]:
             res = collect_task.result()
         except asyncio.CancelledError:
             raise
+        except SchemaValidationError as exc:
+            res = {"kind": "error", "code": 400, "message": str(exc), "error_type": "invalid_request_error"}
         except Exception as e:
             res = {
                 "kind": "error",
                 "code": 502,
                 "message": f"batchGraphql proxy error: {type(e).__name__}: {e}",
             }
-        yield make_openai_chunk(
-            gen.response_id, gen.model_display, role="assistant"
-        )
+        yield _choice_frame(gen, role="assistant")
         if res.get("kind") != "ok":
             stats.add_error()
             print(f"❌ [Studio] 生图失败 | {res.get('message', '')[:300]}")
-            error = create_openai_error_response(
-                res.get("code", 502),
-                res.get("message", "生图失败"),
-                "upstream_error",
+            error = _cookie_error_payload(
+                res.get("code", 502), res.get("message", "生图失败"),
+                res.get("error_type", "upstream_error"), retry_after=res.get("retry_after"),
             )
             yield "data: " + json.dumps(error, ensure_ascii=False) + "\n\n"
             yield "data: [DONE]\n\n"
@@ -566,11 +588,8 @@ async def deliver_image_frames(gen: "CookieGeneration") -> AsyncIterator[str]:
                 gen.prefill_text, full_text
             )
         if res.get("reasoning_text") and not gen.strip_thoughts:
-            yield make_openai_chunk(
-                gen.response_id,
-                gen.model_display,
-                reasoning_content=res["reasoning_text"],
-            )
+            for piece in iter_giant_content(res["reasoning_text"]):
+                yield _choice_frame(gen, reasoning_content=piece)
         # 整张图作为单个 chunk 发出（≤1MiB 小图）；超大 4K base64
         # 改为 256KiB 增量帧：单帧会在序列化/编码瞬间再造三份全量拷贝，
         # 512MB 容器（Render 免费档）叠加解析链会被 OOMKill。切片拼接
@@ -578,9 +597,11 @@ async def deliver_image_frames(gen: "CookieGeneration") -> AsyncIterator[str]:
         # 惰性分帧：不物化整张帧表（4K base64 三份全量拷贝叠加会
         # OOMKill 512MB 容器），逐帧按需产出。
         for _frame in iter_openai_content_chunks(
-            gen.response_id, gen.model_display, content=full_text or " "
+            gen.response_id, gen.model_display, content=full_text or " ", created=gen.response_created
         ):
             yield _frame
+        if res.get("extra_content"):
+            yield _choice_frame(gen, extra_content=res["extra_content"])
         stats.add_success()
         credential_manager.record_cookie_success(
             gen.account_id, credential=gen.record
@@ -588,12 +609,8 @@ async def deliver_image_frames(gen: "CookieGeneration") -> AsyncIterator[str]:
         # 生图正文是 base64 data URL，字符估算失真极大，不做 usage 估算
         usage = map_usage(res.get("usage_meta"))
         if gen.want_usage:
-            yield make_usage_chunk(gen.response_id, gen.model_display, usage)
-        yield make_openai_chunk(
-            gen.response_id,
-            gen.model_display,
-            finish_reason=res.get("finish_reason", "stop"),
-        )
+            yield make_usage_chunk(gen.response_id, gen.model_display, usage, created=gen.response_created)
+        yield _choice_frame(gen, finish_reason=res.get("finish_reason", "stop"))
         yield "data: [DONE]\n\n"
         print(f"✅ [Studio] {gen.base_model_name} | 生图假流式完成")
     finally:
@@ -605,6 +622,17 @@ async def deliver_image_frames(gen: "CookieGeneration") -> AsyncIterator[str]:
             collect_task.cancel()
         await asyncio.gather(collect_task, return_exceptions=True)
 
+
+
+def _record_output_slot(metadata: list, order: list, kind: str, text: str) -> int:
+    index = len(metadata)
+    order.append({"type": "ordinary", "index": index})
+    if kind in ("image", "thought_image"):
+        # The image lives only once in content or reasoning_content.
+        metadata.append(ordinary_part_metadata("image", "", None, thought=kind == "thought_image"))
+    else:
+        metadata.append(ordinary_part_metadata(kind, text, None))
+    return index
 
 
 class _StreamAttemptState:
@@ -623,6 +651,7 @@ class _StreamAttemptState:
         self.got_tool_call = False
         self.got_wire_signature = False  # 是否收到过 thoughtSignature 事件
         self.tool_call_index = 0
+        self.signature_origin = OriginBatch(gen.request_obj._signature_output_prefix)
         self.ordinary_metadata = []
         self.part_order = []
         self.usage_meta = None
@@ -630,23 +659,72 @@ class _StreamAttemptState:
         self.blocked_msg = None
         self.sampler = RawSampler()
         self.deduper = PrefillDeduper(gen.prefill_text)
+        self.prefill_slots: list[tuple[int, int]] = []
+        self.omitted_text_slots: set[int] = set()
         self.pending_safety_html = ""
         self.retry_error = None  # 非 None = 本次尝试应重试（携错误对象）
         self.terminated = False  # 已发出错误帧 + [DONE]，交付就此结束
 
+    def record_ordinary(self, kind: str, text: str) -> int:
+        return _record_output_slot(self.ordinary_metadata, self.part_order, kind, text)
 
-def _role_frames(gen: "CookieGeneration", *, announce: bool) -> list:
+    def feed_text(self, text: str) -> str:
+        if self.deduper.done:
+            self.record_ordinary("text", text)
+            return text
+        # Reserve this source's position even if prefill delays or removes it.
+        self.prefill_slots.append((self.record_ordinary("text", ""), len(text)))
+        out = self.deduper.feed(text)
+        if self.deduper.done:
+            self.resolve_prefill_slots(out)
+        return out
+
+    def resolve_prefill_slots(self, text: str) -> None:
+        # Dedup only removes a prefix: distribute the surviving suffix back to
+        # its original source parts, including parts interrupted by tool calls.
+        end = len(text)
+        for index, width in reversed(self.prefill_slots):
+            start = max(0, end - width)
+            if start < end:
+                self.ordinary_metadata[index]["text"] = text[start:end]
+            else:
+                self.omitted_text_slots.add(index)
+            end = start
+        self.prefill_slots.clear()
+
+    def compact_ordinary(self) -> None:
+        if not self.omitted_text_slots:
+            return
+        metadata, order = [], []
+        for slot in self.part_order:
+            if slot["type"] == "ordinary":
+                index = slot["index"]
+                part = self.ordinary_metadata[index]
+                if index in self.omitted_text_slots:
+                    if not part.get("thought_signature"):
+                        continue
+                    part["kind"] = "signature_only"
+                slot["index"] = len(metadata)
+                metadata.append(part)
+            order.append(slot)
+        self.ordinary_metadata, self.part_order = metadata, order
+
+
+def _ensure_role_frames(gen: "CookieGeneration", st: "_StreamAttemptState", *, announce: bool) -> list:
     """连接建立首帧（role chunk）与 ⚡ 日志。
 
     function_call / thought_signature / 正文三类事件与正常收尾共用形态；
     announce 保留旧口径——签名先到与纯收尾补帧不打「连接建立」日志。
     预填充先行帧不在此处（REQ-P3-9 拆出，见 _ensure_prefill_frames）。
     """
+    if st.has_yielded:
+        return []
+    st.has_yielded = True
     if announce:
         print(
             f"⚡ [Studio] {gen.base_model_name} | 连接建立，正在实时流式输出..."
         )
-    return [make_openai_chunk(gen.response_id, gen.model_display, role="assistant")]
+    return [_choice_frame(gen, role="assistant")]
 
 
 def _ensure_prefill_frames(gen: "CookieGeneration", st: "_StreamAttemptState") -> list:
@@ -664,18 +742,24 @@ def _ensure_prefill_frames(gen: "CookieGeneration", st: "_StreamAttemptState") -
         return []
     st.prefill_sent = True
     # 预填充智能兼容：先把预填充文本作为回复开头发出
-    return [
-        make_openai_chunk(
-            gen.response_id, gen.model_display, content=gen.prefill_text
-        )
-    ]
+    return [_choice_frame(gen, content=gen.prefill_text)]
+
+
+def _cookie_error_payload(code: int, message: str, error_type: str = "upstream_error", *,
+                          retry_after: Optional[str] = None) -> dict:
+    error = create_openai_error_response(code, message, error_type)
+    # Committed streams cannot send a new HTTP header. Preserve the verified
+    # hint in the same error field as our other OpenAI-compatible adapter.
+    if retry_after is not None:
+        error["error"]["retry_after"] = retry_after
+    return error
 
 
 def _error_done_frames(code: int, message: str) -> list:
     """错误帧 + [DONE] 两连帧（transport / api_error_text / cookie_error /
     retryable-fatal 四个终点路径共用；统一走 create_openai_error_response
     拿到凭据脱敏与标准形状，消息按 1024 截断防巨型帧）。"""
-    error = create_openai_error_response(code, str(message)[:1024], "upstream_error")
+    error = _cookie_error_payload(code, str(message)[:1024], retry_after=getattr(message, "retry_after", None))
     return [
         "data: " + json.dumps(error, ensure_ascii=False) + "\n\n",
         "data: [DONE]\n\n",
@@ -694,14 +778,10 @@ def _safety_before_error_frames(gen: "CookieGeneration", st: "_StreamAttemptStat
     if not st.pending_safety_html:
         return []
     frames = []
-    if not st.has_yielded:
-        frames.extend(_role_frames(gen, announce=False))
-        st.has_yielded = True
+    frames.extend(_ensure_role_frames(gen, st, announce=False))
     # 终点路径：预填充若还没发也一并冲刷（流到此结束，不再有机会）。
     frames.extend(_ensure_prefill_frames(gen, st))
-    frames.append(make_openai_chunk(
-        gen.response_id, gen.model_display, content=st.pending_safety_html,
-    ))
+    frames.append(_choice_frame(gen, content=st.pending_safety_html))
     st.pending_safety_html = ""
     return frames
 
@@ -714,7 +794,9 @@ async def _stream_attempt_frames(gen: "CookieGeneration", events: AsyncIterator,
     - st.terminated：已发错误帧 + [DONE]，整个交付就此结束；
     - 两者皆否：流自然结束，调用方进入正常收尾。
     """
+    source_kind: str | None = None
     async for status, data in events:
+        preceding_kind, source_kind = source_kind, None
         if status == "transport_error":
             stats.add_error()
             print(f"❌ [抗截断] {data}")
@@ -725,88 +807,66 @@ async def _stream_attempt_frames(gen: "CookieGeneration", events: AsyncIterator,
             st.terminated = True
             return
         # 思考剥离：batchGraphql 忽略 includeThoughts，这里按解析出的配置主动丢弃思考块
-        if status == "thought":
+        if status in ("thought", "thought_image", "hidden_thought"):
             st.got_thought = True
-            if gen.strip_thoughts:
+            if gen.strip_thoughts or status == "hidden_thought":
                 continue  # 不建连、不输出，等真正的正文
 
         if status == "function_call":
-            if not st.has_yielded:
-                for frame in _role_frames(gen, announce=True):
-                    yield frame
-                st.has_yielded = True
+            for frame in _ensure_role_frames(gen, st, announce=True):
+                yield frame
             for frame in _ensure_prefill_frames(gen, st):
                 yield frame
             tool_payload = openai_tool_call(
                 gen.response_id, st.tool_call_index, data
             )
+            st.signature_origin.add(tool_payload)
             tool_payload["index"] = st.tool_call_index
             st.part_order.append(
                 {"type": "tool_call", "index": st.tool_call_index}
             )
-            yield make_openai_chunk(
-                gen.response_id,
-                gen.model_display,
-                tool_calls=[tool_payload],
-            )
+            yield _choice_frame(gen, tool_calls=[tool_payload])
             st.tool_call_index += 1
             st.got_tool_call = True
 
         elif status == "thought_signature":
-            signature = apply_wire_signature(
-                data, st.ordinary_metadata, st.part_order
-            )
+            # extract_events emits a part's signature immediately after its
+            # source. A filtered thought has no visible slot to attach to.
+            part_kind = data.get("part_kind")
+            if preceding_kind is None or part_kind != preceding_kind:
+                part_kind = "signature_only"
+                data = {**data, "part_kind": part_kind}
+            signature = apply_wire_signature(data, st.ordinary_metadata, st.part_order)
             if signature:
                 st.got_wire_signature = True
-            extra = thought_signature_extra(signature, data.get("part_kind"))
+            if (part_kind == "text" and
+                    len(st.ordinary_metadata) - 1 in st.omitted_text_slots):
+                part_kind = "signature_only"
+            extra = thought_signature_extra(signature, part_kind)
             if extra:
                 # 签名事件只携带签名与 part 类型（2026-11 P2-2 修复）：
                 # 旧实现每个签名事件都内嵌「至今全部普通 part（含全部
                 # 思考全文）」快照，P 个带签名 part 的响应线上传输 O(P²)
                 # （Express 通道已修复过同一问题，见 express_response.py
                 # 的终帧快照注释）；完整拓扑改由收尾帧一次性携带。
-                if not st.has_yielded:
-                    for frame in _role_frames(
-                        gen, announce=False
-                    ):
-                        yield frame
-                    st.has_yielded = True
-                yield make_openai_chunk(
-                    gen.response_id,
-                    gen.model_display,
-                    extra_content=extra,
-                )
-
-        elif status in ("text", "thought", "image", "api_error_text"):
-            if not st.has_yielded:
-                for frame in _role_frames(gen, announce=True):
+                for frame in _ensure_role_frames(gen, st, announce=False):
                     yield frame
-                st.has_yielded = True
+                yield _choice_frame(gen, extra_content=extra)
+
+        elif status in ("text", "thought", "image", "thought_image", "api_error_text"):
+            for frame in _ensure_role_frames(gen, st, announce=True):
+                yield frame
             for frame in _ensure_prefill_frames(gen, st):
                 yield frame
 
-            if status == "thought":
-                st.part_order.append(
-                    {
-                        "type": "ordinary",
-                        "index": len(st.ordinary_metadata),
-                    }
-                )
-                st.ordinary_metadata.append(
-                    ordinary_part_metadata("thought", data, None)
-                )
-                yield make_openai_chunk(
-                    gen.response_id,
-                    gen.model_display,
-                    reasoning_content=data,
-                )
+            if status in ("thought", "thought_image"):
+                st.record_ordinary(status, data)
+                source_kind = "image" if status == "thought_image" else "thought"
+                for piece in iter_giant_content(data):
+                    yield _choice_frame(gen, reasoning_content=piece)
             elif status == "api_error_text":
                 stats.add_error()
-                yield make_openai_chunk(
-                    gen.response_id,
-                    gen.model_display,
-                    content=f"\n[Studio API 错误] {data}",
-                )
+                yield _choice_frame(gen, content=f"\n[Studio API 错误] {data}")
                 for frame in _safety_before_error_frames(gen, st):
                     yield frame
                 for frame in _error_done_frames(502, data):
@@ -815,39 +875,20 @@ async def _stream_attempt_frames(gen: "CookieGeneration", events: AsyncIterator,
                 return
             elif status == "image":
                 st.got_text = True
-                st.part_order.append(
-                    {
-                        "type": "ordinary",
-                        "index": len(st.ordinary_metadata),
-                    }
-                )
-                st.ordinary_metadata.append(
-                    ordinary_part_metadata("image", "", None)
-                )
+                st.record_ordinary("image", "")
+                source_kind = "image"
                 # 超大生图 base64 分帧发射（同整取路径，见
                 # iter_openai_content_chunks 注释）；小图保持单帧。
                 for _frame in iter_openai_content_chunks(
-                    gen.response_id, gen.model_display, content=data
+                    gen.response_id, gen.model_display, content=data, created=gen.response_created
                 ):
                     yield _frame
             else:  # text（经过预填充去重器）
                 st.got_text = True
-                out = st.deduper.feed(data)
+                out = st.feed_text(data)
+                source_kind = "text"
                 if out:
-                    st.part_order.append(
-                        {
-                            "type": "ordinary",
-                            "index": len(st.ordinary_metadata),
-                        }
-                    )
-                    st.ordinary_metadata.append(
-                        ordinary_part_metadata("text", out, None)
-                    )
-                    yield make_openai_chunk(
-                        gen.response_id,
-                        gen.model_display,
-                        content=out,
-                    )
+                    yield _choice_frame(gen, content=out)
 
         elif status == "finish":
             st.finish_raw = data
@@ -856,7 +897,7 @@ async def _stream_attempt_frames(gen: "CookieGeneration", events: AsyncIterator,
             # flush 完尾段再输出。旧实现在循环内即时 yield，预填充 +
             # 短回复场景下会插在去重器攒住的正文尾段**之前**，把安全块
             # 嵌进正文中间（2026-10 修复）。
-            st.pending_safety_html = _safety_html_if_enabled(data)
+            st.pending_safety_html = safety_ratings_presentation(data, structured_output=wants_json_output(gen.request_obj))
         elif status == "usage":
             st.usage_meta = merge_usage_metadata(st.usage_meta, data)
         elif status == "blocked":
@@ -880,6 +921,7 @@ async def _stream_attempt_frames(gen: "CookieGeneration", events: AsyncIterator,
                 not st.has_yielded
                 and status == "retryable_error"
                 and attempt < gen.retry_max
+                and advisory_fits(getattr(data, "retry_after", None), gen.fastapi_request)
             ):
                 st.retry_error = data
                 return
@@ -903,10 +945,8 @@ async def _finalize_cookie_stream(gen: "CookieGeneration", st: _StreamAttemptSta
     签名元数据时一次性携带完整 ordinary_parts + part_order 终帧拓扑
     （2026-11 P2-2：签名事件瘦身，拓扑流量回到线性）。
     """
-    if not st.has_yielded:
-        for frame in _role_frames(gen, announce=False):
-            yield frame
-        st.has_yielded = True
+    for frame in _ensure_role_frames(gen, st, announce=False):
+        yield frame
     # 纯收尾补帧（无任何可见内容）：预填充仍需发出（REQ-P3-9 独立闸，
     # 与旧 with_prefill=True 行为一致；签名先到场景此前会整段丢失）。
     for frame in _ensure_prefill_frames(gen, st):
@@ -914,22 +954,17 @@ async def _finalize_cookie_stream(gen: "CookieGeneration", st: _StreamAttemptSta
 
     # 预填充去重器里可能还攒着开头的一小段（短回复场景）
     tail = st.deduper.flush()
+    st.resolve_prefill_slots(tail)
+    st.compact_ordinary()
     if tail:
-        st.part_order.append(
-            {"type": "ordinary", "index": len(st.ordinary_metadata)}
-        )
-        st.ordinary_metadata.append(ordinary_part_metadata("text", tail, None))
-        yield make_openai_chunk(gen.response_id, gen.model_display, content=tail)
+        yield _choice_frame(gen, content=tail)
 
     # 安全分在正文（含去重尾段）之后、结束帧之前输出，
     # 与非流式路径 content_value = full_text + safety_html 的顺序一致。
     if st.pending_safety_html:
-        yield make_openai_chunk(
-            gen.response_id,
-            gen.model_display,
-            content=st.pending_safety_html,
-        )
+        yield _choice_frame(gen, content=st.pending_safety_html)
 
+    usage_prefix = gen.prefill_text if st.got_text else ""
     if st.got_text or st.got_tool_call:
         stats.add_success()
         credential_manager.record_cookie_success(
@@ -951,18 +986,12 @@ async def _finalize_cookie_stream(gen: "CookieGeneration", st: _StreamAttemptSta
             if last_signed:
                 google["thought_signature"] = last_signed["thought_signature"]
                 google["thought_signature_part"] = last_signed["kind"]
-            yield make_openai_chunk(
-                gen.response_id,
-                gen.model_display,
-                extra_content={"google": google},
-            )
-        yield make_openai_chunk(
-            gen.response_id,
-            gen.model_display,
-            finish_reason=map_finish_reason_to_openai(
-                st.finish_raw, has_tool_calls=st.got_tool_call
-            ),
-        )
+            yield _choice_frame(gen, extra_content={"google": google})
+        finish_reason = map_finish_reason_to_openai(st.finish_raw, has_tool_calls=st.got_tool_call)
+        if (finish_reason == "tool_calls" and not gen.prefill_text and not st.pending_safety_html
+                and st.signature_origin.prefix):
+            st.signature_origin.finish_plain_parts(st.ordinary_metadata, st.part_order)
+        yield _choice_frame(gen, finish_reason=finish_reason)
     else:
         # 无正文：明确告知客户端 + 落诊断日志（旧版此处一个字节都不发就关流）
         desc, detail, notice, no_body_finish = _no_body_outcome(
@@ -981,22 +1010,14 @@ async def _finalize_cookie_stream(gen: "CookieGeneration", st: _StreamAttemptSta
             f"❌ [Studio] {gen.base_model_name} | 上游{desc}（{detail}）"
         )
         print(f"🔎 [Studio 诊断] 原始响应样本：\n{st.sampler.dump()}")
-        yield make_openai_chunk(
-            gen.response_id, gen.model_display, content=f"\n{notice}"
-        )
-        yield make_openai_chunk(
-            gen.response_id,
-            gen.model_display,
-            finish_reason=no_body_finish,
-        )
+        usage_prefix = notice  # Same logical content as the whole-response diagnostic.
+        yield _choice_frame(gen, content=f"\n{notice}")
+        yield _choice_frame(gen, finish_reason=no_body_finish)
 
-    usage = _final_usage(
-        st.usage_meta,
-        gen.request_obj,
-        "\n".join(part.get("text", "") for part in st.ordinary_metadata),
-    )
     if gen.want_usage:
-        yield make_usage_chunk(gen.response_id, gen.model_display, usage)
+        usage = _final_usage(st.usage_meta, gen.request_obj,
+                             _stream_usage_fragments(usage_prefix, st.ordinary_metadata))
+        yield make_usage_chunk(gen.response_id, gen.model_display, usage, created=gen.response_created)
 
     yield "data: [DONE]\n\n"
 
@@ -1035,6 +1056,7 @@ async def deliver_stream_events(gen: "CookieGeneration") -> AsyncIterator[str]:
                 sampler=st.sampler,
                 fallback_body=fallback_body,
                 model=gen.base_model_name,
+                strip_thoughts=gen.strip_thoughts,
             )
             if gen.text_transport:
                 events = gen.text_transport.decoder().cookie_stream(events)
@@ -1091,7 +1113,8 @@ async def deliver_stream_frames(gen: "CookieGeneration") -> AsyncIterator[str]:
         print(
             f"❌ [Studio] {gen.base_model_name} | 流式响应意外中断 | HTTP {code} | {str(e)[:150]}"
         )
-        error = create_openai_error_response(code, message[:1024], "upstream_error")
+        err_type = "invalid_request_error" if isinstance(e, SchemaValidationError) else "upstream_error"
+        error = create_openai_error_response(code, message[:1024], err_type)
         yield "data: " + json.dumps(error, ensure_ascii=False) + "\n\n"
         yield "data: [DONE]\n\n"
 
@@ -1111,6 +1134,7 @@ class _WholeBodyState:
     thought_pieces: list = field(default_factory=list)
     full_text: str = ""
     reasoning_text: str = ""
+    got_thought: bool = False
     safety_html: str = ""
     tool_calls: list = field(default_factory=list)
     ordinary_metadata: list = field(default_factory=list)
@@ -1118,6 +1142,8 @@ class _WholeBodyState:
     message_extra: Optional[dict] = None
     api_error: Optional[str] = None
     api_error_status: int = 502
+    api_error_hint: Optional[str] = None
+    tool_rejection: bool = False
     usage_meta: Optional[dict] = None
     finish_raw: Optional[str] = None
     blocked_msg: Optional[str] = None
@@ -1130,22 +1156,20 @@ def _apply_whole_body_event(gen: "CookieGeneration", st: _WholeBodyState, event_
     与流式路径的 _stream_attempt_frames 同口径的事件族；差异在整取
     只积累不输出（除错误外），结束时由 _assemble_whole_response 统一装配。
     """
-    if event_type == "text":
-        st.text_pieces.append(data)
-        st.part_order.append({"type": "ordinary", "index": len(st.ordinary_metadata)})
-        st.ordinary_metadata.append(ordinary_part_metadata("text", data, None))
-    elif event_type == "thought":
-        # 先收集（供诊断判断），输出时按 strip 决定是否附带
-        st.thought_pieces.append(data)
-        st.part_order.append({"type": "ordinary", "index": len(st.ordinary_metadata)})
-        st.ordinary_metadata.append(ordinary_part_metadata("thought", data, None))
-    elif event_type == "image":
-        st.text_pieces.append(data)
-        st.part_order.append({"type": "ordinary", "index": len(st.ordinary_metadata)})
-        st.ordinary_metadata.append(ordinary_part_metadata("image", "", None))
+    if event_type == "hidden_thought":
+        st.got_thought = True
+    elif event_type in ("text", "image", "thought", "thought_image"):
+        if event_type in ("thought", "thought_image"):
+            st.got_thought = True
+            st.thought_pieces.append(data)
+        else:
+            st.text_pieces.append(data)
+        _record_output_slot(st.ordinary_metadata, st.part_order, event_type, data)
     elif event_type == "function_call":
         st.part_order.append({"type": "tool_call", "index": len(st.tool_calls)})
-        st.tool_calls.append(openai_tool_call(gen.response_id, len(st.tool_calls), data))
+        # Keep raw calls until the complete turn and its finish reason are
+        # known. An invalid batch must not register or return ambiguous IDs.
+        st.tool_calls.append(data)
     elif event_type == "thought_signature":
         sig = apply_wire_signature(data, st.ordinary_metadata, st.part_order)
         if sig:
@@ -1153,13 +1177,22 @@ def _apply_whole_body_event(gen: "CookieGeneration", st: _WholeBodyState, event_
     elif event_type == "finish":
         st.finish_raw = data
     elif event_type == "safety":
-        st.safety_html = _safety_html_if_enabled(data)
+        st.safety_html = safety_ratings_presentation(data, structured_output=wants_json_output(gen.request_obj))
     elif event_type == "blocked":
         st.blocked_msg = data
     elif event_type == "usage":
         st.usage_meta = merge_usage_metadata(st.usage_meta, data)
     elif event_type == "error":
         st.api_error_status, st.api_error = api_error_details(data)
+        st.tool_rejection = is_native_tool_rejection(data)
+
+
+def _whole_object_events(obj: dict, strip_thoughts: bool, text_decoder: Any,
+                         boundary: CookieCandidateBoundary) -> list:
+    # Keep only the stable event list; a loop-local closure can retain the
+    # entire raw object across the next cursor pull.
+    events = extract_events(obj, strip_thoughts=strip_thoughts, boundary=boundary)
+    return list(text_decoder.cookie_events(events) if text_decoder else events)
 
 
 async def _collect_whole_body(gen: "CookieGeneration", response_text: str, text_decoder: Any) -> _WholeBodyState:
@@ -1171,29 +1204,18 @@ async def _collect_whole_body(gen: "CookieGeneration", response_text: str, text_
     """
     st = _WholeBodyState()
     cursor = CompleteTextObjectCursor(response_text)
-    while True:
+    boundary = CookieCandidateBoundary()
+    while st.api_error is None:
         obj = cursor.next_object()
         if obj is None:
             break
         st.sampler.add(obj)
-        # error 即停：后续对象不再解析（生图响应可达数 MB，
-        # 白烧事件循环 CPU），且首个 error 不被后续 error 覆盖。
-        if st.api_error:
-            break
         # PRF-P1-1：含内联图片的对象整段解析搬媒体线程（解码 +
         # 落盘不在事件循环上）；纯文本对象保持原地零开销。
-        def _materialize_cookie_events(obj: Any = obj):  # B023：默认参数绑定循环变量（同迭代调用）
-            events = extract_events(obj)
-            if text_decoder:
-                events = text_decoder.cookie_events(events)
-            # list() 物化：extract_events / cookie_events 是生成器，
-            # 下方 any() 与 for 各消费一次，不物化后者会拿到空。
-            return list(events)
-
-        if image_delivery.has_inline_image(obj):
-            events = await run_media_task(_materialize_cookie_events, heavy=True)
+        if has_pending_inline_image(obj):
+            events = await run_media_task(_whole_object_events, obj, gen.strip_thoughts, text_decoder, boundary, heavy=True)
         else:
-            events = _materialize_cookie_events()
+            events = _whole_object_events(obj, gen.strip_thoughts, text_decoder, boundary)
         # 正文/工具内容已到即停止留存诊断样本（样本只服务
         # 「无正文」日志；留存会钉住含巨型 inlineData 的对象）。
         if any(et in BODY_EVENT_TYPES for et, _ in events):
@@ -1204,7 +1226,7 @@ async def _collect_whole_body(gen: "CookieGeneration", response_text: str, text_
             upstream_chunk()
         for event_type, data in events:
             _apply_whole_body_event(gen, st, event_type, data)
-            if st.api_error:
+            if st.api_error is not None:
                 break
         events = None
     cursor = None
@@ -1229,15 +1251,18 @@ def _assemble_whole_response(gen: "CookieGeneration", st: _WholeBodyState) -> "R
 
     if got_output:
         require_finish_reason(st.finish_raw)
+        finish_reason = map_finish_reason_to_openai(st.finish_raw, has_tool_calls=bool(st.tool_calls))
+        if st.tool_calls:
+            if finish_reason in ("stop", "tool_calls"):
+                require_unique_tool_call_ids(call.get("id") for call in st.tool_calls)
+            for i, call in enumerate(st.tool_calls):
+                st.tool_calls[i] = openai_tool_call(gen.response_id, i, call)
         credential_manager.record_cookie_success(gen.account_id, credential=gen.record)
         # 预填充智能兼容：去重后把预填充文本拼回输出开头
         if gen.prefill_text and got_text:
             st.full_text = gen.prefill_text + strip_prefill_overlap(
                 gen.prefill_text, st.full_text
             )
-        finish_reason = map_finish_reason_to_openai(
-            st.finish_raw, has_tool_calls=bool(st.tool_calls)
-        )
         stats.add_success()
         print(
             f"✅ [Studio] {gen.base_model_name} | {len(st.full_text)} 字符 | {elapsed:.1f}s"
@@ -1247,13 +1272,13 @@ def _assemble_whole_response(gen: "CookieGeneration", st: _WholeBodyState) -> "R
         desc, detail, notice, finish_reason = _no_body_outcome(
             st.finish_raw,
             st.blocked_msg,
-            bool(st.reasoning_text),
+            st.got_thought,
             gen.strip_thoughts,
         )
         stats.add_error()
         # 与流式路径同口径（2026-11 C-2）：收到过思考即证明 Cookie
         # 有效，清零账号失败计数，避免历史累计触发误冷却。
-        if st.reasoning_text:
+        if st.got_thought:
             credential_manager.record_cookie_success(
                 gen.account_id, credential=gen.record
             )
@@ -1289,7 +1314,7 @@ def _assemble_whole_response(gen: "CookieGeneration", st: _WholeBodyState) -> "R
     payload = {
         "id": gen.response_id,
         "object": "chat.completion",
-        "created": int(time.time()),
+        "created": gen.response_created,
         "model": gen.model_display,
         "choices": [
             {
@@ -1300,8 +1325,44 @@ def _assemble_whole_response(gen: "CookieGeneration", st: _WholeBodyState) -> "R
         ],
         "usage": usage,
     }
+    publish_completed_origins(gen.request_obj._signature_output_prefix, payload["choices"])
     response_class = LargeJSONResponse if gen.is_image else JSONResponse
     return response_class(content=payload)
+
+
+async def _collect_with_tool_fallback(
+    gen: "CookieGeneration", body: dict, headers: dict, fallback_body: Any,
+) -> tuple:
+    """Return (HTTP error response, parsed state, decoder); only one shape is populated.
+
+    Successful model data is parsed exactly once. A retry without tools requires
+    an actual provider rejection before any output, never words in user/tool data.
+    """
+    while True:
+        async with open_upstream_client(gen.client_kwargs) as client:
+            upstream_attempt()
+            response = await timed_call(
+                gen.base_model_name, client.post(BATCH_GRAPHQL_URL, headers=headers, json=body), whole_call=True
+            )
+        if response.status_code == 200:
+            # Drop the HTTP bytes before parsing possibly large media.
+            hint = response_retry_after(response)
+            text = response.text
+            response = None
+            decoder = gen.text_transport.decoder() if gen.text_transport else None
+            st = await _collect_whole_body(gen, text, decoder)
+            del text
+            if st.api_error is not None:
+                st.api_error_hint = hint
+            if (fallback_body is None or not st.tool_rejection or retry_after_seconds(st.api_error_hint) or st.part_order
+                    or st.got_thought or st.message_extra or st.finish_raw or st.blocked_msg):
+                return None, st, decoder
+        elif (fallback_body is None or response_requests_delay(response)
+              or not is_native_tool_error_response(response.status_code, response.text)):
+            return response, None, None
+        body = await fallback_body()
+        fallback_body = None  # the cache also latches this shape for transient retries
+        print("⚠️ [Studio] 当前模型/协议拒绝原生函数 Schema；本次及后续重试固定降级为文本工具观测。")
 
 
 async def deliver_collect_response(gen: "CookieGeneration") -> "Response":
@@ -1332,88 +1393,49 @@ async def deliver_collect_response(gen: "CookieGeneration") -> "Response":
         try:
             body, fallback_body, req_headers = await _attempt_context(gen, body_cache)
 
-            async with open_upstream_client(gen.client_kwargs) as client:
-                upstream_attempt()
-                response = await timed_call(
-                    gen.base_model_name,
-                    client.post(BATCH_GRAPHQL_URL, headers=req_headers, json=body),
-                    whole_call=True,
-                )
-                if fallback_body is not None and is_native_tool_error_response(
-                    response.status_code, response.text
+            response, st, text_decoder = await _collect_with_tool_fallback(gen, body, req_headers, fallback_body)
+            hint = response_retry_after(response) if response is not None else None
+            if (response is not None and is_retryable_status(response.status_code)
+                    and attempt < gen.retry_max and advisory_fits(hint, gen.fastapi_request)):
+                if not await backoff.wait(
+                    attempt, retry_after=hint, error=f"HTTP {response.status_code}: {response.text[:200]}",
+                    label=f"HTTP {response.status_code}",
                 ):
-                    resolved_fallback = (
-                        await fallback_body()
-                    )  # degraded() 同时锁定后续重试
-                    print(
-                        "⚠️ [Studio] 当前模型/协议拒绝原生函数 Schema；本次及后续重试固定降级为文本工具观测。"
-                    )
-                    upstream_attempt()
-                    response = await timed_call(
-                        gen.base_model_name,
-                        client.post(
-                            BATCH_GRAPHQL_URL,
-                            headers=req_headers,
-                            json=resolved_fallback,
-                        ),
-                        whole_call=True,
-                    )
-                    fallback_body = None
+                    return _client_gone()
+                continue
 
-            if is_retryable_status(response.status_code):
-                if attempt < gen.retry_max:
-                    if not await backoff.wait(
-                        attempt,
-                        retry_after=getattr(response, "headers", {}).get("retry-after"),
-                        error=f"HTTP {response.status_code}: {response.text[:200]}",
-                        label=f"HTTP {response.status_code}",
-                    ):
-                        return _client_gone()
-                    continue
-
-            if response.status_code != 200:
+            if response is not None:
                 elapsed = time.time() - gen.start_time
                 print(
                     f"❌ [Studio] {gen.base_model_name} | HTTP {response.status_code} | {elapsed:.1f}s"
                 )
                 return JSONResponse(
                     status_code=response.status_code,
-                    content=create_openai_error_response(
-                        response.status_code, response.text[:500], "upstream_error"
-                    ),
+                    headers={"retry-after": hint} if hint is not None else None,
+                    content=_cookie_error_payload(response.status_code, response.text[:500], retry_after=hint),
                 )
-
-            # 生图内存（2026-11 第五轮）：httpx 整取同时持有 content bytes
-            # 与解码 str；text 取本地引用后置 None，bytes 缓冲在解析前回收。
-            # （非流式文本模型响应体积小，收益集中在非流式生图请求。）
-            response_text = response.text
-            response = None
-            text_decoder = (
-                gen.text_transport.decoder() if gen.text_transport else None
-            )
-            st = await _collect_whole_body(gen, response_text, text_decoder)
-            response_text = None
 
             if (
                 st.api_error
+                and not st.tool_rejection
                 and is_retryable_status(st.api_error_status)
+                and advisory_fits(st.api_error_hint, gen.fastapi_request)
                 and attempt < gen.retry_max
             ):
                 if not await backoff.wait(
-                    attempt, error=st.api_error, label="429/限流",
+                    attempt, retry_after=st.api_error_hint, error=st.api_error, label="429/限流",
                 ):
                     return _client_gone()
                 continue
-            if st.api_error:
+            if st.api_error is not None:
                 if st.api_error_status in (401, 403):
                     credential_manager.record_cookie_auth_failure(
                         gen.account_id, credential=gen.record
                     )
                 return JSONResponse(
                     status_code=st.api_error_status,
-                    content=create_openai_error_response(
-                        st.api_error_status, st.api_error, "upstream_error"
-                    ),
+                    headers={"retry-after": st.api_error_hint} if st.api_error_hint is not None else None,
+                    content=_cookie_error_payload(st.api_error_status, st.api_error, retry_after=st.api_error_hint),
                 )
 
             if text_decoder:
@@ -1421,6 +1443,8 @@ async def deliver_collect_response(gen: "CookieGeneration") -> "Response":
 
             return _assemble_whole_response(gen, st)
 
+        except SchemaValidationError as exc:
+            return JSONResponse(status_code=400, content=create_openai_error_response(400, str(exc), "invalid_request_error"))
         except Exception as e:
             err_msg = str(e)
             is_retryable = is_retryable_exception(e)
@@ -1480,6 +1504,9 @@ async def deliver_buffered_frames(gen: "CookieGeneration") -> AsyncIterator[str]
                 yield "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
                 yield "data: [DONE]\n\n"
                 return
+            select_order = gen.request_obj._select_buffered_order
+            if select_order is not None:
+                select_order(payload)
             async for frame in buffered_sse(
                 payload, include_usage=gen.want_usage
             ).body_iterator:

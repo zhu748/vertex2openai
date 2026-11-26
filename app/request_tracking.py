@@ -18,10 +18,9 @@ current_trace = ContextVar("request_trace", default=None)
 _attempt_started = ContextVar("attempt_started", default=None)
 MAX_INSPECTION_BYTES = 2 * 1024 * 1024
 
-# SSE 帧分隔符：PayloadObserver 每个网络块都会扫描，必须预编译。
-# SSE 帧分隔符与 streaming.sse_frames 共用同一份定义（2026-11 审查收敛：
-# 此前两处平行定义，注释互相指认）。
-from streaming import FRAME_SEP_RE as _FRAME_SEP_RE
+from response_validation import native_other_part_has_reply
+from streaming import sse_separator
+from usage import NATIVE_USAGE_COUNTERS, merge_usage_metadata
 
 # redact 在每条日志/每个 SSE 块上都会执行，必须用预编译 pattern。
 _RE_URL_CREDS = re.compile(r"(?i)(?<![a-z0-9+.-])([a-z][a-z0-9+.-]{0,31})://[^/\s@]+@")
@@ -49,6 +48,39 @@ def redact(text):
     return text
 
 
+def _anthropic_sent_counts(payload: dict) -> tuple[int, int, bool]:
+    """Count visible Messages blocks, not the envelope, signature, or ping."""
+    event = payload.get("type")
+    if event == "message" and payload.get("role") == "assistant":
+        blocks = payload.get("content")
+        if not isinstance(blocks, list):
+            return 0, 0, False
+    elif event == "content_block_start":
+        blocks = (payload.get("content_block"),)
+    elif event == "content_block_delta":
+        blocks = (payload.get("delta"),)
+    else:
+        return 0, 0, False
+    content = reasoning = 0
+    tool = False
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        kind = block.get("type")
+        if kind in ("text", "text_delta"):
+            text = block.get("text")
+            if isinstance(text, str):
+                content += len(text)
+        elif kind in ("thinking", "thinking_delta"):
+            thinking = block.get("thinking")
+            if isinstance(thinking, str):
+                reasoning += len(thinking)
+        elif kind in ("tool_use", "server_tool_use", "input_json_delta"):
+            value = block.get("partial_json" if kind == "input_json_delta" else "name")
+            tool |= isinstance(value, str) and bool(value) and not value.isspace()
+    return content, reasoning, tool
+
+
 class RequestTrace:
     def __init__(self, path):
         self.id = "trace-" + secrets.token_hex(8)
@@ -68,6 +100,7 @@ class RequestTrace:
             "sent_content_chars": 0, "sent_reasoning_chars": 0,
             "usage": {}, "finish_reasons": [], "inspection_skipped_bytes": 0,
         }
+        self._native_usage = False
         self.timings = {}
         self.events = deque(maxlen=160)
         self.logs = deque(maxlen=200)
@@ -123,6 +156,10 @@ class RequestTrace:
 
     def attempt(self):
         with self._lock:
+            # Sparse native counters belong to one attempt, not a retry or fallback.
+            if self._native_usage:
+                self.data["usage"] = {}
+                self._native_usage = False
             self.data["attempts"] += 1
             attempt = self.data["attempts"]
             self.data["retry_at"] = None
@@ -190,9 +227,26 @@ class RequestTrace:
             if disconnected and not self.data["generation_active"] and not self.data["outcome"]:
                 self.data["outcome"] = "cancelled"
             self._settle()
-            background = self.data["generation_active"]
-        self.event("connection_end", ("前端连接已断开。" if disconnected else "前端响应发送结束。")
-                   + ("后台上游仍在运行，可通过续传恢复。" if background else ""))
+            reply_retained = bool(self.data["generation_id"])
+            background = self.data["generation_active"] and self.data["detached"]
+        message = "前端连接已断开。" if disconnected else "前端响应发送结束。"
+        if background:
+            message += "后台上游仍在运行。"
+        if disconnected and reply_retained:
+            message += "可在续传窗口内尝试恢复。"
+        self.event("connection_end", message)
+
+    def _set_usage_locked(self, usage, *, native=False):
+        snapshot = numeric_usage(usage)
+        if native:
+            # Keep at most the six known cumulative counters from older frames.
+            # Unknown numeric fields are visible only in their current snapshot;
+            # nested application data and non-numeric metadata are never retained.
+            previous = self.data["usage"] if self._native_usage else {}
+            counts = {k: previous[k] for k in NATIVE_USAGE_COUNTERS.values() if k in previous}
+            snapshot = merge_usage_metadata(counts, snapshot)
+        self.data["usage"] = snapshot
+        self._native_usage = native
 
     def inspect_payload(self, payload, *, sent=False):
         if not isinstance(payload, dict):
@@ -202,8 +256,12 @@ class RequestTrace:
             self.fail(error.get("message", str(error)) if isinstance(error, dict) else error,
                       error.get("code") if isinstance(error, dict) else None)
             return
-        content, reasoning, tools, reasons = 0, 0, 0, []
-        media = False
+        # Generation observes the internal OpenAI/Gemini reply. The sent
+        # observer instead sees Messages wire blocks after protocol conversion.
+        content, reasoning, tools = (_anthropic_sent_counts(payload)
+                                     if sent and "type" in payload else (0, 0, 0))
+        reasons = []
+        other_reply = False
         for choice in payload.get("choices") or []:
             delta = choice.get("delta") or choice.get("message") or {}
             content += len(delta.get("content") or "")
@@ -218,7 +276,7 @@ class RequestTrace:
                 else:
                     content += len(part.get("text") or "")
                 tools += int(bool(part.get("functionCall")))
-                media |= bool(part.get("inlineData") or part.get("fileData"))
+                other_reply = other_reply or native_other_part_has_reply(part)
             if candidate.get("finishReason"):
                 reasons.append(redact(candidate["finishReason"])[:100])
         with self._lock:
@@ -230,16 +288,17 @@ class RequestTrace:
                 self.data["reasoning_chars"] += reasoning
                 self.data["tool_deltas"] += tools
                 self.data["finish_reasons"] = sorted(set(self.data["finish_reasons"] + reasons))
-                usage = payload.get("usage") or payload.get("usageMetadata")
-                if isinstance(usage, dict):
-                    self.data["usage"] = numeric_usage(usage)
+                if isinstance(usage := payload.get("usage"), dict) and usage:
+                    self._set_usage_locked(usage)
+                elif isinstance(usage := payload.get("usageMetadata"), dict):
+                    self._set_usage_locked(usage, native=True)
         if sent:
-            if content or reasoning or tools or media:
+            if content or reasoning or tools or other_reply:
                 self.milestone("first_sent_reply", "首个有效模型回复已通过服务端 ASGI 发送。")
             if content:
                 self.milestone("first_sent_content", "首段正文已通过服务端 ASGI 发送；不代表客户端已渲染。")
         else:
-            if content or reasoning or tools or media:
+            if content or reasoning or tools or other_reply:
                 self.milestone("first_reply", "收到模型首个有效回复，首回复计时结束。")
             if reasoning:
                 self.milestone("first_reasoning", "开始返回思考内容。", phase="thinking")
@@ -308,15 +367,17 @@ class PayloadObserver:
         for offset in range(0, len(raw), step):
             self.buffer.extend(raw[offset:offset + step])
             self._ingest_sse()
+        if final and self.buffer:
+            self._ingest_sse(final=True)
 
     def _skipped(self, count):
         with self.trace._lock:
             self.trace.data["inspection_skipped_bytes"] += count
 
-    def _ingest_sse(self):
+    def _ingest_sse(self, *, final=False):
         start = 0
         scan = self._scan
-        while match := _FRAME_SEP_RE.search(self.buffer, scan):
+        while match := sse_separator(self.buffer, scan, final=final):
             end = match.end()
             if self.skipping or end - start > MAX_INSPECTION_BYTES:
                 self._skipped(end - start)
@@ -551,4 +612,4 @@ def retry_wait(delay, error):
 def record_usage(usage):
     if trace := current_trace.get():
         with trace._lock:
-            trace.data["usage"] = numeric_usage(usage)
+            trace._set_usage_locked(usage)

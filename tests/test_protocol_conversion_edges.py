@@ -1,4 +1,5 @@
 """Cross-protocol stop, indexing, usage, media and terminal stream contracts."""
+from settings_fixture import saved_settings
 import asyncio
 import base64
 from contextlib import asynccontextmanager
@@ -182,6 +183,36 @@ class ClaudeStreamTerminalTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(closed.is_set())
         return result
 
+    async def test_unicode_separators_survive_text_and_tool_arguments_on_fragmented_wire(self):
+        value = "alpha\u2028data: [DONE]\u2029beta\u0085gamma"
+        args = json.dumps({"value": value}, ensure_ascii=False)
+        delta = {"content": value, "tool_calls": [{"index": 0, "id": "call-1", "type": "function",
+                 "function": {"name": "echo", "arguments": args}}]}
+        payload = {"choices": [{"delta": delta, "finish_reason": "tool_calls"}]}
+        wire = ("data: " + json.dumps(payload, ensure_ascii=False) + "\r\n\r\ndata: [DONE]\n\n").encode()
+        result = await self.collect([wire[i:i + 2] for i in range(0, len(wire), 2)])
+        events = [json.loads(line[6:]) for line in result.split("\n") if line.startswith("data: ")]
+        self.assertEqual([e["type"] for e in events].count("message_stop"), 1)
+        self.assertNotIn("error", [e["type"] for e in events])
+        deltas = [e["delta"] for e in events if e["type"] == "content_block_delta"]
+        self.assertEqual([d["text"] for d in deltas if d["type"] == "text_delta"], [value])
+        self.assertEqual([json.loads(d["partial_json"]) for d in deltas if d["type"] == "input_json_delta"],
+                         [{"value": value}])
+
+    async def test_only_empty_physical_sse_lines_terminate_an_event(self):
+        # The comment's apparent "data:" and newline are just comment text.
+        # Unknown whitespace-only field, comments and bare empty data fields
+        # all leave this single multiline JSON object intact.
+        wire = ("\r\n: keep\u2028data: [DONE]\r\r"
+                'data: {"choices": [\r \t \n: note\r\ndata\r\n'
+                'data: {"delta":{"content":"kept"},"finish_reason":"stop"}]}\n\n'
+                'data: [DONE]\r\n\r\n')
+        result = await self.collect([wire])
+        self.assertIn('"text": "kept"', result)
+        self.assertEqual(result.count("event: ping"), 1)
+        self.assertEqual(result.count("event: message_stop"), 1)
+        self.assertNotIn("event: error", result)
+
     async def test_missing_finish_reason_errors_instead_of_successful_message_stop(self):
         for tail in ([], ["data: [DONE]\n\n"]):
             with self.subTest(tail=tail):
@@ -271,7 +302,7 @@ class CookieImageSignatureTests(unittest.IsolatedAsyncioTestCase):
              mock.patch.object(cookie_delivery, "stats", ProxyStats()), \
              mock.patch.object(cookie_proxy.credential_manager, "record_cookie_success"), \
              mock.patch.object(app_state, "get_effective_settings", return_value=settings), \
-             mock.patch.object(app_state, "get_setting", side_effect=lambda k, d=None: settings.get(k, d)):
+             saved_settings(app_state, settings):
             result = await cookie_proxy.CookieProxyUpstream().chat_completions(request,
                 SimpleNamespace(is_disconnected=mock.AsyncMock(return_value=False)),
                 credential_record={"id": "offline", "cookie": "SAPISID=offline", "project_id": "offline"})
@@ -295,7 +326,7 @@ class CookieImageSignatureTests(unittest.IsolatedAsyncioTestCase):
                                 stream=True, stream_options={"include_usage": True})
         settings = dict(config.DEFAULT_SETTINGS, fake_streaming=False, retry_max=0)
         with mock.patch.object(api_helpers, "stats", ProxyStats()), \
-             mock.patch.object(app_state, "get_setting", side_effect=lambda k, d=None: settings.get(k, d)):
+             saved_settings(app_state, settings):
             result = await api_helpers.execute_gemini_call(client, request.model,
                 lambda messages: [types.Content(role="user", parts=[types.Part(text="hello")])], {}, request)
             chunks = [json.loads(line[6:]) async for piece in result.body_iterator
@@ -304,6 +335,56 @@ class CookieImageSignatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([chunk["usage"] for chunk in chunks if "usage" in chunk], [
             {"prompt_tokens": 100, "completion_tokens": 5, "total_tokens": 105,
              "prompt_tokens_details": {"cached_tokens": 20}}])
+
+    async def test_standalone_opaque_parts_stay_after_tool_in_collect_and_stream(self):
+        signature = [base64.b64encode(value).decode() for value in
+                     (b"text sign", b"call sign", bytes([0, 255, 128]), bytes([254, 3]))]
+        raw = wire({"text": "before", "thoughtSignature": signature[0]},
+                   {"functionCall": {"id": "t", "name": "f", "args": {}}, "thoughtSignature": signature[1]},
+                   {"fileData": {"mimeType": "application/pdf", "fileUri": "gs://bucket/test.pdf"},
+                    "thoughtSignature": signature[0]},
+                   {"thoughtSignature": signature[2]}, {"thought": True, "thoughtSignature": signature[3]})
+
+        @asynccontextmanager
+        async def opened(*args, **kwargs):
+            yield SimpleNamespace(post=mock.AsyncMock(return_value=httpx.Response(200, json=raw)))
+
+        async def events(*args, **kwargs):
+            for event in extract_events(raw):
+                yield event
+
+        for mode in ("json", "stream", "buffered_sse"):
+            req = OpenAIRequest(model="gemini-3.5-flash-lite", messages=[{"role": "user", "content": "hello"}],
+                                stream=mode != "json")
+            settings = dict(config.DEFAULT_SETTINGS, proxy_url="", retry_max=0,
+                            fake_streaming=mode == "buffered_sse", fake_streaming_interval=0)
+            with self.subTest(mode=mode), \
+                 mock.patch.object(cookie_delivery, "open_upstream_client", opened), \
+                 mock.patch.object(cookie_delivery, "stats", ProxyStats()), \
+                 mock.patch.object(cookie_delivery, "stream_events", events), \
+                 mock.patch.object(cookie_proxy.credential_manager, "record_cookie_success"), \
+                 mock.patch.object(app_state, "get_effective_settings", return_value=settings), \
+                 saved_settings(app_state, settings):
+                result = await cookie_proxy.CookieProxyUpstream().chat_completions(req,
+                    SimpleNamespace(is_disconnected=mock.AsyncMock(return_value=False)),
+                    credential_record={"id": "offline", "cookie": "SAPISID=offline", "project_id": "offline"})
+                self.assertEqual(result.status_code, 200)
+                if mode == "json":
+                    parts = [json.loads(result.body)["choices"][0]["message"]]
+                else:
+                    parts = [json.loads(line[6:])["choices"][0]["delta"] async for frame in result.body_iterator
+                             for line in frame.splitlines() if line.startswith("data: {")]
+                google = next(p["extra_content"]["google"] for p in parts
+                              if "ordinary_parts" in p.get("extra_content", {}).get("google", {}))
+                self.assertEqual([(p["kind"], p["thought_signature"]) for p in google["ordinary_parts"]],
+                                 [("text", signature[0]), ("text", signature[0]), ("signature_only", signature[2]),
+                                  ("signature_only", signature[3])])
+                self.assertEqual(google["part_order"], [
+                    {"type": "ordinary", "index": 0}, {"type": "tool_call", "index": 0},
+                    {"type": "ordinary", "index": 1}, {"type": "ordinary", "index": 2},
+                    {"type": "ordinary", "index": 3}])
+                call = next(c for p in parts for c in p.get("tool_calls", []) if c.get("id") == "t")
+                self.assertEqual(call["extra_content"]["google"]["thought_signature"], signature[1])
 
     async def test_image_signature_stays_with_image_in_both_history_converters(self):
         output = io.BytesIO()
@@ -320,7 +401,7 @@ class CookieImageSignatureTests(unittest.IsolatedAsyncioTestCase):
              mock.patch.object(cookie_delivery, "stats", ProxyStats()), \
              mock.patch.object(cookie_proxy.credential_manager, "record_cookie_success"), \
              mock.patch.object(app_state, "get_effective_settings", return_value=settings), \
-             mock.patch.object(app_state, "get_setting", side_effect=lambda k, d=None: settings.get(k, d)):
+             saved_settings(app_state, settings):
             result = await cookie_proxy.CookieProxyUpstream().chat_completions(request,
                 SimpleNamespace(is_disconnected=mock.AsyncMock(return_value=False)),
                 credential_record={"id": "offline", "cookie": "SAPISID=offline", "project_id": "offline"})

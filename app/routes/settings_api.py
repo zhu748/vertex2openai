@@ -12,7 +12,7 @@ import model_capabilities as mc
 from console_auth import require_auth
 from keepalive import keepalive_service
 from model_loader import get_express_models
-from runtime_state import app_state, SettingsConflictError
+from runtime_state import app_state, SettingsConflictError, model_override_receipt
 from request_connection import BodyTooLargeError
 from request_ingress import IngressError
 from settings_validation import validate_global_settings_patch, validate_settings_patch
@@ -57,17 +57,19 @@ class ModeSetting(BaseModel):
 @router.get("/api/settings/runtime")
 async def get_runtime_settings(_auth: bool = Depends(require_auth)):
     accounts = app_state.get_cookie_accounts()
-    cookie = next((r["cookie"] for r in accounts if r["enabled"]), "")
+    active = next((r for r in accounts if r["enabled"]), None)
+    cookie = active["cookie"] if active else ""
+    mode = app_state.get_channel_mode(committed=True)
     return JSONResponse(
         content={
-            "use_web_proxy": app_state.is_web_proxy_enabled(),
-            "mode": app_state.get_channel_mode(),
+            "use_web_proxy": mode == "web_proxy",
+            "mode": mode,
             "cookie_accounts": {"total": len(accounts), "enabled": sum(r["enabled"] for r in accounts)},
             # S-1：只回显掩码。完整 Cookie 等价于该 Google 账号的完整访问权，
             # 没有任何理由让它出现在前端 JS / 浏览器缓存 / 截图里。
             "google_cookie": mask_cookie(cookie),
             "google_cookie_configured": bool(cookie),
-            "google_project_id": app_state.get_project_id(),
+            "google_project_id": active["project_id"] if active else app_state.get_project_id(),
         },
         headers={"Cache-Control": "no-store"},
     )
@@ -75,8 +77,11 @@ async def get_runtime_settings(_auth: bool = Depends(require_auth)):
 
 @router.post("/api/settings/mode")
 async def set_settings_mode(setting: ModeSetting, _auth: bool = Depends(require_auth)):
-    await asyncio.to_thread(app_state.set_channel_mode, setting.mode)
-    return JSONResponse(content={"status": "success"})
+    mode = await asyncio.to_thread(app_state.set_channel_mode, setting.mode)
+    if mode != setting.mode:
+        return JSONResponse(status_code=409, content={"error": "通道模式已由另一项更改更新。", "mode": mode},
+                            headers={"Cache-Control": "no-store"})
+    return JSONResponse(content={"status": "success", "mode": mode}, headers={"Cache-Control": "no-store"})
 
 
 @router.get("/api/settings")
@@ -98,18 +103,22 @@ async def update_settings_api(request: Request, _auth: bool = Depends(require_au
     if error:
         return JSONResponse(status_code=400, content=error)
     refresh_keys = {"cookie_auto_refresh", "cookie_refresh_interval_seconds"} & set(patch)
-    previous_refresh = {key: app_state.get_setting(key) for key in refresh_keys}
+    refresh_changed = False
     try:
         expected = _expected_settings(patch, set(patch) & (set(config.DEFAULT_SETTINGS) - {"model_overrides"}))
-        updated = await asyncio.to_thread(app_state.update_settings, patch, expected=expected)
+        if refresh_keys:
+            updated, refresh_changed = await asyncio.to_thread(
+                app_state.update_settings_with_changes, patch, refresh_keys, expected=expected)
+        else:
+            updated = await asyncio.to_thread(app_state.update_settings, patch, expected=expected)
     except SettingsConflictError as exc:
         return _settings_conflict(exc)
     except ValueError as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})
-    if any(updated[key] != previous_refresh[key] for key in refresh_keys):
+    if refresh_changed:
         from cookie_refresh import notify_settings_changed
         notify_settings_changed()
-    if {"keepalive_url", "keepalive_interval"} & set(patch):
+    if {"keepalive_url", "keepalive_interval", "keepalive_allow_private"} & patch.keys():
         # 保活配置热更新：立即按新配置重启任务（清空 URL 即停止），无需重启服务。
         await keepalive_service.restart()
     return JSONResponse(content=updated, headers={"Cache-Control": "no-store"})
@@ -123,14 +132,14 @@ async def get_capabilities_api(_auth: bool = Depends(require_auth)):
         models = []
     # 能力摘要要反映该模型生效的采样策略，否则控制台提示与实际下发不一致
     # （设置基底只取一次：旧实现每个模型都全量 deepcopy 整个设置树）
-    settings_base = app_state.get_settings()
+    settings_base, saved_overrides = app_state.get_model_editor_settings()
     caps = {
         m: mc.capabilities_summary(m, app_state.get_effective_settings(m, base=settings_base)) for m in models
     }
     # 附带各模型是否已有专属参数覆盖，供前端标示
-    overrides = app_state.get_model_overrides()
+    overrides = settings_base["model_overrides"]
     return JSONResponse(content={"models": models, "capabilities": caps, "overrides": overrides,
-                                 "saved_overrides": app_state.get_saved_model_overrides(),
+                                 "saved_overrides": saved_overrides,
                                  "builtin_overrides": config.DEFAULT_SETTINGS["model_overrides"]},
                         headers={"Cache-Control": "no-store"})
 
@@ -170,24 +179,36 @@ async def save_model_override(model_name: str, request: Request, _auth: bool = D
         expected = _expected_settings(patch, set(clean) | set(inherit))
     except ValueError as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})
-    if not clean and not inherit:
-        current = await asyncio.to_thread(app_state.get_model_overrides)
-        return JSONResponse(content={"status": "success", "model": model_name,
-                                     "override": current.get(model_name, {})})
     try:
-        saved = await asyncio.to_thread(app_state.set_model_override, model_name, clean, inherit=inherit, expected=expected)
+        if clean or inherit:
+            receipt = await asyncio.to_thread(app_state.save_model_override, model_name, clean,
+                                              inherit=inherit, expected=expected)
+        else:
+            receipt = app_state.get_model_override_receipt(model_name)
     except SettingsConflictError as exc:
         return _settings_conflict(exc)
-    return JSONResponse(content={"status": "success", "model": model_name, "override": saved})
+    return JSONResponse(content={"status": "success", "model": model_name, **receipt})
+
+
+class ModelOverrideReset(BaseModel):
+    expected_override: dict
 
 
 @router.delete("/api/model-overrides/{model_name}")
-async def delete_model_override(model_name: str, _auth: bool = Depends(require_auth)):
-    ok = await asyncio.to_thread(app_state.clear_model_override, model_name)
+async def delete_model_override(model_name: str, _auth: bool = Depends(require_auth), body: ModelOverrideReset | None = None):
+    # No body retains the legacy unconditional API; a supplied object must
+    # contain the complete loaded baseline, even when there were no overrides.
+    try:
+        ok = await asyncio.to_thread(app_state.clear_model_override, model_name,
+                                     expected=body.expected_override if body is not None else None)
+    except SettingsConflictError as exc:
+        return _settings_conflict(exc)
     return JSONResponse(
         content={
             "status": "success" if ok else "not_found",
             "model": model_name,
-            "override": app_state.get_model_overrides().get(model_name, {}),
+            # Both success and not_found left no owned fields at the reset's
+            # commit point. Do not read another writer's post-reset overrides.
+            **model_override_receipt(model_name, {}),
         }
     )

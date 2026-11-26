@@ -17,10 +17,13 @@ from settings_validation import validate_global_settings_patch
 
 
 class _FakeState:
-    """按 {key: value} 回答 get_setting 的轻量替身（只覆盖保活用到的键）。"""
+    """提供已提交配置及默认值的轻量替身。"""
 
     def __init__(self, values):
-        self.get_setting = mock.Mock(side_effect=values.get)
+        self.values = values
+
+    def get_committed_settings(self, *keys):
+        return {key: self.values.get(key, config.DEFAULT_SETTINGS[key]) for key in keys}
 
 
 class KeepAliveServiceTests(unittest.IsolatedAsyncioTestCase):
@@ -65,7 +68,7 @@ class KeepAliveServiceTests(unittest.IsolatedAsyncioTestCase):
         await service.start()
         self.assertTrue(service.is_running)
         # 控制台清空 URL 保存后的等效操作：配置变为空 → restart 应停止任务。
-        keepalive.app_state.get_setting.side_effect = {}.get
+        keepalive.app_state.values.clear()
         await service.restart()
         self.assertFalse(service.is_running)
 

@@ -135,6 +135,30 @@ class RotateAccountTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(cookie_refresh, "open_upstream_client", open_client):
             return await cookie_refresh.rotate_account(self.record)
 
+    async def test_rotated_duplicate_preserves_both_rows_and_the_existing_edit_revision(self):
+        from routes.credentials_api import CookieAccountsBody, save_cookie_accounts
+
+        neighbor = {"id": "neighbor", "cookie": "SAPISID=old; SIDCC=converged",
+                    "project_id": "other-project", "note": "other account", "enabled": False}
+        for ordered in ([self.record, neighbor], [neighbor, self.record]):
+            with self.subTest(target=ordered.index(self.record)):
+                app_state.set_cookie_accounts(ordered)
+                before, revision = app_state.credential_snapshot("cookies")
+                with mock.patch.object(app_state, "_write_snapshot", side_effect=AssertionError("wrote collision")):
+                    result = await self.rotate(lambda req: httpx.Response(200, headers={
+                        "set-cookie": "SIDCC=converged; Secure"}))
+                self.assertEqual((result["status"], result["changed"]), ("error", []))
+                self.assertIn("重复", result["detail"])
+                self.assertNotIn("converged", result["detail"])
+                self.assertEqual(app_state.credential_snapshot("cookies"), (before, revision))
+                self.assertEqual(AppState().get_cookie_accounts(), before)
+                # A metadata-only edit from the original masked form remains valid.
+                edit = [dict(row, cookie="", note="new note") for row in before]
+                response = await save_cookie_accounts(CookieAccountsBody(accounts=edit, revision=revision))
+                self.assertEqual(response.status_code, 200, response.body)
+                self.assertEqual([row["cookie"] for row in app_state.get_cookie_accounts()],
+                                 [row["cookie"] for row in before])
+
     async def test_refresh_uses_account_fallback_chain_and_custom_ca(self):
         with mock.patch("config.SSL_CERT_FILE", "/custom/ca.pem"):
             result = await self.rotate(lambda req: httpx.Response(200, headers=[
@@ -228,9 +252,9 @@ class RotateAccountTests(unittest.IsolatedAsyncioTestCase):
 class IntervalClampTests(unittest.TestCase):
     def test_auto_refresh_defaults_on_and_preserves_explicit_off(self):
         self.assertIs(config.DEFAULT_SETTINGS["cookie_auto_refresh"], True)
-        with mock.patch.object(app_state, "_state", {}):
+        with mock.patch.object(app_state, "_committed", {}):
             self.assertTrue(cookie_refresh.auto_refresh_enabled())
-        with mock.patch.object(app_state, "_state", {"settings": {"cookie_auto_refresh": False}}):
+        with mock.patch.object(app_state, "_committed", {"settings": {"cookie_auto_refresh": False}}):
             self.assertFalse(cookie_refresh.auto_refresh_enabled())
 
     def test_interval_clamped_to_minimum(self):
@@ -257,6 +281,33 @@ class IntervalClampTests(unittest.TestCase):
 
 
 class RefreshLoopTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        app_state.set_cookie_accounts([{"id": name, "cookie": "fixture=" + name} for name in ("one", "two")])
+
+    async def test_queued_accounts_are_revalidated_after_previous_request(self):
+        initial = [{"id": name, "cookie": "fixture=" + name, "note": name} for name in "ABCD"]
+        app_state.set_cookie_accounts(initial)
+        attempts = []
+
+        async def rotate(row):
+            attempts.append(row)
+            if row["id"] == "A":
+                app_state.set_cookie_accounts([initial[0], {**initial[1], "enabled": False},
+                                               {**initial[3], "cookie": "fixture=edited", "project_id": "new-project",
+                                                "proxies": ["http://new.example:80"], "note": "updated label"},
+                                               {"id": "not-admitted", "cookie": "fixture=extra"}])
+            return {"id": row["id"], "status": "unchanged"}
+
+        with (mock.patch.object(cookie_refresh, "_loop_lock", asyncio.Lock()),
+              mock.patch.object(cookie_refresh, "_ACCOUNT_GAP_SECONDS", 0),
+              mock.patch.object(cookie_refresh, "rotate_account", rotate)):
+            results = await cookie_refresh.refresh_once()
+        self.assertEqual([r["id"] for r in attempts], ["A", "D"])
+        self.assertEqual((attempts[1]["cookie"], attempts[1]["project_id"], attempts[1]["note"], attempts[1]["proxies"]),
+                         ("fixture=edited", "new-project", "updated label", ["http://new.example:80"]))
+        self.assertEqual([r["status"] for r in results], ["unchanged", "skipped", "skipped", "unchanged"])
+        self.assertNotIn("fixture=", repr(results))
+
     async def test_manual_and_automatic_rounds_share_lock_and_release_on_cancel(self):
         started = asyncio.Event()
 
@@ -286,7 +337,6 @@ class RefreshLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([r["status"] for r in results], ["error", "unchanged"])
 
     async def test_settings_save_wakes_disabled_loop_without_waiting_old_interval(self):
-        wake = asyncio.Event()
         entered = asyncio.Event()
         refreshed = asyncio.Event()
         enabled = False
@@ -295,11 +345,11 @@ class RefreshLoopTests(unittest.IsolatedAsyncioTestCase):
             entered.set()
             return enabled
 
-        async def refresh(records):
+        async def refresh(records, *, automatic):
+            self.assertTrue(automatic)
             refreshed.set()
 
-        with (mock.patch.object(cookie_refresh, "_settings_changed", wake),
-              mock.patch.object(cookie_refresh, "_STARTUP_DELAY_SECONDS", 0),
+        with (mock.patch.object(cookie_refresh, "_STARTUP_DELAY_SECONDS", 0),
               mock.patch.object(cookie_refresh, "auto_refresh_enabled", is_enabled),
               mock.patch.object(cookie_refresh, "refresh_interval_seconds", return_value=86400),
               mock.patch.object(app_state, "get_cookie_accounts", return_value=[{"enabled": True}]),
@@ -314,6 +364,41 @@ class RefreshLoopTests(unittest.IsolatedAsyncioTestCase):
                 task.cancel()
                 with self.assertRaises(asyncio.CancelledError):
                     await task
+
+
+class RefreshWorkerRestartTests(unittest.TestCase):
+    def test_each_new_lifespan_can_wait_wake_and_stop_on_its_own_event_loop(self):
+        async def run_once(notify_from_thread):
+            first, next_round = asyncio.Event(), asyncio.Event()
+
+            def check_enabled():
+                (next_round if first.is_set() else first).set()
+                return False  # No accounts, requests or credentials needed.
+
+            with (mock.patch.object(cookie_refresh, "_STARTUP_DELAY_SECONDS", 0),
+                  mock.patch.object(cookie_refresh, "auto_refresh_enabled", check_enabled),
+                  mock.patch.object(cookie_refresh, "refresh_interval_seconds", return_value=86400)):
+                worker = asyncio.create_task(cookie_refresh.refresh_loop())
+                try:
+                    await asyncio.wait_for(first.wait(), 1)
+                    if worker.done():
+                        await worker  # Surface a loop-affinity failure directly.
+                    if notify_from_thread:
+                        await asyncio.to_thread(cookie_refresh.notify_settings_changed)
+                    else:
+                        cookie_refresh.notify_settings_changed()
+                    await asyncio.wait_for(next_round.wait(), 1)
+                finally:
+                    worker.cancel()
+                    await asyncio.gather(worker, return_exceptions=True)
+                self.assertTrue(worker.cancelled())
+            return asyncio.get_running_loop()
+
+        for notify_from_thread in (False, True):
+            stopped = asyncio.run(run_once(notify_from_thread), debug=True)
+            with mock.patch.object(stopped, "call_soon_threadsafe") as notify_stale:
+                cookie_refresh.notify_settings_changed()
+                notify_stale.assert_not_called()
 
 
 class ManualRefreshRouteTests(unittest.TestCase):
@@ -347,6 +432,12 @@ class ManualRefreshRouteTests(unittest.TestCase):
         self.assertNotIn("secret-", response.text)
         self.assertEqual(response.headers["cache-control"], "no-store")
         self.assertFalse(cookie_refresh.auto_refresh_enabled())
+
+    def test_skipped_refresh_is_not_reported_as_a_success_or_error(self):
+        rows = [{"id": "one", "label": "one", "status": "skipped", "changed": [], "detail": "未发送"}]
+        with mock.patch.object(self.routes, "refresh_cookie_accounts", mock.AsyncMock(return_value=rows)):
+            result = self.client.post("/api/cookie-accounts/refresh", json={"id": "one"}).json()
+        self.assertEqual([result[k] for k in ("total", "refreshed", "unchanged", "errors", "skipped")], [1, 0, 0, 0, 1])
 
     def test_unrelated_runtime_save_does_not_trigger_another_rotation(self):
         app_state.update_settings({"cookie_auto_refresh": False, "cookie_refresh_interval_seconds": 600})

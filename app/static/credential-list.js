@@ -17,27 +17,52 @@
   /* cfg 字段：
    *   endpoint       列表端点（GET 加载 / POST 保存）
    *   itemsKey       请求与响应里的列表字段名（'keys' / 'accounts'）
-   *   responseItems  从保存响应取列表；Cookie 侧在此校验数组形态并抛
-   *                  ui 标记错误（错误文案直达 toast，网络错误仍显示
-   *                  统一的网络失败提示）
    *   noticeLabel / loadRetryHint / notLoadedToast / toastNoun
    *   formsGroup     consoleForms.saved(...) 的分组名
    *   accountGroup   consoleForms.openAccount(...) 的分组名
    *   emptyConfirm   空列表保存前的确认（仅 Express Key 需要）
    *   getItems / setItems / getSaved / setSaved / getRevision /
    *   setRevision / isLoaded / markLoaded   —— 调用方闭包状态的读写面
-   *   render / collect / blankRecord / focusNew / afterRemove
+   *   render / collect / prepareSave (optional) / blankRecord / focusNew / afterRemove
    */
   function create(cfg) {
+    // A 2xx alone does not confirm what was durably saved. Validate and copy
+    // before touching any row, revision or dirty baseline (a valid [] is fine).
+    function publishList(data) {
+      const rows = data?.[cfg.itemsKey];
+      if (
+        !Array.isArray(rows) ||
+        rows.some((row) => !row || typeof row !== 'object' || Array.isArray(row))
+      ) {
+        const error = new Error('响应中缺少有效的账号列表；草稿已保留，请重新加载并核对结果');
+        error.ui = true;
+        throw error;
+      }
+      const revision = data.revision ?? null;
+      // Older consoles may genuinely have no revision. Once the server has
+      // demonstrated compare-and-set support, a partial receipt cannot turn it off.
+      if (
+        (revision !== null || cfg.getRevision() !== null) &&
+        (typeof revision !== 'string' || !revision.trim())
+      ) {
+        const error = new Error('响应中缺少有效的账号列表版本；草稿已保留，请重新加载并核对结果');
+        error.ui = true;
+        throw error;
+      }
+      const items = rows.map(credentialCopy);
+      const saved = items.map(credentialCopy);
+      cfg.setItems(items);
+      cfg.setSaved(saved);
+      cfg.setRevision(revision);
+      cfg.markLoaded();
+      cfg.render();
+      window.consoleForms?.saved(cfg.formsGroup);
+      return items.length;
+    }
+
     async function load() {
       try {
-        const d = await readJSON(cfg.endpoint);
-        cfg.setItems((d[cfg.itemsKey] || []).map(credentialCopy));
-        cfg.markLoaded();
-        cfg.setSaved(cfg.getItems().map(credentialCopy));
-        cfg.setRevision(d.revision ?? null);
-        cfg.render();
-        window.consoleForms?.saved(cfg.formsGroup);
+        publishList(await readJSON(cfg.endpoint));
       } catch (e) {
         loadNotice('channel', cfg.noticeLabel + e.message + '。' + cfg.loadRetryHint);
       }
@@ -50,7 +75,8 @@
       }
       let payload;
       try {
-        payload = cfg.collect();
+        const rows = cfg.collect();
+        payload = cfg.prepareSave ? cfg.prepareSave(rows) : rows;
       } catch (error) {
         toast('❌ 收集账号信息失败：' + error.message);
         return;
@@ -68,13 +94,8 @@
         });
         const d = await r.json();
         if (r.ok) {
-          const items = cfg.responseItems(d);
-          cfg.setRevision(d.revision ?? null);
-          cfg.setItems(items);
-          cfg.setSaved(items.map(credentialCopy));
-          cfg.render();
-          window.consoleForms?.saved(cfg.formsGroup);
-          toast('已保存 ' + items.length + ' 个' + cfg.toastNoun + '（已热生效）');
+          const count = publishList(d);
+          toast('已保存 ' + count + ' 个' + cfg.toastNoun + '（已热生效）');
         } else {
           const message = await responseError(r, '保存失败', d);
           if (r.status === 409) loadNotice('channel', message);

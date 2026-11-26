@@ -6,7 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
 import os
-import queue
+from collections import deque
 import threading
 from types import SimpleNamespace
 import unittest
@@ -147,13 +147,73 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         self.manager.record_cookie_success.assert_not_called()
         self.manager.record_cookie_auth_failure.assert_not_called()
 
-    async def test_auth_rejection_never_downloads_body(self):
+    async def test_definitive_http_status_never_downloads_body_and_closes_once(self):
         class Stream(httpx.AsyncByteStream):
+            reads = closes = 0
             async def __aiter__(self):
-                raise AssertionError("auth error body must not be read")
+                self.reads += 1
+                raise AssertionError("a definitive status does not need the body")
                 yield b""
-        result = await self.run_probe(lambda req: httpx.Response(401, stream=Stream()))
-        self.assertEqual(result["status"], "invalid")
+            async def aclose(self):
+                self.closes += 1
+        for status in (302, 307, 401, 403, 429, 500, 503):
+            with self.subTest(status=status):
+                self.manager.reset_mock()
+                stream = Stream()
+                result = await self.run_probe(lambda req: httpx.Response(status, stream=stream))
+                auth = status in (401, 403)
+                self.assertEqual(result["status"], "invalid" if auth else "error")
+                self.assertIn(f"HTTP {status}", result["detail"])
+                self.assertEqual((stream.reads, stream.closes), (0, 1))
+                self.assertEqual(self.manager.record_cookie_auth_failure.call_count, int(auth))
+                self.manager.record_cookie_success.assert_not_called()
+
+    async def test_other_client_errors_still_consult_upstream_body(self):
+        for status, code, expected in ((400, 5, "valid"), (404, 16, "invalid")):
+            with self.subTest(status=status):
+                result = await self.run_probe(lambda req: httpx.Response(status, json=graphql(code)))
+                self.assertEqual(result["status"], expected)
+
+    async def test_definitive_status_closes_stalled_loopback_peer_on_both_transports(self):
+        closed = asyncio.Queue()
+        async def peer(reader, writer):
+            try:
+                head = (await reader.readuntil(b"\r\n\r\n")).lower().split(b"\r\n")
+                status = int(head[0].split()[1].lstrip(b"/"))
+                size = next(int(line.split(b":")[1]) for line in head if line.startswith(b"content-length:"))
+                await reader.readexactly(size)
+                # curl may not expose the status until the first body byte.
+                writer.write(f"HTTP/1.1 {status} Fixture\r\nContent-Length: 64\r\n"
+                             "Connection: close\r\n\r\n{".encode())
+                await writer.drain()
+                await reader.read()  # No body tail is sent: client must close, not drain.
+                closed.put_nowait(status)
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        async with await asyncio.start_server(peer, "127.0.0.1", 0) as server:
+            root = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}"
+            for profile in ("off", "chrome"):
+                client = impersonate._create_upstream_client({"trust_env": False}, (profile, 4))
+                @asynccontextmanager
+                async def opened(_options):
+                    yield client
+                try:
+                    for status in (302, 429, 503):
+                        with (self.subTest(profile=profile, status=status),
+                              mock.patch.object(cookie_probe, "build_headers", return_value={"X-Fixture": "local"}),
+                              mock.patch.object(cookie_probe, "open_upstream_client", opened),
+                              mock.patch.object(cookie_probe, "BATCH_GRAPHQL_URL", f"{root}/{status}"),
+                              mock.patch.object(cookie_probe, "PROBE_TOTAL_TIMEOUT_SECONDS", 1.5)):
+                            result = await cookie_probe.probe_account(account())
+                            self.assertEqual(await asyncio.wait_for(closed.get(), 2), status)
+                            self.assertEqual(result["status"], "error")
+                            self.assertIn(f"HTTP {status}", result["detail"])
+                finally:
+                    await client.aclose()
+        self.manager.record_cookie_success.assert_not_called()
+        self.manager.record_cookie_auth_failure.assert_not_called()
 
     async def test_unknown_length_response_is_bounded_and_closed(self):
         class Stream(httpx.AsyncByteStream):
@@ -377,14 +437,14 @@ class DiagnosticTests(unittest.TestCase):
             open_file.assert_not_called()
 
     def test_stdout_queue_bounds_message_size_as_well_as_item_count(self):
-        pending = queue.Queue(maxsize=2)
+        pending = deque(maxlen=2)
         with mock.patch.object(logger, "_STDOUT_QUEUE", pending), \
              mock.patch.object(logger, "_ensure_stdout_writer"):
             for _ in range(5):
                 logger._enqueue_stdout("x" * 200000, "\n", False)
-        self.assertEqual(pending.qsize(), 2)
-        while not pending.empty():
-            text, _, _ = pending.get_nowait()
+        self.assertEqual(len(pending), 2)
+        while pending:
+            text, _, _ = pending.popleft()
             self.assertLess(len(text), logger._MAX_STDOUT_CHARS + 100)
             self.assertIn("原长度 200000", text)
 

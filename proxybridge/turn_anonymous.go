@@ -32,6 +32,7 @@ import (
 )
 
 const stunHeaderSize = 20
+const rawControlIOBudget = 10 * time.Second
 
 // peerAddrSetter writes XOR-PEER-ADDRESS (same wire format as
 // XORMappedAddress, different attribute type).
@@ -82,11 +83,38 @@ func rawSTUNTransaction(conn net.Conn, request *stun.Message) (*stun.Message, er
 	}
 }
 
-func withTimeout(ctx context.Context, conn net.Conn) (func(), error) {
-	if err := conn.SetDeadline(minDeadline(ctx, 10*time.Second)); err != nil {
-		return func() {}, err
+// withTimeout gives the setup owner both the bounded I/O deadline and the
+// ability to interrupt an already-open socket on cancellation. The returned
+// release must succeed before handing the socket to another owner.
+func withTimeout(ctx context.Context, conn net.Conn) (func() error, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	return func() { conn.SetDeadline(time.Time{}) }, nil
+	if err := conn.SetDeadline(minDeadline(ctx, rawControlIOBudget)); err != nil {
+		return nil, err
+	}
+	clear := func() error { return conn.SetDeadline(time.Time{}) }
+	if ctx.Done() == nil {
+		return sync.OnceValue(clear), nil
+	}
+	interrupted := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		// SetDeadline interrupts reads and writes without racing the owner's
+		// regular Close. If the socket cannot update its deadline, close it.
+		if err := conn.SetDeadline(time.Now()); err != nil {
+			conn.Close()
+		}
+		close(interrupted)
+	})
+	return sync.OnceValue(func() error {
+		if !stop() {
+			<-interrupted // never clear a deadline concurrently with the callback
+		}
+		if err := ctx.Err(); err != nil {
+			return err // cancellation won; a caller must not transfer this socket
+		}
+		return clear()
+	}), nil
 }
 
 // requestedFamily encodes REQUESTED-ADDRESS-FAMILY (0x0017): 0x01 = IPv4,
@@ -121,10 +149,10 @@ func stunError(response *stun.Message) error {
 // unauthenticated Allocate selects the anonymous dialer; any error response
 // (401/438/300/...) selects the Pion client, which handles the standard
 // credential flow.
-func detectTURNMode(ctx context.Context, c config, tlsConfig *tls.Config) (string, error) {
+func detectTURNMode(parent context.Context, c config, tlsConfig *tls.Config) (mode string, err error) {
 	// Tight budget: the Python manager marks the bridge as failed when the
 	// ready marker does not appear within 10 seconds of launch.
-	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 8*time.Second)
 	defer cancel()
 	control, _, err := dialServer(ctx, net.JoinHostPort(c.Server, strconv.Itoa(c.Port)), tlsConfig)
 	if err != nil {
@@ -135,7 +163,14 @@ func detectTURNMode(ctx context.Context, c config, tlsConfig *tls.Config) (strin
 	if err != nil {
 		return "", err
 	}
-	defer clear()
+	defer func() {
+		clear() // probe sockets are not transferred
+		// An internal timeout during best-effort release does not erase the
+		// observed mode, but explicit caller shutdown must not report it as ready.
+		if cause := parent.Err(); cause != nil {
+			mode, err = "", cause
+		}
+	}()
 	// Most open relays are IPv4-only; probe the IPv4 family first and fall
 	// back to the Pion client whenever the server answers with an error.
 	response, err := rawSTUNTransaction(control, allocateRequest(true))
@@ -199,9 +234,11 @@ func refreshInterval(granted time.Duration) time.Duration {
 // the next refresh follows the LIFETIME returned by each response. The old
 // loop kept the interval derived from the Allocate response: a server that
 // reduced the lifetime let the allocation expire between refreshes.
-func (a *rawAllocation) startRefresh(kill func()) {
+func (a *rawAllocation) startRefresh(grantedAt time.Time, kill func()) {
 	go func() {
-		timer := time.NewTimer(refreshInterval(a.lifetime))
+		// The control socket was owned by setup until now. The initial grant
+		// already ran during Permission / Connect / Bind, not from handoff.
+		timer := time.NewTimer(time.Until(grantedAt.Add(refreshInterval(a.lifetime))))
 		defer timer.Stop()
 		granted := a.lifetime
 		for {
@@ -210,8 +247,15 @@ func (a *rawAllocation) startRefresh(kill func()) {
 				return
 			case <-timer.C:
 			}
-			clear, err := withTimeout(context.Background(), a.control)
-			if err != nil {
+			if time.Since(grantedAt) >= granted {
+				// A stalled scheduler can wake after the known grant has expired.
+				kill()
+				return
+			}
+			// A pending Refresh is not a confirmed grant. The existing I/O
+			// budget may be shorter, but must not extend the previous lifetime.
+			expires := grantedAt.Add(granted)
+			if err := a.control.SetDeadline(cappedIODeadline(expires, rawControlIOBudget)); err != nil {
 				a.stop()
 				kill()
 				return
@@ -224,8 +268,9 @@ func (a *rawAllocation) startRefresh(kill func()) {
 				stun.Fingerprint,
 			)
 			response, err := rawSTUNTransaction(a.control, refresh)
-			clear()
-			if err != nil || response.Type.Class != stun.ClassSuccessResponse {
+			grantedAt = time.Now()
+			clearErr := a.control.SetDeadline(time.Time{})
+			if err != nil || clearErr != nil || !grantedAt.Before(expires) || response.Type.Class != stun.ClassSuccessResponse {
 				a.stop()
 				kill()
 				return
@@ -239,7 +284,7 @@ func (a *rawAllocation) startRefresh(kill func()) {
 				kill()
 				return
 			} else {
-				timer.Reset(next)
+				timer.Reset(time.Until(grantedAt.Add(next)))
 			}
 		}
 	}()
@@ -248,16 +293,23 @@ func (a *rawAllocation) startRefresh(kill func()) {
 // dialTURNAnonymous implements outbound RFC 6062 relaying without
 // credentials: Allocate → Connect(peer) → ConnectionBind on a second
 // connection, then plain relayed bytes.
-func (c config) dialTURNAnonymous(ctx context.Context, peer *net.TCPAddr, tlsConfig *tls.Config) (net.Conn, error) {
+func (c config) dialTURNAnonymous(ctx context.Context, peer *net.TCPAddr, tlsConfig *tls.Config) (_ net.Conn, err error) {
 	serverAddr := net.JoinHostPort(c.Server, strconv.Itoa(c.Port))
 	control, _, err := dialServer(ctx, serverAddr, tlsConfig)
 	if err != nil {
 		return nil, err
 	}
+	var data net.Conn
 	complete := false
 	defer func() {
 		if !complete {
+			if data != nil {
+				data.Close()
+			}
 			control.Close()
+			if cause := ctx.Err(); cause != nil {
+				err = cause
+			}
 		}
 	}()
 	clearControl, err := withTimeout(ctx, control)
@@ -274,11 +326,16 @@ func (c config) dialTURNAnonymous(ctx context.Context, peer *net.TCPAddr, tlsCon
 	if response.Type.Class != stun.ClassSuccessResponse {
 		return nil, fmt.Errorf("turn_allocate_failed: %w", stunError(response))
 	}
+	grantedAt := time.Now()
 	lifetime := 600 * time.Second
 	if value, err := response.Get(stun.AttrLifetime); err == nil && len(value) == 4 {
-		if seconds := binary.BigEndian.Uint32(value); seconds > 0 {
-			lifetime = time.Duration(seconds) * time.Second
+		seconds := binary.BigEndian.Uint32(value)
+		if seconds == 0 {
+			// Unlike an omitted LIFETIME, an explicit zero means there is
+			// no live allocation. The setup owner still owns the control socket.
+			return nil, errors.New("turn_allocation_zero_lifetime")
 		}
+		lifetime = time.Duration(seconds) * time.Second
 	}
 
 	// CreatePermission for the peer before Connect, matching the Pion client
@@ -325,7 +382,11 @@ func (c config) dialTURNAnonymous(ctx context.Context, peer *net.TCPAddr, tlsCon
 	// Keep a floor on the binding exchange even when the caller passes a
 	// context without a deadline: a silent server would otherwise block
 	// this dial forever instead of failing within seconds.
-	data.SetDeadline(minDeadline(ctx, 10*time.Second))
+	clearData, err := withTimeout(ctx, data)
+	if err != nil {
+		return nil, err
+	}
+	defer clearData()
 	adapter := &turnDataConn{TCPConn: tcpData, stream: data, binding: true}
 	bind := stun.MustBuild(
 		stun.TransactionID,
@@ -334,37 +395,42 @@ func (c config) dialTURNAnonymous(ctx context.Context, peer *net.TCPAddr, tlsCon
 		stun.Fingerprint,
 	)
 	if _, err := adapter.Write(bind.Raw); err != nil {
-		data.Close()
 		return nil, err
 	}
 	head := make([]byte, stunHeaderSize)
 	if _, err := adapter.Read(head); err != nil || !stun.IsMessage(head) {
-		data.Close()
 		return nil, errors.New("connection bind: invalid response")
 	}
 	body := make([]byte, binary.BigEndian.Uint16(head[2:4]))
 	if _, err := adapter.Read(body); err != nil {
-		data.Close()
 		return nil, err
 	}
 	bindResponse := &stun.Message{Raw: append(head, body...)}
 	if err := bindResponse.Decode(); err != nil {
-		data.Close()
 		return nil, err
 	}
 	if bindResponse.Type.Class != stun.ClassSuccessResponse {
-		data.Close()
 		return nil, fmt.Errorf("turn_connection_bind_failed: %w", stunError(bindResponse))
 	}
 	// Transaction ID 校验（2026-11 G-2）：行为异常的服务器可用任意成功响应
 	// 让绑定「成功」；与同文件 rawSTUNTransaction 的语义对齐，ID 不匹配
 	// 即拒绝。（数据连接不做 indication 跳过循环：绑定期内不该有旁路流量。）
 	if bindResponse.TransactionID != bind.TransactionID {
-		data.Close()
 		return nil, errors.New("connection bind: transaction mismatch")
 	}
 	adapter.binding = false
-	data.SetDeadline(time.Time{})
+	// Stop and join both setup callbacks before starting connection-owned work.
+	// A later cancel of the dial context must not touch either transferred socket.
+	if err := clearData(); err != nil {
+		return nil, err
+	}
+	if err := clearControl(); err != nil {
+		return nil, err
+	}
+	if time.Since(grantedAt) >= lifetime {
+		// The setup owner still owns both sockets; never hand off a stale grant.
+		return nil, errors.New("turn_allocation_expired_during_setup")
+	}
 	complete = true
 
 	// Single ownership: rawAllocation.stop() is the ONLY closer of the
@@ -379,7 +445,7 @@ func (c config) dialTURNAnonymous(ctx context.Context, peer *net.TCPAddr, tlsCon
 		allocation.stop()
 		dataOnce.Do(func() { data.Close() })
 	}
-	allocation.startRefresh(kill)
+	allocation.startRefresh(grantedAt, kill)
 	// The dial context is cancelled by handleSOCKS right after this returns
 	// (same as the Pion path): the connection must survive it, ownership is
 	// purely cleanup-driven from here on.

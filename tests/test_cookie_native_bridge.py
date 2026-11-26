@@ -4,6 +4,7 @@
 事件流 → 原生响应（流式 parts / 非流式整包 / promptFeedback / inlineData 反解 /
 finishReason 缺失报错）、toolConfig 收窄、SSE 错误帧格式。
 """
+from settings_fixture import saved_settings
 import asyncio
 import os
 import unittest
@@ -25,8 +26,7 @@ from schema_validation import SchemaValidationError  # noqa: E402
 
 def _settings(**overrides):
     base = {"cookie_structured_output": False, "safety_score": False, **overrides}
-    return mock.patch.object(cookie_native.app_state, "get_setting",
-                             side_effect=lambda key, default=None: base.get(key, default))
+    return saved_settings(cookie_native.app_state, base)
 
 
 class RequestConversionTests(unittest.TestCase):
@@ -270,7 +270,7 @@ class NativeAssemblerTests(unittest.TestCase):
 
     def test_blocked_without_parts_returns_prompt_feedback(self):
         asm = NativeAssembler("m")
-        asm.feed("blocked", "SAFETY（违规）")
+        asm.feed("blocked", {"blockReason": "SAFETY"})
         payload = asm.payload()
         self.assertEqual(payload, {"promptFeedback": {"blockReason": "SAFETY"}})
 

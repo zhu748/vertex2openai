@@ -40,24 +40,28 @@ streamGenerateContent 也优先走 Cookie 桥接（旧实现只看"有没有 Key
 Key 霸占）；Cookie 桥接不支持的操作在有 Key 时回退 Key 透传。两者皆无时返回明确错误。
 """
 
-import asyncio
+import time
 import json
 from typing import Optional
 from urllib.parse import parse_qs, quote
 
 from fastapi import APIRouter, Depends, Header, Request
+from starlette.requests import ClientDisconnect
 
-from admission import GenerationCapacityError
+from admission import GenerationCapacityError, ManagedStreamingResponse
 from auth import constant_time_equal, extract_candidate_key
 from config import API_KEY
 from logger import stats
 from model_loader import get_express_models
+from retry_policy import note_retry_deadline
+from request_connection import ClientConnection
 from request_errors import MAX_GENERATION_BODY_BYTES, declared_body_exceeds
 from request_tracking import configure as track_configure
 from runtime_state import app_state
-from streaming import prepare_sse
+from schema_validation import SchemaValidationError
+from streaming import StreamDeadlineExceeded, close_stream_response, prepare_sse, response_before_deadline
 from upstream_errors import extract_upstream_error
-from resumable import (image_bypass_enabled, request_timeout_seconds,
+from resumable import (image_bypass_enabled, request_timeout_seconds, resume_intent, ResumeRequestError,
                        is_enabled as resumable_enabled)
 router = APIRouter()
 
@@ -90,6 +94,7 @@ from upstreams.native_catalog import (  # noqa: F401
 )
 from upstreams.native_passthrough import (  # noqa: F401
     NativeAPIError,
+    native_expects_one_candidate,
     NativeStreamError,
     _NativeStreamState,
     _close_upstream,
@@ -135,6 +140,34 @@ async def get_gemini_auth(
         ))
     return candidate
 
+
+
+async def _run_direct(request: Request, action: str, operation):
+    """Direct JSON/array setup follows the client up to its response handoff."""
+    deadline = note_retry_deadline(request, time.monotonic() + request_timeout_seconds())
+
+    async def execute():
+        return await response_before_deadline(operation, deadline, clock=time.monotonic)
+
+    connection = getattr(request, "scope", {}).get("state", {}).get("client_connection")
+    try:
+        if (not isinstance(connection, ClientConnection)
+                or (action == "streamGenerateContent" and request.query_params.get("alt") == "sse")):
+            # SSE setup may instead be handed to the keepalive response.
+            return await execute()
+        return await connection.while_connected(execute, discard=close_stream_response)
+    except StreamDeadlineExceeded as exc:
+        return _native_error(504, str(exc))
+    except ClientDisconnect:
+        return _native_error(499, "客户端已断开连接，请求已取消。", "CANCELLED")
+
+
+def _direct_sender(request: Request, response):
+    # Bind the final ASGI sender, including slow SSE setup wrappers. A replay
+    # reader must never attach its connection to the independently owned pump.
+    if isinstance(response, ManagedStreamingResponse):
+        response.client_connection = ClientConnection.for_request(request)
+    return response
 
 
 def _passthrough_endpoint():
@@ -190,28 +223,36 @@ def _passthrough_endpoint():
         # -search 变体（与 OpenAI / Claude 端点对齐；目录也列出这些变体）：
         # 剥后缀 + 注入 google_search 工具。监控按客户端原始请求名记录。
         requested_model = model
-        if model.lower().endswith("-search"):
+        # Scope is an address, not a capability (an ordinary text model may
+        # live in e.g. projects/image-studio). Resolve aliases only on its ID.
+        scope, sep, model_id = model.rpartition("/")
+        if model_id.lower().endswith("-search"):
             from model_catalog import search_variant_available
-            base_probe = model[: -len("-search")]
+            base_probe = model_id[: -len("-search")]
             if not search_variant_available(base_probe):
                 return _native_error(
                     400, f"模型 {base_probe} 不支持 -search 变体（仅 Gemini 文本模型支持）。")
-            model, rebuilt = _strip_search_variant(model, action, parsed)
+            model_id, rebuilt = _strip_search_variant(model_id, action, parsed)
             if rebuilt is not None:
                 raw_body = rebuilt
-                print(f"🔎 [Gemini 透传] {model} | -search 变体：已注入 google_search 工具"
+                print(f"🔎 [Gemini 透传] {model_id} | -search 变体：已注入 google_search 工具"
                       "（body 最小重组；普通模型仍字节级透传）。")
 
         # 生图分辨率后缀变体（-1k/-2k/-4k/-512，目录已列出）：剥后缀 +
         # 注入 imageConfig.imageSize。与 -search 互斥（生图无 -search 变体），
         # 二者尾部形态不同不会同时命中。仅生图档案生效，文本模型名原样透传。
         from model_capabilities import image_resolution_suffix
-        if image_resolution_suffix(model)[1]:
-            model, rebuilt = _strip_image_size_variant(model, action, parsed)
+        if image_resolution_suffix(model_id)[1]:
+            try:
+                model_id, rebuilt = _strip_image_size_variant(model_id, action, parsed)
+            except SchemaValidationError as exc:
+                return _native_error(400, str(exc))
             if rebuilt is not None:
                 raw_body = rebuilt
-                print(f"🔎 [Gemini 透传] {model} | 分辨率后缀变体：已注入"
+                print(f"🔎 [Gemini 透传] {model_id} | 分辨率后缀变体：已注入"
                       " imageConfig.imageSize（body 最小重组；普通模型仍字节级透传）。")
+
+        model = scope + sep + model_id  # retain the full resource for dispatch and replay identity
 
         # 通道选择（尊重控制台的通道模式开关，与 chat_api 的选路语义对齐）：
         # - web_proxy（Cookie 模式）：配置了 Cookie 账号就走 Cookie 通道**协议级桥接**
@@ -226,34 +267,29 @@ def _passthrough_endpoint():
         express_manager = getattr(getattr(request, "app", None), "state", None)
         manager = getattr(express_manager, "express_key_manager", None)
         from credential_manager import credential_manager
-        if manager is None:
-            # 凭据池不可知（测试桩 / 极早期生命周期）：保持旧行为——不做模式
-            # 改道，直接落到透传路径；否则桩环境会被误判为"无凭据"而 403。
-            has_keys, has_cookie = True, False
-        else:
-            has_keys = manager.get_total_keys() > 0
-            has_cookie = credential_manager.get_cookie_record() is not None
+        # Unknown pool (early startup/test stub) retains the old passthrough path.
+        has_keys = manager is None or manager.get_total_keys() > 0
         mode = app_state.get_channel_mode()
-        cookie_bridgable = has_cookie and action in ("generateContent", "streamGenerateContent")
-
         if not has_keys or mode == "web_proxy":
-            if cookie_bridgable and (mode == "web_proxy" or not has_keys):
+            has_cookie = manager is not None and credential_manager.has_cookie_record()
+            if has_cookie and action in ("generateContent", "streamGenerateContent"):
                 from upstreams.cookie_native import handle_native_request
                 is_stream = action == "streamGenerateContent"
                 track_configure(model=requested_model, protocol="gemini", channel="cookie",
                                 stream=is_stream, mode="stream" if is_stream else "json")
                 print(f"🔁 [Gemini 透传] {requested_model}:{action} | {'流式' if is_stream else '非流式'}"
                       f" | Cookie 通道协议级桥接（{mode} 模式）")
-                return await handle_native_request(
-                    request, model, action, parsed, requested_model=requested_model)
-            if has_cookie and not cookie_bridgable and not has_keys:
+                response = await _run_direct(request, action, lambda: handle_native_request(
+                    request, model, action, parsed, requested_model=requested_model))
+                return _direct_sender(request, response)
+            if has_cookie and not has_keys:
                 # Cookie 模式 / 无 Key 部署：桥接不支持的明确报错（不要静默换通道）。
                 return _native_error(
                     400,
                     f"Cookie 通道暂不支持 :{action}（上游 batchGraphql 无对应操作），"
                     "请配置 Express API Key 使用该操作。",
                     "INVALID_ARGUMENT")
-            if not has_keys and not has_cookie:
+            if not has_keys:
                 return _native_error(
                     403,
                     "该端点需要至少一个 Express API Key（字节级透传）或一个启用的 Cookie 账号"
@@ -271,30 +307,27 @@ def _passthrough_endpoint():
         query = "&".join(f"{quote(k, safe='')}={quote(v, safe='')}" for k, v in qp)
 
         is_stream = action == "streamGenerateContent"
+        if is_stream and hasattr(request, "scope"):
+            request.scope.setdefault("state", {})["native_single_candidate"] = native_expects_one_candidate(parsed)
+        # The Express hop, retries and replay fingerprint need only the final wire
+        # bytes. Cookie dispatch and any variant rewrites above consumed the tree.
+        parsed = None
         track_configure(model=requested_model, protocol="gemini", channel="express", stream=is_stream,
                         mode="stream" if is_stream else "json")
         print(f"🔁 [Gemini 透传] {model}:{action} | {'流式' if is_stream else '非流式'}"
               f" | 原生协议透传（Express 通道）")
         try:
             sse = is_stream and "sse" in parse_qs(query).get("alt", [])
-            # 续传识别与 chat 通道（resume_cursor）同口径：x-resumable 头、
-            # X-Resume-Id、Last-Event-ID（带生成 ID 的 rid 游标或裸数字序号）、
-            # ?resume_from=。旧实现漏掉后两者，?resume_from= 会被当全新请求
-            # 重复烧上游配额（该参数 791 行已从转发 query 剥离，表明本就支持）。
-            resume = (request.headers.get("x-resumable", "").lower() in ("1", "true", "yes")
-                      or request.headers.get("x-resume-id")
-                      or bool(request.headers.get("last-event-id", "").strip())
-                      or bool(request.query_params.get("resume_from", "").strip()))
-            if resume and not sse:
+            requested, explicit = resume_intent(request, default_on=False)
+            if requested and not sse:
                 return _native_error(400, "原生续传需要 streamGenerateContent?alt=sse。")
-            if sse and resume and resumable_enabled() and not image_bypass_enabled(model):
-                # 生图默认绕过续传缓冲（512MB 容器内存治理，见
-                # resumable.image_bypass_enabled）：4K base64 的全量驻留
-                # 会叠加 OOMKill，直通交付（落到下方直通分支）。
-                return await _resumable_native(request, _auth, model, action, query, raw_body, parsed)
+            if requested and resumable_enabled() and not image_bypass_enabled(model_id):
+                return await _resumable_native(request, _auth, model, action, query, raw_body)
+            if explicit:
+                return _native_error(409, "当前请求不支持续传；如需重新生成，请移除续传 ID 与游标。")
             async def execute():
-                async with asyncio.timeout(request_timeout_seconds()):
-                    return await _passthrough_request(request, model, action, query, raw_body)
+                return await _run_direct(request, action, lambda: _passthrough_request(
+                    request, model, action, query, raw_body))
 
             def error_body(result):
                 if isinstance(result, Exception):
@@ -308,11 +341,12 @@ def _passthrough_endpoint():
                 code = result.status_code if result.status_code >= 400 else 502
                 return _native_error(code, f"上游返回非 SSE 响应（HTTP {result.status_code}）。").body
 
-            if sse:
-                return await prepare_sse(execute, request, error_body, stats.add_error)
-            return await execute()
-        except TimeoutError:
-            return _native_error(504, "本轮请求超过总执行期限。")
+            response = await prepare_sse(execute, request, error_body, stats.add_error) if sse else await execute()
+            return _direct_sender(request, response)
+        except ResumeRequestError as exc:
+            return _native_error(exc.code, str(exc))
+        except TimeoutError as exc:
+            return _native_error(504, str(exc)[:1024] or "上游响应超时。")
         except GenerationCapacityError as exc:
             return _native_error(503, str(exc))
         except Exception as exc:
@@ -331,6 +365,13 @@ for _prefix in ("/v1beta", "/v1"):
     )
 
 
+async def _catalog_capabilities(request: Request) -> tuple[list[str], bool]:
+    has_keys = request.app.state.express_key_manager.get_total_keys() > 0
+    has_channel = has_keys or app_state.get_channel_mode() in ("web_proxy", "mixed")
+    raw = await get_express_models() if has_channel else []
+    return _native_catalog_ids(raw), has_keys
+
+
 @router.get("/v1beta/models")
 async def native_list_models(fastapi_request: Request,
                              _auth: str = Depends(get_gemini_auth)):
@@ -340,12 +381,8 @@ async def native_list_models(fastapi_request: Request,
     （透传侧 _strip_search_variant 会剥后缀并注入 google_search 工具，
     目录与实际能力一致）。抗截断后缀仍仅限 OpenAI 兼容端点。
     """
-    manager = fastapi_request.app.state.express_key_manager
-    has_any = manager.get_total_keys() > 0 or app_state.get_channel_mode() in ("web_proxy", "mixed")
-    raw = await get_express_models() if has_any else []
-
-    models = [_native_model_entry(mid) for mid in _native_catalog_ids(raw)]
-    return {"models": models}
+    ids, has_keys = await _catalog_capabilities(fastapi_request)
+    return {"models": [_native_model_entry(mid, can_count_tokens=has_keys) for mid in ids]}
 
 
 @router.get("/v1beta/models/{model_action}")
@@ -353,13 +390,11 @@ async def native_get_model(model_action: str, fastapi_request: Request,
                            _auth: str = Depends(get_gemini_auth)):
     # 与 native_list_models 一致：未配置任何通道时不返回模型详情
     # （旧实现缺这个检查，无 Key 也照常返回目录条目，与列表行为矛盾）。
-    manager = fastapi_request.app.state.express_key_manager
-    has_any = manager.get_total_keys() > 0 or app_state.get_channel_mode() in ("web_proxy", "mixed")
     model, action = _split_model_action(model_action)
     if action:
         return _native_error(400, f"GET 不支持 :{action}，请用 POST。")
-    raw = await get_express_models() if has_any else []
-    if model and model in _native_catalog_ids(raw):
-        return _native_model_entry(model)
+    ids, has_keys = await _catalog_capabilities(fastapi_request)
+    if model and model in ids:
+        return _native_model_entry(model, can_count_tokens=has_keys)
     return _native_error(404, f"Model {model} not found.", status_detail="NOT_FOUND")
 

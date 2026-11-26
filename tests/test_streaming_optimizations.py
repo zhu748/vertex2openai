@@ -1,4 +1,5 @@
 """Offline regressions for quiet streams, hot settings and tool/error contracts."""
+from settings_fixture import saved_settings
 import asyncio
 from contextlib import asynccontextmanager
 import json
@@ -70,6 +71,34 @@ class QuietStreamTests(unittest.IsolatedAsyncioTestCase):
             await anext(events)
         self.assertTrue(closed.is_set())
 
+    async def test_only_attached_requests_need_disconnect_poll_timeout(self):
+        real_wait = asyncio.wait
+        for request in (None, SimpleNamespace(is_disconnected=mock.AsyncMock(return_value=False))):
+            with self.subTest(attached=request is not None):
+                release = asyncio.Event()
+                timeouts = []
+
+                async def source():
+                    await release.wait()
+                    yield "ready"
+
+                async def observe(tasks, *, timeout):
+                    timeouts.append(timeout)
+                    release.set()
+                    return await real_wait(tasks, timeout=timeout)
+
+                events = streaming.with_heartbeats(source(), request, interval=60)
+                with mock.patch.object(streaming.asyncio, "wait", observe):
+                    try:
+                        self.assertEqual(await asyncio.wait_for(anext(events), 1), "ready")
+                    finally:
+                        await events.aclose()
+                self.assertEqual(len(timeouts), 1)
+                if request is None:
+                    self.assertGreater(timeouts[0], 59)
+                else:
+                    self.assertEqual(timeouts[0], .5)
+
     async def test_cancelled_reader_closes_pending_upstream(self):
         started, closed = asyncio.Event(), asyncio.Event()
         async def source():
@@ -135,7 +164,7 @@ class QuietStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("id: 0\n", output)
         self.assertIn("id: 1\n", output)
         self.assertEqual(buf.next_seq, 2)
-        self.assertTrue(buf.fully_delivered)
+        self.assertFalse(buf.fully_delivered)  # iterator exhaustion alone is not an HTTP send
         self.assertEqual(buf.readers, 0)
 
     async def test_closing_quiet_buffer_reader_releases_reader_count(self):
@@ -176,7 +205,7 @@ class SettingsTests(unittest.TestCase):
     def state(self):
         state = AppState()
         state._state = {}
-        patch = mock.patch.object(state, "_save")
+        patch = mock.patch.object(state, "_write_snapshot")
         patch.start()
         self.addCleanup(patch.stop)
         return state
@@ -260,7 +289,7 @@ class CookieStreamTests(unittest.IsolatedAsyncioTestCase):
         self.request = SimpleNamespace(is_disconnected=mock.AsyncMock(return_value=False))
         self.stats = ProxyStats()
         for patch in (
-            mock.patch.object(app_state, "get_setting", side_effect=lambda k, d=None: self.settings.get(k, d)),
+            saved_settings(app_state, self.settings),
             mock.patch.object(app_state, "get_effective_settings", side_effect=lambda m, base=None: (self.settings.copy() if base is None else dict(base))),
             mock.patch.object(cookie_proxy, "_get_cookie_string", return_value="SAPISID=test"),
             mock.patch.object(cookie_proxy, "_get_project_id", return_value="project"),
@@ -483,7 +512,7 @@ class SignatureTopologyTests(unittest.IsolatedAsyncioTestCase):
         self.request = SimpleNamespace(is_disconnected=mock.AsyncMock(return_value=False))
         self.stats = ProxyStats()
         for patch in (
-            mock.patch.object(app_state, "get_setting", side_effect=lambda k, d=None: self.settings.get(k, d)),
+            saved_settings(app_state, self.settings),
             mock.patch.object(app_state, "get_effective_settings", side_effect=lambda m, base=None: (self.settings.copy() if base is None else dict(base))),
             mock.patch.object(cookie_proxy, "_get_cookie_string", return_value="SAPISID=test"),
             mock.patch.object(cookie_proxy, "_get_project_id", return_value="project"),

@@ -6,7 +6,7 @@ from google.genai import types
 
 import config as app_config
 import model_capabilities as mc
-from models import OpenAIRequest, normalize_content_part
+from models import OpenAIRequest, normalize_content_part, wants_json_output
 from runtime_state import app_state
 from schema_validation import sanitize_for_gemini
 from tool_policy import is_builtin_search_tool, is_forced_builtin_search
@@ -87,7 +87,7 @@ def _request_parameters(request: OpenAIRequest) -> dict[str, Any]:
 
 def _response_format(request: OpenAIRequest) -> dict[str, Any]:
     fmt = request.response_format or {}
-    if fmt.get("type") not in ("json_object", "json_schema"):
+    if not wants_json_output(request):
         return {}
     result: dict[str, Any] = {"response_mime_type": "application/json"}
     json_schema = fmt.get("json_schema")
@@ -97,7 +97,7 @@ def _response_format(request: OpenAIRequest) -> dict[str, Any]:
             # 方言净化：OpenAI 宽松写法（空节点/{} / type 数组）会被 Gemini
             # 服务端以 400 "missing field" 拒绝，或令 SDK 序列化崩溃。
             result["response_schema"] = sanitize_for_gemini(
-                {key: value for key, value in schema.items() if key != "$schema"})
+                {key: value for key, value in schema.items() if key != "$schema"}, sdk_carrier="response")
     return result
 
 
@@ -116,7 +116,7 @@ def _function_tools(request: OpenAIRequest) -> list[dict]:
         if isinstance(parameters, dict):
             # 与 response_schema 同一严格 proto 校验：工具参数同样需要方言净化。
             declaration["parameters"] = sanitize_for_gemini(
-                {key: value for key, value in parameters.items() if key != "$schema"})
+                {key: value for key, value in parameters.items() if key != "$schema"}, sdk_carrier="function")
         declarations.append(declaration)
     return [{"function_declarations": declarations}] if declarations else []
 

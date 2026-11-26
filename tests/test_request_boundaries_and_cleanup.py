@@ -202,7 +202,7 @@ class AuxiliaryIOTests(unittest.IsolatedAsyncioTestCase):
             return original_client(**kwargs, transport=httpx.MockTransport(handle))
         service = keepalive.KeepAliveService()
         with mock.patch.object(keepalive.httpx, "AsyncClient", side_effect=client):
-            task = asyncio.create_task(service._run("https://health.example/start", 3600))
+            task = asyncio.create_task(service._run("https://health.example/start", 3600, False))
             try:
                 await asyncio.wait_for(sources[1].closed.wait(), 1)
             finally:
@@ -288,7 +288,7 @@ class KeepAliveConfigTests(unittest.IsolatedAsyncioTestCase):
         service = keepalive.KeepAliveService()
         with mock.patch.object(keepalive.httpx, "AsyncClient", side_effect=client), \
              mock.patch.object(keepalive, "_MAX_REDIRECTS", 2):
-            task = asyncio.create_task(service._run("https://test.example/loop", 3600))
+            task = asyncio.create_task(service._run("https://test.example/loop", 3600, False))
             try:
                 await asyncio.wait_for(sources[-1].closed.wait(), 1)
             finally:
@@ -304,8 +304,9 @@ class KeepAliveConfigTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_invalid_legacy_interval_does_not_break_startup(self):
         service = keepalive.KeepAliveService()
-        with mock.patch.object(keepalive.app_state, "get_setting", side_effect=lambda key, default=None: {
-                "keepalive_url": "https://test.example", "keepalive_interval": "broken"}.get(key, default)):
+        with mock.patch.object(keepalive.app_state, "get_committed_settings", return_value={
+                "keepalive_url": "https://test.example", "keepalive_interval": "broken",
+                "keepalive_allow_private": False}):
             await service.start()
         self.assertFalse(service.is_running)
 
@@ -321,7 +322,7 @@ class KeepAliveConfigTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await asyncio.sleep(.001)
                 active -= 1
-        with mock.patch.object(service, "_current_config", return_value=("https://test.example", 60)), \
+        with mock.patch.object(service, "_current_config", return_value=("https://test.example", 60, False)), \
              mock.patch.object(service, "_run", side_effect=run):
             await service.start()
             await asyncio.sleep(0)
@@ -402,11 +403,13 @@ class HotPathOptimizationTests(unittest.TestCase):
         self.assertNotEqual(fp_same_a, fp_other)
         # 折叠生效：指纹不含原始 base64，只含摘要。
         self.assertNotIn(big, fp_same_a)
-        self.assertIn("folded:", fp_same_a)
-        # 短文本请求保持全量参与（不折叠）。
+        self.assertEqual(len(fp_same_a), 64)
+        # 短文本也完整参与同一规范 JSON 摘要，不保留明文。
         short = OpenAIRequest(model="gemini-3.6-flash",
                               messages=[{"role": "user", "content": "你好"}])
-        self.assertIn("你好", _request_fingerprint(short))
+        short_fp = _request_fingerprint(short)
+        short.messages[0].content = "您好"
+        self.assertNotEqual(short_fp, _request_fingerprint(short))
 
     def test_sse_frame_kind_fast_path_matches_parsed_semantics(self):
         # O-7：子串快筛与完整解析口径一致——内容帧零解析直通，空串内容

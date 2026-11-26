@@ -152,20 +152,20 @@ class ClaudeTopologyTests(unittest.TestCase):
                          ["before", "a", "between", "b", "after"])
         self.assertEqual([p.get("text", p.get("functionCall", {}).get("id")) for p in cookie[0]["parts"]],
                          ["before", "a", "between", "b", "after"])
-        self.assertEqual([p.function_response.id for p in sdk[1].parts], ["b", "a"])
-        self.assertEqual([p["functionResponse"]["id"] for p in cookie[1]["parts"]], ["b", "a"])
+        self.assertEqual([p.function_response.id for p in sdk[1].parts], ["a", "b"])
+        self.assertEqual([p["functionResponse"]["id"] for p in cookie[1]["parts"]], ["a", "b"])
 
     def test_untrusted_incomplete_topology_does_not_drop_visible_content(self):
         message = {"content": "complete answer", "tool_calls": [call()], "extra_content": {"google": {
             "ordinary_parts": [{"kind": "text", "text": "short"}], "part_order": [{"type": "tool_call", "index": 0}]}}}
-        result = cp.openai_completion_to_anthropic({"choices": [{"message": message}]}, "m", "id")
+        result = cp.openai_completion_to_anthropic({"choices": [{"message": message, "finish_reason": "tool_calls"}]}, "m", "id")
         self.assertEqual(result["content"][0]["text"], "complete answer")
         self.assertEqual(result["content"][1]["type"], "tool_use")
 
     def test_malformed_upstream_arguments_never_become_an_invented_value_argument(self):
         for args in ('{"x":', '[1]', '{"x":NaN}'):
             with self.subTest(args=args), self.assertRaises(IncompleteResponseError):
-                cp.openai_completion_to_anthropic({"choices": [{"message": {"tool_calls": [call(args)]}}]}, "m", "id")
+                cp.openai_completion_to_anthropic({"choices": [{"message": {"tool_calls": [call(args)]}, "finish_reason": "tool_calls"}]}, "m", "id")
 
     def test_invalid_claude_description_rejected(self):
         with self.assertRaises(cp.ClaudeRequestError):
@@ -264,7 +264,7 @@ class IncompleteNativeCalls(unittest.TestCase):
 class ClaudeRouteErrors(unittest.IsolatedAsyncioTestCase):
     async def test_bad_nonstream_tool_reply_is_an_anthropic_502(self):
         body = {"model": MODEL, "max_tokens": 10, "messages": [{"role": "user", "content": "x"}]}
-        response = JSONResponse({"choices": [{"message": {"tool_calls": [call('not-json')]}}]})
+        response = JSONResponse({"choices": [{"message": {"tool_calls": [call('not-json')]}, "finish_reason": "tool_calls"}]})
         with mock.patch.object(claude_api, "_available_models", mock.AsyncMock(return_value=[])), \
                 mock.patch.object(claude_api, "call_upstream", mock.AsyncMock(return_value=response)):
             result = await claude_api.claude_messages(SimpleNamespace(json=mock.AsyncMock(return_value=body)), "offline")

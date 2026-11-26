@@ -1,6 +1,7 @@
 /* Offline DOM interaction regression. npm ci && npm run test:console.
  * jsdom checks behavior, not layout; use verify_console_ui.cjs for rendering. */
 const assert=require('node:assert/strict');
+const {isDeepStrictEqual}=require('node:util');
 const fs=require('node:fs');
 const path=require('node:path');
 const {JSDOM,VirtualConsole}=require('jsdom');
@@ -34,6 +35,9 @@ async function main(){
   const target=new URL(url,w.location.href),method=options.method||'GET',body=options.body?JSON.parse(options.body):null;requests.push({path:target.pathname,query:target.search,method,body});
   const intercepted=transport?.(target,options);if(intercepted!==undefined)return intercepted;
   let result={};
+  if(method==='DELETE'&&body?.expected_override&&!isDeepStrictEqual(body.expected_override,overrides[target.pathname.split('/').pop()]||{})){
+   return new Response(JSON.stringify({error:'已被另一页面修改，请重新加载后检查草稿再保存。'}),{status:409});
+  }
   if(body?._expected){
    const baseline=target.pathname==='/api/settings'?settings:(overrides[target.pathname.split('/').pop()]||{});
    const conflict=Object.entries(body._expected).find(([key,old])=>old.present!==Object.hasOwn(baseline,key)||(old.present&&JSON.stringify(baseline[key])!==JSON.stringify(old.value)));
@@ -42,7 +46,7 @@ async function main(){
   if(target.pathname==='/api/settings/runtime')result={mode};
   else if(target.pathname==='/api/settings'){if(body)Object.assign(settings,Object.fromEntries(Object.entries(body).filter(([k])=>k!=='_expected')));result={...settings};}
   else if(target.pathname==='/api/capabilities')result={models:['text','image'],capabilities:{text:{...cap,is_image:false},image:{...cap,is_image:true}},overrides:{text:{...builtins.text,...overrides.text},...Object.fromEntries(Object.entries(overrides).filter(([m])=>m!=='text'))},saved_overrides:overrides,builtin_overrides:builtins};
-  else if(target.pathname.startsWith('/api/model-overrides/')){const model=target.pathname.split('/').pop();if(method==='DELETE')delete overrides[model];else{const current={...overrides[model]};for(const key of body._inherit||[])delete current[key];Object.assign(current,Object.fromEntries(Object.entries(body).filter(([k])=>!['_inherit','_expected'].includes(k))));overrides[model]=current;}result={override:{...builtins[model],...overrides[model]}};}
+  else if(target.pathname.startsWith('/api/model-overrides/')){const model=target.pathname.split('/').pop();if(method==='DELETE')delete overrides[model];else{const current={...overrides[model]};for(const key of body._inherit||[])delete current[key];Object.assign(current,Object.fromEntries(Object.entries(body).filter(([k])=>!['_inherit','_expected'].includes(k))));overrides[model]=current;}result={override:{...builtins[model],...overrides[model]},saved_override:{...overrides[model]}};}
   else if(target.pathname==='/api/express-keys'){if(body)keys=body.keys;result={keys};}
   else if(target.pathname==='/api/cookie-accounts'){if(body)cookies=body.accounts;result={accounts:cookies};}
   else if(target.pathname==='/api/cookie-accounts/reveal')result={id:body.id,cookie:savedCookie};
@@ -58,7 +62,7 @@ async function main(){
   }
   else if(target.pathname.startsWith('/api/requests/'))result={...record,id:decodeURIComponent(target.pathname.split('/').pop())};
   else if(target.pathname==='/api/proxy/parse')result={proxies:[]};
-  else if(target.pathname==='/api/settings/mode'){mode=body.mode;result={status:'success'};}
+  else if(target.pathname==='/api/settings/mode'){mode=body.mode;result={status:'success',mode};}
   else throw Error('Unexpected endpoint '+target.pathname);
   return new Response(JSON.stringify(result),{status:200,headers:{'content-type':'application/json'}});
  };
@@ -152,6 +156,12 @@ async function main(){
   transport=target=>{if(target.pathname==='/api/settings/mode'){transport=null;return new Response('{}',{status:503});}};
   d.querySelector('input[name=mode][value=web_proxy]').checked=true;await w.updateMode('web_proxy');
   assert.equal(mode,'mixed');modeVisible('mixed');assert.equal(d.querySelector('input[name=mode]:checked').value,'mixed');
+  transport=target=>{if(target.pathname==='/api/settings/mode'){transport=null;mode='api_key';return new Response(JSON.stringify({error:'conflict',mode}),{status:409});}};
+  d.querySelector('input[name=mode][value=web_proxy]').checked=true;await w.updateMode('web_proxy');
+  modeVisible('api_key');assert.equal(d.querySelector('input[name=mode]:checked').value,'api_key');
+  transport=target=>{if(target.pathname==='/api/settings/mode'){transport=null;return new Response('{}',{status:200});}};
+  d.querySelector('input[name=mode][value=mixed]').checked=true;await w.updateMode('mixed');
+  modeVisible('api_key');assert.equal(d.querySelector('input[name=mode]:checked').value,'api_key');
   assert.equal(requests.filter(r=>r.method==='POST'&&['/api/express-keys','/api/cookie-accounts'].includes(r.path)).length,credentialWrites);
   w.consoleForms.discard('keys');w.consoleForms.discard('cookies');assert.equal(w.consoleForms.dirty(),false);
   check('Three channel modes show matching credential lists, preserve drafts and roll back failed saves');
@@ -185,6 +195,22 @@ async function main(){
   assert.equal(el('thinking_g3_level').querySelector('[value=minimal]').disabled,true);
   check('Sparse model save, per-field inheritance, capability options and model drafts');
 
+  {
+   const old=overrides.text;edit('first_reply_timeout_seconds','29');
+   overrides.text={...old,default_top_p:.65};  // another editor pins an unrelated field
+   await save('btn-scope-save');
+   assert.equal(el('default_top_p').value,'0.65');assert.match(el('source-default_top_p').textContent,/模型专属/);
+   assert.match(el('source-anti_truncation_mode').textContent,/继承内置/);
+   edit('default_top_p','0.7');await save('btn-scope-save');
+   assert.deepEqual(requests.filter(r=>r.path==='/api/model-overrides/text').at(-1).body,
+     {default_top_p:.7,_expected:{default_top_p:{present:true,value:.65}}});
+   assert.equal(overrides.text.default_top_p,.7);
+   edit('first_reply_timeout_seconds','31');delete overrides.text.default_top_p;
+   await save('btn-scope-save');assert.match(el('source-default_top_p').textContent,/继承全局/);
+   overrides.text=old;await w.loadParams();
+   check('A disjoint model save adopts server-owned additions and removals without pinning built-ins or inventing a conflict');
+  }
+
   edit('first_reply_timeout_seconds','25');edit('first_reply_timeout_seconds','15');
   assert.equal(w.consoleForms.dirty(),false);
   w.setFieldInheritance('first_reply_timeout_seconds',false);assert.equal(w.consoleForms.dirty(),true);
@@ -209,6 +235,75 @@ async function main(){
   await w.loadParams();
   check('Reverted edits, deliberate pins, obsolete override cleanup and exact inherited values');
 
+  overrides.image={default_max_tokens:256};await w.loadParams();edit('model-sel','image');
+  edit('first_reply_timeout_seconds','45');overrides.image.default_top_p=0.4;
+  await save('btn-scope-clear');
+  assert.deepEqual(requests.filter(r=>r.path==='/api/model-overrides/image').at(-1).body,{expected_override:{default_max_tokens:256}});
+  assert.equal(el('first_reply_timeout_seconds').value,'45');assert.equal(w.consoleForms.dirty(),true);
+  assert.equal(overrides.image.default_top_p,0.4);assert.match(el('toast').textContent,/另一页面/);
+  await w.loadParams();await save('btn-scope-clear');assert.equal(overrides.image,undefined);
+  assert.equal(w.consoleForms.dirty(),false);
+  check('Full model reset sends the saved baseline, preserves a stale draft and permits an informed fresh reset');
+
+  const lastModelBody=()=>requests.filter(r=>r.path==='/api/model-overrides/image'&&r.method==='POST').at(-1).body;
+  edit('default_temperature','0.5');
+  overrides.image={default_temperature:0.7,default_max_tokens:777};
+  edit('model-sel','text');await w.loadParams();edit('model-sel','image');await w.loadParams();
+  assert.equal(el('default_temperature').value,'0.5');assert.equal(el('default_max_tokens').value,'777');
+  await save('btn-scope-save');
+  assert.equal(overrides.image.default_temperature,0.7);
+  assert.deepEqual(lastModelBody(),{default_temperature:0.5,_expected:{default_temperature:{present:false}}});
+  assert.match(el('scope-draft-state').textContent,/另一页面/);
+  edit('default_temperature','0.7');assert.equal(w.consoleForms.dirty(),false);
+  edit('default_temperature','0.61');await save('btn-scope-save');
+  assert.deepEqual(lastModelBody(),{default_temperature:0.61,_expected:{default_temperature:{present:true,value:0.7}}});
+
+  w.setFieldInheritance('default_temperature',true);overrides.image.default_temperature=0.84;
+  await w.loadParams();edit('model-sel','text');edit('model-sel','image');
+  await save('btn-scope-save');
+  assert.deepEqual(lastModelBody(),{_inherit:['default_temperature'],_expected:{default_temperature:{present:true,value:0.61}}});
+  assert.equal(overrides.image.default_temperature,0.84);
+  // Re-pinning the inherited (null) value does not bless another editor's change.
+  w.setFieldInheritance('default_temperature',false);await w.loadParams();await save('btn-scope-save');
+  assert.deepEqual(lastModelBody(),{default_temperature:null,_expected:{default_temperature:{present:true,value:0.61}}});
+  w.discardModelDraft();assert.equal(el('default_temperature').value,'0.84');
+  w.setFieldInheritance('default_temperature',true);delete overrides.image.default_temperature;
+  await w.loadParams();assert.equal(w.consoleForms.dirty(),false);
+
+  w.setFieldInheritance('default_top_p',false);settings.default_top_p=0.8;
+  await w.loadParams();assert.equal(el('default_top_p').value,'');
+  overrides.image.default_top_p=0.6;await w.loadParams();await save('btn-scope-save');
+  assert.deepEqual(lastModelBody(),{default_top_p:null,_expected:{default_top_p:{present:false}}});
+  overrides.image.default_top_p=null;await w.loadParams();assert.equal(w.consoleForms.dirty(),false);
+  check('Sparse overrides freeze presence and value through reload, scope switching and pin/inherit; identical writes and removals converge');
+
+  edit('model-sel','__global__');const origTimeout=settings.first_reply_timeout_seconds,origSize=settings.image_size;
+  edit('first_reply_timeout_seconds','22');settings.first_reply_timeout_seconds=33;settings.image_size='1K';
+  await w.loadParams();edit('model-sel','text');edit('model-sel','__global__');await w.loadParams();
+  assert.equal(el('first_reply_timeout_seconds').value,'22');assert.equal(el('image_size').value,'1K');
+  await save('btn-scope-save');
+  const modelGlobalBody=()=>requests.filter(r=>r.path==='/api/settings'&&r.method==='POST').at(-1).body;
+  assert.equal(settings.first_reply_timeout_seconds,33);
+  assert.deepEqual(modelGlobalBody(),{first_reply_timeout_seconds:22,_expected:{first_reply_timeout_seconds:{present:true,value:origTimeout}}});
+  assert.match(el('scope-draft-state').textContent,/另一页面/);
+  w.discardModelDraft();assert.equal(el('first_reply_timeout_seconds').value,'33');
+  edit('first_reply_timeout_seconds','22');await save('btn-scope-save');assert.equal(settings.first_reply_timeout_seconds,22);
+  edit('first_reply_timeout_seconds','44');settings.first_reply_timeout_seconds=44;
+  await w.loadParams();assert.equal(w.consoleForms.dirty(),false);
+  settings.first_reply_timeout_seconds=origTimeout;settings.image_size=origSize;settings.default_top_p=null;delete overrides.image;
+  await w.loadParams();
+  check('Global model defaults freeze only edited fields across reloads, support discard/re-edit and independent convergence');
+
+  let releaseModelSettings;
+  transport=target=>{if(target.pathname==='/api/settings'){transport=null;return new Promise(resolve=>{releaseModelSettings=resolve;});}};
+  const loadingModels=w.loadParams();edit('model-sel','image');edit('default_max_tokens','321');
+  releaseModelSettings(new Response(JSON.stringify(settings)));await loadingModels;
+  assert.equal(el('model-sel').value,'image');assert.equal(el('default_max_tokens').value,'321');
+  w.discardModelDraft();
+  check('Reload applies to the currently selected model without erasing edits made in flight');
+
+
+
   edit('model-sel','__global__');edit('default_top_p','2');await save('btn-scope-save');
   assert.equal(el('default_top_p').getAttribute('aria-invalid'),'true');
   assert(el('default_top_p-error'));
@@ -218,6 +313,25 @@ async function main(){
   edit('retry_max','12');assert.equal(w.consoleForms.dirty(),true);
   await w.loadParams();assert.equal(el('retry_max').value,'12');
   w.consoleForms.discard('runtime');assert.equal(el('retry_max').value,'10');
+  {
+   const saveRuntime=async()=>{d.querySelector('button[onclick*="saveSettings"]').click();await tick();};
+   const writes=()=>requests.filter(r=>r.path==='/api/settings'&&r.method==='POST');
+   edit('retry_max','12');
+   for(const bad of [{},{status:'success'},{retry_max:11},null,[]]){
+    const before=writes().length;
+    transport=(url,options)=>url.pathname==='/api/settings'&&options.method==='POST'?new Response(JSON.stringify(bad)):undefined;
+    await saveRuntime();
+    assert.equal(writes().length,before+1);assert.equal(w.consoleForms.dirty(),true);
+    assert.deepEqual(writes().at(-1).body._expected.retry_max,{present:true,value:10});
+    assert.equal(el('retry_max').value,'12');assert.equal(settings.retry_max,10);
+    assert(el('toast').textContent.includes('核对草稿'));
+   }
+   const falsy={cookie_auto_refresh:false,retry_jitter_seconds:0,default_top_p:null,keepalive_url:''};
+   transport=(url,options)=>url.pathname==='/api/settings'&&options.method==='POST'?new Response(JSON.stringify(falsy)):undefined;
+   let observed=false;assert.equal(await w.postSettings(falsy,()=>{observed=true;}),true);assert(observed);
+   transport=null;w.consoleForms.discard('runtime');assert.equal(el('retry_max').value,'10');
+   check('Unconfirmed settings receipts keep edits and the last CAS baseline; explicit false/zero/null/empty values are accepted');
+  }
   edit('retry_max','13');d.querySelector('button[onclick*="saveSettings"]').click();await tick();
   assert.equal(settings.retry_max,13);assert.equal(w.consoleForms.dirty(),false);
   check('Runtime draft reload preservation, save and undo');
@@ -272,6 +386,72 @@ async function main(){
   edit('proxy-input','http://proxy.test:80');await w.saveProxy();assert.equal(w.consoleForms.dirty(),false);
   check('Credential drafts, filters, add/undo, immediate strategy and proxy save state');
 
+  {
+   const original=keys, posts=()=>requests.filter(r=>r.path==='/api/express-keys'&&r.method==='POST');
+   keys=[{key:'fixture-A'},{key:'fixture-B'}];await w.loadExpressKeys();
+   const before=posts().length;edit('key-0','   ');edit('key-note-1','keep this draft');
+   await w.saveExpressKeys();
+   assert.equal(posts().length,before);assert.deepEqual(keys.map(k=>k.key),['fixture-A','fixture-B']);
+   assert.equal(el('key-note-1').value,'keep this draft');assert.equal(w.consoleForms.dirty(),true);
+   assert.equal(el('key-0').getAttribute('aria-invalid'),'true');assert(el('key-0').closest('details').open);
+   edit('key-0','replacement');w.addKeyRow();  // an unused placeholder can be ignored
+   await w.saveExpressKeys();assert.deepEqual(keys.map(k=>k.key),['replacement','fixture-B']);
+   assert.equal(keys[1].note,'keep this draft');
+   w.addKeyRow();edit('key-note-2','unfinished');await w.saveExpressKeys();
+   assert.equal(posts().length,before+1);assert.equal(el('key-note-2').value,'unfinished');
+   w.removeKeyRow(2);w.removeKeyRow(0);await w.saveExpressKeys();
+   assert.deepEqual(keys.map(k=>k.key),['fixture-B']);  // explicit deletion is still supported
+   let confirms=0;w.confirm=()=>{confirms++;return false;};w.removeKeyRow(0);await w.saveExpressKeys();
+   assert.equal(confirms,1);assert.equal(posts().length,before+2);w.confirm=()=>true;
+   keys=original;await w.loadExpressKeys();
+   check('Clearing a stored Key or leaving a partial new row preserves drafts without a write; explicit removal and pristine placeholders still work');
+  }
+
+  {
+   const original=keys;
+   const base={key:'fixture-A',project_id:'old-project',project_source:'auto',detected_at:123,note:'keep note',proxies:['http://local.test:80']};
+   const sibling={key:'fixture-B',project_id:'sibling',project_source:'auto',detected_at:234};
+   keys=[sibling,base];await w.loadExpressKeys();
+   edit('key-1','new-key');
+   assert.equal(el('project-1').value,'');assert.equal(el('key-1').closest('[data-i]').querySelector('[data-detected]').hidden,true);
+   w.removeKeyRow(0); // saved origin must follow the draft, never its index
+   edit('key-0',base.key);
+   assert.equal(el('project-0').value,base.project_id);
+   assert.equal(w.collectKeys()[0].detected_at,123);assert.equal(w.collectKeys()[0].project_source,'auto');
+   edit('key-0','new-key');w.addKeyRow();await w.saveExpressKeys();
+   assert.deepEqual([keys[0].key,keys[0].project_id,keys[0].project_source,keys[0].detected_at],['new-key','','',0]);
+   assert.equal(keys[0].note,base.note);assert.deepEqual(keys[0].proxies,base.proxies);
+   keys=[base,sibling];await w.loadExpressKeys();edit('key-0','replacement');
+   edit('project-0',base.project_id); // deliberately assigning even the same project to the NEW key is manual
+   await w.saveExpressKeys();
+   assert.deepEqual([keys[0].project_id,keys[0].project_source,keys[0].detected_at],[base.project_id,'manual',0]);
+   assert.equal(keys[1].detected_at,234);
+   keys=original;await w.loadExpressKeys();
+   check('Replacing a key clears only its detected project; rerenders, key undo and an explicit manual project preserve intent');
+  }
+
+  {
+   for(const [endpoint,field,note,load,save,list,readSaved] of [
+    ['/api/express-keys','keys','key-note-0',()=>w.loadExpressKeys(),()=>w.saveExpressKeys(),'keys-list',()=>keys],
+    ['/api/cookie-accounts','accounts','cookie-note-0',()=>w.loadCookieAccounts(),()=>w.saveCookieAccounts(),'cookies-list',()=>cookies]
+   ]){
+    const initial=structuredClone(readSaved());
+    const answer=value=>{transport=target=>target.pathname===endpoint?new Response(JSON.stringify(value)):undefined;};
+    answer({[field]:initial,revision:'last-good'});await load();
+    edit(note,'keep pending draft');
+    for(const invalid of [{revision:'unverified'}, {[field]:{}, revision:'wrong'}, {[field]:[null], revision:'wrong-row'},
+                          {[field]:initial}, {[field]:initial,revision:null}, {[field]:initial,revision:'  '}, {[field]:initial,revision:42}]){
+      answer(invalid);await save();assert(el('toast').textContent.includes('草稿已保留'));
+      assert.equal(el(note).value,'keep pending draft');assert.equal(w.consoleForms.dirty(),true);
+      assert.equal(requests.filter(r=>r.path===endpoint&&r.method==='POST').at(-1).body.revision,'last-good');
+      await load();assert.equal(el(note).value,'keep pending draft');assert.equal(w.consoleForms.dirty(),true);
+    }
+    answer({[field]:[],revision:'empty-confirmed'});await load();assert.equal(el(list).children.length,0);
+    answer({[field]:initial,revision:'restored'});await load();transport=null;
+   }
+   check('Malformed credential receipts cannot drop a known revision or the draft; initial legacy responses and explicit empty lists remain valid');
+  }
+
   let probed={...keys[0],project_id:'detected-project',project_source:'auto'};
   keys=[probed];w.mergeProbeResults([{key:probed.key,ok:true,project_id:probed.project_id}],keys);
   assert.equal(el('project-0').value,'detected-project');assert.equal(w.consoleForms.dirty(),false);
@@ -307,6 +487,7 @@ async function main(){
   await w.saveExpressKeys();
   assert.equal(el('key-note-0').value,'冲突时保留的草稿');assert.equal(w.consoleForms.dirty(),true);
   assert(el('channel-load-error').textContent.includes('草稿已保留'));
+  transport=target=>{if(target.pathname==='/api/express-keys'){transport=null;return new Response(JSON.stringify({keys,revision:'r4'}));}};
   await w.loadExpressKeys();
   check('Probe revisions rebase expected metadata only; repeated probes cannot bypass conflicts or discard drafts');
 
@@ -379,6 +560,68 @@ async function main(){
   edit('thinking_g3_level','medium');await save('btn-scope-save');
   assert(el('toast').textContent.includes('另一页面'));w.discardModelDraft();
   check('Cross-tab sparse runtime/global saves and same-field conflict preservation');
+  await w.loadParams();
+  const lastSettings=()=>requests.filter(r=>r.path==='/api/settings'&&r.method==='POST').at(-1).body;
+  const clickRuntime=async()=>{d.querySelector('button[onclick*="saveSettings"]').click();await tick();};
+  const initialRetry=settings.retry_max,initialInterval=settings.keepalive_interval;
+  edit('keepalive_interval',String(initialInterval+3));
+  settings.retry_max=initialRetry+1;
+  await w.loadParams();
+  assert.equal(el('retry_max').value,String(initialRetry+1));
+  assert.equal(el('keepalive_interval').value,String(initialInterval+3));
+  await clickRuntime();
+  assert.deepEqual(lastSettings(),{keepalive_interval:initialInterval+3,_expected:{keepalive_interval:{present:true,value:initialInterval}}});
+  const local=initialRetry+4,remote=initialRetry+2;
+  edit('retry_max',String(local));settings.retry_max=remote;
+  for(let i=0;i<2;i++)await w.loadParams();
+  await clickRuntime();
+  assert.equal(settings.retry_max,remote);assert.equal(el('retry_max').value,String(local));
+  assert.deepEqual(lastSettings()._expected.retry_max,{present:true,value:initialRetry+1});
+  assert(d.querySelector('[data-draft-group=runtime] .draft-toolbar').textContent.includes('另一页面'));
+  edit('retry_max',String(remote));edit('retry_max',String(local));await clickRuntime();
+  assert.equal(settings.retry_max,local);
+  edit('retry_max',String(local+1));settings.retry_max=local+1;await w.loadParams();
+  assert.equal(w.consoleForms.dirty(),false);
+  check('Runtime reload merges only dirty fields; repeated reload retains the original comparison; matching edits converge');
+
+  for(const [id,key,group,local,remote,save] of [
+    ['proxy-input','proxy_urls','proxy','http://local.invalid:81','http://remote.invalid:82',()=>w.saveProxy()],
+    ['cookie-impersonate','cookie_impersonate','fingerprint','firefox','edge',()=>w.saveFingerprint()],
+    ['express-ua-profile','express_ua_profile','express-fingerprint','node','gcloud',()=>w.saveExpressUa()]
+  ]){
+    const before=settings[key],asWire=v=>key==='proxy_urls'?[v]:v;
+    edit(id,local);settings[key]=asWire(remote);await w.loadParams();await w.loadParams();
+    await save();
+    assert.deepEqual(lastSettings()._expected[key],{present:true,value:before});assert.deepEqual(settings[key],asWire(remote));
+    assert.equal(el(id).value,local);w.consoleForms.discard(group);assert.equal(el(id).value,remote);
+    edit(id,local);await save();assert.deepEqual(settings[key],asWire(local));
+  }
+  settings.express_ua_custom='server-before';await w.loadParams();
+  edit('express-ua-profile','custom');settings.express_ua_custom='server-after';await w.loadParams();
+  assert.equal(el('express-ua-custom').value,'server-after');await w.saveExpressUa();
+  assert.deepEqual(lastSettings(),{express_ua_profile:'custom',_expected:{express_ua_profile:{present:true,value:'node'}}});
+  check('Proxy and both fingerprint forms preserve same-field conflicts and save only changed settings');
+
+  const proxyAtOpen=settings.proxy_urls;
+  w.consoleChannels.open('global');w.deleteProxy(0);
+  settings.proxy_urls=['http://another.invalid:83'];await w.loadParams();
+  assert.equal(await w.applyProxyEditor(true),false);
+  assert.deepEqual(lastSettings()._expected.proxy_urls,{present:true,value:proxyAtOpen});
+  assert.equal(el('proxy-dialog').open,true);assert(el('proxy-editor-error').textContent.includes('另一页面'));
+  assert.equal(await w.applyProxyEditor(false),true);assert.equal(el('proxy-input').value,'');
+  await w.saveProxy();
+  assert.deepEqual(lastSettings()._expected.proxy_urls,{present:true,value:proxyAtOpen});
+  assert.deepEqual(settings.proxy_urls,['http://another.invalid:83']);
+  w.consoleForms.discard('proxy');assert.equal(el('proxy-input').value,'http://another.invalid:83');
+  check('A global proxy dialog retains its opening comparison for direct saves and applying to the page draft');
+
+  let resolveSettings;
+  transport=target=>{if(target.pathname==='/api/settings'){transport=null;return new Promise(resolve=>{resolveSettings=resolve;});}};
+  const loading=w.loadParams();edit('retry_max',String(settings.retry_max+2));
+  resolveSettings(new Response(JSON.stringify(settings)));await loading;
+  assert.equal(el('retry_max').value,String(settings.retry_max+2));w.consoleForms.discard('runtime');
+  check('Typing while a reload is in flight does not drop the draft');
+
   console.log(`${passed} groups of console DOM checks passed. Layout requires the browser suite.`);
  }finally{dom.window.close();}
 }

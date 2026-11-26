@@ -1,4 +1,5 @@
 """Loopback HTTP disconnect/reconnect tests with a real Uvicorn ASGI server."""
+from settings_fixture import saved_settings
 import asyncio
 import socket
 from types import SimpleNamespace
@@ -97,7 +98,7 @@ class SocketRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 patches = [
                     mock.patch.object(app_state, "is_web_proxy_enabled", return_value=web),
                     mock.patch.object(app_state, "get_effective_settings", side_effect=lambda m, base=None: (dict(settings) if base is None else dict(base))),
-                    mock.patch.object(app_state, "get_setting", side_effect=lambda k, d=None: settings.get(k, d)),
+                    saved_settings(app_state, settings),
                     mock.patch.object(main.app.state, "express_key_manager", key_manager),
                     mock.patch.object(streaming, "HEARTBEAT_INTERVAL", 0.01),
                     mock.patch.object(target, "chat_completions", side_effect=slow_prepare),

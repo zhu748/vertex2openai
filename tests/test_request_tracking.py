@@ -1,4 +1,5 @@
 """Request diagnostics across real ASGI delivery, detached streams and retries."""
+from settings_fixture import saved_settings
 import asyncio
 import json
 from types import SimpleNamespace
@@ -7,7 +8,7 @@ from unittest import mock
 
 
 import httpx
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from google.genai import types
 
 import upstreams.express_pipeline as api_helpers
@@ -18,7 +19,7 @@ import middleware
 import request_tracking as tracking
 import resumable
 from logger import ProxyStats
-from routes import chat_api, console, gemini_native
+from routes import chat_api, claude_api, console, gemini_native
 from starlette.requests import ClientDisconnect  # B017 断言收窄用
 from upstreams import native_passthrough
 
@@ -29,6 +30,57 @@ def frame(text="answer", reasoning=None, finish=None):
 
 
 class DiagnosticTests(unittest.TestCase):
+    def test_anthropic_control_frames_are_not_replies_and_tool_only_replies_are(self):
+        control = [
+            {"type": "message_start", "message": {"content": [], "usage": {"output_tokens": 1}}},
+            {"type": "ping"},
+            {"type": "content_block_start", "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_start", "content_block": {"type": "thinking", "thinking": ""}},
+            {"type": "content_block_delta", "delta": {"type": "signature_delta", "signature": "sig"}},
+            {"type": "content_block_delta", "delta": {"type": "input_json_delta", "partial_json": ""}},
+            {"type": "content_block_start", "content_block": {"type": "tool_use", "id": "id-only"}},
+            {"type": "message_delta", "delta": {"stop_reason": "end_turn"}},
+            {"type": "message_stop"},
+        ]
+        call = {"type": "tool_use", "id": "id", "name": "weather", "input": {}}
+        for event in (
+            {"type": "content_block_start", "content_block": call},
+            {"type": "content_block_delta", "delta": {"type": "input_json_delta", "partial_json": "{}"}},
+            {"type": "message", "role": "assistant", "content": [call]},
+        ):
+            with self.subTest(event=event["type"]):
+                trace = tracking.RequestTrace("/v1/messages")
+                observer = tracking.PayloadObserver(trace, sent=True)
+                for scaffold in control:
+                    observer.feed(f"data: {json.dumps(scaffold)}\n\n")
+                self.assertNotIn("first_sent_reply", trace.timings)
+                observer.feed(f"data: {json.dumps(event)}\n\n")
+                self.assertIn("first_sent_reply", trace.timings)
+                self.assertNotIn("first_sent_content", trace.timings)
+                self.assertNotIn("first_reply", trace.timings)
+                self.assertEqual(trace.data["sent_content_chars"], 0)
+                self.assertEqual(trace.data["sent_reasoning_chars"], 0)
+                self.assertEqual(trace.data["tool_deltas"], 0)
+
+    def test_anthropic_nonempty_start_blocks_and_deltas_count_only_their_visible_fields(self):
+        trace = tracking.RequestTrace("/v1/messages")
+        pairs = (
+            ("start", {"type": "thinking", "thinking": "想"}),
+            ("delta", {"type": "thinking_delta", "thinking": "想"}),
+            ("delta", {"type": "signature_delta", "signature": "not visible"}),
+            ("start", {"type": "redacted_thinking", "data": "not visible"}),
+        )
+        for phase, block in pairs:
+            key = "content_block" if phase == "start" else "delta"
+            trace.inspect_payload({"type": "content_block_" + phase, key: block}, sent=True)
+        self.assertEqual(trace.data["sent_reasoning_chars"], 2)
+        self.assertIn("first_sent_reply", trace.timings)
+        self.assertNotIn("first_sent_content", trace.timings)
+        trace.inspect_payload({"type": "content_block_start", "content_block": {"type": "text", "text": "是"}}, sent=True)
+        trace.inspect_payload({"type": "content_block_delta", "delta": {"type": "text_delta", "text": "的"}}, sent=True)
+        self.assertEqual(trace.data["sent_content_chars"], 2)
+        self.assertIn("first_sent_content", trace.timings)
+
     def test_disabled_nonstream_inspection_counts_bytes_without_retaining_body(self):
         for sent in (False, True):
             with self.subTest(sent=sent):
@@ -178,6 +230,41 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                  "headers": [(k.encode(), v.encode()) for k, v in values.items()],
                  "client": ("127.0.0.1", 1), "server": ("test", 80)}
         return await main.app(scope, receive, send)
+
+    async def test_messages_asgi_sent_text_and_thinking_follow_the_converted_wire(self):
+        text, thought = "答🌱", "推理ABC"
+
+        async def upstream(obj, _request):
+            if not obj.stream:
+                return JSONResponse({"choices": [{"message": {"content": text, "reasoning_content": thought},
+                                                  "finish_reason": "stop"}]})
+            async def chunks():
+                yield ": keep-alive\n\n"
+                yield frame(reasoning=thought)
+                yield frame(text=text, finish="stop")
+                yield resumable.DONE_FRAME
+            return StreamingResponse(chunks(), media_type="text/event-stream")
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://test") as client:
+            with mock.patch.object(claude_api, "_available_models", return_value=["gemini-test"]), \
+                 mock.patch.object(chat_api, "_dispatch_upstream", side_effect=upstream):
+                for stream in (False, True):
+                    for omit in (False, True):
+                        with self.subTest(stream=stream, omit=omit):
+                            payload = {**self.payload, "max_tokens": 2048, "stream": stream}
+                            if omit:
+                                payload["thinking"] = {"type": "enabled", "budget_tokens": 1024, "display": "omitted"}
+                            response = await client.post("/v1/messages", json=payload, headers=self.headers)
+                            self.assertEqual(response.status_code, 200, response.text)
+                            self.assertIn(text, response.text)
+                            self.assertEqual(thought in response.text, not omit)
+                            trace = self.registry.get(response.headers["x-trace-id"])
+                            self.assertEqual(trace.data["content_chars"], len(text))
+                            self.assertEqual(trace.data["reasoning_chars"], len(thought))
+                            self.assertEqual(trace.data["sent_content_chars"], len(text))
+                            self.assertEqual(trace.data["sent_reasoning_chars"], 0 if omit else len(thought))
+                            self.assertIn("first_sent_content", trace.timings)
+                            self.assertIn("first_sent_reply", trace.timings)
 
     async def test_disconnect_background_generation_and_replay_have_distinct_lifetimes(self):
         release = asyncio.Event()
@@ -338,7 +425,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                  mock.patch.object(gemini_native, "API_KEY", "native-client"), \
                  mock.patch.object(native_passthrough, "passthrough_client_pool", SimpleNamespace(get=lambda *args: upstream)), \
                  mock.patch.object(gemini_native.app_state, "get_settings", return_value=settings), \
-                 mock.patch.object(gemini_native.app_state, "get_setting", side_effect=lambda k, d=None: settings.get(k, d)):
+                 saved_settings(gemini_native.app_state, settings):
                 async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://test") as client:
                     response = await client.post('/v1beta/models/gemini-test:streamGenerateContent?alt=sse',
                                                  headers={"x-goog-api-key": "native-client"}, json={"contents": []})
@@ -375,7 +462,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         client = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(generate_content_stream=generate)))
         obj = api_helpers.OpenAIRequest(**self.payload)
         settings = {"fake_streaming": False, "retry_max": 1, "retry_backoff_seconds": 0, "retry_jitter_seconds": 0}
-        with mock.patch.object(api_helpers, "stats", stats), mock.patch.object(api_helpers.app_state, "get_setting", side_effect=lambda k, d=None: settings.get(k, d)):
+        with mock.patch.object(api_helpers, "stats", stats), saved_settings(api_helpers.app_state, settings):
             response = await api_helpers.execute_gemini_call(client, obj.model, lambda messages: [], {}, obj)
             async for _ in response.body_iterator:
                 pass

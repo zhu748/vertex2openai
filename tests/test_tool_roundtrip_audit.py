@@ -58,7 +58,7 @@ class CookieCallIdentityTests(unittest.TestCase):
                 results = [part["functionResponse"] for part in contents[1]["parts"]]
                 self.assertEqual([(result["id"], result["name"], result["response"]["temperature"])
                                   for result in results],
-                                 [("call-tokyo", "lookup", 20), ("call-paris", "lookup", 10)])
+                                 [("call-paris", "lookup", 10), ("call-tokyo", "lookup", 20)])
         self.assertEqual(parts, original)
 
     def test_native_parts_and_legacy_event_assembly_keep_upstream_call_id(self):
@@ -200,6 +200,35 @@ class ClaudeToolContractTests(unittest.TestCase):
 
 
 class ClaudeRouteContractTests(unittest.IsolatedAsyncioTestCase):
+    def test_custom_tool_can_be_named_like_a_server_tool(self):
+        for api_type in ({}, {"type": "custom"}):
+            with self.subTest(api_type=api_type):
+                tool = {**api_type, "name": "web_search", "input_schema": {"type": "object"}}
+                req = cp.anthropic_to_openai_request(claude_body(tools=[tool]), "gemini-2.5-flash")
+                self.assertEqual(req.tools, [{"type": "function", "function": {
+                    "name": "web_search", "parameters": {"type": "object"}}}])
+
+    async def test_server_tool_returns_anthropic_400_before_generation_and_counting(self):
+        from routes import claude_api
+        from fastapi.responses import JSONResponse
+
+        tool = {"type": "web_search_20250305", "name": "web_search", "max_uses": 3}
+        request = SimpleNamespace(json=mock.AsyncMock(return_value=claude_body(tools=[tool])), headers={})
+        with (mock.patch.object(claude_api, "_available_models", mock.AsyncMock(return_value=[])),
+              mock.patch.object(claude_api, "call_upstream",
+                                mock.AsyncMock(return_value=JSONResponse(content={}))) as generate,
+              mock.patch.object(claude_api, "_express_exact_input_tokens", mock.AsyncMock(return_value=1)) as count):
+            for route in (claude_api.claude_messages, claude_api.claude_count_tokens):
+                with self.subTest(route=route.__name__):
+                    response = await route(request, "unused")
+                    self.assertEqual(response.status_code, 400)
+                    payload = json.loads(response.body)
+                    self.assertEqual(payload["type"], "error")
+                    self.assertEqual(payload["error"]["type"], "invalid_request_error")
+                    self.assertIn("tools[0].type", payload["error"]["message"])
+            generate.assert_not_awaited()
+            count.assert_not_awaited()
+
     async def test_malformed_tool_results_return_anthropic_400_without_calling_upstream(self):
         from routes import claude_api
 

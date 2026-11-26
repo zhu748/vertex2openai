@@ -10,6 +10,7 @@ import config
 import express_key_probe
 from client_pool import close_all_clients
 from config import DEFAULT_API_KEY
+from image_processing import reset_image_clients
 from keepalive import keepalive_service
 from model_loader import close_models_refresh, get_models_config, schedule_models_refresh
 from proxy_resolver import (bridge_manager, find_bridge_binary, singbox_available,
@@ -245,6 +246,7 @@ async def lifespan(app: FastAPI):
         await keepalive_service.stop()
         await close_models_refresh()
         await close_all_clients()
+        await asyncio.to_thread(reset_image_clients)
         # 终止全部 sing-box 子进程（vless/vmess 等协议转换进程；
         # atexit 里还有一道兑底，这里保证 FastAPI 优雅停机时先收掉）。
         await asyncio.gather(asyncio.to_thread(singbox_manager.shutdown_all),

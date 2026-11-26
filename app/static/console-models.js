@@ -5,9 +5,6 @@ let GLOBAL_SETTINGS = {},
   OVERRIDES = {},
   SAVED_MODEL_OVERRIDES = {},
   BUILTIN_OVERRIDES = {};
-let modelEdits = new Set(),
-  modelInherit = new Set(),
-  modelPins = new Set();
 const PER_MODEL_KEYS = [
   'first_reply_timeout_seconds',
   'anti_truncation_mode',
@@ -64,16 +61,18 @@ function setV(id, v) {
   else el.value = v === null || v === undefined ? '' : v;
 }
 async function loadParams() {
-  captureModelDraft();
-  const selected = $('model-sel').value;
-  const formDrafts = window.consoleForms?.capture();
   loadNotice('params', '');
   // 设置与模型能力两个接口互不依赖：并行拉取，面板加载不再串行等两次往返。
   const [sRes, cRes] = await Promise.allSettled([
     readJSON('/api/settings'),
     readJSON('/api/capabilities')
   ]);
+  // The selection and edits may have changed while the two reads were in flight.
+  const selected = $('model-sel').value;
+  captureModelDraft();
   if (sRes.status === 'fulfilled') {
+    // Capture immediately before applying the response, not before the network wait.
+    const formDrafts = window.consoleForms?.capture();
     const s = sRes.value;
     GLOBAL_SETTINGS = s;
     settingsLoaded = true;
@@ -152,53 +151,92 @@ async function loadParams() {
     loadNotice('params', '模型能力' + cRes.reason.message + '。重新加载成功后再保存模型参数。');
   }
 }
-function readModelFields() {
-  return Object.fromEntries(
-    PER_MODEL_KEYS.map((key) => [key, $(key).type === 'checkbox' ? $(key).checked : $(key).value])
+function modelFieldValue(key) {
+  const el = $(key);
+  return el.type === 'checkbox' ? el.checked : el.value;
+}
+function modelWireValue(key, raw) {
+  if ($(key).type !== 'number') return raw;
+  return raw === '' ? (key === 'first_reply_timeout_seconds' ? 0 : null) : Number(raw);
+}
+function sameExpectation(left, right) {
+  // Editable model settings are scalar; null and absence are deliberately distinct.
+  return left.present === right.present && left.value === right.value;
+}
+function modelDraftConverged(key, edit, current) {
+  if (edit.kind === 'inherit') return !current.expected.present;
+  const value = modelWireValue(key, edit.raw);
+  if (current.expected.present && current.expected.value === value) return true;
+  // Typing and then undoing is not a deliberate pin. Only abandon the
+  // original comparison if the server's own field has not also changed.
+  return (
+    edit.kind === 'edit' &&
+    value === modelWireValue(key, edit.origin.raw) &&
+    sameExpectation(current.expected, edit.origin.expected)
   );
 }
-function captureModelDraft() {
-  if (!renderedModel || modelSnapshot === null) return;
-  const values = readModelFields(),
-    baseline = JSON.parse(modelSnapshot);
-  for (const key of PER_MODEL_KEYS) {
-    if (!modelInherit.has(key) && (values[key] !== baseline[key] || modelPins.has(key)))
-      modelEdits.add(key);
-    else modelEdits.delete(key);
-  }
-  const dirty =
-    renderedModel === '__global__'
-      ? JSON.stringify(values) !== modelSnapshot
-      : modelEdits.size > 0 || modelInherit.size > 0;
-  if (dirty)
-    MODEL_DRAFTS.set(renderedModel, {
-      values,
-      edited: [...modelEdits],
-      inherit: [...modelInherit],
-      pinned: [...modelPins]
-    });
+function modelFieldEdit(key) {
+  return MODEL_DRAFTS.get(renderedModel)?.get(key);
+}
+function recordModelField(key, kind = 'edit') {
+  if (!modelSnapshot || !renderedModel) return;
+  const draft = MODEL_DRAFTS.get(renderedModel) || new Map();
+  const old = draft.get(key);
+  if (kind === 'edit' && old?.kind === 'pin') kind = 'pin';
+  const current = modelSnapshot[key];
+  const edit = { kind, raw: modelFieldValue(key), origin: old?.origin || current };
+  if (modelDraftConverged(key, edit, current)) {
+    draft.delete(key);
+    if (kind === 'inherit' || modelWireValue(key, edit.raw) !== modelWireValue(key, current.raw))
+      setV(key, current.raw);
+  } else draft.set(key, edit);
+  if (draft.size) MODEL_DRAFTS.set(renderedModel, draft);
   else MODEL_DRAFTS.delete(renderedModel);
-  $('scope-draft-state').classList.toggle('hidden', !dirty);
+}
+function refreshModelDraft() {
+  const draft = MODEL_DRAFTS.get(renderedModel);
+  const count = [...(draft || [])].filter(
+    ([key, edit]) => !sameExpectation(edit.origin.expected, modelSnapshot[key].expected)
+  ).length;
+  const status = $('scope-draft-state');
+  status.textContent = count
+    ? `未保存 · ${count} 项也被另一页面修改；可撤销本模型修改后重新编辑`
+    : '未保存';
+  status.classList.toggle('hidden', !draft);
   refreshModelSelStars();
   renderFieldSources();
 }
+function captureModelDraft() {
+  if (!modelSnapshot) return;
+  // Also capture direct DOM edits before switching/reloading, even without an input event.
+  for (const key of PER_MODEL_KEYS) {
+    const edit = modelFieldEdit(key);
+    if (modelFieldValue(key) !== (edit ? edit.raw : modelSnapshot[key].raw)) recordModelField(key);
+  }
+  refreshModelDraft();
+}
 function finishModelRender(model) {
-  modelSnapshot = JSON.stringify(readModelFields());
-  modelEdits = new Set();
-  modelInherit = new Set();
-  modelPins = new Set();
+  renderedModel = model;
+  const baseline = model === '__global__' ? GLOBAL_SETTINGS : SAVED_MODEL_OVERRIDES[model] || {};
+  const expected = settingsExpectation(baseline, PER_MODEL_KEYS);
+  modelSnapshot = Object.fromEntries(
+    PER_MODEL_KEYS.map((key) => [key, { raw: modelFieldValue(key), expected: expected[key] }])
+  );
   const draft = MODEL_DRAFTS.get(model);
   if (draft) {
-    // Reapply only edited fields: inherited values must follow newer defaults.
-    for (const key of draft.edited) setV(key, draft.values[key]);
-    for (const key of draft.inherit) setV(key, inheritedModelValue(model, key));
-    modelEdits = new Set(draft.edited);
-    modelInherit = new Set(draft.inherit);
-    modelPins = new Set(draft.pinned || []);
+    for (const [key, edit] of draft) {
+      if (modelDraftConverged(key, edit, modelSnapshot[key])) {
+        draft.delete(key);
+        continue;
+      }
+      // Inheritance follows the latest defaults; pins retain the chosen value.
+      setV(key, edit.kind === 'inherit' ? inheritedModelValue(model, key) : edit.raw);
+      edit.raw = modelFieldValue(key);
+    }
+    if (!draft.size) MODEL_DRAFTS.delete(model);
   }
   curAR = $('image_aspect_ratio').value;
-  renderedModel = model;
-  captureModelDraft();
+  refreshModelDraft();
   updateSamplingDisplay();
   updateModelCapabilities();
 }
@@ -216,18 +254,10 @@ function inheritedModelValue(model, key) {
 }
 function setFieldInheritance(key, inherit) {
   if (!PER_MODEL_KEYS.includes(key) || renderedModel === '__global__') return;
-  if (inherit) {
-    modelEdits.delete(key);
-    modelPins.delete(key);
-    if (Object.hasOwn(SAVED_MODEL_OVERRIDES[renderedModel] || {}, key)) modelInherit.add(key);
-    else modelInherit.delete(key);
-    setV(key, inheritedModelValue(renderedModel, key));
-  } else {
-    if ($(key).disabled) return;
-    modelInherit.delete(key);
-    modelPins.add(key);
-  }
-  captureModelDraft();
+  if (inherit) setV(key, inheritedModelValue(renderedModel, key));
+  else if ($(key).disabled) return;
+  recordModelField(key, inherit ? 'inherit' : 'pin');
+  refreshModelDraft();
   updateModelCapabilities();
 }
 function renderFieldSources() {
@@ -244,14 +274,16 @@ function renderFieldSources() {
       anchor.after(row);
     }
     const global = renderedModel === '__global__';
+    const edit = modelFieldEdit(key);
     const own =
       !global &&
-      !modelInherit.has(key) &&
-      (modelEdits.has(key) || Object.hasOwn(SAVED_MODEL_OVERRIDES[renderedModel] || {}, key));
+      (edit
+        ? edit.kind !== 'inherit'
+        : Object.hasOwn(SAVED_MODEL_OVERRIDES[renderedModel] || {}, key));
     const builtin = Object.hasOwn(BUILTIN_OVERRIDES[renderedModel] || {}, key);
     row.innerHTML = global
       ? ''
-      : `<span>${own ? '模型专属' : builtin ? '继承内置默认' : key === 'anti_truncation_mode' ? '继承模型默认' : '继承全局默认'}${modelEdits.has(key) || modelInherit.has(key) ? ' · 未保存' : ''}</span><button type="button" data-inherit="${key}" data-value="${own}" ${el.disabled && !own ? 'disabled' : ''}>${own ? '恢复继承' : '设为专属'}</button>`;
+      : `<span>${own ? '模型专属' : builtin ? '继承内置默认' : key === 'anti_truncation_mode' ? '继承模型默认' : '继承全局默认'}${edit ? ' · 未保存' : ''}</span><button type="button" data-inherit="${key}" data-value="${own}" ${el.disabled && !own ? 'disabled' : ''}>${own ? '恢复继承' : '设为专属'}</button>`;
     row.hidden = global;
   }
 }
@@ -327,12 +359,40 @@ function changedSettings(values) {
     )
   );
 }
-function settingsBody(patch, baseline = GLOBAL_SETTINGS) {
-  const keys = [
-    ...Object.keys(patch).filter((key) => key !== '_inherit'),
-    ...(patch._inherit || [])
+function postFormSettings(values, onSaved) {
+  const patch = changedSettings(values);
+  if (!Object.keys(patch).length) {
+    toast('没有需要保存的修改');
+    return false;
+  }
+  const body = { ...patch, _expected: settingsExpectation(GLOBAL_SETTINGS, Object.keys(patch)) };
+  if (window.consoleForms?.guardSettings)
+    body._expected = window.consoleForms.guardSettings(body._expected);
+  return postSettings(body, (saved) => {
+    // Do not publish stale values from the response for an unrelated form.
+    Object.keys(patch).forEach((key) => (GLOBAL_SETTINGS[key] = saved[key]));
+    onSaved(saved);
+  });
+}
+
+function applyModelReceipt(model, receipt) {
+  const maps = [
+    [OVERRIDES, receipt?.override],
+    [SAVED_MODEL_OVERRIDES, receipt?.saved_override]
   ];
-  return { ...patch, _expected: settingsExpectation(baseline, keys) };
+  if (maps.some(([, value]) => !value || typeof value !== 'object' || Array.isArray(value))) {
+    // An old/partial response cannot distinguish a built-in default from an
+    // owned field. Keep the draft; reload is safe even if the save committed.
+    toast('模型保存响应缺少完整的专属参数，请重新加载配置后核对草稿。');
+    return false;
+  }
+  for (const [target, value] of maps) {
+    if (Object.keys(value).length) target[model] = value;
+    else delete target[model];
+  }
+  MODEL_DRAFTS.delete(model);
+  renderCaps(false);
+  return true;
 }
 
 async function saveModelOverride() {
@@ -342,33 +402,24 @@ async function saveModelOverride() {
   }
   const m = $('model-sel').value;
   if (!m) return;
-  let patch = {
-    first_reply_timeout_seconds: numOr('first_reply_timeout_seconds', 0),
-    anti_truncation_mode: $('anti_truncation_mode').value,
-    native_thinking_mode: $('native_thinking_mode').value,
-    thinking_g3_level: $('thinking_g3_level').value,
-    image_size: $('image_size').value,
-    image_aspect_ratio: $('image_aspect_ratio').value,
-    default_temperature: numOrNull('default_temperature'),
-    default_top_p: numOrNull('default_top_p'),
-    default_max_tokens: numOrNull('default_max_tokens'),
-    inject_system_instruction: $('inject_system_instruction').value,
-    inject_prefill: $('inject_prefill').value,
-    prefill_instruction: $('prefill_instruction').value,
-    image_system_instruction: $('image_system_instruction').checked,
-    inject_prefill_for_image: $('inject_prefill_for_image').checked,
-    sampling_policy: $('sampling_policy').value,
-    prefill_cot_guard: $('prefill_cot_guard').checked
-  };
+  captureModelDraft();
+  const patch = {},
+    expected = {},
+    inherit = [];
+  for (const [key, edit] of MODEL_DRAFTS.get(m) || []) {
+    if (m === '__global__' && key === 'anti_truncation_mode') continue;
+    if (edit.kind === 'inherit') inherit.push(key);
+    else patch[key] = modelWireValue(key, edit.raw);
+    expected[key] = edit.origin.expected;
+  }
+  if (!Object.keys(expected).length) {
+    toast('没有需要保存的修改');
+    return;
+  }
+  const body = { ...patch, ...(inherit.length ? { _inherit: inherit } : {}), _expected: expected };
   if (m === '__global__') {
-    delete patch.anti_truncation_mode;
-    patch = changedSettings(patch);
-    if (!Object.keys(patch).length) {
-      toast('没有需要保存的修改');
-      return;
-    }
     // 全局默认作用域：写进全局设置，而不是任何模型的专属值
-    await postSettings(settingsBody(patch), () => {
+    await postSettings(body, () => {
       Object.assign(GLOBAL_SETTINGS, patch);
       MODEL_DRAFTS.delete(m);
       renderCaps(false);
@@ -376,32 +427,16 @@ async function saveModelOverride() {
     });
     return;
   }
-  patch = Object.fromEntries(Object.entries(patch).filter(([key]) => modelEdits.has(key)));
-  if (modelInherit.size) patch._inherit = [...modelInherit];
-  if (!Object.keys(patch).length) {
-    toast('没有需要保存的修改');
-    return;
-  }
   try {
     const r = await fetch('/api/model-overrides/' + encodeURIComponent(m), {
       signal: AbortSignal.timeout(30000),
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(settingsBody(patch, SAVED_MODEL_OVERRIDES[m] || {}))
+      body: JSON.stringify(body)
     });
     const d = await r.json();
     if (r.ok) {
-      if (Object.keys(d.override || {}).length) OVERRIDES[m] = d.override;
-      else delete OVERRIDES[m];
-      const own = { ...(SAVED_MODEL_OVERRIDES[m] || {}) };
-      for (const key of modelInherit) delete own[key];
-      Object.assign(
-        own,
-        Object.fromEntries(Object.entries(patch).filter(([key]) => key !== '_inherit'))
-      );
-      SAVED_MODEL_OVERRIDES[m] = own;
-      MODEL_DRAFTS.delete(m);
-      renderCaps(false);
+      if (!applyModelReceipt(m, d)) return;
       toast('已保存 ' + m + ' 专属参数');
     } else toast(await responseError(r, '保存失败', d));
   } catch (e) {
@@ -423,15 +458,13 @@ async function clearModelOverride() {
   try {
     const r = await fetch('/api/model-overrides/' + encodeURIComponent(m), {
       signal: AbortSignal.timeout(30000),
-      method: 'DELETE'
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ expected_override: SAVED_MODEL_OVERRIDES[m] || {} })
     });
     if (r.ok) {
       const d = await r.json();
-      if (d.override && Object.keys(d.override).length) OVERRIDES[m] = d.override;
-      else delete OVERRIDES[m];
-      delete SAVED_MODEL_OVERRIDES[m];
-      MODEL_DRAFTS.delete(m);
-      renderCaps(false);
+      if (!applyModelReceipt(m, d)) return;
       toast('已恢复 ' + m + ' 默认参数');
     } else toast(await responseError(r, '清除失败'));
   } catch (e) {
@@ -583,10 +616,6 @@ function updateSamplingDisplay() {
             ? '官方建议 Gemini 3.x 保持采样默认值（可调，但改动可能致循环/降智）；留空即用模型默认。'
             : '该模型支持采样参数；留空即用模型默认。';
 }
-function numOrNull(id) {
-  const v = $(id).value.trim();
-  return v === '' ? null : Number(v);
-}
 function numOr(id, d) {
   const v = $(id).value.trim();
   return v === '' ? d : Number(v);
@@ -608,7 +637,7 @@ async function saveSettings() {
   // 只保存全局运行设置。
   // 模型行为字段显示的是当前编辑对象的生效值，不能在这里一并提交。
   // 一起提交会把某个模型的专属值（比如生图的注入内容）写成全局默认。
-  const patch = changedSettings({
+  const values = {
     img_compress_enabled: $('img_compress_enabled').checked,
     img_compress_max_dim: numOr('img_compress_max_dim', 1536),
     img_compress_max_mb: numOr('img_compress_max_mb', 1.5),
@@ -638,17 +667,10 @@ async function saveSettings() {
     keepalive_interval: numOr('keepalive_interval', 60),
     cookie_auto_refresh: $('cookie_auto_refresh').checked,
     cookie_refresh_interval_seconds: numOr('cookie_refresh_interval_seconds', 600)
-  });
-  if (!Object.keys(patch).length) {
-    toast('没有需要保存的修改');
-    return;
-  }
+  };
   const m = $('model-sel').value;
   const overriding = !!(OVERRIDES[m] && Object.keys(OVERRIDES[m]).length > 0);
-  await postSettings(settingsBody(patch), (saved) => {
-    // Another section may have saved model defaults while this response was in flight.
-    // Only merge the fields owned by this form, never an older full-state snapshot.
-    Object.keys(patch).forEach((key) => (GLOBAL_SETTINGS[key] = saved[key]));
+  await postFormSettings(values, () => {
     window.consoleForms?.saved('runtime');
     toast(overriding ? '全局运行设置已保存；模型专属参数保持不变' : '全局运行设置已保存');
   });

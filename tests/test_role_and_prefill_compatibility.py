@@ -154,6 +154,17 @@ class LogprobsTests(unittest.TestCase):
         self.assertEqual([t["token"] for t in entries[0]["top_logprobs"]], ["你好", "您好"])
         self.assertEqual(entries[0]["bytes"], list("你好".encode()))
 
+    def test_chosen_token_has_empty_list_when_alternatives_are_not_returned(self):
+        candidate = self._candidate()
+        for trailing in ([], [genai_types.LogprobsResultTopCandidates(candidates=[])]):
+            with self.subTest(trailing=trailing):
+                first = candidate.logprobs_result.top_candidates[0]
+                candidate.logprobs_result.top_candidates = [first, *trailing]
+                entries = logprobs_payload_from_candidate(candidate)["content"]
+                self.assertEqual(entries[1]["top_logprobs"], [])
+                self.assertTrue(entries[0]["top_logprobs"])
+                self.assertTrue(all("top_logprobs" not in top for top in entries[0]["top_logprobs"]))
+
     def test_missing_or_barren_result_yields_none(self):
         self.assertIsNone(logprobs_payload_from_candidate(genai_types.Candidate()))
         blank = genai_types.Candidate(logprobs_result=genai_types.LogprobsResult())
@@ -211,22 +222,9 @@ class ResumablePollGuardTests(unittest.IsolatedAsyncioTestCase):
 
     async def _poll(self, from_, api_key, owner_key):
         from routes import chat_api
-        buf = SimpleNamespace(done=False, next_seq=0, kind="stream", model="m",
-                              status="running", error=None,
-                              snapshot=lambda s, l: [],
-                              payload=None, status_code=200,
-                              owner_key_digest=hashlib.sha256(owner_key.encode()).hexdigest())
-        # 轮询端点把每次轮询记为客户端活动（滑动续传窗口）；桩缓冲无窗口状态，空实现即可。
-        buf.note_client_activity = lambda horizon=0.0: None
-
-        async def fake_wait_for(seq, timeout):
-            return True
-        buf.wait_for = fake_wait_for
-        delivered = []
-
-        async def fake_mark_delivered():
-            delivered.append(True)
-        buf.mark_delivered = fake_mark_delivered
+        from resumable import ResumableBuffer
+        buf = ResumableBuffer("rid-x", model="m")
+        buf.owner_key_digest = hashlib.sha256(owner_key.encode()).hexdigest()
         request = SimpleNamespace(headers={})
 
         async def fake_get_exact(sid):

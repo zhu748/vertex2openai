@@ -1,4 +1,5 @@
 """模型请求与重试边界回归：模拟 SDK、HTTP 和 Key 池，无外网调用。"""
+from settings_fixture import saved_settings
 import asyncio
 from contextlib import asynccontextmanager
 import json
@@ -44,8 +45,7 @@ class StreamRetryTests(unittest.IsolatedAsyncioTestCase):
                          "fake_streaming": False, "fake_streaming_interval": 0}
         for patch in (
             mock.patch.object(api_helpers, "stats", self.stats),
-            mock.patch.object(api_helpers.app_state, "get_setting",
-                              side_effect=lambda key, default=None: self.settings.get(key, default)),
+            saved_settings(api_helpers.app_state, self.settings),
         ):
             patch.start()
             self.addCleanup(patch.stop)
@@ -200,13 +200,55 @@ class StreamRetryTests(unittest.IsolatedAsyncioTestCase):
 
         async def wait(request, delay):
             self.assertTrue(closed)
-            self.assertEqual(delay, 0.25)
+            self.assertGreater(delay, 0)
+            self.assertLessEqual(delay, 0.25)  # only the remaining backoff is slept
             return False
 
         with mock.patch.object(api_helpers, "wait_for_retry", side_effect=wait):
             await self.stream(factory)
         self.assertEqual(len(calls), 1)
         self.assertEqual(self.stats.retry_counts, 0)
+
+    async def test_stream_retry_uses_wall_time_while_consumer_holds_heartbeat(self):
+        self.settings.update(retry_backoff_seconds=8, retry_jitter_seconds=0)
+        # Normal waiter, partial pause, pause beyond the deadline, disconnected while paused.
+        for pause, gone, waits_wanted, retries_at, heartbeat_count in (
+            (0, False, [3, 3, 2], [0, 8], 2),
+            (1, False, [3, 3, 1], [0, 8], 2),
+            (12, False, [3], [0, 15], 1),
+            (12, True, [3], [0], 1),
+        ):
+            with self.subTest(pause=pause, gone=gone):
+                now, waits, calls = [0.0], [], []
+                request = SimpleNamespace(is_disconnected=mock.AsyncMock(return_value=False))
+                async def wait(_request, delay):
+                    waits.append(delay)
+                    now[0] += delay
+                    return True
+                async def factory(**kwargs):
+                    calls.append(now[0])
+                    if len(calls) == 1:
+                        raise api_error(429)
+                    async def chunks():
+                        yield text_response()
+                    return chunks()
+                client = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(generate_content_stream=factory)))
+                obj = api_helpers.OpenAIRequest(model="gemini-3.6-flash", messages=[], stream=True)
+                clock = SimpleNamespace(monotonic=lambda: now[0], time=lambda: now[0])
+                with mock.patch.object(api_helpers, "time", clock), mock.patch.object(api_helpers, "wait_for_retry", wait):
+                    result = await api_helpers.execute_gemini_call(
+                        client, obj.model, lambda _: [], {}, obj, fastapi_request=request)
+                    frames = result.body_iterator
+                    self.assertEqual(await anext(frames), ": keep-alive\n\n")  # opening frame
+                    self.assertEqual(await anext(frames), ": keep-alive\n\n")  # first retry heartbeat
+                    self.assertEqual(now[0], 3)
+                    now[0] += pause
+                    request.is_disconnected.return_value = gone
+                    remaining = [frame async for frame in frames]
+                self.assertEqual(waits, waits_wanted)
+                self.assertEqual(calls, retries_at)
+                self.assertEqual(1 + remaining.count(": keep-alive\n\n"), heartbeat_count)
+                self.assertEqual(sum("answer" in frame for frame in remaining), int(not gone))
 
     async def test_nonstream_backoff_stops_on_disconnect(self):
         generate = mock.AsyncMock(side_effect=api_error(429))
@@ -364,8 +406,7 @@ class CookieRetryTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(cookie_delivery, "build_request_body_async", return_value={"variables": {}}),
             mock.patch.object(cookie_delivery, "CompleteTextObjectCursor", FakeTextCursor),
             mock.patch.object(cookie_delivery, "extract_events", return_value=[("error", {"code": 429, "message": "quota exhausted"})]),
-            mock.patch.object(cookie_proxy.app_state, "get_setting",
-                              side_effect=lambda key, default=None: self.settings.get(key, default)),
+            saved_settings(cookie_proxy.app_state, self.settings),
             mock.patch.object(cookie_proxy.app_state, "get_effective_settings",
                               side_effect=lambda model: self.settings.copy()),
         ):
@@ -514,8 +555,7 @@ class KeyRotationTests(unittest.IsolatedAsyncioTestCase):
         for patch in (
             mock.patch.object(api_helpers, "stats", self.stats),
             mock.patch.object(api_helpers.app_state, "get_express_keys", side_effect=lambda: list(self.records)),
-            mock.patch.object(api_helpers.app_state, "get_setting",
-                              side_effect=lambda key, default=None: self.settings.get(key, default)),
+            saved_settings(api_helpers.app_state, self.settings),
             mock.patch.object(api_helpers.app_state, "get_effective_settings",
                               side_effect=lambda model: self.settings.copy()),
             mock.patch.object(express_sdk, "_log_resolved_endpoint"),

@@ -18,6 +18,7 @@ denied ..."）——探测随之判 invalid，用户只能手动重抓整条 Coo
 """
 
 import asyncio
+import threading
 import time
 from typing import Iterable
 
@@ -28,7 +29,7 @@ from http_io import read_limited_bytes
 from impersonate import apply_browser_headers, open_upstream_client
 from proxy_failover import ProxyChain
 from request_tracking import redact
-from runtime_state import app_state
+from runtime_state import CookieAccountConflictError, app_state
 
 ROTATE_COOKIES_URL = "https://accounts.google.com/RotateCookies"
 
@@ -54,7 +55,10 @@ _STARTUP_DELAY_SECONDS = 15
 
 # 自动和手动共用锁，避免重复轮换同一批凭证。
 _loop_lock = asyncio.Lock()
-_settings_changed = asyncio.Event()
+# Each lifespan owns its event, registered only while its worker is alive.
+# A settings save may run on another loop in an embedded application.
+_wake_guard = threading.Lock()
+_worker_wakes: set[tuple[asyncio.AbstractEventLoop, asyncio.Event]] = set()
 
 
 class RefreshInProgressError(RuntimeError):
@@ -62,15 +66,31 @@ class RefreshInProgressError(RuntimeError):
 
 
 def notify_settings_changed() -> None:
-    """Wake the loop on its owning event loop after a console settings save."""
-    _settings_changed.set()
+    """Notify live workers on their own loops; a stopped worker has no pending signal."""
+    with _wake_guard:
+        targets = tuple(_worker_wakes)
+    if not targets:
+        return
+    try:
+        current = asyncio.get_running_loop()
+    except RuntimeError:
+        current = None
+    for loop, wake in targets:
+        if loop is current:
+            wake.set()
+        else:
+            try:
+                loop.call_soon_threadsafe(wake.set)
+            except RuntimeError:
+                # Shutdown may close a loop after we snapshot the subscribers.
+                if not loop.is_closed():
+                    raise
 
 
 def refresh_interval_seconds() -> float:
     """当前生效的轮换间隔（秒），下限钳位到 MIN_REFRESH_INTERVAL_SECONDS。"""
     try:
-        raw = app_state.get_setting("cookie_refresh_interval_seconds",
-                                    DEFAULT_REFRESH_INTERVAL_SECONDS)
+        raw = app_state.get_committed_settings("cookie_refresh_interval_seconds")["cookie_refresh_interval_seconds"]
         value = float(raw)
     except Exception:
         value = float(DEFAULT_REFRESH_INTERVAL_SECONDS)
@@ -81,7 +101,7 @@ def refresh_interval_seconds() -> float:
 
 def auto_refresh_enabled() -> bool:
     try:
-        return bool(app_state.get_setting("cookie_auto_refresh", True))
+        return bool(app_state.get_committed_settings("cookie_auto_refresh")["cookie_auto_refresh"])
     except Exception:
         return False
 
@@ -221,8 +241,12 @@ async def rotate_account(record: dict) -> dict:
 
     # 健康表按凭证摘要绑定：凭证更新后，旧凭证的失败计数/冷却会被
     # _prune_cookie_health_locked 在下次访问时自动清理，无需手动重置。
-    saved = await asyncio.to_thread(
-        app_state.update_cookie_account_cookie, account_id, new_cookie, expected_cookie=cookie)
+    try:
+        saved = await asyncio.to_thread(
+            app_state.update_cookie_account_cookie, account_id, new_cookie, expected_cookie=cookie)
+    except CookieAccountConflictError as exc:
+        return {"id": account_id, "label": label, "status": "error", "changed": [],
+                "detail": str(exc), "elapsed_ms": elapsed}
     if not saved:
         return {"id": account_id, "label": label, "status": "error", "changed": [],
                 "detail": "新令牌未写回：账号已删除或凭证已被更新，请使用当前凭证重试。",
@@ -232,25 +256,36 @@ async def rotate_account(record: dict) -> dict:
             "elapsed_ms": elapsed}
 
 
-async def refresh_once(records: list | None = None) -> list[dict]:
+async def refresh_once(records: list | None = None, *, automatic: bool = False) -> list[dict]:
     """手动/单轮入口：对所有启用账号各续期一次，返回逐账号结果。"""
     if _loop_lock.locked():
         raise RefreshInProgressError("Cookie 正在刷新，请等待当前任务完成后再试。")
     async with _loop_lock:
-        return await _refresh_records(records)
+        return await _refresh_records(records, automatic=automatic)
 
 
-async def _refresh_records(records: list | None) -> list[dict]:
+async def _refresh_records(records: list | None, *, automatic: bool) -> list[dict]:
     if records is None:
         records = [r for r in app_state.get_cookie_accounts() if r.get("enabled")]
+    # The queue is only a selection of identities. Records can be disabled,
+    # removed, rotated or reassigned while an earlier account is on the wire.
+    selected = [(str(row.get("id") or ""), str(row.get("note") or row.get("id") or "")) for row in records]
     results = []
-    for index, record in enumerate(records):
+    for index, (account_id, label) in enumerate(selected):
         if index:
             await asyncio.sleep(_ACCOUNT_GAP_SECONDS)
+        if automatic and not auto_refresh_enabled():
+            break  # A committed disable ends the automatic queue; an in-flight request already finished.
         try:
+            record = app_state.get_cookie_refresh_account(account_id)
+            if record is None:
+                results.append({"id": account_id, "label": label, "status": "skipped", "changed": [],
+                                "detail": "账号已移除、停用或正在变更；未发送刷新请求。", "elapsed_ms": 0})
+                continue
+            label = record.get("note") or account_id
             results.append(await rotate_account(record))
         except Exception as exc:
-            results.append({"id": str(record.get("id", "") or ""), "label": str(record.get("note", "") or ""),
+            results.append({"id": account_id, "label": label,
                             "status": "error", "changed": [],
                             "detail": redact(f"续期异常：{type(exc).__name__}: {exc}")[:400],
                             "elapsed_ms": 0})
@@ -268,15 +303,27 @@ def _log_round(results: list) -> None:
 
 async def refresh_loop() -> None:
     """后台常驻循环：启动后先做一轮，此后按 cookie_refresh_interval_seconds 周期续期。"""
+    wake = asyncio.Event()
+    target = (asyncio.get_running_loop(), wake)
+    with _wake_guard:
+        _worker_wakes.add(target)
+    try:
+        await _run_refresh_loop(wake)
+    finally:
+        with _wake_guard:
+            _worker_wakes.discard(target)
+
+
+async def _run_refresh_loop(wake: asyncio.Event) -> None:
     # 启动先小憩，避开 lifespan 高峰；首轮尽快验证配置是否可用。
     await asyncio.sleep(_STARTUP_DELAY_SECONDS)
     while True:
-        _settings_changed.clear()
+        wake.clear()
         if auto_refresh_enabled():
             accounts = [r for r in app_state.get_cookie_accounts() if r.get("enabled")]
             if accounts:
                 try:
-                    await refresh_once(accounts)
+                    await refresh_once(accounts, automatic=True)
                 except RefreshInProgressError:
                     pass  # A manual round is already refreshing the accounts.
                 except asyncio.CancelledError:
@@ -285,6 +332,6 @@ async def refresh_loop() -> None:
                     print(f"⚠️ [Cookie 续期] 本轮异常（不影响服务）：{type(exc).__name__}: {exc}")
         try:
             async with asyncio.timeout(refresh_interval_seconds()):
-                await _settings_changed.wait()
+                await wake.wait()
         except TimeoutError:
             pass

@@ -2,6 +2,7 @@
 
 from contextlib import asynccontextmanager
 from itertools import product
+from settings_fixture import saved_settings
 import json
 from types import SimpleNamespace
 import unittest
@@ -32,8 +33,7 @@ class CookieSearchTests(unittest.IsolatedAsyncioTestCase):
         for patcher in (
             mock.patch.object(app_state, "get_effective_settings",
                               side_effect=lambda *args, **kwargs: dict(self.settings)),
-            mock.patch.object(app_state, "get_setting",
-                              side_effect=lambda key, default=None: self.settings.get(key, default)),
+            saved_settings(app_state, self.settings),
             mock.patch.object(cookie_proxy.credential_manager, "record_cookie_success"),
         ):
             patcher.start()

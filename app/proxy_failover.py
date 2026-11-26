@@ -5,12 +5,14 @@ policy. Once streaming data has been exposed, errors propagate without replay.
 """
 
 import threading
+from collections import deque
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import httpx
 
 from proxy_resolver import ProxyResolveError, mask_proxy_uri, resolve_proxy_uri_async, resolved_proxy_scope
+from retry_policy import exception_retry_after, retry_after_seconds
 from runtime_state import get_effective_proxy_uris_for_account
 
 PROXY_FAILURE_STATUSES = {407, 502, 503, 504}
@@ -50,15 +52,17 @@ class ProxyChain:
         self.candidates = tuple(candidates if candidates is not None else
                                 get_effective_proxy_uris_for_account(record)) or ("",)
         self.index = 0
-        # index 的读-改-写加锁（2026-11 C-13）：事件循环与媒体下载 worker
-        # 线程会并发触碰同一链（to_thread 里的下载失败触发 advance），裸
-        # `+=` 非原子，最坏丢失一次自增导致故障切换跳档/回退。
+        # Event-loop requests and media workers can share this cursor. Never
+        # hold its lock across resolution, I/O, callbacks, or a retry.
         self._index_lock = threading.Lock()
+
+    def _snapshot(self):
+        with self._index_lock:
+            return self.index, self.candidates[self.index]
 
     @property
     def current(self):
-        with self._index_lock:
-            return self.candidates[self.index]
+        return self._snapshot()[1]
 
     def log_current(self) -> None:
         """打印当前出口代理（掩码）——四条通道调用点共用同一日志形态
@@ -66,12 +70,24 @@ class ProxyChain:
         from proxy_resolver import mask_proxy_uri
         print(f"🌐 [出站代理] 当前出口：{mask_proxy_uri(self.current)}")
 
-    def advance(self, error=None, *, status=None):
+    def advance(self, error=None, *, status=None, failed_index=None, retry_after=None):
+        if len(self.candidates) < 2:
+            return False
+        if status not in PROXY_FAILURE_STATUSES and (error is None or not is_proxy_failure(error)):
+            return False
+        # An explicit wait applies to this request even when a sibling already
+        # selected another exit. Do not count a retry or discard the response.
+        if retry_after_seconds(retry_after) or (error is not None and retry_after_seconds(exception_retry_after(error))):
+            return False
         with self._index_lock:
-            if self.index + 1 >= len(self.candidates):
+            if failed_index is None:
+                failed_index = self.index
+            if failed_index + 1 >= len(self.candidates):
                 return False
-            if status not in PROXY_FAILURE_STATUSES and not is_proxy_failure(error):
-                return False
+            if failed_index != self.index:
+                # A sibling already advanced. Retry on its selection, even if
+                # it is the last candidate, without advancing/counting twice.
+                return True
             previous = self.candidates[self.index]
             self.index += 1
             current = self.candidates[self.index]
@@ -84,35 +100,45 @@ class ProxyChain:
               f"{mask_proxy_uri(current) or '直连'}")
         return True
 
+    def _advance_response(self, response, index):
+        return self.advance(status=getattr(response, "status_code", None), failed_index=index,
+                            retry_after=(getattr(response, "headers", None) or {}).get("retry-after"))
+
+    @staticmethod
+    async def _prepare_at(raw, factory):
+        resolved = await resolve_proxy_uri_async(raw)
+        with resolved_proxy_scope(raw, resolved):
+            return factory(raw, resolved)
+
     async def prepare(self, factory):
         while True:
+            index, raw = self._snapshot()
             try:
-                resolved = await resolve_proxy_uri_async(self.current)
-                with resolved_proxy_scope(self.current, resolved):
-                    return factory(self.current, resolved)
+                return await self._prepare_at(raw, factory)
             except Exception as exc:
-                if not self.advance(exc):
+                if not self.advance(exc, failed_index=index):
                     raise
 
     async def run(self, operation):
         """Operation receives (raw URI, resolved URL); resources belong to it."""
         attempted = False
         while True:
+            index, raw = self._snapshot()
             try:
                 from first_reply import proxy_attempt
                 async with proxy_attempt(len(self.candidates) > 1):
-                    resolved = await resolve_proxy_uri_async(self.current)
+                    resolved = await resolve_proxy_uri_async(raw)
                     if attempted:
                         from request_tracking import upstream_attempt
                         upstream_attempt()
                     attempted = True
-                    with resolved_proxy_scope(self.current, resolved):
-                        result = await operation(self.current, resolved)
+                    with resolved_proxy_scope(raw, resolved):
+                        result = await operation(raw, resolved)
             except Exception as exc:
-                if self.advance(exc):
+                if self.advance(exc, failed_index=index):
                     continue
                 raise
-            if self.advance(status=getattr(result, "status_code", None)):
+            if self._advance_response(result, index):
                 await close_response(result)
                 continue
             return result
@@ -125,11 +151,12 @@ class ProxyChain:
         """
         from proxy_resolver import resolve_proxy_uri
         while True:
+            index, raw = self._snapshot()
             try:
-                resolved = resolve_proxy_uri(self.current)
-                return operation(self.current, resolved)
+                resolved = resolve_proxy_uri(raw)
+                return operation(raw, resolved)
             except Exception as exc:
-                if not self.advance(exc):
+                if not self.advance(exc, failed_index=index):
                     raise
 
     def bind_to_generation(self):
@@ -160,10 +187,11 @@ class FailoverHTTPClient:
     async def stream(self, *args, **kwargs):
         attempted = False
         while True:
+            index, raw = self.chain._snapshot()
             try:
                 from first_reply import proxy_attempt
                 async with proxy_attempt(len(self.chain.candidates) > 1):
-                    client = await self.chain.prepare(self.factory)
+                    client = await self.chain._prepare_at(raw, self.factory)
                     context = client.stream(*args, **kwargs)
                     if attempted:
                         from request_tracking import upstream_attempt
@@ -171,10 +199,10 @@ class FailoverHTTPClient:
                     attempted = True
                     response = await context.__aenter__()
             except Exception as exc:
-                if self.chain.advance(exc):
+                if self.chain.advance(exc, failed_index=index):
                     continue
                 raise
-            if self.chain.advance(status=response.status_code):
+            if self.chain._advance_response(response, index):
                 await context.__aexit__(None, None, None)
                 continue
             break
@@ -225,7 +253,7 @@ class FailoverSDKClient:
 
                 self.client = self.factory(raw, resolved)
                 source = await self.client.aio.models.generate_content_stream(**kwargs)
-                prefix, size = [], 0
+                prefix, size = deque(), 0
                 try:
                     async for chunk in source:
                         prefix.append(chunk)
@@ -244,10 +272,14 @@ class FailoverSDKClient:
                     raise
             source, prefix = await self.chain.run(start)
             try:
-                for chunk in prefix:
-                    yield chunk
+                while prefix:
+                    yield prefix.popleft()
                 async for chunk in source:
-                    yield chunk
+                    try:
+                        yield chunk
+                    finally:
+                        del chunk
             finally:
+                prefix.clear()
                 await source.aclose()
         return events()

@@ -8,7 +8,7 @@ CookieGeneration、装配函数与路由适配器）。
 
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import config as app_config
 import httpx
 import model_capabilities as mc
@@ -89,6 +89,11 @@ class CookieGeneration:
     cookie_debug: bool
     is_stream: bool
     is_image: bool
+    response_created: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        # The attempt timer can restart on retry; the OpenAI completion cannot.
+        self.response_created = int(self.start_time)
 
     async def response(self) -> Response:
         """按请求形态分发到 cookie_delivery 的四条交付路径。"""
@@ -273,8 +278,8 @@ def _prepare_cookie_generation(
         or app_state.get_setting("fake_streaming", app_config.FAKE_STREAMING_ENABLED)
     )
     is_stream = request_obj.stream and not buffer_text
-    response_id = f"chatcmpl-studio-{int(time.time())}-{uuid.uuid4().hex[:8]}"
     start_time = time.time()
+    response_id = f"chatcmpl-studio-{int(start_time)}-{uuid.uuid4().hex[:8]}"
     want_usage = wants_usage(request_obj)
     cookie_debug = bool(
         app_state.get_setting("debug_outbound", False)

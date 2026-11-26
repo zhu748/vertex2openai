@@ -77,11 +77,11 @@ class GrpcStatusMappingTests(unittest.TestCase):
         self.assertEqual(code, 429)
 
     def test_usage_estimation_counts_thought_exactly_once(self):
-        # 2026-11 C-1 核验回归：流式（元数据 join，含 thought 项）与非流式
+        # 2026-11 C-1 核验回归：流式（元数据片段，含 thought 项）与非流式
         # （full_text + reasoning_text）两条估算路径必须给出**相同**的
         # completion 估算——思考文本恰好计一次。评审报告曾疑有双计，
         # 实测两条路径口径一致；本测试锁定该不变量，防止未来分叉。
-        from upstreams.cookie_delivery import _final_usage
+        from upstreams.cookie_delivery import _final_usage, _stream_usage_fragments
         from thought_signatures import ordinary_part_metadata
         request = SimpleNamespace(
             messages=[{"role": "user", "content": "hello world"}])
@@ -94,7 +94,7 @@ class GrpcStatusMappingTests(unittest.TestCase):
             "get_setting", return_value=True):
             streaming = _final_usage(
                 None, request,
-                "\n".join(p.get("text", "") for p in meta))
+                _stream_usage_fragments("", meta))
             nonstream = _final_usage(
                 None, request, "answer body text",
                 "thinking hard about the problem")
@@ -251,13 +251,13 @@ class UsageEstimationTests(unittest.TestCase):
 class RetryBackoffModeTests(unittest.TestCase):
     def test_fixed_mode_ignores_attempt(self):
         from retry_policy import _retry_delay_value
-        with mock.patch("retry_policy.app_state.get_setting", return_value="fixed"):
+        with mock.patch("retry_policy.app_state.get_committed_setting", return_value="fixed"):
             self.assertAlmostEqual(_retry_delay_value(None, 5.0, 0, 0.0), 5.0)
             self.assertAlmostEqual(_retry_delay_value(None, 5.0, 4, 0.0), 5.0)
 
     def test_exponential_mode_grows_and_caps(self):
         from retry_policy import _retry_delay_value
-        with mock.patch("retry_policy.app_state.get_setting", return_value="exponential"):
+        with mock.patch("retry_policy.app_state.get_committed_setting", return_value="exponential"):
             self.assertAlmostEqual(_retry_delay_value(None, 5.0, 0, 0.0), 5.0)
             self.assertAlmostEqual(_retry_delay_value(None, 5.0, 1, 0.0), 10.0)
             self.assertAlmostEqual(_retry_delay_value(None, 5.0, 2, 0.0), 20.0)

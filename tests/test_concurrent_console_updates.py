@@ -1,6 +1,7 @@
 """Saved credential preservation must be resolved at commit time."""
 
 import asyncio
+from pathlib import Path
 import unittest
 from unittest import mock
 
@@ -12,7 +13,7 @@ import main
 import lifecycle
 import express_key_probe
 from routes import credentials_api
-from runtime_state import AppState, app_state
+from runtime_state import AppState, STATE_FILE, app_state
 
 
 class CookieSaveConcurrencyTests(unittest.TestCase):
@@ -73,6 +74,36 @@ class CookieSaveConcurrencyTests(unittest.TestCase):
             response = self.save(replacement)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(AppState().get_cookie_accounts()[0]["cookie"], replacement)
+
+    def test_rotated_cookie_and_new_idless_row_cannot_share_an_effective_id(self):
+        # Both rows have different Cookie values at the point of saving. The
+        # derived ID of the new row matches the original stable ID of the rotated one.
+        original = "SAPISID=cfg-source; SID=fixture"
+        rotated = "SAPISID=cfg-rotated; SID=fixture"
+        self.write([{"cookie": original, "project_id": "original", "note": "saved"}])
+        account_id = app_state.get_cookie_accounts()[0]["id"]
+        self.assertTrue(app_state.update_cookie_account_cookie(account_id, rotated))
+        before = app_state.credential_snapshot("cookies")
+        disk = Path(STATE_FILE).read_bytes()
+        existing = {"id": account_id, "cookie": "", "project_id": "original", "note": "edited"}
+        new = {"cookie": original, "project_id": "different", "note": "new"}
+        for rows in ([existing, new], [new, existing]):
+            with self.subTest(existing_first=rows[0] is existing):
+                response = self.client.post("/api/cookie-accounts", json={"accounts": rows, "revision": before[1]})
+                self.assertEqual(response.status_code, 409)
+                self.assertNotIn("SAPISID", response.text)
+                self.assertEqual(app_state.credential_snapshot("cookies"), before)
+                self.assertEqual(Path(STATE_FILE).read_bytes(), disk)
+                self.assertEqual(AppState().credential_snapshot("cookies"), before)
+        # Distinct new IDs still work and a blank existing credential stays rotated.
+        response = self.client.post("/api/cookie-accounts", json={
+            "accounts": [existing, {**new, "cookie": "SAPISID=cfg-unrelated"}], "revision": before[1]})
+        self.assertEqual(response.status_code, 200)
+        saved = AppState().get_cookie_accounts()
+        self.assertEqual([(r["cookie"], r["project_id"]) for r in saved],
+                         [(rotated, "original"), ("SAPISID=cfg-unrelated", "different")])
+        self.assertEqual(saved[0]["id"], account_id)
+        self.assertNotEqual(saved[1]["id"], account_id)
 
     def test_preserved_cookie_collision_rejects_entire_save(self):
         collision = "SAPISID=collision"

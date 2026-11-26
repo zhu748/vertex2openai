@@ -25,6 +25,8 @@ Cherry Studio 等说 Claude 协议的客户端）说的是另一套协议：
   场景 Gemini 可能 10-30s 不发内容，静默超 10s 自动补 event: ping，防止
   Claude Code SDK 误判超时断连（对齐 vertex-master 的 10s ping ticker）；
   中途错误不改变 HTTP 状态码（SSE 头已提交，对齐 Anthropic 官方流式行为）；
+- 已知 Retry-After：快速失败返回合法 HTTP 头；已提交的流在 error 前发限长的只读 SSE 注释，
+  不改 Anthropic JSON 结构、不触发自动重连；
 - 非流式与流式的快速失败（0.05s 窗口内）：保留真实 HTTP 状态码 + Anthropic
   错误体（invalid_request_error / not_found_error / rate_limit_error 等）；
 - 续传缓冲（resumable）为 OpenAI SSE 专属语义，Claude 路径直连上游，
@@ -40,8 +42,11 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from google.genai import types
+from starlette.background import BackgroundTask
+from starlette.requests import ClientDisconnect
 
 from admission import GenerationCapacityError, ManagedStreamingResponse
+from signature_origin import bind_signature_origins
 from auth import constant_time_equal, extract_candidate_key
 from claude_protocol import (
     ClaudeRequestError,
@@ -63,19 +68,25 @@ from express_endpoint import resolve_express_model_path
 from generation_config import function_tools, system_instruction
 from logger import stats
 from json_encoding import LargeJSONResponse
-from media_tasks import run_media_task
+from media_tasks import prompt_needs_media_pool, run_media_task
 from message_processing import create_gemini_prompt
 from model_loader import get_express_models
 from proxy_failover import FailoverSDKClient, ProxyChain, ProxyResolveError
 from proxy_resolver import ProxyUsage, current_proxy_usage
+from replay_event import ReplayEvent
 from client_pool import get_pooled_express_client
 from request_tracking import configure as track_configure
 from response_validation import IncompleteResponseError
-from request_connection import BodyTooLargeError
+from request_connection import BodyTooLargeError, ClientConnection
+from stream_cleanup import await_owned_close
 from request_ingress import IngressError
 from routes.chat_api import call_upstream
 from runtime_state import app_state
 from streaming import ByteBoundedQueue, SSE_NO_BUFFER_HEADERS, sse_frames
+from tool_policy import validate_parallel_tool_calls
+from request_validation import validate_model_response_format
+from schema_validation import SchemaValidationError, preflight_schema_contracts
+from retry_policy import advisory_headers, bounded_sse_advisory, response_retry_after
 from upstream_errors import extract_upstream_error
 from upstreams.express_sdk import normalize_model_name
 
@@ -174,9 +185,71 @@ def _json_response_payload(response) -> Optional[dict]:
         return None
 
 
+async def _claude_frames(queue: ByteBoundedQueue, producer: asyncio.Task, ready: asyncio.Event):
+    """Drain real frames before observing EOF/failure; None denotes an idle ping."""
+    while True:
+        if not queue.empty():
+            yield await queue.get()
+        elif producer.done():
+            if producer.cancelled():
+                # This is the upstream task, not the connected client's task.
+                raise IncompleteResponseError("上游 OpenAI 流读取被取消，回复可能不完整。")
+            producer.result()  # propagate ordinary upstream errors after buffered frames
+            return
+        else:
+            # Single consumer: nothing can enqueue/finish between these checks
+            # and clear() without an await. Completion never needs a queue slot.
+            ready.clear()
+            try:
+                async with asyncio.timeout(IDLE_PING_SECONDS):
+                    await ready.wait()
+            except TimeoutError:
+                if queue.empty() and not producer.done():
+                    yield None
+
+
+def _translate_openai_sse_frame(state: ClaudeStreamState, item: Optional[bytes]):
+    """Decode one input locally; retain only output frames or state genuinely needed later."""
+    if item is None:
+        return None, [PING_EVENT]
+    # Extra leading empty lines do not dispatch an event.
+    text = item.decode("utf-8", errors="replace").lstrip("\r\n")
+    event = ReplayEvent(text)
+    if not event.has_data:
+        return None, [PING_EVENT] if text.startswith(":") else []
+    data = event.data().strip(" \t\r\n")
+    if not data:
+        return None, []
+    if data == "[DONE]":
+        return "done", []
+    try:
+        payload = json.loads(data)
+    except (ValueError, TypeError):
+        raise IncompleteResponseError("上游 OpenAI 流包含无效 JSON 事件。") from None
+    if not isinstance(payload, dict):
+        raise IncompleteResponseError("上游 OpenAI 流事件必须是 JSON 对象。")
+    if error := payload.get("error"):
+        code = error.get("code") if isinstance(error, dict) else None
+        try:
+            code = int(code)
+        except (ValueError, TypeError, OverflowError):
+            code = 502
+        message = _openai_error_message(payload, "上游流式响应出错。")
+        hint = bounded_sse_advisory(error.get("retry_after")) if isinstance(error, dict) else None
+        # A committed stream can only carry the optional wait as a bounded comment.
+        frames = [f": retry-after {hint}\n\n"] if hint is not None else []
+        frames.append(error_event(anthropic_error_type(code), message))
+        return "error", frames
+    if not payload.get("choices") and isinstance(payload.get("usage"), dict):
+        state.feed_usage(payload["usage"])
+        return None, []
+    return None, state.feed_openai_chunk(payload)
+
+
 def _claude_stream_response(response: StreamingResponse, display_model: str, *,
                            omit_thinking: bool,
-                           started_at: Optional[float] = None) -> ManagedStreamingResponse:
+                           started_at: Optional[float] = None,
+                           state: Optional[ClaudeStreamState] = None) -> ManagedStreamingResponse:
     """把上游 OpenAI SSE 流翻译成 Anthropic 事件流（claude_messages 的流式段）。
 
     职责与保活策略（详见模块 docstring 与 IDLE_PING_SECONDS 注释）：
@@ -185,7 +258,8 @@ def _claude_stream_response(response: StreamingResponse, display_model: str, *,
     - 有界帧队列背压防慢客户端堆内存；生产者/消费者生命周期与上游
       关闭均在 finally 中收尾，客户端断开不泄漏任务与连接。
     """
-    state = ClaudeStreamState(display_model, omit_thinking=omit_thinking)
+    if state is None:
+        state = ClaudeStreamState(display_model, omit_thinking=omit_thinking)
     upstream_iterator = response.body_iterator
 
     async def _bytes_source():
@@ -195,83 +269,36 @@ def _claude_stream_response(response: StreamingResponse, display_model: str, *,
             else:
                 yield chunk
 
-    _END = object()  # 生产者结束哨兵
     # Text retains the existing 128-frame read-ahead, while image slices have
     # a 2 MiB byte budget (128 x 256 KiB would otherwise retain 32 MiB).
     # Cancelling the producer also interrupts a blocked byte-budget wait.
     frame_queue = ByteBoundedQueue(maxsize=128, max_bytes=2 * 1024 * 1024)
 
+    ready = asyncio.Event()
+
     async def _produce_frames():
-        """后台任务：从上游读帧入队；异常/结束也入队，交给消费者统一处理。"""
-        try:
-            async for frame in sse_frames(_bytes_source()):
-                await frame_queue.put(frame)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            await frame_queue.put(exc)
-        # Cancellation means the consumer has gone away. Never enqueue a
-        # sentinel in finally: a full queue would block cancellation forever.
-        await frame_queue.put(_END)
+        async for frame in sse_frames(_bytes_source()):
+            await frame_queue.put(frame)
+            ready.set()
 
     async def event_stream():
         failed = False
-        done = False
         delivered = False  # message_stop 已完整发出（客户端断开/异常时不算完成）
         producer = asyncio.create_task(_produce_frames())
+        producer.add_done_callback(lambda _: ready.set())
         try:
             # message_start 先行：不等上游首字节，客户端连接立刻建立
             yield state.message_start_event()
-            while True:
-                try:
-                    item = await asyncio.wait_for(frame_queue.get(), timeout=IDLE_PING_SECONDS)
-                except TimeoutError:
-                    # 静默超时：补发 ping 保活（不取消上游读取任务）
-                    yield PING_EVENT
-                    continue
-                if item is _END:
-                    break
-                if isinstance(item, Exception):
-                    raise item
-                frame = item
-                text = frame.decode("utf-8", errors="replace")
-                data_events = list(_sse_data_lines(text))
-                if not data_events and text.lstrip().startswith(":"):
-                    # 上游心跳注释帧 → Anthropic ping 事件（防客户端空闲超时）
-                    yield PING_EVENT
-                    continue
-                for data in data_events:
-                    if not data.strip():
-                        continue
-                    if data.strip() == "[DONE]":
-                        done = True
-                        break
-                    try:
-                        payload = json.loads(data)
-                    except (ValueError, TypeError):
-                        raise IncompleteResponseError("上游 OpenAI 流包含无效 JSON 事件。") from None
-                    if isinstance(payload, dict) and payload.get("error"):
-                        # 流中错误帧：转成 Anthropic error 事件后终止
-                        error = payload["error"]
-                        code = error.get("code") if isinstance(error, dict) else None
-                        try:
-                            code = int(code)
-                        except (ValueError, TypeError, OverflowError):
-                            code = 502
-                        err_type = anthropic_error_type(code)
-                        message = _openai_error_message(payload, "上游流式响应出错。")
-                        yield error_event(err_type, message)
-                        failed = True
-                        break
-                    if not isinstance(payload, dict):
-                        raise IncompleteResponseError("上游 OpenAI 流事件必须是 JSON 对象。")
-                    choices = payload.get("choices")
-                    if not choices and isinstance(payload.get("usage"), dict):
-                        state.feed_usage(payload["usage"])
-                        continue
-                    for event in state.feed_openai_chunk(payload):
-                        yield event
-                if failed or done:
+            async for item in _claude_frames(frame_queue, producer, ready):
+                terminal, frames = _translate_openai_sse_frame(state, item)
+                del item
+                # The list contains only this translated chunk; retire each
+                # rendered event once offered to the consumer.
+                frames.reverse()
+                while frames:
+                    yield frames.pop()
+                if terminal:
+                    failed = terminal == "error"
                     break
             if not failed:
                 if not state.finish:
@@ -297,26 +324,28 @@ def _claude_stream_response(response: StreamingResponse, display_model: str, *,
                 if usage.get("input_tokens") or usage.get("output_tokens"):
                     tokens = f" | 输入 {usage.get('input_tokens', 0)} / 输出 {usage.get('output_tokens', 0)} tokens"
                 print(f"✅ [Claude] 模型 {display_model} | 流式翻译完成 | 耗时 {elapsed:.1f}s{tokens}")
-            # 结束/异常/客户端断开：停掉生产者并回收任务，释放上游连接
-            producer.cancel()
-            try:
-                await producer
-            # REQ-P3-2：收窄吞异常面——BaseException 会连 KeyboardInterrupt /
-            # SystemExit 一起吞掉，收尸路径不应屏蔽进程级信号。
-            except (asyncio.CancelledError, Exception):
-                pass
-            close = getattr(response, "aclose", None) or getattr(upstream_iterator, "aclose", None)
-            if close is not None:
-                try:
-                    await close()
-                except Exception:
-                    pass
+            # Drain the producer in a separate owned task. Its expected
+            # cancellation must not consume an independent server cancellation.
+            await await_owned_close(stop_producer(producer))
+
+    async def stop_producer(producer):
+        producer.cancel()
+        try:
+            await producer
+        except (asyncio.CancelledError, Exception):
+            pass
+        await cleanup()
+
+    closing = None
 
     async def cleanup():
+        nonlocal closing
         close = getattr(response, "aclose", None) or getattr(upstream_iterator, "aclose", None)
         if close is not None:
+            if closing is None:
+                closing = asyncio.ensure_future(close())
             try:
-                await close()
+                await await_owned_close(closing)
             except Exception:
                 pass
 
@@ -355,13 +384,23 @@ async def claude_messages(fastapi_request: Request, api_key: str = Depends(get_c
     display_model, internal_model = resolve_claude_model(raw_model, await _available_models())
     try:
         request_obj = anthropic_to_openai_request(body, internal_model)
+        validate_model_response_format(request_obj, label="output_config.format")
+        validate_parallel_tool_calls(request_obj, serial_setting="tool_choice.disable_parallel_tool_use=true")
+        preflight_schema_contracts(request_obj)
     except ClaudeRequestError as exc:
         return claude_error(exc.status, exc.err_type, str(exc))
+    except SchemaValidationError as exc:
+        return claude_error(400, "invalid_request_error", str(exc))
 
     # thinking.display=omitted：响应侧不回传思考块（对齐 vertex-master
     # includeThoughts 口径；模型照常思考，reasoning_tokens 照计 usage）。
+    bind_signature_origins(request_obj, api_key)
     omit_thinking = anthropic_omit_thinking(body)
     request_started = time.monotonic()
+    stream_state = None
+    if request_obj.stream:
+        stream_state = ClaudeStreamState(display_model, omit_thinking=omit_thinking)
+        request_obj._select_buffered_order = stream_state.select_buffered_order
 
     track_configure(model=display_model, protocol="claude",
                     stream=bool(request_obj.stream), channel=_track_channel())
@@ -377,7 +416,9 @@ async def claude_messages(fastapi_request: Request, api_key: str = Depends(get_c
     except Exception as exc:
         code, message = extract_upstream_error(exc)
         print(f"❌ [Claude] 模型 {display_model} 调用失败 | HTTP {code} | {message[:200]}")
-        return claude_error(code, anthropic_error_type(code), message[:1024])
+        failure = claude_error(code, anthropic_error_type(code), message[:1024])
+        failure.headers.update(advisory_headers(exc))
+        return failure
 
     if not isinstance(response, StreamingResponse):
         # 非流式 / 流式快速失败：真实 HTTP 状态码 + Anthropic 错误体
@@ -386,14 +427,18 @@ async def claude_messages(fastapi_request: Request, api_key: str = Depends(get_c
         if status >= 400 or (isinstance(payload, dict) and payload.get("error")):
             message = _openai_error_message(payload, f"上游请求失败（HTTP {status}）。")
             err_status = status if status >= 400 else 502
-            return claude_error(err_status, anthropic_error_type(err_status), message)
+            failure = claude_error(err_status, anthropic_error_type(err_status), message)
+            hint = response_retry_after(response)
+            if hint is not None:
+                failure.headers["retry-after"] = hint
+            return failure
         # The parsed content owns the image now. Release the intermediate
         # OpenAI JSON body before encoding its Anthropic representation.
         body_size = len(getattr(response, "body", b""))
         response = None
         try:
             anthropic_payload = openai_completion_to_anthropic(
-                payload or {}, display_model, new_message_id(), omit_thinking=omit_thinking)
+                payload, display_model, new_message_id(), omit_thinking=omit_thinking)
         except IncompleteResponseError as exc:
             return claude_error(502, "api_error", str(exc))
         # 与 OpenAI 通道的完成日志同构：显示模型 | 耗时 | tokens
@@ -407,29 +452,11 @@ async def claude_messages(fastapi_request: Request, api_key: str = Depends(get_c
         return response_class(content=anthropic_payload)
 
     # ---- 流式：OpenAI SSE 帧 → Anthropic SSE 事件 ----
-    return _claude_stream_response(response, display_model, omit_thinking=omit_thinking,
-                                   started_at=request_started)
-
-
-def _sse_data_lines(frame_text: str):
-    """从单条 SSE 帧中提取全部 data: 行负载（多行 data 按 SSE 规范拼接）。"""
-    data_parts: list[str] = []
-    for line in frame_text.splitlines():
-        if line.startswith("data:"):
-            # REQ-P3-1：SSE 规范只剥**一个**前导空格——lstrip(" ") 会剥全部，
-            # 多行 data 拼接后代码块缩进等正文被损坏（对齐 Cookie 通道口径）。
-            payload = line[len("data:"):]
-            if payload.startswith(" "):
-                payload = payload[1:]
-            data_parts.append(payload)
-        elif line.startswith(":"):
-            continue  # SSE comments do not dispatch or split the current event.
-        elif not line.strip():
-            if data_parts:
-                yield "\n".join(data_parts)
-                data_parts = []
-    if data_parts:
-        yield "\n".join(data_parts)
+    translated = _claude_stream_response(response, display_model, omit_thinking=omit_thinking,
+                                         started_at=request_started, state=stream_state)
+    # The adapter, rather than its upstream iterator, owns the actual ASGI send.
+    translated.client_connection = ClientConnection.for_request(fastapi_request)
+    return translated
 
 
 # ============================================================
@@ -516,9 +543,9 @@ async def _count_exact_input_tokens(request_obj, fastapi_request: Request,
         # 压缩——Express 主路径（express_pipeline）与 Cookie 路径（cookie_request）
         # 都已线程化，唯独此处曾在事件循环上直跑：多模态 count_tokens 可把
         # 整个服务冻结 10~40s，所有并发流的心跳集体停摆（2026-10 修复）。
-        # PRF-P1-5：prompt 构建是每请求必经的轻载路径，走 prep 池。
-        contents = await run_media_task(create_gemini_prompt, request_obj.messages, base_model,
-                                        heavy=False)
+        contents = await run_media_task(
+            create_gemini_prompt, request_obj.messages, base_model, heavy=prompt_needs_media_pool(request_obj.messages)
+        )
     except Exception:
         return None
     if not contents:
@@ -549,7 +576,7 @@ async def _count_exact_input_tokens(request_obj, fastapi_request: Request,
     except ProxyResolveError:
         return None
     except Exception as exc:
-        print(f"⚠️ [Claude] count_tokens 精确计数失败，回退启发式估算：{type(exc).__name__}: {exc}")
+        print(f"⚠️ [Claude] count_tokens 精确计数失败：{type(exc).__name__}: {exc}")
         return None
 
 
@@ -575,23 +602,36 @@ async def claude_count_tokens(fastapi_request: Request, api_key: str = Depends(g
     if not isinstance(raw_model, str) or not raw_model.strip():
         return claude_error(400, "invalid_request_error", "model is required")
 
-    display_model, internal_model = resolve_claude_model(raw_model, await _available_models())
-    try:
-        # 复用同一套消息校验（但不要求 max_tokens）
+    async def count():
+        display_model, internal_model = resolve_claude_model(raw_model, await _available_models())
         request_obj = anthropic_to_openai_request(body, internal_model, require_max_tokens=False)
+        exact = await _express_exact_input_tokens(request_obj, fastapi_request, internal_model)
+        return display_model, internal_model, exact
+
+    # The connection middleware owns receive. Join any cancelled SDK call
+    # (and its semaphore) before returning; a lost caller needs no estimate.
+    connection = ClientConnection.for_request(fastapi_request)
+    try:
+        display_model, internal_model, exact = await (connection.while_connected(count) if connection else count())
+    except ClientDisconnect:
+        return claude_error(499, "api_error", "客户端已断开连接，计数已取消。")
     except ClaudeRequestError as exc:
         return claude_error(exc.status, exc.err_type, str(exc))
-
-    # Express 通道有 Key 时优先模型侧精确计数（同 Vertex countTokens 分词器）；
-    # 无 Key（纯 Cookie 通道）/ 任一失败 → 启发式估算（量级正确，非逐 token 精确）。
-    exact = await _express_exact_input_tokens(request_obj, fastapi_request, internal_model)
     if exact is not None:
         print(f"🔢 [Claude] count_tokens 模型 {display_model} → {internal_model}："
               f"精确 {exact} tokens（Express 分词器）")
-        return JSONResponse(content={"input_tokens": exact})
-    estimated = estimate_request_tokens(body)
-    print(f"🔢 [Claude] count_tokens 模型 {display_model} → {internal_model}：估算 ~{estimated} tokens")
-    return JSONResponse(content={"input_tokens": estimated})
+        result = exact
+    else:
+        result = estimate_request_tokens(body)
+        print(f"🔢 [Claude] count_tokens 模型 {display_model} → {internal_model}：估算 ~{result} tokens")
+
+    async def record_delivered_count():
+        # Middleware owns totals and HTTP errors. Count a successful helper
+        # response once, never as generated/billed usage or a discarded send.
+        if connection is None or connection.delivery_possible:
+            stats.add_success()
+
+    return JSONResponse(content={"input_tokens": result}, background=BackgroundTask(record_delivered_count))
 
 
 # ============================================================

@@ -88,10 +88,10 @@ async def fetch_and_parse_models_config() -> Optional[Dict[str, List[str]]]:
                         return json.loads(await read_limited_bytes(response, MAX_MODELS_CONFIG_BYTES))
             async with asyncio.timeout(MODELS_FETCH_TIMEOUT_SECONDS):
                 normalized = _normalize_models_config(await chain.run(fetch))
-            if normalized is not None:
+            if normalized and normalized["models"]:
                 print(f"✅ [模型配置] 远程模型配置加载成功，共 {len(normalized['models'])} 个模型。")
                 return normalized
-            print(f"⚠️ [模型配置] 远程模型配置结构无效，准备尝试下一个地址：{url}")
+            print(f"⚠️ [模型配置] 远程模型配置为空或结构无效，准备尝试下一个地址：{url}")
         except httpx.HTTPStatusError as exc:
             print(f"⚠️ [模型配置] 远程模型配置地址返回 HTTP {exc.response.status_code}，准备尝试下一个地址：{url}")
         except httpx.RequestError as exc:

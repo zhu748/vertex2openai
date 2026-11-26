@@ -7,7 +7,6 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-import config
 import express_key_probe
 from auth import constant_time_equal
 from console_auth import (
@@ -32,7 +31,7 @@ router = APIRouter()
 
 
 class ExpressKeysBody(BaseModel):
-    keys: list = []
+    keys: list
     revision: str | None = None
 
 
@@ -47,15 +46,15 @@ class KeyProjectBody(BaseModel):
     project_id: str = ""
 
 
-def _express_keys_payload() -> dict:
+def _express_keys_payload(receipt: tuple[list, str] | None = None) -> dict:
     """控制台按用户要求**明文**返回 Key（控制台本身有密码保护）；日志里仍打掩码。"""
-    records, revision = app_state.credential_snapshot("keys")
+    records, revision = receipt if receipt is not None else app_state.credential_snapshot("keys")
     return {
         "revision": revision,
         "keys": records,
         "total": len(records),
         "enabled": sum(1 for r in records if r.get("enabled", True)),
-        "roundrobin": bool(app_state.get_setting("roundrobin", config.ROUNDROBIN)),
+        "roundrobin": bool(app_state.get_committed_settings("roundrobin")["roundrobin"]),
         "env_import_done": True,
     }
 
@@ -92,12 +91,19 @@ async def save_express_keys(body: ExpressKeysBody, request: Request, _auth: bool
     Key 级代理（proxy 字段）在此做静态格式校验：畸形代理一旦存进去，
     该 Key 的所有请求都会统一失败且报错晦涩，必须前置拦截。
     """
+    seen = set()
     for idx, item in enumerate(body.keys):
         if not isinstance(item, dict):
             return JSONResponse(status_code=400, content={"error": "每条 Key 记录必须是对象。"})
         for field in ("key", "project_id", "project_source", "note"):
             if field in item and not isinstance(item[field], str):
                 return JSONResponse(status_code=400, content={"error": f"第 {idx + 1} 个 Key 的 {field} 必须是字符串。"})
+        key = item.get("key", "").strip()
+        if not key:
+            return JSONResponse(status_code=400, content={"error": f"第 {idx + 1} 个 Key 不能为空。"})
+        if key in seen:
+            return JSONResponse(status_code=400, content={"error": f"第 {idx + 1} 个 Key 与前面的记录重复。"})
+        seen.add(key)
         detected = item.get("detected_at", 0)
         if (isinstance(detected, bool) or not isinstance(detected, (int, float))
                 or detected < 0 or (isinstance(detected, float) and not math.isfinite(detected))):
@@ -112,29 +118,30 @@ async def save_express_keys(body: ExpressKeysBody, request: Request, _auth: bool
                 },
             )
     try:
-        saved = await asyncio.to_thread(app_state.set_express_keys, body.keys, expected_revision=body.revision)
+        receipt = await asyncio.to_thread(app_state.set_express_keys, body.keys,
+                                          expected_revision=body.revision, with_revision=True)
     except CredentialRevisionConflictError as exc:
         return JSONResponse(status_code=409, content={"error": str(exc)}, headers={"Cache-Control": "no-store"})
     request.app.state.express_key_manager.refresh_keys()
     # 新加进来、还没有 Project ID 的 Key 立刻在后台探一次
-    pending = [r["key"] for r in saved if r.get("enabled", True) and not r.get("project_id")]
+    pending = [r["key"] for r in receipt[0] if r.get("enabled", True) and not r.get("project_id")]
     if pending:
         start_background_task(express_key_probe.probe_all(keys=pending))
-    payload = _express_keys_payload()
+    payload = _express_keys_payload(receipt)
     payload["status"] = "success"
     return JSONResponse(content=payload, headers={"Cache-Control": "no-store"})
 
 
 class CookieAccountsBody(BaseModel):
-    accounts: list = []
+    accounts: list
     revision: str | None = None
 
 
-def _cookie_accounts_payload():
+def _cookie_accounts_payload(receipt: tuple[list, str] | None = None):
     from routes.settings_api import mask_cookie
     from credential_manager import credential_manager
-    records, revision = app_state.credential_snapshot("cookies")
-    health = credential_manager.cookie_health_snapshot()
+    records, revision = receipt if receipt is not None else app_state.credential_snapshot("cookies", committed=True)
+    health = credential_manager.cookie_health_snapshot(for_records=records)
     accounts = [{**{k: v for k, v in rec.items() if k != "cookie"},
                  "cookie_configured": bool(rec["cookie"]), "cookie_preview": mask_cookie(rec["cookie"]),
                  "health": health.get(rec["id"], {"cooldown_remaining": 0.0, "failures": 0})}
@@ -192,11 +199,11 @@ async def save_cookie_accounts(body: CookieAccountsBody, _auth: bool = Depends(r
         record.update(cookie=cookie, project_id=project)
         clean.append(record)
     try:
-        await asyncio.to_thread(app_state.set_cookie_accounts, clean, preserve_cookie_ids=preserve_cookie_ids,
-                                expected_revision=body.revision)
+        receipt = await asyncio.to_thread(app_state.set_cookie_accounts, clean, preserve_cookie_ids=preserve_cookie_ids,
+                                          expected_revision=body.revision, with_revision=True)
     except (CookieAccountConflictError, CredentialRevisionConflictError) as exc:
         return JSONResponse(status_code=409, content={"error": str(exc)}, headers={"Cache-Control": "no-store"})
-    return JSONResponse(content={"status": "success", **_cookie_accounts_payload()},
+    return JSONResponse(content={"status": "success", **_cookie_accounts_payload(receipt)},
                         headers={"Cache-Control": "no-store"})
 
 
@@ -258,26 +265,29 @@ async def refresh_cookie_accounts_api(body: CookieTestBody, _auth: bool = Depend
         "results": results, "total": len(results),
         "refreshed": sum(r["status"] == "refreshed" for r in results),
         "unchanged": sum(r["status"] == "unchanged" for r in results),
+        "skipped": sum(r["status"] == "skipped" for r in results),
         "errors": sum(r["status"] == "error" for r in results),
     }, headers={"Cache-Control": "no-store"})
 
 
 @router.post("/api/cookie-accounts/test")
 async def test_cookie_accounts(body: CookieTestBody, _auth: bool = Depends(require_auth)):
-    accounts = [rec for rec in app_state.get_cookie_accounts() if rec["enabled"]]
+    accounts = [{"id": rec["id"], "note": rec["note"]} for rec in app_state.get_cookie_accounts() if rec["enabled"]]
     if body.id.strip():
         accounts = [rec for rec in accounts if rec["id"] == body.id.strip()]
     if not accounts:
         return JSONResponse(status_code=404, content={"error": "没有匹配的启用 Cookie 账号。"})
-    results = await probe_cookie_accounts(accounts)
+    results = await probe_cookie_accounts(accounts, resolve=app_state.get_cookie_dispatch_account)
     from credential_manager import credential_manager
     health = credential_manager.cookie_health_snapshot()
     for result in results:
         result["health"] = health.get(result["id"], {"cooldown_remaining": 0.0, "failures": 0})
-    valid = sum(1 for r in results if r["status"] == "valid")
     return JSONResponse(content={
-        "results": results, "total": len(results), "valid": valid,
-        "invalid": len(results) - valid,
+        "results": results, "total": len(results),
+        "valid": sum(r["status"] == "valid" for r in results),
+        "invalid": sum(r["status"] == "invalid" for r in results),
+        "errors": sum(r["status"] == "error" for r in results),
+        "skipped": sum(r["status"] == "skipped" for r in results),
     }, headers={"Cache-Control": "no-store"})
 
 
@@ -299,15 +309,16 @@ async def probe_express_keys(body: ProbeBody, _auth: bool = Depends(require_auth
 @router.post("/api/express-keys/project")
 async def set_express_key_project(body: KeyProjectBody, _auth: bool = Depends(require_auth)):
     """人工覆盖某个 Key 的 Project ID（来源标记为 manual，自动探测不会再覆盖它）。"""
-    ok = await asyncio.to_thread(
-        app_state.update_express_key_project,
-        body.key,
-        body.project_id,
-        source=("manual" if body.project_id.strip() else ""),
-    )
-    if not ok:
+    try:
+        receipt = await asyncio.to_thread(
+            app_state.update_express_key_project, body.key, body.project_id,
+            source=("manual" if body.project_id.strip() else ""), with_revision=True,
+        )
+    except CredentialRevisionConflictError as exc:
+        return JSONResponse(status_code=409, content={"error": str(exc)}, headers={"Cache-Control": "no-store"})
+    if not receipt:
         return JSONResponse(status_code=404, content={"error": "该 Key 不在列表中。"})
-    payload = _express_keys_payload()
+    payload = _express_keys_payload(receipt)
     payload["status"] = "success"
     return JSONResponse(content=payload, headers={"Cache-Control": "no-store"})
 
@@ -333,11 +344,12 @@ async def set_google_cookie(setting: CookieSetting, _auth: bool = Depends(requir
             return JSONResponse(status_code=400, content={"error": validation["message"]})
         message = validation["message"]
     else:
-        if not app_state.get_google_cookie():
-            return JSONResponse(
-                status_code=400, content={"error": "尚未配置 Cookie，请粘贴完整的 Google Cookie。"}
-            )
         message = "✅ 已保留原有 Cookie，仅更新 Project ID。"
 
-    await asyncio.to_thread(app_state.set_cookie_credentials, new_cookie, project_id)
+    try:
+        saved = await asyncio.to_thread(app_state.set_cookie_credentials, new_cookie, project_id)
+    except CookieAccountConflictError as exc:
+        return JSONResponse(status_code=409, content={"error": str(exc)})
+    if not saved:
+        return JSONResponse(status_code=400, content={"error": "尚未配置 Cookie，请粘贴完整的 Google Cookie。"})
     return JSONResponse(content={"status": "success", "message": message})

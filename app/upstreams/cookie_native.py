@@ -38,7 +38,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 import config as app_config
 import model_capabilities as mc
-from json_encoding import LargeJSONResponse, iter_json_bytes
+from json_encoding import LargeJSONResponse, estimate_json_chars, iter_json_bytes
 from admission import GenerationCapacityError, limit_generation, run_with_image_limit
 from cookie_auth import (
     STREAM_GENERATE_OPERATION_NAME,
@@ -49,15 +49,20 @@ from credential_manager import credential_manager
 from impersonate import open_upstream_client
 from logger import stats
 from proxy_failover import ProxyChain
-from response_validation import IncompleteResponseError
+from protojson import int32_value
+from response_validation import IncompleteResponseError, PendingMetadataGate
 from resumable import request_timeout_seconds
-from retry_policy import get_retry_settings
+from retry_policy import advisory_fits, get_retry_settings, note_retry_deadline
 from runtime_state import app_state
-from schema_validation import SchemaValidationError, sanitize_for_gemini, validate_json_schema
+from schema_validation import (
+    MAX_SCHEMA_DEPTH, MAX_SCHEMA_NODES, SchemaValidationError, native_definition_ref,
+    sanitize_for_gemini, validate_json_schema, validate_schema_size,
+)
 from streaming import HEARTBEAT, HEARTBEAT_FRAME, SSE_NO_BUFFER_HEADERS, with_heartbeats
 from tool_policy import has_search_suffix
 from usage import merge_usage_metadata
 from upstream_errors import google_status_detail
+from upstreams.cookie_candidate_metadata import check_grounding_references, merge_candidate_metadata
 from upstreams.cookie_response import RawSampler
 from upstreams.cookie_transport import (
     cookie_retry_backoff_heartbeats,
@@ -92,7 +97,7 @@ def _bridge_response_budget(model: str) -> int:
     return IMAGE_RESPONSE_BYTES if is_image else MAX_RESPONSE_BYTES
 
 # 原生请求里上游 GraphQL 无法承载、需要静默丢弃的字段（丢弃时打一条日志）
-_DROPPED_NATIVE_KEYS = ("cachedContent", "labels")
+_DROPPED_NATIVE_KEYS = ("labels",)
 
 # 原生 generationConfig 采样键（camelCase）→ 模型档案采样键（OpenAI 命名）。
 # 用于按模型档案剥离官方已废弃 / 私有协议拒绝的采样参数（与 OpenAI 通道同口径）。
@@ -101,6 +106,14 @@ _NATIVE_SAMPLING_KEYS = {
     "candidateCount": "candidate_count", "seed": "seed",
     "stopSequences": "stop_sequences", "maxOutputTokens": "max_output_tokens",
 }
+
+
+def _native_thinking_budget(value: Any) -> int:
+    """ProtoJSON int32 permits quoted numbers and integer-valued exponents, not bools."""
+    integer = int32_value(value)
+    if integer is not None and integer >= -1:
+        return integer
+    raise SchemaValidationError("thinkingBudget 必须是 -1、0 或 int32 范围内的正整数。")
 
 
 def _normalize_thinking_config(gen: dict, profile: dict) -> None:
@@ -122,24 +135,27 @@ def _normalize_thinking_config(gen: dict, profile: dict) -> None:
         print("⚠️ [Cookie 原生桥] thinkingConfig 非法（需对象），已丢弃。")
         gen.pop("thinkingConfig", None)
         return
-    if profile.get("thinking_kind") is None:
+    cleaned = dict(tc)
+    level = cleaned.pop("thinkingLevel", None)
+    budget = cleaned.pop("thinkingBudget", None)
+    include = cleaned.get("includeThoughts")
+    if include is not None and not isinstance(include, bool):
+        raise SchemaValidationError("includeThoughts 必须是布尔值（true/false），或为 null。")
+    if budget is not None:
+        if level is not None:
+            raise SchemaValidationError("不能同时指定 thinkingBudget 与 thinkingLevel。")
+        budget = _native_thinking_budget(budget)
+    kind = profile.get("thinking_kind")
+    if kind is None:
+        if budget is not None:
+            raise SchemaValidationError("Cookie 通道未验证该模型的 thinkingBudget，请改用支持目标预算的通道。")
         print("⚠️ [Cookie 原生桥] 该模型不支持思考参数，已丢弃 thinkingConfig。")
         gen.pop("thinkingConfig", None)
         return
 
     levels = profile.get("thinking_levels") or {"low", "high"}
-    cleaned = dict(tc)
-    level = cleaned.pop("thinkingLevel", None)
-    budget = cleaned.pop("thinkingBudget", None)
-    include = cleaned.get("includeThoughts")
-
-    if profile.get("thinking_kind") == "budget" and budget is not None:
-        # 未来若出现 budget 型模型：透传整数，丢弃档位
-        try:
-            out = {"thinkingBudget": int(budget)}
-        except (TypeError, ValueError):
-            print(f"⚠️ [Cookie 原生桥] thinkingBudget 非法（{budget!r}），已丢弃。")
-            out = {}
+    if kind == "budget" and budget is not None:
+        out = {"thinkingBudget": budget}
     else:
         if level is not None:
             raw = str(level).strip().lower()
@@ -150,21 +166,18 @@ def _normalize_thinking_config(gen: dict, profile: dict) -> None:
             if lv in ("off", "none", "disabled"):
                 lv = "minimal"
         elif budget is not None:
-            try:
-                b = int(budget)
-            except (TypeError, ValueError):
-                b = -1
-            if b <= 0:
-                lv = profile.get("default_level", "high")
-            else:
-                lv = "low" if b <= 1024 else ("medium" if b <= 8192 else "high")
-            print(f"ℹ️ [Cookie 原生桥] thinkingBudget={budget} → 换算档位（私有协议仅接受 thinkingLevel）。")
+            if budget == 0:
+                raise SchemaValidationError("此 Cookie 模型无法完全关闭思考（thinkingBudget=0）；"
+                                            "请改用支持关闭思考的模型，或明确选择 thinkingLevel。")
+            # -1 requests automatic behavior. Don't pin a fixed level to it.
+            lv = None if budget == -1 else (
+                "low" if budget <= 1024 else "medium" if budget <= 8192 else "high")
         else:
             lv = None
         out = {"thinkingLevel": mc._collapse_level(lv, levels).upper()} if lv else {}
 
     if include is not None:
-        out["includeThoughts"] = bool(include)
+        out["includeThoughts"] = include
     unknown = [k for k in cleaned if k != "includeThoughts"]
     if unknown:
         print(f"⚠️ [Cookie 原生桥] thinkingConfig 不支持的字段已丢弃：{sorted(unknown)}")
@@ -174,7 +187,8 @@ def _normalize_thinking_config(gen: dict, profile: dict) -> None:
         gen.pop("thinkingConfig", None)
 
 
-def _google_error_body(code: int, message: str, status_detail: Optional[str] = None) -> dict:
+def _google_error_body(code: int, message: str, status_detail: Optional[str] = None, *,
+                       retry_after: Optional[str] = None) -> dict:
     """Google 风格错误体（原生 SDK 按 error.message 展示）。
 
     状态映射统一走 upstream_errors.google_status_detail——与 gemini_native
@@ -182,8 +196,14 @@ def _google_error_body(code: int, message: str, status_detail: Optional[str] = N
     状态码在所有路径给出一致的 detail（2026-11 审查修复：此前此处内联的
     平行映射与共享版在 413/502/默认值上互相矛盾）。
     """
-    return {"error": {"code": code, "message": message,
-                     "status": status_detail or google_status_detail(code)}}
+    error = {"code": code, "message": message, "status": status_detail or google_status_detail(code)}
+    if retry_after is not None:
+        # A committed SSE/array cannot change HTTP headers. ErrorInfo's string
+        # metadata carries both delay-seconds and HTTP-date without conversion.
+        error["details"] = [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                             "reason": "UPSTREAM_HTTP_ERROR", "domain": "upstream",
+                             "metadata": {"retryAfter": retry_after}}]
+    return {"error": error}
 
 
 def _native_error(code: int, message: str, status_detail: Optional[str] = None) -> JSONResponse:
@@ -193,7 +213,8 @@ def _native_error(code: int, message: str, status_detail: Optional[str] = None) 
 class NativeBridgeError(Exception):
     """桥接层终结性错误（携带 Google 风格错误码）。"""
 
-    def __init__(self, code: int, message: str):
+    def __init__(self, code: int, message: str, retry_after: Optional[str] = None):
+        self.retry_after = retry_after
         self.code = code if isinstance(code, int) and 400 <= code <= 599 else 502
         self.message = message
         super().__init__(message)
@@ -215,38 +236,197 @@ def _normalize_system_instruction(si: Any) -> Optional[dict]:
     return None
 
 
-def _native_tools_to_variables(tools: Any) -> tuple[list[dict], bool, list[str]]:
-    """原生 tools → (functionDeclarations 列表, 是否启用 googleSearch, 声明名)。
+def _proto_shape(leaves: str = "", **children: dict | tuple) -> dict:
+    """Both ProtoJSON spellings point to one canonical field and a typed child, if any."""
+    shape = {}
+    for snake, child in {**dict.fromkeys(leaves.split()), **children}.items():
+        first, *tail = snake.split("_")
+        camel = first + "".join(part.title() for part in tail)
+        shape[snake] = shape[camel] = (camel, child)
+    return shape
 
-    工具冲突由调用方结合搜索后缀和 functionCallingConfig 决定，避免在
-    解析阶段丢掉搜索意图。parameters 走 Studio 私有 UI Schema。
-    """
+
+def _proto_message(obj: Any, shape: dict | tuple | None) -> Any:
+    """Copy on change. Recurse only through declared message/repeated-message edges."""
+    if shape is None:
+        return obj
+    if isinstance(shape, tuple):
+        if not isinstance(obj, list):
+            return obj
+        result = obj
+        for index, value in enumerate(obj):
+            child = _proto_message(value, shape[0])
+            if child is not value:
+                if result is obj:
+                    result = obj.copy()
+                result[index] = child
+        return result
+    if not isinstance(obj, dict):
+        return obj
+    result = obj
+    for key, value in obj.items():
+        if key not in shape:
+            continue
+        camel, nested = shape[key]
+        if key != camel and camel in obj:
+            raise SchemaValidationError(f"不能同时声明 {camel} 与 {key}。")
+        child = _proto_message(value, nested)
+        if key != camel or child is not value:
+            if result is obj:
+                result = obj.copy()
+            if key != camel:
+                del result[key]
+            result[camel] = child
+    return result
+
+
+# Only protocol envelopes belong here. In particular args, response, schema
+# properties, metadata and all free-form dictionaries keep their original keys.
+_BLOB = _proto_shape("mime_type display_name")
+_FILE = _proto_shape("file_uri mime_type display_name")
+_RESPONSE_PART = _proto_shape(inline_data=_BLOB, file_data=_FILE)
+_PARTIAL_ARG = _proto_shape("json_path bool_value null_value number_value string_value will_continue")
+_PART = _proto_shape(
+    "thought_signature part_metadata code_execution_result executable_code speech_metadata "
+    "audio_transcription media_processing",
+    inline_data=_BLOB, file_data=_FILE,
+    media_resolution=_proto_shape("num_tokens"), video_metadata=_proto_shape("start_offset end_offset"),
+    function_call=_proto_shape("will_continue", partial_args=(_PARTIAL_ARG,)),
+    function_response=_proto_shape("will_continue", parts=(_RESPONSE_PART,)),
+    tool_call=_proto_shape("tool_type"), tool_response=_proto_shape("tool_type"),
+)
+_CONTENT = _proto_shape(parts=(_PART,))
+_GENERATION_CONFIG = _proto_shape(
+    "top_p top_k max_output_tokens candidate_count stop_sequences response_mime_type response_schema "
+    "response_json_schema response_modalities media_resolution response_logprobs presence_penalty "
+    "frequency_penalty audio_timestamp",
+    thinking_config=_proto_shape("include_thoughts thinking_level thinking_budget"),
+    image_config=_proto_shape(
+        "image_size aspect_ratio output_mime_type output_compression_quality person_generation prominent_people",
+        image_output_options=_proto_shape("compression_quality mime_type")),
+)
+_REQUEST_FIELDS = _proto_shape(
+    "cached_content safety_settings", contents=(_CONTENT,), system_instruction=_CONTENT,
+    generation_config=_GENERATION_CONFIG,
+    tool_config=_proto_shape(
+        "include_server_side_tool_invocations", retrieval_config=_proto_shape("language_code lat_lng"),
+        function_calling_config=_proto_shape("allowed_function_names stream_function_call_arguments")),
+)
+_DECLARATION_FIELDS = _proto_shape("parameters_json_schema response_json_schema")
+_TOOL_FIELDS = _proto_shape("google_search function_declarations")
+
+_TYPED_SCHEMA_FIELDS = _proto_shape(
+    "additional_properties any_of max_items min_items max_length min_length "
+    "max_properties min_properties property_ordering")
+
+
+def _normalize_typed_schema(schema: dict) -> dict:
+    """Normalize only public Schema messages; names and literal values are application data."""
+    remaining = MAX_SCHEMA_NODES
+    has_typed_refs = False
+
+    def visit(node: Any, depth: int) -> Any:
+        nonlocal remaining, has_typed_refs
+        remaining -= 1
+        if depth > MAX_SCHEMA_DEPTH or remaining < 0:
+            raise SchemaValidationError("Schema 超过深度或节点数上限。")
+        if not isinstance(node, dict):
+            return node
+        out = _proto_message(node, _TYPED_SCHEMA_FIELDS)
+        if "ref" in out:
+            if "$ref" in out:
+                raise SchemaValidationError("原生 Schema 不能同时声明 ref 与 $ref。")
+            if out is node:
+                out = node.copy()
+            reference = out.pop("ref")
+            if reference is not None:
+                has_typed_refs = True
+                out["$ref"] = native_definition_ref(reference)
+        for key in ("items", "additionalProperties", "anyOf", "properties", "defs"):
+            value = out.get(key)
+            if key in ("items", "additionalProperties") and isinstance(value, dict):
+                updated = visit(value, depth + 1)
+            elif ((key == "anyOf" and isinstance(value, list))
+                  or (key in ("properties", "defs") and isinstance(value, dict))):
+                if len(value) > remaining:  # avoid copying a map already known to exceed the budget
+                    raise SchemaValidationError("Schema 超过节点数上限。")
+                updated = value
+                entries = enumerate(value) if isinstance(value, list) else value.items()
+                for name, child in entries:
+                    canonical = visit(child, depth + 1)
+                    if canonical is not child:
+                        if updated is value:
+                            updated = value.copy()
+                        updated[name] = canonical
+            else:
+                continue
+            if updated is not value:
+                if out is node:
+                    out = node.copy()
+                out[key] = updated
+        return out
+
+    result = visit(schema, 0)
+    if has_typed_refs:
+        validate_schema_size(schema)  # Includes definitions pruned after reference expansion.
+        if "defs" not in result or not isinstance(result["defs"], dict) or "$defs" in result:
+            raise SchemaValidationError("原生 Schema.ref 需要根 defs 定义表，不能混用 $defs。")
+        result = {**result, "$defs": result["defs"]}
+        del result["defs"]
+    return result
+
+
+def _native_declaration(decl: Any) -> dict:
+    if not isinstance(decl, dict) or not isinstance(decl.get("name"), str) or not decl["name"].strip():
+        raise SchemaValidationError("functionDeclarations 的每个函数必须包含非空名称。")
+    decl = _proto_message(decl, _DECLARATION_FIELDS)
+    if decl.get("response") is not None and decl.get("responseJsonSchema") is not None:
+        raise SchemaValidationError("函数不能同时声明 response 与 responseJsonSchema。")
+    if decl.get("response") is not None or decl.get("responseJsonSchema") is not None:
+        raise SchemaValidationError("Cookie 通道无法保留函数的 response / responseJsonSchema，请改用 Express 通道。")
+    if decl.get("behavior") is not None:
+        raise SchemaValidationError("Cookie 通道无法保留函数的 behavior，请改用 Express 通道。")
+    converted = {"name": decl["name"]}
+    if decl.get("description") is not None:
+        converted["description"] = decl["description"]
+    parameters = decl.get("parameters")
+    json_schema = decl.get("parametersJsonSchema")
+    if parameters is not None and json_schema is not None:
+        raise SchemaValidationError("函数不能同时声明 parameters 与 parametersJsonSchema。")
+    if json_schema is not None:
+        validate_json_schema(json_schema, label=f"{decl['name']}.parametersJsonSchema")
+        parameters = sanitize_for_gemini(json_schema)
+    elif parameters is not None:
+        if not isinstance(parameters, dict):
+            raise SchemaValidationError("函数 parameters 必须是 JSON 对象。")
+        parameters = _normalize_typed_schema(parameters)
+    converted["parameters"] = cookie_ui_schema(parameters if parameters is not None else {"type": "object"})
+    return converted
+
+
+def _native_tools_to_variables(tools: Any) -> tuple[list[dict], bool, list[str]]:
+    """Convert supported tools; reject a tool the Cookie bridge cannot represent."""
     declarations: list[dict] = []
     use_search = False
+    if tools is not None and not isinstance(tools, list):
+        raise SchemaValidationError("tools 必须是工具数组。")
     for tool in tools or []:
         if not isinstance(tool, dict):
-            continue
-        if "googleSearch" in tool or "google_search" in tool:
+            raise SchemaValidationError("tools 的每一项必须是 JSON 对象。")
+        tool = _proto_message(tool, _TOOL_FIELDS)
+        for key, value in tool.items():
+            if value is not None and key not in ("googleSearch", "functionDeclarations"):
+                raise SchemaValidationError(f"Cookie 通道暂不支持工具 {key[:64]}，请改用 Express 通道。")
+        search = tool.get("googleSearch")
+        if search is not None:
+            if search != {}:
+                raise SchemaValidationError("Cookie 通道仅支持空配置 googleSearch，请改用 Express 通道。")
             use_search = True
-            continue
-        for decl in tool.get("functionDeclarations") or []:
-            if not isinstance(decl, dict) or not str(decl.get("name") or "").strip():
-                continue
-            converted = {"name": str(decl["name"])}
-            if decl.get("description") is not None:
-                converted["description"] = decl["description"]
-            parameters = decl.get("parameters")
-            json_schema = decl.get("parametersJsonSchema")
-            if parameters is not None and json_schema is not None:
-                raise SchemaValidationError("函数不能同时声明 parameters 与 parametersJsonSchema。")
-            if json_schema is not None:
-                validate_json_schema(json_schema, label=f"{decl['name']}.parametersJsonSchema")
-                parameters = sanitize_for_gemini(json_schema)
-            elif parameters is not None and not isinstance(parameters, dict):
-                raise SchemaValidationError("函数 parameters 必须是 JSON 对象。")
-            converted["parameters"] = cookie_ui_schema(
-                parameters if parameters is not None else {"type": "object"})
-            declarations.append(converted)
+        functions = tool.get("functionDeclarations")
+        if functions is not None:
+            if not isinstance(functions, list):
+                raise SchemaValidationError("functionDeclarations 必须是函数数组。")
+            declarations.extend(_native_declaration(decl) for decl in functions)
     return declarations, use_search, [d["name"] for d in declarations]
 
 
@@ -257,12 +437,22 @@ def _sanitize_tool_config(tool_config: Any, declared_names: list[str]) -> Option
         if tool_config is not None:
             raise SchemaValidationError("toolConfig 必须是 JSON 对象。")
         return None
-    config = tool_config.get("functionCallingConfig")
+    # These public controls aren't part of the Cookie request contract. Do not
+    # drop an explicit search restriction (or pass it through for mixed tools).
+    cleaned = dict(tool_config)
+    retrieval = cleaned.pop("retrievalConfig", None)
+    if retrieval is not None and (not isinstance(retrieval, dict) or any(
+            value is not None for value in retrieval.values())):
+        raise SchemaValidationError("Cookie 通道不支持 toolConfig.retrievalConfig（搜索语言或位置），请改用 Express 通道。")
+    invocations = cleaned.pop("includeServerSideToolInvocations", None)
+    if invocations is not None and invocations is not False:
+        raise SchemaValidationError("Cookie 通道不支持 toolConfig.includeServerSideToolInvocations，"
+                                    "需要服务端工具调用记录时请改用 Express 通道。")
+    config = cleaned.get("functionCallingConfig")
     if not isinstance(config, dict):
         if config is not None:
             raise SchemaValidationError("toolConfig.functionCallingConfig 必须是 JSON 对象。")
-        return dict(tool_config) if tool_config else None
-    cleaned = dict(tool_config)
+        return cleaned or None
     fcc = dict(config)
     allowed = fcc.get("allowedFunctionNames")
     if allowed is not None and (
@@ -286,26 +476,57 @@ def _sanitize_tool_config(tool_config: Any, declared_names: list[str]) -> Option
     return cleaned
 
 
+def _cookie_model_id(resource: str, project_id: str) -> str:
+    """Accept only resources equivalent to this Cookie account's Google/global model."""
+    scope, sep, model_id = resource.rpartition("/")
+    if model_id not in ("", ".", "..") and (not sep or scope in (
+            "models", "publishers/google/models",
+            f"projects/{project_id}/locations/global/publishers/google/models")):
+        return model_id
+    raise SchemaValidationError("Cookie 通道仅支持本账号项目 global 区域下的 Google 模型；"
+                                "请使用对应的模型 ID，或改用支持目标资源的通道。")
+
+
+def _require_no_continuation(parsed: dict) -> None:
+    # This protocol's model cursor is distinct from the gateway's SSE receipt.
+    # A new batchGraphql call cannot continue the supplied provider response.
+    if parsed.get("continuationToken") is not None or parsed.get("continuation_token") is not None:
+        raise SchemaValidationError("Cookie 通道不支持原生 continuationToken；请使用可原样传输此字段的通道。")
+
+
 def native_request_to_variables(parsed: dict, model_name: str, project_id: str,
                                 *, requested_model: str = "") -> dict:
     """Gemini 原生请求体 → batchGraphql variables（未包信封）。
 
     raises SchemaValidationError：结构化输出被策略拒绝（与 OpenAI 通道同口径）。
     """
+    model_name = _cookie_model_id(model_name, project_id)
+    _require_no_continuation(parsed)
+    parsed = _proto_message(parsed, _REQUEST_FIELDS)
+    if parsed.get("cachedContent") is not None:
+        raise SchemaValidationError("Cookie 通道无法保留 cachedContent 上下文，请改用 Express 通道。")
     profile = mc.apply_sampling_policy(
         mc.get_profile(model_name), app_state.get_effective_settings(model_name)
     )
 
     gen = parsed.get("generationConfig")
     gen = dict(gen) if isinstance(gen, dict) else {}
-    if "responseJsonSchema" in gen:
+    # Null on these declared ProtoJSON fields means absent. Preserve nulls in
+    # schemas and other application-owned data; alias conflicts were already checked.
+    for key in ("candidateCount", "responseSchema", "responseJsonSchema", "responseLogprobs", "logprobs"):
+        if gen.get(key) is None:
+            gen.pop(key, None)
+    has_json_schema = "responseJsonSchema" in gen
+    if has_json_schema:
         if gen.get("responseSchema") is not None:
             raise SchemaValidationError("不能同时声明 responseSchema 与 responseJsonSchema。")
         schema = gen.pop("responseJsonSchema")
         validate_json_schema(schema, label="generationConfig.responseJsonSchema")
         gen["responseSchema"] = sanitize_for_gemini(schema)
-    if gen.get("candidateCount", 1) != 1:
-        raise SchemaValidationError("Cookie 通道暂不支持 candidateCount != 1。")
+    if "candidateCount" in gen:
+        if int32_value(gen["candidateCount"]) != 1:
+            raise SchemaValidationError("Cookie 通道仅支持整数 candidateCount = 1。")
+        gen["candidateCount"] = 1
     if gen.get("responseLogprobs") or "logprobs" in gen:
         raise SchemaValidationError("Cookie 通道暂不支持 responseLogprobs / logprobs。")
     unknown_gen = [k for k in gen if k not in NATIVE_GENERATION_KEYS]
@@ -320,11 +541,17 @@ def native_request_to_variables(parsed: dict, model_name: str, project_id: str,
             print(f"⚠️ [Cookie 原生桥] 该模型不支持 {native_key}，已剥离。")
             gen.pop(native_key, None)
     _normalize_thinking_config(gen, profile)
-    if gen.get("responseMimeType") or gen.get("responseSchema"):
+    # Gemini's explicit default is ordinary text, not a request for the
+    # private channel's opt-in output-format fields. Leave real schemas gated.
+    if gen.get("responseMimeType") == "text/plain" and gen.get("responseSchema") is None:
+        gen.pop("responseMimeType")
+    if gen.get("responseMimeType") or gen.get("responseSchema") is not None:
         if not app_state.get_setting("cookie_structured_output", False):
             raise SchemaValidationError(COOKIE_STRUCTURED_OUTPUT_DISABLED_MESSAGE)
         schema = gen.get("responseSchema")
         if isinstance(schema, dict) and schema:
+            if not has_json_schema:
+                schema = _normalize_typed_schema(schema)
             gen["responseSchema"] = cookie_ui_schema(
                 {k: v for k, v in schema.items() if k != "$schema"})
     if profile["is_image"] and not gen.get("responseModalities"):
@@ -353,7 +580,13 @@ def native_request_to_variables(parsed: dict, model_name: str, project_id: str,
         # Gemini's NONE applies to function calling, not to built-in search.
         declarations = []
     if profile["is_image"]:
+        if (mode not in ("AUTO", "MODE_UNSPECIFIED", "NONE")
+                or (mode != "NONE" and function_config and function_config.get("allowedFunctionNames"))):
+            raise SchemaValidationError("此生图通道无法保留 toolConfig.functionCallingConfig 的显式函数选择；"
+                                        "请使用 AUTO/NONE 或支持函数调用的文本模型。")
         declarations = []
+    if mode == "ANY" and not declarations:
+        raise SchemaValidationError("Cookie 通道的函数调用模式 ANY 需要至少一个已声明的客户端函数。")
     if declarations and use_search:
         if has_search_suffix(requested_model or model_name) and mode in ("AUTO", "MODE_UNSPECIFIED"):
             declarations = []
@@ -446,7 +679,9 @@ class NativeAssembler:
         self.finish: Optional[str] = None
         self.usage: Optional[dict] = None
         self.safety: Any = None
-        self.blocked: Optional[str] = None
+        self.candidate_metadata: dict = {}
+        self.metadata_bytes = 0
+        self.prompt_feedback: Optional[dict] = None
         self.has_content = False
 
     # -- 事件喂入 --------------------------------------------------------
@@ -480,8 +715,14 @@ class NativeAssembler:
             self.usage = merge_usage_metadata(self.usage, data)
         elif kind == "safety":
             self.safety = data
+        elif kind == "candidate_metadata":
+            updated, size = merge_candidate_metadata(self.candidate_metadata, data)
+            if self.response_bytes + size - self.metadata_bytes > self.max_response_bytes:
+                raise NativeBridgeError(502, "上游响应超过允许的大小。")
+            self.response_bytes += size - self.metadata_bytes
+            self.candidate_metadata, self.metadata_bytes = updated, size
         elif kind == "blocked":
-            self.blocked = str(data).split("（")[0].split("(")[0].strip() or "BLOCKED"
+            self.prompt_feedback = data
         if part is not None:
             size = _part_json_size(part)
             # 累计语义（2026-11 P2-3）：流式/非流式同口径，预算名副其实；
@@ -508,13 +749,16 @@ class NativeAssembler:
 
     def terminal(self) -> Optional[dict]:
         """流式收尾帧：无任何可交付内容时返回 None（由调用方决定报错文案）。"""
-        if self.blocked and not self.has_content:
-            payload: dict[str, Any] = {"promptFeedback": {"blockReason": self.blocked}}
+        if self.prompt_feedback and not self.has_content:
+            payload: dict[str, Any] = {"promptFeedback": self.prompt_feedback}
             if self.usage:
                 payload["usageMetadata"] = self.usage
             payload["modelVersion"] = self.model_version
             return payload
         candidate: dict[str, Any] = {"index": 0, "finishReason": self._require_finish()}
+        if self.candidate_metadata:
+            check_grounding_references(self.candidate_metadata, final=True)
+            candidate.update(self.candidate_metadata)
         if self.safety:
             candidate["safetyRatings"] = self.safety
         payload = {"candidates": [candidate], "modelVersion": self.model_version}
@@ -524,8 +768,8 @@ class NativeAssembler:
 
     def payload(self) -> dict:
         """非流式整包。"""
-        if self.blocked and not self.has_content:
-            result: dict[str, Any] = {"promptFeedback": {"blockReason": self.blocked}}
+        if self.prompt_feedback and not self.has_content:
+            result: dict[str, Any] = {"promptFeedback": self.prompt_feedback}
             if self.usage:
                 result["usageMetadata"] = self.usage
             return result
@@ -534,6 +778,9 @@ class NativeAssembler:
             "index": 0,
             "finishReason": self._require_finish(),
         }
+        if self.candidate_metadata:
+            check_grounding_references(self.candidate_metadata, final=True)
+            candidate.update(self.candidate_metadata)
         if self.safety:
             candidate["safetyRatings"] = self.safety
         result = {"candidates": [candidate]}
@@ -546,7 +793,7 @@ class NativeAssembler:
 # 事件泵：复用 cookie 通道生成器 + 429 退避重试（首个内容前）
 # ============================================================
 async def _events_with_retry(fastapi_request: Request, record: dict, body: dict,
-                             model_name: str):
+                             model_name: str, *, deadline: Optional[float] = None):
     """yield (kind, data) 原始事件；"heartbeat" 用于退避等待期间的 SSE 保活。
 
     首个内容分片前的可重试错误（429/网络）按控制台预算整体重发；已有内容
@@ -576,6 +823,9 @@ async def _events_with_retry(fastapi_request: Request, record: dict, body: dict,
         req_headers = build_headers(cookie_str)
         async with open_upstream_client(client_kwargs) as client:
             has_content = False
+            # stream_events deliberately flushes diagnostic prefixes before an
+            # error. They belong to this attempt, not a later successful one.
+            pending = PendingMetadataGate()
             retry_now: Any = None
             sampler = RawSampler()
             events = stream_events(
@@ -583,27 +833,39 @@ async def _events_with_retry(fastapi_request: Request, record: dict, body: dict,
             try:
                 async for status, data in events:
                     if status in ("text", "thought", "image", "function_call", "thought_signature", "native_part"):
-                        has_content = True
+                        if not has_content:
+                            for item in pending.drain():
+                                yield item
+                            has_content = True
                         yield status, data
-                    elif status in ("finish", "usage", "blocked", "safety"):
-                        yield status, data
+                    elif status in ("finish", "usage", "blocked", "safety", "candidate_metadata"):
+                        if has_content:
+                            yield status, data
+                        else:
+                            pending.add((status, data), 64 + estimate_json_chars(data))
                     elif status == "cookie_error":
                         credential_manager.record_cookie_auth_failure(account_id, credential=record)
                         raise NativeBridgeError(
-                            getattr(data, "status_code", None) or 403, str(data)[:1024])
+                            getattr(data, "status_code", None) or 403, str(data)[:1024],
+                            getattr(data, "retry_after", None))
                     elif status in ("retryable_error", "fatal_error"):
-                        if (not has_content and status == "retryable_error"
-                                and attempt < retry_max):
+                        hint = getattr(data, "retry_after", None)
+                        if (not has_content and status == "retryable_error" and attempt < retry_max
+                                and advisory_fits(hint, fastapi_request, deadline=deadline)):
                             retry_now = data
                             break
                         default_code = 429 if status == "retryable_error" else 502
                         raise NativeBridgeError(
-                            getattr(data, "status_code", None) or default_code, str(data)[:1024])
+                            getattr(data, "status_code", None) or default_code, str(data)[:1024], hint)
             finally:
                 await events.aclose()
 
             if retry_now is None:
+                # A genuine refusal can finish without producing any Parts.
+                for item in pending.drain():
+                    yield item
                 return
+            pending.drain()  # release the losing attempt before sleeping
             # 退避等待期间吐心跳保活（SSE 消费方转成 : keep-alive）；
             # 同一 Cookie 身份重试，Retry-After 有约束力（口径见
             # cookie_transport._cookie_backoff_delay）。
@@ -624,7 +886,8 @@ async def _events_with_retry(fastapi_request: Request, record: dict, body: dict,
 # ============================================================
 async def _timed_events(request: Request, record: dict, body: dict, model: str, deadline: float):
     """A single wall-clock budget covers retries, setup and all response chunks."""
-    source = _events_with_retry(request, record, body, model)
+    deadline = note_retry_deadline(request, deadline)
+    source = _events_with_retry(request, record, body, model, deadline=deadline)
     async with aclosing(with_heartbeats(source, request)) as events:
         while True:
             remaining = deadline - time.monotonic()
@@ -654,6 +917,10 @@ async def handle_native_request(fastapi_request: Request, model: str, action: st
     if fastapi_request.query_params.get("alt", "json") not in ("sse", "json"):
         return _native_error(400, "alt 仅支持 sse 或 json。", "INVALID_ARGUMENT")
     try:
+        _require_no_continuation(parsed)
+    except SchemaValidationError as exc:
+        return _native_error(400, str(exc), "INVALID_ARGUMENT")
+    try:
         return await _handle_native_request(fastapi_request, model, action, parsed,
                                             requested_model=requested_model,
                                             deadline=time.monotonic() + request_timeout_seconds())
@@ -665,7 +932,7 @@ async def handle_native_request(fastapi_request: Request, model: str, action: st
 async def _handle_native_request(fastapi_request: Request, model: str, action: str,
                                  parsed: dict, *, requested_model: str, deadline: float):
     return await run_with_image_limit(
-        model if action in ("generateContent", "streamGenerateContent") else "",
+        model.rpartition("/")[2] if action in ("generateContent", "streamGenerateContent") else "",
         lambda: _handle_native_request_impl(fastapi_request, model, action, parsed,
                                            requested_model=requested_model, deadline=deadline),
     )
@@ -689,6 +956,9 @@ async def _handle_native_request_impl(fastapi_request: Request, model: str, acti
     except SchemaValidationError as exc:
         return _native_error(400, str(exc), "INVALID_ARGUMENT")
 
+    # After the builder has validated scope, use only the model ID for budget,
+    # timeout and image policies. A project name is not a model capability.
+    model = body["variables"]["model"].rpartition("/")[2]
     is_stream = action == "streamGenerateContent"
     use_sse = fastapi_request.query_params.get("alt") == "sse"
     print(f"🍪 [Cookie 原生桥] {requested_model or model}:{action} | "
@@ -741,7 +1011,7 @@ async def _handle_native_request_impl(fastapi_request: Request, model: str, acti
                 if exc.code == 499:
                     return
                 stats.add_error()
-                for chunk in encode(_google_error_body(exc.code, exc.message)):
+                for chunk in encode(_google_error_body(exc.code, exc.message, retry_after=exc.retry_after)):
                     yield chunk
             except IncompleteResponseError as exc:
                 stats.add_error()
@@ -767,7 +1037,10 @@ async def _handle_native_request_impl(fastapi_request: Request, model: str, acti
         payload = assembler.payload()
     except NativeBridgeError as exc:
         # Non-streaming HTTP errors are counted by StatsMiddleware once.
-        return _native_error(exc.code, exc.message)
+        response = _native_error(exc.code, exc.message)
+        if exc.retry_after is not None:
+            response.headers["retry-after"] = exc.retry_after
+        return response
     except Exception as exc:
         return _native_error(502, str(exc)[:1024], "UNAVAILABLE")
     stats.add_success()

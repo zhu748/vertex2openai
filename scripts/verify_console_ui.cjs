@@ -18,6 +18,8 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const fixture = `
 import time
 from main import app
+import model_loader
+model_loader._next_refresh_allowed = float('inf')  # use only the packaged model catalog
 from logger import stats, rt_logger
 from request_tracking import request_registry
 from runtime_state import app_state
@@ -1093,6 +1095,35 @@ async function main() {
     assert.equal((await page.request.post(origin+'/api/settings',{data:{proxy_urls:originalSettings.proxy_urls}})).status(),200);
     check('代理离线且编辑器脚本不可用时，Key、模型与参数仍加载，原代理可修改保存，组件可重新加载恢复');
 
+    // The proxy script alone can fail while the Cookie component, credentials
+    // and all other controls are already loaded. Retrying must not reload forms.
+    const partialPage=await context.newPage();
+    let proxyBlocked=true,proxyLoads=0,channelLoads=0,cookieGets=0;
+    partialPage.on('request',r=>{
+      const pathname=new URL(r.url()).pathname;
+      if(pathname==='/static/channel-config.js')channelLoads++;
+      if(pathname==='/api/cookie-accounts'&&r.method()==='GET')cookieGets++;
+    });
+    await partialPage.route('**/static/proxy-editor.js*',route=>{
+      proxyLoads++;return proxyBlocked?route.abort():route.continue();
+    });
+    await partialPage.goto(origin+'/#channel');
+    await partialPage.waitForSelector('#console-assets-error:not(.hidden)');
+    await partialPage.waitForFunction(()=>window.consoleChannels?.isLoaded()&&keysLoaded);
+    assert.equal(channelLoads,1);assert.equal(proxyLoads,2);  // initial + automatic retry
+    const cookieRow=partialPage.locator('[data-cookie-index="0"]');
+    await cookieRow.locator('summary').click();await cookieRow.locator('.c-note').fill('保留的组件重试草稿');
+    const beforeGets=cookieGets;proxyBlocked=false;
+    await partialPage.locator('#console-assets-error button').click();
+    await partialPage.waitForSelector('#console-assets-error',{state:'hidden'});
+    assert.equal(channelLoads,1);assert.equal(proxyLoads,3);assert.equal(cookieGets,beforeGets);
+    await cookieRow.locator('button[onclick*="manageProxies"]').click();
+    await partialPage.waitForSelector('#proxy-dialog[open]');await partialPage.keyboard.press('Escape');
+    assert.equal(await cookieRow.locator('.c-note').inputValue(),'保留的组件重试草稿');
+    assert.equal(await partialPage.evaluate(()=>consoleForms.dirty()),true);
+    await partialPage.close();
+    check('仅代理脚本失败时 Cookie 仍可编辑；原地只重试缺失脚本并恢复账号弹窗，不清空草稿');
+
     const mismatchedPage=await context.newPage();
     await mismatchedPage.route(origin+'/',async route=>{
       const response=await route.fetch();
@@ -1191,6 +1222,23 @@ async function main() {
     await runtimeB.waitForFunction(()=>document.querySelector('#toast').textContent.includes('另一页面'));
     assert.equal(await runtimeB.inputValue('#retry_max'),String(oldRetry+2));
     assert.equal(await runtimeB.evaluate(()=>consoleForms.dirty()),true);
+    await runtimeB.evaluate(async()=>{await loadParams();await loadParams()});
+    const stillConflicting=await saveRuntime(runtimeB);
+    assert.equal(stillConflicting.status(),409);
+    assert.deepEqual(stillConflicting.request().postDataJSON()._expected.retry_max,{present:true,value:oldRetry});
+    assert.equal(await runtimeB.inputValue('#retry_max'),String(oldRetry+2));
+    await runtimeB.locator('[data-draft-group=runtime] [data-discard]').click();
+    assert.equal(await runtimeB.inputValue('#retry_max'),String(oldRetry+1));
+    await runtimeB.fill('#keepalive_interval',String(oldKeepalive+7));
+    await runtimeA.fill('#retry_max',String(oldRetry+3));
+    assert.equal((await saveRuntime(runtimeA)).status(),200);
+    await runtimeB.evaluate(()=>loadParams());
+    assert.equal(await runtimeB.inputValue('#retry_max'),String(oldRetry+3));
+    const merged=await saveRuntime(runtimeB);
+    assert.equal(merged.status(),200);
+    assert.deepEqual(Object.keys(merged.request().postDataJSON()).sort(),['_expected','keepalive_interval']);
+    assert.equal((await merged.json()).retry_max,oldRetry+3);
+    check('重新加载时仅合并实际编辑字段；同字段冲突在多次刷新后仍返回 409');
     await runtimeA.close();await runtimeB.close();
     check('运行设置双标签页：独立字段合并，同字段冲突返回 409 并保留草稿');
     const modelA=await context.newPage(), modelB=await context.newPage();
@@ -1209,8 +1257,54 @@ async function main() {
     await modelB.waitForFunction(()=>document.querySelector('#toast').textContent.includes('另一页面'));
     assert.equal(await modelB.inputValue('#first_reply_timeout_seconds'),String(oldTimeout+2));
     assert.equal(await modelB.evaluate(()=>consoleForms.dirty()),true);
+    const baseline=await modelB.evaluate(()=>SAVED_MODEL_OVERRIDES['gemini-4-argon']||{});
+    async function resetModel(editor){
+      const reset=editor.waitForResponse(r=>new URL(r.url()).pathname==='/api/model-overrides/gemini-4-argon' && r.request().method()==='DELETE');
+      await editor.click('#btn-scope-clear');
+      return await reset;
+    }
+    const staleReset=await resetModel(modelB);
+    assert.equal(staleReset.status(),409);
+    assert.deepEqual(staleReset.request().postDataJSON(),{expected_override:baseline});
+    assert.equal(await modelB.inputValue('#first_reply_timeout_seconds'),String(oldTimeout+2));
+    assert.equal(await modelB.evaluate(()=>consoleForms.dirty()),true);
+    const persisted=(await (await page.request.get(origin+'/api/model-overrides')).json())['gemini-4-argon'];
+    assert.equal(persisted.first_reply_timeout_seconds,oldTimeout+1);
+    async function saveModelScope(editor,path){
+      const pending=editor.waitForResponse(r=>new URL(r.url()).pathname===path && r.request().method()==='POST');
+      await editor.click('#btn-scope-save');
+      const result=await pending;
+      await editor.waitForFunction(()=>!document.querySelector('#model-sel').matches(':disabled'));
+      return result;
+    }
+    await modelB.selectOption('#model-sel','__global__');await modelB.evaluate(()=>loadParams());
+    await modelB.selectOption('#model-sel','gemini-4-argon');await modelB.evaluate(()=>loadParams());
+    const conflictModel=await saveModelScope(modelB,'/api/model-overrides/gemini-4-argon');
+    assert.equal(conflictModel.status(),409);
+    assert.deepEqual(conflictModel.request().postDataJSON()._expected.first_reply_timeout_seconds,
+      Object.hasOwn(baseline,'first_reply_timeout_seconds')?{present:true,value:baseline.first_reply_timeout_seconds}:{present:false});
+    assert.equal(await modelB.inputValue('#first_reply_timeout_seconds'),String(oldTimeout+2));
+    await modelB.locator('button[onclick="discardModelDraft()"]').click();
+    assert.equal(await modelB.inputValue('#first_reply_timeout_seconds'),String(oldTimeout+1));
+    assert.equal((await resetModel(modelA)).status(),200);
+    for(const editor of [modelA,modelB])await editor.selectOption('#model-sel','__global__');
+    const originalGlobal=Number(await modelB.inputValue('#first_reply_timeout_seconds'));
+    await modelB.fill('#first_reply_timeout_seconds',String(originalGlobal+5));
+    await modelA.fill('#first_reply_timeout_seconds',String(originalGlobal+3));
+    assert.equal((await saveModelScope(modelA,'/api/settings')).status(),200);
+    await modelB.evaluate(async()=>{await loadParams();await loadParams();});
+    const conflictGlobal=await saveModelScope(modelB,'/api/settings');
+    assert.equal(conflictGlobal.status(),409);
+    assert.deepEqual(conflictGlobal.request().postDataJSON(),{first_reply_timeout_seconds:originalGlobal+5,
+      _expected:{first_reply_timeout_seconds:{present:true,value:originalGlobal}}});
+    assert.equal(await modelB.inputValue('#first_reply_timeout_seconds'),String(originalGlobal+5));
+    await modelB.locator('button[onclick="discardModelDraft()"]').click();
+    assert.equal(await modelB.inputValue('#first_reply_timeout_seconds'),String(originalGlobal+3));
+    await modelB.fill('#first_reply_timeout_seconds',String(originalGlobal));
+    assert.equal((await saveModelScope(modelB,'/api/settings')).status(),200);
+    check('模型专属与全局默认的同字段草稿经重复加载与切换页仍保留原始比较，撤销后可重新编辑');
     await modelA.close();await modelB.close();
-    check('模型参数双标签页：拒绝过期覆盖并保留未保存修改');
+    check('模型参数双标签页：过期保存与清除都返回 409，保留草稿并允许基于最新值清除');
     const beforeLogout=page.url();
     await page.route('**/api/logout',route=>route.fulfill({status:503,json:{error:'测试退出失败'}}));
     pending=responseFor('/api/logout');

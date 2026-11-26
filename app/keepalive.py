@@ -18,12 +18,14 @@
 
 import asyncio
 import ipaddress
+from time import monotonic
 from typing import Optional
 
 import httpx
 
 import config as app_config
 from runtime_state import app_state
+from retry_policy import retry_after_seconds
 
 # 单次保活请求的超时（秒）。
 _REQUEST_TIMEOUT_SECONDS = 30.0
@@ -45,7 +47,7 @@ def keepalive_private_targets_allowed(override=None) -> bool:
     if override is not None:
         return bool(override)
     try:
-        return bool(app_state.get_setting("keepalive_allow_private", False))
+        return bool(app_state.get_committed_settings("keepalive_allow_private")["keepalive_allow_private"])
     except Exception:
         return False
 
@@ -97,23 +99,31 @@ def validate_keepalive_url(url: str, allow_private: bool = False) -> bool:
     return _keepalive_host_allowed(parsed.host, allow_private=allow_private)
 
 
+def _wire_target(url: httpx.URL) -> httpx.URL:
+    # Fragments are not sent; HTTPX's raw path preserves path/query distinctions
+    # and spells an empty request path as '/'. Normalize the host and default port too.
+    return url.copy_with(raw_path=url.raw_path, fragment=None)
+
+
 class KeepAliveService:
     """保活服务：定期向指定 URL 发送 GET 请求（未配置 URL 时零开销）。"""
 
     def __init__(self):
         self._task: Optional[asyncio.Task] = None
         self._lifecycle_lock = asyncio.Lock()
+        # The worker is disposable on settings reload; its server advisory is not.
+        # Keep only the configured entry and final endpoint of the latest hint.
+        self._retry_targets: tuple[httpx.URL, ...] = ()
+        self._not_before = 0.0
 
-    def _current_config(self) -> tuple[str, int]:
-        """读取当前生效配置（控制台保存值 > 环境变量初始值 > 内置默认）。"""
-        url = str(app_state.get_setting("keepalive_url", "") or "").strip()
-        interval = app_state.get_setting("keepalive_interval", 60)
-        return url, int(interval)
+    def _current_config(self) -> tuple[str, int, bool]:
+        """A single committed revision supplies the target, cadence and target policy."""
+        saved = app_state.get_committed_settings("keepalive_url", "keepalive_interval", "keepalive_allow_private")
+        return (str(saved["keepalive_url"] or "").strip(), int(saved["keepalive_interval"]),
+                bool(saved["keepalive_allow_private"]))
 
-    async def _run(self, url: str, interval: int):
-        # 私网/环回裁决在任务启动时固定（SEC-P2-6）：运行中改设置需重启任务
-        # 生效（settings_api 的 restart 已覆盖）。
-        allow_private = keepalive_private_targets_allowed()
+    async def _run(self, url: str, interval: int, allow_private: bool):
+        entry = _wire_target(httpx.URL(url))
         print(f"💓 [保活] 任务启动：GET {url}，间隔 {interval}s。")
         try:
             # 客户端随任务生命周期创建/关闭：重启（改配置）会换新客户端，
@@ -123,20 +133,34 @@ class KeepAliveService:
                 verify=app_config.SSL_CERT_FILE or True,
             ) as client:
                 while True:
+                    next_delay = interval
                     try:
                         # Only response headers are needed. A large or endless
                         # body must not consume memory or hold the task forever.
                         async with asyncio.timeout(_REQUEST_TIMEOUT_SECONDS):
-                            current = httpx.URL(url)
+                            current = entry
                             for redirect in range(_MAX_REDIRECTS + 1):
+                                if current in self._retry_targets:
+                                    remaining = self._not_before - monotonic()
+                                    if remaining > 0:
+                                        # Sleep outside the request timeout and before opening a GET.
+                                        next_delay = remaining
+                                        break
                                 async with client.stream("GET", current) as response:
                                     if response.has_redirect_location:
                                         if redirect == _MAX_REDIRECTS:
                                             raise ValueError("保活重定向次数超过上限。")
-                                        current = current.join(response.headers["location"])
-                                        if not validate_keepalive_url(str(current), allow_private=allow_private):
+                                        redirected = current.join(response.headers["location"])
+                                        if not validate_keepalive_url(str(redirected), allow_private=allow_private):
                                             raise ValueError("保活重定向地址无效。")
+                                        current = _wire_target(redirected)
                                         continue
+                                    if response.status_code in (429, 503):
+                                        advised = retry_after_seconds(response.headers.get("retry-after"))
+                                        if advised:
+                                            self._retry_targets = (entry, current)
+                                            self._not_before = monotonic() + advised
+                                            next_delay = max(interval, advised)
                                     print(f"💓 [保活] GET {url} -> {response.status_code}")
                                     break
                     except asyncio.CancelledError:
@@ -144,7 +168,7 @@ class KeepAliveService:
                     except Exception as e:
                         # 单次失败（网络抖动/目标临时不可用）只记日志，下一轮照常。
                         print(f"⚠️ [保活] GET {url} 失败：{type(e).__name__} - {e}")
-                    await asyncio.sleep(interval)
+                    await asyncio.sleep(next_delay)
         finally:
             print("💓 [保活] 任务已停止。")
 
@@ -159,14 +183,14 @@ class KeepAliveService:
             return
 
         try:
-            url, interval = self._current_config()
+            url, interval, allow_private = self._current_config()
         except (TypeError, ValueError, OverflowError):
             print("⚠️ [保活] 间隔配置无效，保活未启动。")
             return
         if not url:
             # 未配置：静默跳过，不在每次启动时给不使用保活的用户刷日志。
             return
-        if not validate_keepalive_url(url, allow_private=keepalive_private_targets_allowed()):
+        if not validate_keepalive_url(url, allow_private=allow_private):
             if validate_keepalive_url(url, allow_private=True):
                 print("⚠️ [保活] 目标是私网/环回地址：被劫持的控制台会话可借保活任务探测内网。"
                       "确属自我保活/内网监控场景时，请在控制台「运行设置」开启 keepalive_allow_private 后重启。")
@@ -176,12 +200,14 @@ class KeepAliveService:
         if interval < _MIN_INTERVAL_SECONDS:
             print(f"⚠️ [保活] 间隔 {interval}s 低于下限 {_MIN_INTERVAL_SECONDS}s，保活未启动。")
             return
-        self._task = asyncio.create_task(self._run(url, interval), name="keepalive_service")
+        self._task = asyncio.create_task(self._run(url, interval, allow_private), name="keepalive_service")
 
     async def stop(self):
         """停止保活任务（幂等；未运行时为空操作）。"""
         async with self._lifecycle_lock:
             await self._stop()
+            self._retry_targets = ()
+            self._not_before = 0.0
 
     async def _stop(self):
         task, self._task = self._task, None

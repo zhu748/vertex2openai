@@ -11,7 +11,7 @@ import unittest
 
 
 from models import OpenAIRequest
-from schema_validation import sanitize_for_gemini, validate_json_schema
+from schema_validation import SchemaValidationError, sanitize_for_gemini, validate_json_schema
 import generation_config
 
 
@@ -145,11 +145,10 @@ class TestTypeArrayAndInference(unittest.TestCase):
         self.assertEqual(sanitized["type"], "string")
         self.assertEqual(sanitized["enum"], ["a", "b"])
 
-    def test_tuple_items_becomes_anyof(self):
+    def test_positional_tuple_is_not_an_unordered_union(self):
         schema = {"type": "array", "items": [{"type": "string"}, {"type": "number"}]}
-        sanitized = sanitize_for_gemini(schema)
-        self.assertEqual(sanitized["items"],
-                         {"anyOf": [{"type": "string"}, {"type": "number"}]})
+        with self.assertRaisesRegex(SchemaValidationError, r"schema\.items: positional"):
+            sanitize_for_gemini(schema)
 
 
 class TestSanitizerContracts(unittest.TestCase):

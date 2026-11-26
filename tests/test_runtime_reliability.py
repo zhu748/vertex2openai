@@ -1,4 +1,5 @@
 """运行态、连接、续传和 SDK 边界回归；不使用真实凭据或外网。"""
+from settings_fixture import saved_settings
 import asyncio
 import json
 from types import SimpleNamespace
@@ -38,7 +39,7 @@ class ConfigTests(unittest.TestCase):
         self.client = TestClient(main.app)
         self.addCleanup(self.client.close)
         self.save = mock.patch.object(settings_api.app_state, "update_settings").start()
-        self.override = mock.patch.object(settings_api.app_state, "set_model_override").start()
+        self.override = mock.patch.object(settings_api.app_state, "save_model_override").start()
         self.addCleanup(mock.patch.stopall)
 
     def test_malformed_json_is_rejected_without_saving(self):
@@ -158,7 +159,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch("config.PROXY_URL", "socks5://1.2.3.4:1080"):
             self.assertIs(pool.get(lambda: direct2, None), direct2)
             self.assertIs(pool.get(lambda: direct2, None), direct2)
-        cookie_pool.get({}, lambda kwargs: cookie)
+        cookie_pool.get({}, lambda _options, _shape: cookie)
         await asyncio.gather(sdk_pool.aclose(), pool.aclose(), cookie_pool.aclose())
         self.assertEqual(sdk_pool.size(), 0)
         sdk.close.assert_called_once()
@@ -233,9 +234,11 @@ class ResumableTests(unittest.IsolatedAsyncioTestCase):
         buf.deadline_monotonic -= 100000
         task = asyncio.create_task(asyncio.Event().wait())
         self.store.register_pump("stale", task, buffer=buf)
-        self.assertEqual(await self.store.sweep(), 1)
+        self.assertEqual(await self.store.sweep(), 0)  # settled, not evicted
         await asyncio.gather(task, return_exceptions=True)
         self.assertTrue(task.cancelled())
+        self.assertIs(await self.store.get_exact(buf.id), buf)
+        self.assertEqual(buf.status_code, 504)
 
     async def test_resume_header_advances_past_delivered_frame(self):
         request = SimpleNamespace(headers={"last-event-id": "2"}, query_params={"resume_from": "1"})
@@ -317,8 +320,7 @@ class SdkTests(unittest.IsolatedAsyncioTestCase):
         self.stats = ProxyStats()
         self.settings = {"retry_max": 0, "retry_backoff_seconds": 0, "fake_streaming_interval": 0}
         self.patches = [mock.patch.object(api_helpers, "stats", self.stats),
-                        mock.patch.object(api_helpers.app_state, "get_setting",
-                                          side_effect=lambda key, default=None: self.settings.get(key, default))]
+                        saved_settings(api_helpers.app_state, self.settings)]
         for patch in self.patches:
             patch.start()
             self.addCleanup(patch.stop)

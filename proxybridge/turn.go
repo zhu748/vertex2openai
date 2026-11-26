@@ -23,11 +23,16 @@ import (
 // convergence: this "take-the-earlier" glue was previously duplicated in
 // withTimeout / dialTURN / dialTURNAnonymous).
 func minDeadline(ctx context.Context, floor time.Duration) time.Time {
-	deadline := time.Now().Add(floor)
-	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
-		deadline = ctxDeadline
+	due, _ := ctx.Deadline()
+	return cappedIODeadline(due, floor)
+}
+
+func cappedIODeadline(due time.Time, budget time.Duration) time.Time {
+	limit := time.Now().Add(budget)
+	if !due.IsZero() && due.Before(limit) {
+		return due
 	}
-	return deadline
+	return limit
 }
 
 func (c config) tlsConfig() (*tls.Config, error) {

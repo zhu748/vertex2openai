@@ -39,9 +39,11 @@ from typing import Any, Optional
 
 from models import OpenAIMessage, OpenAIRequest
 from tool_arguments import parse_tool_arguments
+from tool_policy import validate_model_tool_choice
 from response_validation import IncompleteResponseError
 from thought_signatures import google_metadata, ordinary_part_metadata
-from schema_validation import SchemaValidationError, validate_json_schema, sanitize_for_gemini
+from signature_origin import VisibleText
+from schema_validation import SchemaValidationError, validate_json_schema, sanitize_for_gemini, validate_tool_name_identity, validate_tool_strict
 
 # ============================================================
 # 错误与 ID 生成
@@ -377,7 +379,7 @@ def _append_user_blocks(label: str, content: list, openai_messages: list) -> Non
                 role="tool",
                 content=result,
                 tool_call_id=tool_use_id,
-                extra_content={"anthropic": {"tool_result_is_error": True}} if is_error else None,
+                extra_content={"anthropic": {"tool_result_is_error": is_error}},
             ))
         else:
             raise ClaudeRequestError(f"{block_label} has unsupported type {btype!r}")
@@ -389,6 +391,7 @@ def _append_assistant_blocks(label: str, content: list, openai_messages: list) -
     texts: list[str] = []
     tool_calls: list[dict] = []
     ordinary, order = [], []
+    observed_reasoning = None
     for bi, block in enumerate(content):
         block_label = f"{label}.content[{bi}]"
         block = _block_dict(block, block_label)
@@ -420,19 +423,27 @@ def _append_assistant_blocks(label: str, content: list, openai_messages: list) -
             tool_calls.append({"id": call_id, "type": "function",
                                "function": {"name": name, "arguments": args_str}})
         elif btype in ("thinking", "redacted_thinking"):
-            # Gemini 无法消费 Anthropic 思考签名；丢弃但保留相邻 text / tool_use
+            # Never send an Anthropic signature to Google. A private digest of
+            # the visible thinking string can still identify this exact tool turn.
+            if observed_reasoning is None:
+                observed_reasoning = VisibleText()
+            if btype != "thinking" or not isinstance(block.get("thinking"), str) or tool_calls:
+                observed_reasoning.size = -1
+            else:
+                observed_reasoning.feed(block["thinking"])
             continue
         else:
             raise ClaudeRequestError(f"{block_label} has unsupported type {btype!r}")
     text = "".join(texts)  # 多 text 块直接拼接（对齐 vertex-master）
     if not text and not tool_calls:
         return  # 仅含 thinking 块的历史轮：整条跳过
-    openai_messages.append(OpenAIMessage(
-        role="assistant",
-        content=text or None,
-        tool_calls=tool_calls or None,
+    message = OpenAIMessage(
+        role="assistant", content=text or None, tool_calls=tool_calls or None,
         extra_content={"google": {"ordinary_parts": ordinary, "part_order": order}} if tool_calls else None,
-    ))
+    )
+    if observed_reasoning is not None:
+        message._signature_observed_reasoning = observed_reasoning.result()
+    openai_messages.append(message)
 
 
 def _convert_tools(raw_tools: Any) -> Optional[list[dict]]:
@@ -443,9 +454,25 @@ def _convert_tools(raw_tools: Any) -> Optional[list[dict]]:
     decls = []
     for ti, tool in enumerate(raw_tools):
         tool = _block_dict(tool, f"tools[{ti}]")
+        # Only caller-owned custom tools can be converted into client functions.
+        if tool.get("type", "custom") != "custom":
+            raise ClaudeRequestError(f"tools[{ti}].type is unsupported; only custom tools are supported")
+        # The translated declaration is immediately available for direct
+        # client calls. Do not broaden a restricted caller or deferred tool.
+        callers = tool.get("allowed_callers")
+        if callers is not None and callers != ["direct"]:
+            raise ClaudeRequestError(f"tools[{ti}].allowed_callers is unsupported unless it is ['direct']")
+        deferred = tool.get("defer_loading")
+        if deferred is not None and deferred is not False:
+            raise ClaudeRequestError(f"tools[{ti}].defer_loading is unsupported unless it is false")
         name = tool.get("name")
         if not isinstance(name, str) or not name.strip():
             raise ClaudeRequestError(f"tools[{ti}].name must be a non-empty string")
+        try:
+            validate_tool_name_identity(name, f"tools[{ti}].name")
+            validate_tool_strict(tool.get("strict"), f"tools[{ti}].strict")
+        except SchemaValidationError as exc:
+            raise ClaudeRequestError(str(exc)) from None
         function: dict[str, Any] = {"name": name}
         description = tool.get("description")
         if description is not None and not isinstance(description, str):
@@ -580,7 +607,7 @@ def _parse_output_config(body: dict) -> tuple[Optional[dict], Any]:
         schema = output_format.get("schema")
         try:
             validate_json_schema(schema, label="output_config.format.schema")
-            sanitize_for_gemini(schema)
+            sanitize_for_gemini(schema, label="output_config.format.schema")
         except SchemaValidationError as exc:
             raise ClaudeRequestError(str(exc)) from None
         response_format = {"type": "json_schema", "json_schema": {"name": "response", "schema": schema}}
@@ -627,6 +654,7 @@ def anthropic_to_openai_request(body: dict, internal_model: str,
 
     # ---- 顶层 system ----
     openai_messages: list[OpenAIMessage] = []
+    origin_cutoff = None
     system_text = _instruction_text(body.get("system"), "system")
     if system_text:
         openai_messages.append(OpenAIMessage(role="system", content=system_text))
@@ -663,15 +691,31 @@ def anthropic_to_openai_request(body: dict, internal_model: str,
         if role == "user":
             _append_user_blocks(label, content, openai_messages)
         else:
+            before = len(openai_messages)
             _append_assistant_blocks(label, content, openai_messages)
+            if before == len(openai_messages) and content and origin_cutoff is None:
+                # A thinking-only turn is deliberately omitted from the Google
+                # wire, but must not silently disappear from origin identity.
+                origin_cutoff = before
     if not openai_messages:
         raise ClaudeRequestError("messages did not contain supported content")
 
     # ---- tools / tool_choice ----
     tools = _convert_tools(body.get("tools"))
-    tool_choice = _convert_tool_choice(body.get("tool_choice"), tools)
+    raw_choice = body.get("tool_choice")
+    tool_choice = _convert_tool_choice(raw_choice, tools)
+    parallel_tool_calls = None
+    if isinstance(raw_choice, dict) and (disabled := raw_choice.get("disable_parallel_tool_use")) is not None:
+        if not isinstance(disabled, bool):
+            raise ClaudeRequestError("tool_choice.disable_parallel_tool_use must be a boolean")
+        parallel_tool_calls = not disabled
     if tool_choice == "required" and not tools:
         raise ClaudeRequestError("tool_choice 'any' requires at least one tool")
+
+    try:
+        validate_model_tool_choice(internal_model, tool_choice)
+    except SchemaValidationError as exc:
+        raise ClaudeRequestError(str(exc)) from None
 
     # ---- stop_sequences ----
     stop_sequences = body.get("stop_sequences")
@@ -690,7 +734,7 @@ def anthropic_to_openai_request(body: dict, internal_model: str,
     stream_flag = body.get("stream")
     stream = stream_flag is True or (isinstance(stream_flag, str) and stream_flag.strip().lower() == "true")
 
-    return OpenAIRequest(
+    request = OpenAIRequest(
         model=internal_model,
         messages=openai_messages,
         stream=stream,
@@ -702,11 +746,14 @@ def anthropic_to_openai_request(body: dict, internal_model: str,
         response_format=response_format,
         tools=tools,
         tool_choice=tool_choice,
+        parallel_tool_calls=parallel_tool_calls,
         # Claude 协议的用量在 message_delta 里给出：内部流式开启 include_usage
         # 让上游在流末尾附带一个 usage-only 块（Express 真流式与假流式均支持）。
         stream_options={"include_usage": True} if stream else None,
         reasoning_effort=extras.get("reasoning_effort"),
     )
+    request._signature_origin_cutoff = origin_cutoff
+    return request
 
 
 # ============================================================
@@ -854,17 +901,41 @@ def _anthropic_usage(usage: Any) -> dict:
     return out
 
 
-def openai_completion_to_anthropic(payload: dict, display_model: str, message_id: str,
+def _completed_choice(choices: Any) -> tuple[dict, str, list]:
+    """A Claude request has exactly one choice. Never infer a finish from HTTP 200."""
+    if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
+        raise IncompleteResponseError("上游 OpenAI 响应需要且只能包含一个有效候选。")
+    choice = choices[0]
+    message = choice.get("message")
+    if not isinstance(message, dict) or message.get("role", "assistant") != "assistant":
+        raise IncompleteResponseError("上游 OpenAI 候选缺少有效的 assistant 消息。")
+    finish = choice.get("finish_reason")
+    if finish not in ("stop", "length", "content_filter", "tool_calls"):
+        raise IncompleteResponseError("上游 OpenAI 候选缺少有效结束原因，回复可能不完整。")
+    for field in ("content", "reasoning_content"):
+        if message.get(field) is not None and not isinstance(message[field], str):
+            raise IncompleteResponseError(f"上游 OpenAI 消息的 {field} 必须是字符串。")
+    raw_calls = message.get("tool_calls")
+    calls = [] if raw_calls is None else raw_calls
+    if not isinstance(calls, list):
+        raise IncompleteResponseError("上游 tool_calls 必须是数组。")
+    if finish == "tool_calls" and not calls:
+        raise IncompleteResponseError("上游标记工具调用结束，但未返回任何工具调用。")
+    if finish == "stop" and not (message.get("content") or message.get("reasoning_content") or calls):
+        raise IncompleteResponseError("上游标记正常结束，但未返回正文、思考或工具调用。")
+    return message, finish, calls
+
+
+def openai_completion_to_anthropic(payload: object, display_model: str, message_id: str,
                                    omit_thinking: bool = False) -> dict:
     """内部非流式 OpenAI 响应 → Anthropic message JSON。
 
     omit_thinking=True（thinking.display=omitted）：跳过 thinking 块，
     正文 / 工具 / 用量不受影响（reasoning_tokens 仍计入 usage）。
     """
-    payload = payload if isinstance(payload, dict) else {}
-    choices = payload.get("choices") or []
-    choice = choices[0] if choices and isinstance(choices[0], dict) else {}
-    message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+    if not isinstance(payload, dict):
+        raise IncompleteResponseError("上游 OpenAI 响应必须是有效的 JSON 对象。")
+    message, finish, tool_calls = _completed_choice(payload.get("choices"))
 
     content_blocks: list[dict] = []
     reasoning = message.get("reasoning_content")
@@ -873,14 +944,11 @@ def openai_completion_to_anthropic(payload: dict, display_model: str, message_id
             "type": "thinking", "thinking": reasoning, "signature": thinking_signature(reasoning),
         })
     text = message.get("content")
-    tool_calls = message.get("tool_calls") or []
     if isinstance(text, str) and text:
         content_blocks.append({"type": "text", "text": text})
     elif not tool_calls:
         # 无工具调用时 Anthropic 必须至少一个 text 块（可为空串）
         content_blocks.append({"type": "text", "text": text if isinstance(text, str) else ""})
-    if not isinstance(tool_calls, list):
-        raise IncompleteResponseError("上游 tool_calls 必须是数组。")
     tool_blocks = [_tool_use_block(call) for call in tool_calls]
     content_blocks.extend(tool_blocks)
     ordered = _ordered_completion_blocks(message, tool_blocks, omit_thinking)
@@ -893,7 +961,7 @@ def openai_completion_to_anthropic(payload: dict, display_model: str, message_id
         "role": "assistant",
         "model": display_model,
         "content": content_blocks,
-        "stop_reason": anthropic_stop_reason(choice.get("finish_reason"), bool(tool_calls)),
+        "stop_reason": anthropic_stop_reason(finish, bool(tool_calls)),
         "stop_sequence": None,
         "usage": _anthropic_usage(payload.get("usage")),
     }
@@ -918,6 +986,69 @@ def error_event(err_type: str, message: str) -> str:
 #（2026-11 审查收敛：此前双常量同值异名，改一处漏一处）。
 from tool_stream import MAX_TOOL_CALLS, MAX_TOOL_STREAM_BYTES  # noqa: E402
 MAX_STREAM_TOOL_CALLS = MAX_TOOL_CALLS
+
+
+# A second, whole JSON frame is only appropriate for small, ordinary tool turns.
+# Budget both visible text and its topology copy, plus actual encoded call data.
+_FAKE_ORDER_MAX_CHARS = 64 * 1024
+_FAKE_ORDER_MAX_SLOTS = 64
+
+
+def _bounded_fake_tool_turn(message):
+    calls = message.get("tool_calls")
+    google = google_metadata(message)
+    parts, order = google.get("ordinary_parts"), google.get("part_order")
+    if (message.get("role") != "assistant"
+            or not message.keys() <= {"role", "content", "reasoning_content", "tool_calls", "extra_content"}
+            or not isinstance(message.get("extra_content"), dict) or set(message["extra_content"]) != {"google"}
+            or not isinstance(calls, list) or not calls or not isinstance(parts, list) or not parts
+            or len(parts) + len(calls) > _FAKE_ORDER_MAX_SLOTS
+            or not isinstance(order, list) or len(order) != len(parts) + len(calls)
+            or set(google) != {"ordinary_parts", "part_order"}):
+        return False
+    # Narrow to the case which actually loses ordering: visible ordinary after
+    # a tool. Unknown metadata, signed ordinary parts, image or empty carriers
+    # retain the prior general/media route. Never encode them as Claude fields.
+    next_slot = {"ordinary": 0, "tool_call": 0}
+    reordered = False
+    for slot in order:
+        if (not isinstance(slot, dict) or set(slot) != {"type", "index"}
+                or slot["type"] not in ("ordinary", "tool_call") or type(slot["index"]) is not int
+                or slot["index"] != next_slot[slot["type"]]):
+            return False
+        if slot["type"] == "ordinary" and next_slot["tool_call"]:
+            reordered = True
+        next_slot[slot["type"]] += 1
+    if not reordered or next_slot != {"ordinary": len(parts), "tool_call": len(calls)}:
+        return False
+    total = 0
+    for field in ("content", "reasoning_content"):
+        value = message.get(field)
+        if value is not None:
+            if not isinstance(value, str):
+                return False
+            total += len(value)
+    for part in parts:
+        if (not isinstance(part, dict) or set(part) != {"kind", "text"}
+                or part["kind"] not in ("text", "thought") or not isinstance(part["text"], str)):
+            return False
+        total += len(part["text"])
+    for call in calls:
+        if (not isinstance(call, dict) or call.get("type") != "function"
+                or not call.keys() <= {"id", "type", "function", "index", "extra_content"}
+                or not isinstance(call.get("function"), dict) or set(call["function"]) != {"name", "arguments"}):
+            return False
+        fn = call["function"]
+        extra = call.get("extra_content")
+        if extra is not None and (not isinstance(extra, dict) or set(extra) != {"google"}
+                                  or set(google_metadata(call)) != {"thought_signature"}):
+            return False
+        sig = google_metadata(call).get("thought_signature", "")
+        for value in (call.get("id"), fn.get("name"), fn.get("arguments"), sig):
+            if not isinstance(value, str):
+                return False
+            total += len(value)
+    return total <= _FAKE_ORDER_MAX_CHARS
 
 
 class ClaudeStreamState:
@@ -962,6 +1093,56 @@ class ClaudeStreamState:
         self._tool_ids = {}
         self._tool_bytes = 0
         self._finished = False
+        self._buffered_source = None
+        self._buffered_blocks = None
+        self._buffered_confirmed = False
+
+    def select_buffered_order(self, payload: dict) -> bool:
+        """Only called by completed fake producers, never inferred from a client setting/ID."""
+        choices, source_id = payload.get("choices"), payload.get("id")
+        if (self._next_index or self._tools or self.finish or self._buffered_blocks is not None
+                or not isinstance(source_id, str) or not source_id
+                or not isinstance(choices, list) or len(choices) != 1):
+            return False
+        choice = choices[0]
+        if (not isinstance(choice, dict) or choice.get("finish_reason") not in ("stop", "tool_calls")
+                or not isinstance(choice.get("message"), dict)
+                or not _bounded_fake_tool_turn(choice["message"])):
+            return False
+        self._buffered_source = (source_id, choice["finish_reason"])
+        return True
+
+    def _consume_buffered_choice(self, choice, delta):
+        # Both finite producers send exactly one complete delta in this mode.
+        # Use bytes actually received, not just an earlier side-channel preview.
+        if delta:
+            if self._buffered_blocks is not None or self._next_index or self._tools:
+                raise IncompleteResponseError("上游已完成的工具回复包含额外内容。")
+            if not _bounded_fake_tool_turn(delta):
+                raise IncompleteResponseError("上游已完成的工具回复缺少有效的分块信息。")
+            tools, seen = [], set()
+            for index, call in enumerate(delta["tool_calls"]):
+                ident, raw = call["id"], call["function"]["arguments"]
+                if (type(call.get("index")) is not int or call["index"] != index or not ident.strip()
+                        or ident in seen or not raw.strip()):
+                    raise IncompleteResponseError("上游已完成的工具调用缺少唯一 ID 或完整参数。")
+                seen.add(ident)
+                tool = _tool_use_block(call)  # Validate the whole batch before any tool_use.
+                # Keep the accepted argument spelling and do not store a parsed JSON tree.
+                tools.append({"type": "tool_use", "id": ident, "name": tool["name"], "arguments": raw})
+            self._buffered_blocks = _ordered_completion_blocks(delta, tools, self.omit_thinking)
+            if self._buffered_blocks is None:
+                # Stale or incomplete topology: process this delta by the usual
+                # validated tool-after-text path instead of trusting its order.
+                self._buffered_source = None
+                return False
+        finish = choice.get("finish_reason")
+        if finish is not None:
+            if self._buffered_blocks is None or finish != self._buffered_source[1]:
+                raise IncompleteResponseError("上游已完成的工具回复结束状态不一致。")
+            self.finish = finish
+            self.has_tools = self._buffered_confirmed = True
+        return True
 
     # ---- 事件构造 ----
     def message_start_event(self) -> str:
@@ -1029,31 +1210,13 @@ class ClaudeStreamState:
             return []
         choice = choices[0] if isinstance(choices[0], dict) else {}
         delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
-        events: list[str] = []
-
-        # 1) 思考增量（reasoning_content → thinking_delta）：逐帧喂增量哈希；
-        #    omit_thinking（display=omitted）时直接丢弃，不开块、不哈希
-        reasoning = delta.get("reasoning_content")
-        if isinstance(reasoning, str) and reasoning and not self.omit_thinking:
-            if not (self._open and self._open["kind"] == "thinking"):
-                events += self._start_block("thinking", {
-                    "type": "thinking", "thinking": "", "signature": "",
-                })
-            self._open["hash"].update(reasoning.encode("utf-8"))
-            events.append(_sse_event("content_block_delta", {
-                "type": "content_block_delta", "index": self._open["index"],
-                "delta": {"type": "thinking_delta", "thinking": reasoning},
-            }))
-
-        # 2) 文本增量（content → text_delta）：先于工具处理
-        content = delta.get("content")
-        if isinstance(content, str) and content:
-            if not (self._open and self._open["kind"] == "text"):
-                events += self._start_block("text", {"type": "text", "text": ""})
-            events.append(_sse_event("content_block_delta", {
-                "type": "content_block_delta", "index": self._open["index"],
-                "delta": {"type": "text_delta", "text": content},
-            }))
+        if self._buffered_source:
+            if payload.get("id") == self._buffered_source[0]:
+                if self._consume_buffered_choice(choice, delta):
+                    return []
+            elif self._buffered_blocks is not None:
+                raise IncompleteResponseError("上游已完成的工具回复来源发生变化。")
+        events = self._ordinary_events(delta)
 
         # 3) 工具调用：分片参数只累积，块事件延迟到 finish_events
         #    （交错场景下立即开块会引用已关闭的块索引，见类 docstring）
@@ -1112,6 +1275,35 @@ class ClaudeStreamState:
             self.finish = finish
         return events
 
+    def _ordinary_events(self, delta):
+        events: list[str] = []
+
+        # 1) 思考增量（reasoning_content → thinking_delta）：逐帧喂增量哈希；
+        #    omit_thinking（display=omitted）时直接丢弃，不开块、不哈希
+        reasoning = delta.get("reasoning_content")
+        if isinstance(reasoning, str) and reasoning and not self.omit_thinking:
+            if not (self._open and self._open["kind"] == "thinking"):
+                events += self._start_block("thinking", {
+                    "type": "thinking", "thinking": "", "signature": "",
+                })
+            self._open["hash"].update(reasoning.encode("utf-8"))
+            events.append(_sse_event("content_block_delta", {
+                "type": "content_block_delta", "index": self._open["index"],
+                "delta": {"type": "thinking_delta", "thinking": reasoning},
+            }))
+
+        # 2) 文本增量（content → text_delta）：先于工具处理
+        content = delta.get("content")
+        if isinstance(content, str) and content:
+            if not (self._open and self._open["kind"] == "text"):
+                events += self._start_block("text", {"type": "text", "text": ""})
+            events.append(_sse_event("content_block_delta", {
+                "type": "content_block_delta", "index": self._open["index"],
+                "delta": {"type": "text_delta", "text": content},
+            }))
+
+        return events
+
     def feed_usage(self, usage: Any) -> None:
         if not isinstance(usage, dict):
             return
@@ -1130,10 +1322,27 @@ class ClaudeStreamState:
                     self._usage_fields[field] = {key: got}
         self.usage = _anthropic_usage(self._usage_fields)
 
+    def _complete_tool_events(self, ident, name, args):
+        index = self._next_index
+        self._next_index += 1
+        return [
+            _sse_event("content_block_start", {
+                "type": "content_block_start", "index": index,
+                "content_block": {"type": "tool_use", "id": ident, "name": name, "input": {}},
+            }),
+            _sse_event("content_block_delta", {
+                "type": "content_block_delta", "index": index,
+                "delta": {"type": "input_json_delta", "partial_json": args},
+            }),
+            _sse_event("content_block_stop", {"type": "content_block_stop", "index": index}),
+        ]
+
     # ---- 收尾 ----
     def finish_events(self) -> list[str]:
         if self._finished:
             return []
+        if self._buffered_blocks is not None and not self._buffered_confirmed:
+            raise IncompleteResponseError("上游已完成的工具回复未确认结束。")
         # Validate all calls before emitting any executable tool block. Truncated
         # streams retain their raw partial JSON and their max_tokens/refusal stop.
         calls = []
@@ -1147,21 +1356,16 @@ class ClaudeStreamState:
         self._finished = True
         events = self._close_block()
         # 延迟发射的全部 tool_use 块：start → 单条完整 input_json_delta → stop
+        for block in self._buffered_blocks or ():
+            if block["type"] == "tool_use":
+                events.extend(self._complete_tool_events(block["id"], block["name"], block["arguments"]))
+            else:
+                field = "content" if block["type"] == "text" else "reasoning_content"
+                events.extend(self._ordinary_events({field: block[block["type"]]}))
+                events.extend(self._close_block())
+        self._buffered_blocks = self._buffered_source = None
         for known, args in calls:
-            index = self._next_index
-            self._next_index += 1
-            events.append(_sse_event("content_block_start", {
-                "type": "content_block_start", "index": index,
-                "content_block": {"type": "tool_use", "id": known["id"] or new_tool_id(),
-                                  "name": known["name"], "input": {}},
-            }))
-            events.append(_sse_event("content_block_delta", {
-                "type": "content_block_delta", "index": index,
-                "delta": {"type": "input_json_delta", "partial_json": args},
-            }))
-            events.append(_sse_event("content_block_stop", {
-                "type": "content_block_stop", "index": index,
-            }))
+            events.extend(self._complete_tool_events(known["id"] or new_tool_id(), known["name"], args))
         self._tools.clear()
         self._tool_ids.clear()
         self._tool_bytes = 0

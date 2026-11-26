@@ -43,6 +43,16 @@ class JsonObjects:
             raise IncompleteResponseError("上游单个 JSON 对象超过字节上限。")
         self.buffer.append(fragment)
 
+    def _decode_object(self) -> dict:
+        # Only the joined text, not the fragment list as well, needs to
+        # coexist with the decoded object. Its lifetime ends before feed yields.
+        text = "".join(self.buffer)
+        self.buffer.clear()
+        try:
+            return json.loads(text)
+        except (json.JSONDecodeError, RecursionError) as exc:
+            raise IncompleteResponseError("上游返回无效的 JSON 对象。") from exc
+
     def _separator(self, token):
         if self._state == "start" and token == "[":
             self._array, self._state = True, "first"
@@ -87,15 +97,12 @@ class JsonObjects:
                 self.depth -= 1
                 if not self.depth:
                     self._append(chunk[start:match.end()])
-                    try:
-                        obj = json.loads("".join(self.buffer))
-                    except (json.JSONDecodeError, RecursionError) as exc:
-                        raise IncompleteResponseError("上游返回无效的 JSON 对象。") from exc
-                    self.buffer = []
+                    obj = self._decode_object()
                     self.size, start = 0, None
                     self._state = "separator" if self._array else "end"
                     outside = match.end()
                     yield obj
+                    del obj  # the next object may already be in this same chunk
         if start is not None:
             self._append(chunk[start:])
         elif self.document and chunk[outside:].strip(" \t\r\n"):

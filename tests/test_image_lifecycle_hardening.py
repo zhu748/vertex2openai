@@ -63,6 +63,8 @@ class LazySlicingTests(unittest.TestCase):
 
 
 class CookieLazyChunkTests(unittest.TestCase):
+    # Compare serialized chunks without a real-time second boundary changing created.
+    @mock.patch("upstreams.cookie_response._current_created", lambda: 1_700_000_000)
     def test_lazy_frames_identical_to_list_version(self):
         content = _image_markdown(2 * 1024 * 1024)
         lazy = list(
@@ -140,7 +142,7 @@ class ImageBypassTests(unittest.TestCase):
 
     def test_setting_restores_image_resumable(self):
         with mock.patch.object(
-            resumable.app_state, "get_setting",
+            resumable.app_state, "get_committed_setting",
             lambda key, default=None: True if key == "resumable_image_streams" else default,
         ):
             self.assertFalse(resumable.image_bypass_enabled(IMAGE_MODEL))
@@ -242,7 +244,7 @@ class ImageConcurrencyGateTests(unittest.IsolatedAsyncioTestCase):
         # app_state 里已保存的 image_max_concurrency 会盖过构造
         # 参数：单测里钉住设置值，只验证闸门自身的计数/幂等/无 trace 语义。
         with mock.patch.object(
-            __import__("admission").app_state, "get_setting", return_value=1
+            __import__("admission").app_state, "get_committed_setting", return_value=1
         ), self.assertRaises(GenerationCapacityError):
             lease = limiter.reserve()
             self.assertEqual(limiter.active, 1)

@@ -5,7 +5,22 @@ $('image_aspect_ratio').addEventListener('change', (e) => {
 });
 
 /* init */
-let channelConfigLoading = null;
+const channelAssets = {
+  channels: {
+    file: 'channel-config.js',
+    ready: () => typeof window.consoleChannels?.isLoaded === 'function' && window.consoleChannels
+  },
+  proxy: {
+    file: 'proxy-editor.js',
+    ready: () =>
+      typeof window.proxyEditorKit?.mount === 'function' &&
+      typeof window.proxyEditorKit.init === 'function' &&
+      typeof window.proxyEditorKit.open === 'function' &&
+      window.proxyEditorKit
+  }
+};
+const channelAssetLoads = new Map();
+let cookieRowsLoading = null;
 function channelAssetNotice(message) {
   let box = $('console-assets-error');
   if (!box) {
@@ -14,72 +29,68 @@ function channelAssetNotice(message) {
     box.className = 'inline-notice hidden';
     box.setAttribute('role', 'alert');
     box.innerHTML =
-      '<span></span><button type="button" class="btn-ghost" onclick="location.reload()">刷新面板</button>';
+      '<span></span><button type="button" class="btn-ghost" onclick="loadChannelFeatures(false)">重试编辑器</button>';
     document.querySelector('main').prepend(box);
   }
   box.classList.toggle('hidden', !message);
   box.querySelector('span').textContent = message;
 }
-async function ensureChannelConfig() {
-  if (window.consoleChannels) return window.consoleChannels;
-  if (!channelConfigLoading) {
-    channelConfigLoading = new Promise((resolve, reject) => {
-      // QUA-P1-4：代理编辑器拆为独立文件后，懒加载重试需先补齐
-      // proxy-editor.js（幂等：其 IIFE 有 window.proxyEditorKit 守卫），
-      // 再注入 channel-config.js（其 mount 依赖 proxyEditorKit 已就位）。
-      const sources = ['/static/proxy-editor.js', '/static/channel-config.js'];
-      const scripts = [];
-      let settled = false;
+function ensureChannelAsset(asset) {
+  const current = asset.ready();
+  if (current) return Promise.resolve(current);
+  if (!channelAssetLoads.has(asset)) {
+    const loading = new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      const url = new URL('/static/' + asset.file, location.href);
+      url.searchParams.set('retry', Date.now());
+      script.src = url.href;
+      script.dataset.cfasync = 'false';
       const timer = setTimeout(() => finish(new Error('账号与代理编辑器加载超时')), 10000);
       function finish(error) {
-        if (settled) return;
-        settled = true;
         clearTimeout(timer);
-        for (const script of scripts) script.onload = script.onerror = null;
+        script.onload = script.onerror = null;
         if (error) {
-          for (const script of scripts) script.remove();
+          script.remove();
           reject(error);
-        } else resolve(window.consoleChannels);
+        } else resolve(asset.ready());
       }
-      sources.forEach((src, i) => {
-        const script = document.createElement('script');
-        const url = new URL(src, location.href);
-        url.searchParams.set('retry', Date.now());
-        script.src = url.href;
-        script.async = false;
-        script.dataset.cfasync = 'false';
-        script.onload = () => {
-          if (i === sources.length - 1)
-            finish(window.consoleChannels ? null : new Error('账号与代理编辑器版本不一致'));
-        };
-        script.onerror = () => finish(new Error('账号与代理编辑器加载失败'));
-        scripts.push(script);
-        document.head.append(script);
-      });
-    });
+      script.onload = () => finish(asset.ready() ? null : new Error('账号与代理编辑器版本不一致'));
+      script.onerror = () => finish(new Error('账号与代理编辑器加载失败'));
+      document.head.append(script);
+    }).finally(() => channelAssetLoads.delete(asset));
+    channelAssetLoads.set(asset, loading);
   }
-  try {
-    return await channelConfigLoading;
-  } finally {
-    channelConfigLoading = null;
-  }
+  return channelAssetLoads.get(asset);
 }
-async function loadChannelFeatures() {
+async function readyChannelRows(reload) {
+  const channels = await ensureChannelAsset(channelAssets.channels);
+  if (reload || !channels.isLoaded()) {
+    cookieRowsLoading ||= channels.load().finally(() => (cookieRowsLoading = null));
+    await cookieRowsLoading;
+  }
+  return channels;
+}
+async function ensureChannelConfig(reload = false) {
+  // A missing proxy asset must not prevent independent Cookie rows from loading.
+  // Conversely, a successful account editor alone is not a working proxy dialog.
+  const [channels] = await Promise.all([
+    readyChannelRows(reload),
+    ensureChannelAsset(channelAssets.proxy)
+  ]);
+  channels.init();
+  return channels;
+}
+async function loadChannelFeatures(reload = true) {
   try {
-    const channels = await ensureChannelConfig();
-    await channels.load();
-    channels.init();
+    await ensureChannelConfig(reload);
     channelAssetNotice('');
   } catch (error) {
-    channelAssetNotice(
-      error.message +
-        '。已保存的 Key、代理和模型参数仍可查看与修改，请刷新或重新加载配置以重试编辑器。'
-    );
+    channelAssetNotice(error.message + '。可重试编辑器，不会丢弃已填写的配置。');
   }
 }
 async function refreshCookies(index = null) {
   try {
-    const channels = await ensureChannelConfig();
+    const channels = await readyChannelRows(false);
     await channels.refreshCookies(index);
   } catch (error) {
     toast('Cookie 刷新未完成：' + error.message);
@@ -88,8 +99,8 @@ async function refreshCookies(index = null) {
 async function manageProxies(scope = 'global', index = 0, view = 'list') {
   try {
     const channels = await ensureChannelConfig();
-    channels.init();
     channels.open(scope, index, view);
+    channelAssetNotice('');
   } catch (error) {
     channelAssetNotice(error.message + '，请重新加载配置或刷新面板。');
     toast(error.message);
@@ -163,9 +174,8 @@ document.addEventListener('input', (event) => {
   window.consoleForms?.clearError(event.target);
   if (event.target.id === 'proxy-input') updateProxyDraft();
   if (PER_MODEL_KEYS.includes(event.target.id)) {
-    modelEdits.add(event.target.id);
-    modelInherit.delete(event.target.id);
-    captureModelDraft();
+    recordModelField(event.target.id);
+    refreshModelDraft();
     if (event.target.id === 'sampling_policy') updateSamplingDisplay();
   }
 });

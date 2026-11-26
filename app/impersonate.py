@@ -9,11 +9,13 @@ upstream account restrictions or private API changes.
 from contextlib import asynccontextmanager
 import asyncio
 import codecs
+import math
 import threading
 from typing import Any, AsyncIterator, Callable
 
 import httpx
-from http_io import BoundedAsyncClient, buffer_upstream_response
+from curl_cffi.requests.exceptions import RequestException as CurlRequestError
+from http_io import BoundedAsyncClient, buffer_upstream_response, decoded_http_response
 from proxy_tls import build_httpx_proxy
 
 from runtime_state import app_state
@@ -22,8 +24,7 @@ from client_pool import register_extra_pool_closer, schedule_graceful_close, _cl
 # 控制台可选的伪装档案（curl_cffi 泛别名会跟随其内置的最新浏览器版本）
 SUPPORTED_PROFILES = ("off", "chrome", "edge", "safari", "firefox", "safari_ios")
 
-# 超时总上限：curl 的 timeout 是“整个请求”的硬超时（不像 httpx 的 read 是
-# “两块数据之间的间隔”），长思考流可能持续数分钟，这里放宽到 30 分钟。
+# curl_cffi 的流式 low-speed 窗口；整轮硬期限由请求层掌管。
 _CURL_TOTAL_TIMEOUT_SECONDS = 1800.0
 # 有界读取上限与 http_io.MAX_UPSTREAM_RESPONSE_BYTES 同源（curl/httpx 两条
 # 传输线共用同一响应体预算；2026-11 审查收敛：此前两常量平行定义）。
@@ -36,10 +37,12 @@ from http_io import MAX_UPSTREAM_RESPONSE_BYTES as _CURL_BUFFER_LIMIT_BYTES  # n
 _CURL_SELF_BUFFER_LIMIT_BYTES = 1024 * 1024
 
 
-def get_impersonate_profile() -> str:
+def get_impersonate_profile(settings: dict | None = None) -> str:
     """读取当前伪装档案（热生效）。非法值一律回退 chrome。"""
     try:
-        value = str(app_state.get_setting("cookie_impersonate", "chrome") or "chrome").strip().lower()
+        raw = (app_state.get_setting("cookie_impersonate", "chrome") if settings is None
+               else settings.get("cookie_impersonate", "chrome"))
+        value = str(raw or "chrome").strip().lower()
     except Exception:
         value = "chrome"
     return value if value in SUPPORTED_PROFILES else "chrome"
@@ -196,24 +199,29 @@ class _CurlClientShim:
         self._stream_timeout = stream_timeout
 
     async def post(self, url: str, *, headers=None, json=None):
-        resp = await self._s.request("POST", url, headers=headers, json=json,
-                                     timeout=self._post_timeout, stream=True)
-        response = _CurlRespShim(resp, from_stream=True)
-        try:
+        async with self._stream_ctx("POST", url, headers=headers, json=json,
+                                    timeout=self._post_timeout) as response:
             return await buffer_upstream_response(response)
-        finally:
-            await response.aclose()
 
     def stream(self, method: str, url: str, *, headers=None, json=None):
         return self._stream_ctx(method, url, headers=headers, json=json)
 
     @asynccontextmanager
-    async def _stream_ctx(self, method: str, url: str, *, headers=None, json=None):
+    async def _stream_ctx(self, method: str, url: str, *, headers=None, json=None, timeout=None):
         # Own response closure: AsyncSession.stream() unconditionally awaits
         # the raw aclose(), which re-raises a cancelled producer on early exit.
-        resp = await self._s.request(method, url, headers=headers, json=json,
-                                     timeout=self._stream_timeout, stream=True)
-        response = _CurlRespShim(resp, from_stream=True)
+        try:
+            resp = await self._s.request(method, url, headers=headers, json=json,
+                                         timeout=self._stream_timeout if timeout is None else timeout, stream=True)
+        except CurlRequestError as exc:
+            # With no first chunk curl may raise on acquisition even though
+            # it parsed error headers and already returned its handle.
+            status = getattr(exc.response, "status_code", None)
+            if not isinstance(status, int) or not 400 <= status <= 599:
+                raise
+            response = decoded_http_response(exc.response, None)
+        else:
+            response = _CurlRespShim(resp, from_stream=True)
         try:
             yield response
         finally:
@@ -224,15 +232,10 @@ class _CurlClientShim:
 
 
 def _httpx_timeout_to_curl(timeout: Any) -> tuple:
-    """httpx.Timeout / (connect, read, write, pool) 语义 → curl 总超时。
+    """Post and long-stream low-speed budgets, separate from connection setup.
 
-    curl_cffi 的 timeout 是整个请求的硬超时（CURLOPT_TIMEOUT_MS），没有
-    "两块数据之间"的 read 超时概念，因此按用途拆两个值（2026-10 修复）：
-      - 非流式：max(2×read, 60s)。旧实现统一 max(total*2, 1800) 把
-        "2× read"意图恒吞掉，非流式 POST 也挂满 30 分钟，同一故障在
-        伪装开关下的探测时间差 10 倍（httpx 180s vs curl 1800s）。
-      - 流式：保留 1800s 硬下限（首回复之后可能有长思考停顿，放宽是有意
-        行为，且外层 within_request_deadline 有同值总期限兑底）。
+    Both paths use curl_cffi stream=True (even the size-bounded whole POST).
+    The outer route owns its absolute deadline.
     """
     try:
         if isinstance(timeout, httpx.Timeout):
@@ -309,14 +312,23 @@ def _curl_remote_dns_proxy(proxy: str) -> str:
     return proxy
 
 
-def _create_upstream_client(client_kwargs: dict):
-    profile = get_impersonate_profile()
+def _transport_shape() -> tuple[str, int | None]:
+    """One durable snapshot for both the cache key and the created session."""
+    settings = app_state.get_committed_settings("cookie_impersonate", "upstream_max_concurrency")
+    profile = get_impersonate_profile(settings)
+    capacity = None if profile == "off" else max(10, int(settings["upstream_max_concurrency"]))
+    return profile, capacity
+
+
+def _create_upstream_client(client_kwargs: dict, shape: tuple[str, int | None] | None = None):
+    profile, capacity = _transport_shape() if shape is None else shape
     if profile == "off":
         options = dict(client_kwargs)
         if isinstance(options.get("proxy"), str):
             options["proxy"] = build_httpx_proxy(options["proxy"], verify=options.get("verify", True))
         return BoundedAsyncClient(**options)
 
+    from curl_cffi import CurlOpt
     from curl_transport import CancellationSafeSession
 
     proxy = client_kwargs.get("proxy")
@@ -334,12 +346,17 @@ def _create_upstream_client(client_kwargs: dict):
         # 空时 pop_curl 无限等待。闸门默认 32，流式请求占住句柄直到流结束，
         # 第 11 个并发流开始无限排队，最终以「等待模型首回复超时」报错
         # （模型根本没收到请求），并触发换 Key/换账号的重试放大。
-        # 取当前生效闸门值（控制台热调后新建的会话跟随新值；已池化会话
-        # 维持构造时容量，签名淘汰后自然更新）。
-        "max_clients": max(
-            10, int(app_state.get_setting("upstream_max_concurrency", 32))
-        ),
+        # 热调并发后按新签名分桶；不强制关闭仍被旧请求租用的会话。
+        "max_clients": capacity,
     }
+    # On pinned curl_cffi both streamed shapes map a scalar timeout to the
+    # handshake AND the low-speed window. Override only the handshake option,
+    # applied after per-request timeout options; retain the per-shape body policy.
+    timeout = client_kwargs.get("timeout")
+    connect = timeout.connect if isinstance(timeout, httpx.Timeout) else timeout
+    if isinstance(connect, (int, float)) and math.isfinite(connect) and connect >= 0:
+        # libcurl treats 0 milliseconds as its own default, not an immediate cap.
+        session_kwargs["curl_options"] = {CurlOpt.CONNECTTIMEOUT_MS: max(1, math.ceil(connect * 1000))}
     if proxy:
         session_kwargs["proxy"] = _curl_remote_dns_proxy(proxy)
     return _CurlClientShim(CancellationSafeSession(**session_kwargs), post_timeout, stream_timeout)
@@ -360,7 +377,7 @@ class _UpstreamClientPool:
 
     客户端创建/登记在锁内完成（两个构造器都是纯内存操作，无 IO）；
     被淘汰的客户端交给延迟关闭器（护住飞行中的流）。签名覆盖
-    client_kwargs 的全部关键字 + 伪装档案，任一变化自然分桶。
+    连接设置与 curl 实际生效的档案/容量；纯 HTTPX 不因 curl 容量变化分桶。
     """
 
     def __init__(self):
@@ -368,10 +385,10 @@ class _UpstreamClientPool:
         self._entries: dict[tuple, Any] = {}
 
     @staticmethod
-    def _signature(client_kwargs: dict) -> tuple:
+    def _signature(client_kwargs: dict, shape: tuple[str, int | None]) -> tuple:
         timeout = client_kwargs.get("timeout")
         return (
-            get_impersonate_profile(),
+            shape,
             str(client_kwargs.get("proxy") or ""),
             repr(timeout),
             bool(client_kwargs.get("follow_redirects", False)),
@@ -381,8 +398,9 @@ class _UpstreamClientPool:
             repr(client_kwargs.get("verify", True)),
         )
 
-    def get(self, client_kwargs: dict, factory: Callable[[dict], Any], *, usage=None) -> Any:
-        sig = self._signature(client_kwargs)
+    def get(self, client_kwargs: dict, factory: Callable[[dict, tuple[str, int | None]], Any], *, usage=None) -> Any:
+        shape = _transport_shape()
+        sig = self._signature(client_kwargs, shape)
         with self._lock:
             hit = self._entries.get(sig)
             if hit is not None:
@@ -395,7 +413,7 @@ class _UpstreamClientPool:
         _closer.ensure_capacity(int(len(self._entries) >= _UPSTREAM_POOL_MAX))
         client = _closer.reclaim(("cookie", id(self), sig))
         if client is None:
-            client = factory(client_kwargs)
+            client = factory(client_kwargs, shape)
         stale: list = []
         with self._lock:
             hit = self._entries.get(sig)

@@ -156,7 +156,7 @@ class ExpressSDKUpstream(BaseUpstream):
     async def chat_completions(self, request_obj: OpenAIRequest, fastapi_request: Request, *, credential_record: dict=None) -> Response:
         track_configure(channel="express")
         try:
-            validate_openai_request(request_obj)
+            validate_openai_request(request_obj, sdk_schema=True)
         except SchemaValidationError as exc:
             return JSONResponse(
                 status_code=400,
@@ -227,7 +227,7 @@ class ExpressSDKUpstream(BaseUpstream):
         profile = mc.get_profile(base_model_name)
 
         request_obj, prefill_text, prefill_active = prepare_messages(
-            request_obj, profile, _inj_settings, has_tools=bool(request_obj.tools)
+            request_obj, profile, _inj_settings
         )
 
         request_obj, text_transport = prepare_transport(

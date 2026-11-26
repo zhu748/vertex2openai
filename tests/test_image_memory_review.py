@@ -141,7 +141,6 @@ class NativeImageDeliveryTests(unittest.IsolatedAsyncioTestCase):
         for patcher in (
             mock.patch.object(cookie_native.credential_manager, "get_cookie_record", return_value=record),
             mock.patch.object(cookie_native, "build_headers", return_value={}),
-            mock.patch.object(cookie_native, "build_native_body", return_value={}),
             mock.patch.object(cookie_native, "_timed_events", events),
             mock.patch.object(cookie_native.credential_manager, "record_cookie_success"),
         ):

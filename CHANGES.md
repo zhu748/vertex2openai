@@ -2,6 +2,13 @@
 
 基于原版 `vertex2openai-main`（2026-09-01），持续完善兼容性、可靠性和代码组织。
 
+## 未发布：JSON Schema 位置元组兼容性变更
+
+- 此前 OpenAI/Claude 兼容接口、原生 Cookie 桥把旧版 `items:[A,B]` 改成逐项 `anyOf`，会错误地接受顺序颠倒的数组，
+  也会拒绝本应允许的尾部元素。现在只转换有显式长度上限且能证明等价的同构前缀；不能忠实表示就返回带路径的 400。
+- 原本使用 `items:{...}` 的同构数组不受影响。依赖位置的客户端若改为带命名字段的对象，需要一起更新协议形状；
+  迁移示例见 [README 的位置元组说明](README.md#json-schema-迁移同构数组与位置元组不同)。
+
 ## 2026-11-19：收录 gemini-4-neon；思考档位对齐官方 xhigh 第四档（修正 4 Hydrogen 档案）
 
 - 新模型：`vertexModels.json` 收录 `gemini-4-neon`（官方 2026-11 发布，Agent Platform "Google Frontier Model"，1M 统一上下文 / 64K 默认 1M 长解码输出）。按官方档位表适配，不走 4 系默认档案。

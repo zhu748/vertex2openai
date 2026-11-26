@@ -8,7 +8,7 @@ fragments (verified 2026-10-30: only complete tool objects arrive), so the
 Cookie channel parses complete calls directly and does not use this module.
 """
 
-import ast
+import json
 from collections import deque
 from typing import Any, Optional
 from dataclasses import dataclass, field
@@ -20,13 +20,17 @@ from response_validation import (
     ToolStreamError,
     complete_function_arguments,
     has_finish_reason,
+    sdk_function_call,
 )
 from json_encoding import estimate_json_chars
 
 MAX_TOOL_STREAM_BYTES = 32 * 1024 * 1024
 MAX_TOOL_CALLS = 1024
 MAX_ARGUMENT_FIELDS = 65536
-_PATH_TOKEN = re.compile(r'''\.([^.[\]]+)|\[(0|[1-9][0-9]*)\]|\[("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')\]''')
+# RFC 9535 §2.5.1.1: non-ASCII scalar values are allowed regardless of
+# Unicode category. Names are compared literally, without normalization.
+_NAME_FIRST = r"A-Za-z_\x80-\ud7ff\ue000-\U0010ffff"
+_PATH_TOKEN = re.compile(rf'''\.([{_NAME_FIRST}][{_NAME_FIRST}0-9]*)|\[(0|[1-9][0-9]*)\]|\[("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')\]''')
 from request_tracking import SURROGATE_RE as _SURROGATES
 
 
@@ -50,6 +54,29 @@ def _normalize_string(value: str):
         _fail("字符串包含未配对的 Unicode 代理项。")
 
 
+def _decode_quoted_name(literal: str) -> str:
+    """RFC 9535 §2.3.1.1: JSON escapes, with a matching escaped delimiter."""
+    if literal.startswith("'"):
+        def json_quote(match: re.Match) -> str:
+            token = match.group()
+            if token == r"\'":
+                return "'"
+            if token == '"':
+                return r'\"'
+            if token == r'\"':
+                raise ValueError("Invalid escape in single-quoted JSONPath name")
+            return token
+
+        # Transform only quote syntax. Consuming each backslash pair together
+        # keeps \\ and Unicode escapes intact for the JSON decoder.
+        literal = '"' + re.sub(r'\\.|"', json_quote, literal[1:-1]) + '"'
+    name = json.loads(literal)
+    # json.loads unifies a correctly escaped pair; reject unpaired surrogates.
+    if _SURROGATES.search(name):
+        raise ValueError("Invalid surrogate in JSONPath name")
+    return name
+
+
 def _path_tokens(path: str):
     # Native partialArgs use singular JSONPaths, never selectors or wildcards.
     if not isinstance(path, str) or not path.startswith("$") or len(path) > 8192:
@@ -61,11 +88,9 @@ def _path_tokens(path: str):
             _fail("参数路径不是受支持的单值 JSONPath。")
         name, index, quoted = match.groups()
         try:
-            token = name if name is not None else int(index) if index is not None else ast.literal_eval(quoted)
-        except (ValueError, SyntaxError):
+            token = name if name is not None else int(index) if index is not None else _decode_quoted_name(quoted)
+        except ValueError:
             _fail("参数名的引号或转义无效。")
-        if name is not None and ("*" in name or not name.isidentifier()):
-            _fail("特殊参数名必须使用括号引号路径。")
         if isinstance(token, int) and token >= MAX_ARGUMENT_FIELDS:
             _fail("数组索引超过上限。")
         result.append(token)
@@ -83,20 +108,9 @@ class _String:
     open: bool = True
 
 
-class _Node(dict):
-    def __init__(self):
-        super().__init__()
-        self.order = []
-
-    def __setitem__(self, key: Any, value: Any):
-        if key not in self:
-            self.order.append(key)
-        super().__setitem__(key, value)
-
-
 class _Arguments:
     def __init__(self):
-        self.root = _Node()
+        self.root = {}
         self.fields = 0
         self._last_path = None
         self._last_tokens = ()
@@ -112,7 +126,7 @@ class _Arguments:
             self._check_key(node, token)
             if token not in node:
                 self._new_field()
-                node[token] = _Node()
+                node[token] = {}
             node = node[token]
             if not isinstance(node, dict):
                 _fail("参数路径与已有值冲突。")
@@ -173,7 +187,7 @@ class _Arguments:
                     if sorted(value) != list(range(len(value))):
                         _fail("数组存在缺失元素。")
                     return [materialize(value[i]) for i in range(len(value))]
-                return {_normalize_string(key): materialize(item) for key, item in value.items()}
+                return {key: materialize(item) for key, item in value.items()}
             if isinstance(value, float) and not math.isfinite(value):
                 _fail("数值参数必须是有限数。")
             return value
@@ -189,6 +203,12 @@ class _Call:
     complete: object = None
 
 
+@dataclass(slots=True)
+class _BlockedPart:
+    part: Any
+    size: int
+
+
 class ToolStreamAssembler:
     """Per-attempt state; IDs, signatures and interleaved Part order survive."""
 
@@ -196,10 +216,12 @@ class ToolStreamAssembler:
         self.active = {}
         self.queues = {}
         self.ids = {}
+        # Cumulative function traffic plus only *currently blocked* ordinary
+        # parts. An ordinary part ready to send is not tool-assembly state.
         self.bytes = 0
         self.calls = 0
 
-    def _account(self, part: Any):
+    def _account(self, part: Any) -> int:
         """字节记账（PRF-P2-2：repr 物化改按字段增量估长）。
 
         repr(part) 会递归构造整个 Part 的字符串表示（CJK 六倍展开、
@@ -238,6 +260,7 @@ class ToolStreamAssembler:
         self.bytes += size
         if self.bytes > MAX_TOOL_STREAM_BYTES:
             _fail("缓冲超过字节上限。")
+        return size
 
     def _feed(self, index: int, part: Any):
         fc = part.function_call
@@ -257,7 +280,7 @@ class ToolStreamAssembler:
                 _fail("分片没有对应的函数名称。")
             if fc.id and fc.id in seen_ids:
                 _fail("调用 ID 被重复使用。")
-            if fc.id is None and active:
+            if not fc.id and active:
                 _fail("缺少调用 ID，无法开始另一条并行调用。")
             self.calls += 1
             if self.calls > MAX_TOOL_CALLS:
@@ -268,8 +291,13 @@ class ToolStreamAssembler:
                 _complete_arguments(fc)
                 queue.append(part)
                 return
-            call = _Call(part)
-            active[fc.id] = call
+            # The assembler owns the parsed values, not the caller's SDK
+            # envelope. Keep header metadata, including ID/signature; shallow
+            # copies release consumed PartialArg wrappers without mutating input.
+            header = part.model_copy(update={"function_call": fc.model_copy(
+                update={"partial_args": None})}) if fc.partial_args else part
+            call = _Call(header)
+            active[fc.id or None] = call
             queue.append(call)
         else:
             original = call.part.function_call
@@ -301,40 +329,43 @@ class ToolStreamAssembler:
                 "args": args, "partial_args": None, "will_continue": None})
             _complete_arguments(complete)
             call.complete = call.part.model_copy(update={"function_call": complete})
-            del active[complete.id]
+            del active[complete.id or None]
 
     def restore_sdk(self, response: Any) -> Any:
         candidates = []
         for ci, candidate in enumerate(response.candidates or []):
             index = candidate.index if candidate.index is not None else ci
             queue = self.queues.setdefault(index, deque())
+            parts = []
             for part in getattr(candidate.content, "parts", None) or []:
-                if part.function_call is not None:
+                if sdk_function_call(part, active=bool(self.active.get(index))) is not None:
                     self._account(part)
                     self._feed(index, part)
+                    # A completion can free a prefix before the next sibling
+                    # starts a different call, even in the very same frame.
+                    self._drain_into(queue, parts)
+                elif queue:
+                    queue.append(_BlockedPart(part, self._account(part)))
                 else:
-                    if queue:
-                        self._account(part)
-                    queue.append(part)
+                    parts.append(part)
             if has_finish_reason(candidate.finish_reason) and self.active.get(index):
                 _fail("函数参数未完成，上游已结束回复。")
-            parts = self._drain(queue)
             content = candidate.content.model_copy(update={"parts": parts}) if candidate.content else None
             candidates.append(candidate.model_copy(update={"content": content}))
         return response.model_copy(update={"candidates": candidates})
 
-    @staticmethod
-    def _drain(queue: deque):
-        parts = []
+    def _drain_into(self, queue: deque, parts: list) -> None:
         while queue:
             value = queue[0]
             if isinstance(value, _Call):
                 if value.complete is None:
                     break
                 value = value.complete
+            elif isinstance(value, _BlockedPart):
+                self.bytes -= value.size
+                value = value.part
             parts.append(value)
             queue.popleft()
-        return parts
 
     def validate_end(self) -> None:
         if any(self.active.values()) or any(self.queues.values()):

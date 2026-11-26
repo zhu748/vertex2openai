@@ -287,6 +287,10 @@ curl -s https://你的域名/v1/messages/count_tokens -H "x-api-key: 你的API_K
   `claude-haiku-*` → Flash-Lite（静态别名表 + 模型目录热启发）；`gemini-*` 名字原样透传，
   Claude 客户端也可直接用 Gemini 模型及其 `-search` / 抗截断后缀变体。
 - **结构化输出**：`output_config.format = {"type":"json_schema","schema":{...}}` 转为 Gemini JSON Schema，格式或 Schema 非法时返回 400，并遵循上表通道限制。
+  OpenAI 的 `json_object` / `json_schema` 和 Claude 的结构化输出请求均不注入控制台预填充，以免在 JSON 前多出文字；控制台系统指令、客户端历史和显式续写仍按原规则处理。
+  Express 的工具及响应 Schema 都只有一个 `example` 字段：单个非空的 `examples` 示例会映射到该字段；
+  多个示例、单个 null 示例或同时声明两种示例字段时返回带字段路径的 400，而非在后台生成时失败。Cookie 保留原示例列表。
+  `type:"null"` 表示只能为 null，并不等于“任意值都可为空”。
 - **思考兼容**：`thinking.budget_tokens`（整数 ≥1024）映射到内部思考档位
   （≤1024 → low、≤8192 → medium、>8192 → high；`disabled` → off、`adaptive` → 跟随默认）；
   优先级对齐 vertex-master：`thinking` 的 enabled/disabled 钉住档位，
@@ -300,6 +304,14 @@ curl -s https://你的域名/v1/messages/count_tokens -H "x-api-key: 你的API_K
   （auto/any/none/tool → OpenAI 同义档位）；`tool_use` / `tool_result` 块双向转换，
   tool_result 纯文本拼接为字符串、复杂块剥离 `cache_control` 后整体透传；流式中工具
   参数分片先累积，收尾时以一条完整 `input_json_delta` 下发（对齐 vertex-master）。
+- **严格工具参数**：OpenAI 的 `tools[].function.strict:true` 和 Claude 的 `tools[].strict:true`
+  均在生成前返回 400。当前桥接不会用原始 schema 验证整批工具调用，因此不承诺严格模式。
+  如果你的应用能在执行前自行验证参数，可以省略 `strict` 或传 `false` 使用普通工具调用。
+- **单次回复最多一次工具调用**：有可调用的客户端函数时，OpenAI 的 `parallel_tool_calls:false` 和 Claude 的
+  `tool_choice.disable_parallel_tool_use:true` 返回 400，不启动生成。指定一个函数名也不能防止模型连续调用它两次。
+  仅在客户端能处理同一回复中的多次调用时才省略此限制。未声明函数或使用 `tool_choice:none` 不受影响。
+- **正文与工具块顺序**：假流式已经拿到完整上游回复。小型、顺序可核对的普通文本/思考与工具混合回复，在整批调用和结束状态校验通过后按原顺序发块；例如 `文本 A → 工具 → 文本 B`。真流式不缓存整段正文，工具块仍延迟到收尾。含图片、普通块签名或超出有界预算的回复继续使用原有路径。
+- **思考签名边界**：标准 Anthropic 块没有承载 Gemini 普通 Part 签名或末尾空签名 Part 的字段；Claude 的 `thinking.signature` 不能替代这些原始字节。需要逐 Part 原样回放时，使用原生 Gemini，或保留完整 `extra_content` 的 OpenAI 兼容响应。
 - **流式保活**：`message_start` 先行（不等上游首字节）；上游心跳注释帧与 10s 空闲窗口
   均转换为 `event: ping`——长思考场景 Gemini 可能 10-30s 不发内容，没有 ping 会导致
   Claude Code SDK 误判超时断连；上游错误帧转换为 `event: error`，不改 HTTP 状态码。
@@ -433,7 +445,7 @@ TCP+TLS 握手（每次约省 100~300ms 与相应 CPU）；429 重试场景收�
 | `ALLOW_DEFAULT_KEY` | 否 | 空 | 仅用于在公开托管环境（如 HF Space）临时放行默认 `API_KEY`，正常部署不要设置。 |
 | `SINGBOX_BIN` | 否 | 自动探测 | sing-box 可执行文件路径（默认依次找 `$SINGBOX_BIN` → `/usr/local/bin` 等常见路径 → 仓库根 `bin/sing-box` → `PATH`）。仅影响 vless/vmess 等分享链接协议；缺失时这些协议明确报错、不降级直连。 |
 | `SINGBOX_IDLE_MINUTES` | 否 | `30` | sing-box 空闲实例回收阈值（分钟；`0` = 永不回收）。每个代理链接占一个本地端口与一个子进程，长时间不用自动回收、下次请求时秒级重启。 |
-| `KEEPALIVE_URL` | 否 | 空 | 出站保活：定期 GET 该 URL（默认 60 秒一次）。填自己的 `https://你的域名/healthz` 可防止免费托管平台（Render / HF Space 等）冻结闲置实例，也可驱动外部监控。留空 = 不启动；请求直连出站、不走出站代理。仅作初始值，控制台「运行设置」页可热改。私网/环回目标（如 `http://127.0.0.1:port/healthz` 自我保活）需在控制台开启 `keepalive_allow_private`（默认拒绝，防内网探测）。 |
+| `KEEPALIVE_URL` | 否 | 空 | 出站保活：定期 GET 该 URL（默认 60 秒一次）。填自己的 `https://你的域名/healthz` 可防止免费托管平台（Render / HF Space 等）冻结闲置实例，也可驱动外部监控。留空 = 不启动；请求直连出站、不走出站代理。仅作初始值，控制台「运行设置」页可热改。私网/环回目标（如 `http://127.0.0.1:port/healthz` 自我保活）受运行设置 `keepalive_allow_private` 约束，默认拒绝。控制台页面当前仅提供 URL 和间隔输入项。 |
 | `KEEPALIVE_INTERVAL` | 否 | `60` | 保活请求间隔（秒），下限 5，上限 86400。仅作初始值，控制台可热改。 |
 
 ### Render 生图与客户端内存
@@ -449,6 +461,8 @@ Markdown 重解析或图片解码期间耗尽内存，即使代理已经记录�
 Render 未挂持久磁盘时，文件会随实例重建或重新部署丢失，历史链接可能失效，
 需要长期保留的图片请及时下载。多实例部署需要共享该目录或改用对象存储。
 
+多轮修图时，可把上一轮返回的完整 `assistant` 消息（含 `extra_content`）放回历史，然后发送新的编辑要求。OpenAI 聊天接口会按原始顺序从**本机存储**还原本站签发的图片和对应签名，不会联网抓取普通 Markdown 图片链接。链接必须仍在有效期内且未被存储配额淘汰；每张历史图片适用 20 MiB 输入上限，按 Base64 展开后的图片与请求正文合计不超过 32 MiB。若收到过期或超限提示，请重新附上合适大小的原图。
+
 小内存 Render 实例建议在控制台将 `image_max_concurrency` 设为 **1**；
 新安装默认值已改为 1，升级保留已有设置，需自行检查。
 如返回链接使用了错误域名，设置 `IMAGE_PUBLIC_BASE_URL=https://你的服务域名`。
@@ -462,7 +476,7 @@ Render 未挂持久磁盘时，文件会随实例重建或重新部署丢失，�
 | 功能 | Express 通道 | Cookie 通道 |
 | --- | --- | --- |
 | OpenAI / Claude 文本、工具调用、图片历史 | 支持，受模型能力限制 | 支持，受模型和私有协议限制 |
-| JSON Schema（含 Claude `output_config.format`） | 映射为 Gemini Schema | 需开启 `cookie_structured_output` 并验证上游支持 |
+| OpenAI JSON 对象 / Schema、Claude `output_config.format` | 文本模型支持；生图模型返回 400 | 文本模型需开启 `cookie_structured_output` 并验证上游支持；生图模型返回 400 |
 | OpenAI `n > 1` | 仅支持多候选的模型；Gemini 3.x 明确拒绝 | 明确返回 400，避免合并不同答案 |
 | `logprobs` / `top_logprobs` | 受模型支持情况限制 | 明确返回 400 |
 | 原生 `generateContent` / `streamGenerateContent` | 透传 | 协议桥接；只支持单候选 |
@@ -477,7 +491,26 @@ Render 未挂持久磁盘时，文件会随实例重建或重新部署丢失，�
 `"_expected": {"retry_max": {"present": true, "value": 10}}`；模型继承字段用
 `{"present": false}` 表示尚无专属值。未传 `_expected` 的旧客户端继续使用原有合并语义。
 
-> **Cookie 通道结构化输出（`cookie_structured_output`，默认关）**：batchGraphql 私有协议对 `responseMimeType` / `responseSchema` 的接受度没有官方承诺，离线无法验证，因此默认对 `response_format` 显式 400 并提示改用 Express 通道。要启用：先在部署环境运行 `python scripts/probe_cookie_structured_output.py --model 模型名`（凭证取 `--cookie/--project-id`、环境变量或加 `--use-state` 读控制台记录），脚本直连上游跑 json_object / 严格 schema / json_patch 宽松方言三档用例并给出「完全可开 / 仅 JSON 模式 / 不可开」结论；探测通过后在控制台「运行设置」打开开关。开启后转换链与工具参数完全一致：`sanitize_for_gemini`（OpenAI 宽松方言 → Gemini 严格方言，空节点/`type` 数组/元组 `items` 自动净化）→ Studio 私有 UI Schema。若探测报告 `QUERY_SIGNATURE_NOT_FOUND` 或未知字段错误，说明 Google 已改私有协议，保持开关关闭即可，其余功能不受影响。
+> **Cookie 通道结构化输出（`cookie_structured_output`，默认关）**：batchGraphql 私有协议对 `responseMimeType` / `responseSchema` 的接受度没有官方承诺，离线无法验证，因此默认对 `response_format` 显式 400 并提示改用 Express 通道。要启用：先在部署环境运行 `python scripts/probe_cookie_structured_output.py --model 模型名`（凭证取 `--cookie/--project-id`、环境变量或加 `--use-state` 读控制台记录），脚本直连上游跑 json_object / 严格 schema / json_patch 宽松方言三档用例并给出「完全可开 / 仅 JSON 模式 / 不可开」结论；探测通过后在控制台「运行设置」打开开关。开启后转换链与工具参数完全一致：`sanitize_for_gemini`（OpenAI 宽松方言 → Gemini 严格方言，空节点与 `type` 数组自动净化；位置式 `items` 仅在可证明等价时转换）→ Studio 私有 UI Schema。若探测报告 `QUERY_SIGNATURE_NOT_FOUND` 或未知字段错误，说明 Google 已改私有协议，保持开关关闭即可，其余功能不受影响。
+
+函数参数和结构化输出只做等义转换：字符串 `const`（包括省略 `type` 的写法）转换成只含该值的 `enum`；显式数组的 `items:false` 在没有位置前缀且允许空数组时转换成 `maxItems:0`。两通道无法表示的 `not`、`oneOf`、非字符串枚举等约束会在调用上游前返回 400，错误指出具体字段，不会当作“任意值”。
+
+### JSON Schema 迁移：同构数组与位置元组不同
+
+兼容接口的响应格式和函数参数，以及原生 Cookie 桥的 schema，不再把旧版 Draft 7 的
+`"items":[A,B]` 改成 `"items":{"anyOf":[A,B]}`。前者只约束前两项的各自位置，默认不限制第三项；
+后者每一项都可选 A 或 B，既丢了顺序，又限制了原本自由的尾部。例如第一项应为币种、第二项为金额时，
+`[10,"USD"]` 会被错误的联合接受。
+
+- **实际需要同一种元素的列表**：声明 `{"type":"array","items":{"type":"number"}}`。
+- **确实需要位置**：例如旧数据 `["USD",10]`，可改用带有必填字段 `currency`、`amount` 的对象
+  并同步修改客户端。这样会改变数据格式，不是原元组的等价改写。如果不能改变线上的数组协议，请保留位置校验，
+  不要把无序联合当成保证。
+- 只有显式 `type:"array"` 和 `maxItems` 证明所有可达位置都受同一子 schema 约束时，才自动转换。
+  例如 `"items":[S,S],"maxItems":2` 与 `"items":S,"maxItems":2` 等价；`maxItems:0` 则没有可达位置。
+  其余位置式声明在生成前返回 HTTP 400，错误会指出具体的 `items` 路径。
+
+### 通道配置示例
 
 例如在 `.env` 中填写（以下均为占位值）：
 
@@ -545,7 +578,7 @@ SAPISID=cookie-b; SID=sid-b
 | **控制台会话有效期** | 固定 30 天 | 双窗口：签发后 7 天必须重新登录 + 闲置 2 小时失效（每次操作滑动续期）；新增「撤销全部会话」按钮与 `POST /api/sessions/revoke-all` |
 | **CORS** | `allow_origins=["*"]`（任意站点可无凭据探测） | 默认同源（不装 CORS 中间件）；需要跨源时显式设 `ALLOWED_ORIGINS` |
 | **CSRF 判定** | 仅比对 Origin 与 Host | 额外拒绝 `Origin: null`（沙箱 iframe）与 `Sec-Fetch-Site: cross-site`（浏览器强制头） |
-| **保活私网目标** | 环回/私网 URL 直接放行 | 默认拒绝（防被劫持会话借保活探测内网）；自我保活/内网监控需在控制台开启 `keepalive_allow_private` |
+| **保活私网目标** | 环回/私网 URL 直接放行 | 默认拒绝；管理设置 `keepalive_allow_private` 变更后，运行中的保活任务也会立即按新策略重新校验 |
 | **代理测试内网地址** | 任意代理地址可直接测试 | 字面私网/环回 IP 默认拒绝；确需测试内网节点请开启 `proxy_test_allow_private`，或设 `DISABLE_PROXY_TEST` 整体禁用 |
 | **生图 URL 有效期** | 7 天 | 默认 24 小时（`IMAGE_URL_TTL_SECONDS` 可调，上限仍为 7 天） |
 | **状态文件** | 每次读设置都同步读盘、非原子写 | 内存优先 + 原子写 + 权限 0600 + 支持 `STATE_DIR`；可选 `STATE_ENCRYPTION_KEY` 静态加密 |
@@ -555,6 +588,10 @@ SAPISID=cookie-b; SID=sid-b
 | **生图比例白名单** | 所有生图模型共用同一套比例 | 按模型分别校验；Flash Image 支持含 `9:21` 在内的扩展比例，Pro Image 使用较小白名单 |
 
 思考签名优先使用请求/响应中的 `extra_content.google` 携带，因此跨进程、多副本部署不依赖本地缓存；旧格式、进程内缓存与跳过校验哨兵仅用于兼容缺失显式签名的客户端。
+
+如果 harness 会剥离扩展字段，请保留原始工具 ID、名称、参数和顺序。对使用同一认证凭据及内部模型、历史由纯文本/工具轮次组成、当前 assistant 轮含工具调用（可以先有普通正文或公开思考文本）的情况，代理会按完整历史前缀、准确的可见正文/思考和整个有序批次恢复各自的签名，包括确有签名的并行后续调用。不同会话复用同一 ID 不会互取签名。媒体、缺失的思考、不能无歧义表示的交错顺序，以及过大或被改写的历史不保证恢复；同一可见来源对应不同签名时，代理不会选「最近一次」或为冲突额外补哨兵，严格上游可能拒绝。跨实例、重启或缓存过期仍应依靠客户端原样保留的扩展字段。
+
+如果上游给出的不透明工具 ID 恰好与旧格式 `前缀__thought__规范base64` 完全相同，OpenAI 回复会在该条工具调用的 `extra_content.vertex2openai.literal_call_id_sha256_v1` 标记原 ID。请原样回传**整个工具调用的 `extra_content`**，不要只提取签名：这样即使缓存过期，调用和紧随其后的工具结果也能保留原 ID。该标记只说明 ID 的编码方式，不包含思考签名，也不证明调用者身份；必需签名本身仍应保存在 `extra_content.google.thought_signature`。普通 ID 和标准 Claude 输出不添加标记。客户端丢弃标记、使用旧回复或标准 Claude 历史时，缓存失效后无法从 ID 本身判断它究竟是原始 ID 还是老格式，仍沿用旧兼容解释。
 
 ---
 
@@ -656,18 +693,22 @@ Cookie 直连通道会把 OpenAI `tools` 转成 batchGraphql 的原生 `function
 
 OpenAI 入口的 `tool_choice` 字符串在两个通道都兼容大小写。强制选择未声明的自定义函数、未知选择模式，或没有任何可用工具时使用 `required`，会在请求上游前返回 400。Express 的 `[Express 工具]` 日志会列出实际函数声明、搜索启用状态和工具选择方式，便于区分工具回传引起的第二轮请求。
 
+生图模型不会下发自定义函数声明。OpenAI / Claude 强制工具调用（`required` / `any` 或点名函数）及 Cookie 原生的显式函数选择会在生成前返回 400，而不是静默改为普通生图。可选声明（默认 / `auto`）和未声明工具的生图请求保持原有行为。
+
 Cookie 原生入口会检查 `toolConfig` 和 `allowedFunctionNames` 的格式；允许名称全部未声明时返回 400，不会通过删除名称限制改成任意函数调用。禁用工具或已优先选择搜索时，会跳过不会发送的函数 Schema 转换。
 
 | 情况 | 行为 |
 |---|---|
 | 自定义函数声明 | 原生下发；流式与非流式响应都返回 OpenAI `tool_calls` |
 | `-search` 模型 + 默认/`auto` 工具选择 | 优先内建搜索，跳过客户端附带的可选自定义函数（如 `get_time_info`）；显式 `required` / 指定自定义函数仍优先执行自定义函数 |
-| 原生搜索工具类型 `web_search` / `web_search_preview` / `google_search` | 两个通道的 OpenAI 入口均识别并映射为 Google 内建搜索；纯搜索请求不附加函数专用配置 |
+| 原生搜索工具类型 `web_search` / `web_search_preview` / `google_search` | 两个通道的 OpenAI 入口均识别并映射为无配置的 Google 内建搜索；不支持的域名限制、用户位置和搜索上下文等选项返回 400，不会降级为不受限搜索。Chat 请求内有实际配置的顶层 `web_search_options` 也返回 400；本项目的空对象或 null 保留旧行为，不负责开启搜索。纯搜索请求不附加函数专用配置 |
 | 显式声明内建搜索与自定义函数 | batchGraphql 不允许二者混用：普通模型的混合 AUTO/required 请求优先自定义函数并忽略搜索；显式选择未声明为自定义函数的搜索别名时，仅发送 `googleSearch` |
 | 自定义函数恰好叫 `search` / `google_search` / `web_search` | 两通道均保留其函数声明、参数和指定调用；不再按名字替换为内建搜索。需要 Google 搜索时使用 `{"type":"web_search"}`、`{"google_search":{}}` 或 `-search` 模型后缀 |
 | 历史里的 assistant `tool_calls` | 回放为 role=`model` 的 `functionCall` Parts，并从 `extra_content` 或短期缓存恢复 thought signature |
 | 连续的 role=`tool` 结果 | 按 `tool_call_id` 关联函数名，合并为 role=`user` 的 `functionResponse` Parts；并行顺序为 FC1, FC2, FR1, FR2 |
 | 模型或协议明确拒绝原生函数 Schema | 仅本次固定降级为文本工具观测并重试一次；没有用户可见策略开关，也不会恢复旧版严格拒绝路径 |
+
+Claude 自定义工具仅支持直接调用：仅允许默认调用方式或 `allowed_callers: ["direct"]`，不支持延迟加载（`defer_loading: true`）。无法保真的限制会返回 400，不会变成普通可直接调用的工具。
 
 工具历史按消息顺序关联结果；客户端跨轮复用 ID 不会改写先前的调用名。`extra_content.google.part_order` 中重复、布尔和越界索引会被忽略，避免同一调用被重复回放。Claude `tool_result.is_error: true` 会保留为 Gemini 的工具错误响应，供模型判断失败并选择下一步。
 
@@ -984,16 +1025,16 @@ NODE_PATH=/tmp/vertex-console-ui/node_modules node scripts/verify_console_ui.cjs
 共享 API Key 的独立请求应使用不同幂等键，避免相同请求被合并。
 
 **酒馆等客户端的取消与重新生成：** 默认前端取消只断开读者，后台生成仍继续。最后一个读者断开后，
-10 秒内再次发送完全相同的请求会接回旧生成，日志显示“续传命中”；超过 10 秒后再次发送会丢弃旧缓冲、
-取消旧上游任务并等待其释放名额，再开始新一轮。还有其他客户端读取时，不会因其中一个客户端断开而替换任务。
-不同请求可以并发，不需要等上一轮结束。
+10 秒内再次发送完全相同的请求会接回旧生成，日志显示“续传命中”；超过 10 秒后再次发送会先取消旧任务并等待连接清理，再开始新一轮。
+旧连接仍在关闭时重试可能暂时返回 503，不会重复启动上游；携带旧 ID 的超窗重连在缓冲被回收前始终返回 410。还有其他客户端读取时，不会因其中一个客户端断开而替换任务。
+整轮执行超时会保留原 ID 和可重放的 504 错误，不会把它当成旧 ID 不存在。相同请求需要新生成时，旧连接关闭完毕才会启动；其他不同请求仍可并发。
 
 控制台“请求与缓冲预算”的 `resumable_disconnect_grace_seconds` 可调整此窗口，0 表示断开后不再复用。
 每次最后一个读者断开时采用当时的设置；服务无法区分主动取消与网络中断，两者使用相同窗口。
 窗口到点即取消：断开超过窗口且无人续接时，仍在运行的后台生成会被直接取消（日志与请求面板显示已取消），
 不再空烧至整轮期限；已完成或已完整交付的缓冲不受影响，仍按 TTL 回收。`/v1/resumable/{id}` 轮询
-属于客户端活动，会把窗口从最后一次轮询向后滑动（长轮询按其 wait 预支在途时间），
-弱网下仅靠轮询续接的生成不会被误取消。
+仅在续传窗口内算作客户端活动，会把窗口从最后一次轮询向后滑动（长轮询按其 wait 预支在途时间）；超窗轮询与显式重连同样返回 410，不标记交付。
+因此，在窗口内持续轮询的弱网客户端不会被误取消。
 若重连仍携带已超窗口的旧 `X-Resume-Id` 或游标，返回 410，客户端需移除旧 ID / 游标再重新生成，
 避免把旧偏移错误地用在新答案上。
 

@@ -1,13 +1,14 @@
 """两条 OpenAI 上游共用的消息注入与预填充处理。"""
 
 import config
-from models import OpenAIRequest
+from models import OpenAIRequest, wants_json_output
 from prefill import (
     DEFAULT_IMAGE_PREFILL_NUDGE,
     apply_console_injection,
     apply_prefill_compat,
 )
 from runtime_state import app_state
+from tool_history import has_tool_history
 
 
 def _prefill_template(user_template: str, is_image: bool) -> str:
@@ -38,18 +39,23 @@ def prepare_messages(
     profile: dict,
     settings: dict,
     *,
-    has_tools: bool,
+    has_tools: bool | None = None,
 ) -> tuple[OpenAIRequest, str, bool]:
     """先注入控制台消息，再兼容末尾预填充，返回请求、回拼文本与激活状态。
 
-    has_tools 由通道判定：Cookie 还需检查历史中的函数往返，避免破坏调用顺序。
+    两条通道均保护历史工具往返；已分类的通道可复用结果，避免重复扫描。
     只有消息变化时才复制请求，调用方持有的原始请求不受影响。
     """
     is_image = profile["is_image"]
+    service_prefill = "" if wants_json_output(request) else settings.get("inject_prefill", "")
+    if has_tools is None:
+        has_tools = bool(request.tools or (service_prefill and has_tool_history(request.messages)))
     messages, notes = apply_console_injection(
         request.messages,
         system_text=settings.get("inject_system_instruction", ""),
-        prefill_text=settings.get("inject_prefill", ""),
+        # A service-authored prefix would be spliced into the client's JSON document.
+        # Do not disable a real assistant continuation or the independent system instruction.
+        prefill_text=service_prefill,
         has_tools=has_tools,
         is_image_model=is_image,
         allow_image_prefill=bool(settings.get("inject_prefill_for_image", False)),

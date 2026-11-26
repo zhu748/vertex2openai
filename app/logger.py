@@ -1,7 +1,7 @@
 import atexit
 import builtins
 import io
-import queue
+from collections import deque
 import sys
 import time
 import re
@@ -80,19 +80,21 @@ _in_hook = threading.local()
 # 兼容性：redirect_stdout/capsys 活跃时（sys.stdout 不是导入时捕获的
 # 真实 stdout）仍走同步路径，测试的输出断言时序完全不变。
 _REAL_STDOUT = sys.stdout
-_STDOUT_QUEUE: "queue.Queue" = queue.Queue(maxsize=1000)
+_STDOUT_QUEUE: deque[tuple[str, str, bool]] = deque(maxlen=1000)
 _MAX_STDOUT_CHARS = 16 * 1024
-_STDOUT_SENTINEL = object()
 _writer_thread: Optional[threading.Thread] = None
-_writer_lock = threading.Lock()
+_writer_condition = threading.Condition()
+_writer_stopping = False
 
 
 def _stdout_writer_loop() -> None:
     while True:
-        item = _STDOUT_QUEUE.get()
-        if item is _STDOUT_SENTINEL:
-            return
-        text, end, flush = item
+        with _writer_condition:
+            while not _STDOUT_QUEUE and not _writer_stopping:
+                _writer_condition.wait()
+            if not _STDOUT_QUEUE:
+                return  # Stop was requested and every accepted item has drained.
+            text, end, flush = _STDOUT_QUEUE.popleft()
         try:
             original_print(text, end=end, flush=flush, file=_REAL_STDOUT)
         except Exception:
@@ -102,12 +104,13 @@ def _stdout_writer_loop() -> None:
 
 
 def _ensure_stdout_writer() -> None:
-    global _writer_thread
-    with _writer_lock:
-        if _writer_thread is None or not _writer_thread.is_alive():
-            _writer_thread = threading.Thread(
-                target=_stdout_writer_loop, name="stdout-writer", daemon=True)
-            _writer_thread.start()
+    """Called under _writer_condition, as part of accepting a new entry."""
+    global _writer_thread, _writer_stopping
+    if _writer_thread is None or not _writer_thread.is_alive():
+        _writer_stopping = False
+        _writer_thread = threading.Thread(
+            target=_stdout_writer_loop, name="stdout-writer", daemon=True)
+        _writer_thread.start()
 
 
 def _enqueue_stdout(text: str, end: str, flush: bool) -> None:
@@ -115,31 +118,32 @@ def _enqueue_stdout(text: str, end: str, flush: bool) -> None:
     # contain an entire image/request body. Bound each retained log as well.
     if len(text) > _MAX_STDOUT_CHARS:
         text = text[:_MAX_STDOUT_CHARS] + f"…（已截断，原长度 {len(text)} 字符）"
-    _ensure_stdout_writer()
-    try:
-        _STDOUT_QUEUE.put_nowait((text, end, flush))
-    except queue.Full:
-        # 丢最旧腾位（与控制台 SSE 流同策略）：背压场景下保住最新日志。
-        try:
-            _STDOUT_QUEUE.get_nowait()
-            _STDOUT_QUEUE.put_nowait((text, end, flush))
-        except (queue.Empty, queue.Full):
-            pass
+    with _writer_condition:
+        _ensure_stdout_writer()
+        if _writer_stopping:
+            # The old writer still owns a (possibly blocked) sink. Seal its
+            # backlog while draining; a later enqueue restarts after it exits.
+            return
+        _STDOUT_QUEUE.append((text, end, flush))  # 满时丢最旧，保住最新日志。
+        _writer_condition.notify()
 
 
 def shutdown_stdout_writer(timeout: float = 2.0) -> None:
     """排空并停止后台写线程（lifespan 关闭与 atexit 双保险）。"""
-    global _writer_thread
-    with _writer_lock:
+    global _writer_thread, _writer_stopping
+    with _writer_condition:
         thread = _writer_thread
-        _writer_thread = None
-    if thread is None or not thread.is_alive():
-        return
-    try:
-        _STDOUT_QUEUE.put_nowait(_STDOUT_SENTINEL)
-    except queue.Full:
-        return
-    thread.join(timeout)
+        if thread is None:
+            return
+        # Out-of-band: a saturated buffer cannot discard or displace this signal.
+        _writer_stopping = True
+        _writer_condition.notify()
+    if thread is not threading.current_thread():
+        thread.join(timeout)
+    with _writer_condition:
+        if _writer_thread is thread and not thread.is_alive():
+            _writer_thread = None
+            _writer_stopping = False
 
 
 @atexit.register

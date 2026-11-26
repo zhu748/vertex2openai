@@ -2,7 +2,9 @@
  * window.proxyEditorKit 显式命名空间协作）。Shared form helpers live in dashboard.js.
  * Keep state local so a failed/cached script can be retried without redeclaration errors. */
 (() => {
-  if (window.consoleChannels) return;
+  // A cached older namespace lacks the readiness contract. The current
+  // bootstrap retries this asset before starting account loads in that case.
+  if (typeof window.consoleChannels?.isLoaded === 'function') return;
   let cookiesRevision = null;
   let COOKIE_ACCOUNTS = [],
     SAVED_COOKIES = [],
@@ -28,11 +30,12 @@
     select.disabled = false;
   }
 
-  /* Cookie 会话探测结果文案：与后端 cookie_probe 的三种状态一一对应。 */
+  /* Cookie 会话探测结果：不能把网络未确定或尚未派发算作凭证失效。 */
   const COOKIE_TEST_STATUS = {
     valid: { label: '✓ 会话有效', ok: true },
     invalid: { label: '✕ 会话已失效', ok: false },
-    error: { label: '⚠ 无法判定', ok: false }
+    error: { label: '⚠ 无法判定', ok: false },
+    skipped: { label: '未测试', ok: false }
   };
   function cookieTestMessage(res) {
     const st = COOKIE_TEST_STATUS[res.status] || { label: res.status, ok: false };
@@ -217,14 +220,6 @@
     toastNoun: 'Cookie 账号',
     formsGroup: 'cookies',
     accountGroup: 'cookie',
-    responseItems: (d) => {
-      if (!Array.isArray(d.accounts)) {
-        const error = new Error('保存响应缺少账号列表，请刷新面板后重试');
-        error.ui = true;
-        throw error;
-      }
-      return d.accounts;
-    },
     getItems: () => COOKIE_ACCOUNTS,
     setItems: (v) => {
       COOKIE_ACCOUNTS = v;
@@ -310,13 +305,19 @@
       });
       const result = await response.json();
       if (!response.ok) throw new Error(await responseError(response, '刷新失败', result));
-      const labels = { refreshed: '已更新', unchanged: '无新令牌', error: '失败' };
+      const labels = {
+        refreshed: '已更新',
+        unchanged: '无新令牌',
+        error: '失败',
+        skipped: '已跳过'
+      };
       const lines = (result.results || []).map(
         (rec) => `${rec.label || rec.id}：${labels[rec.status] || rec.status} · ${rec.detail || ''}`
       );
       show(lines.join('\n') || '没有可刷新的账号');
       toast(
-        `刷新完成：更新 ${result.refreshed || 0}，无新令牌 ${result.unchanged || 0}，失败 ${result.errors || 0}`
+        `刷新完成：更新 ${result.refreshed || 0}，无新令牌 ${result.unchanged || 0}，失败 ${result.errors || 0}` +
+          (result.skipped ? `，跳过 ${result.skipped}` : '')
       );
       // Leave credential editors untouched: refreshing must never discard drafts
       // created in the other section while this request was in flight.
@@ -391,6 +392,12 @@
     renderCookieAccounts();
   }
 
+  const proxyDependencies = {
+    isLoaded: () => cookiesLoaded,
+    collect: collectCookieAccounts,
+    accounts: () => COOKIE_ACCOUNTS,
+    render: renderCookieAccounts
+  };
   window.consoleChannels = {
     // 草稿 = Cookie 账号草稿 || 代理编辑器草稿（后者经显式命名空间委托）。
     hasDraft: () => window.proxyEditorKit?.hasDraft?.() ?? false,
@@ -398,11 +405,17 @@
       COOKIE_ACCOUNTS = SAVED_COOKIES.map(credentialCopy);
       renderCookieAccounts();
     },
+    isLoaded: () => cookiesLoaded,
     load: loadCookieAccounts,
     refreshCookies,
     testCookieAccount,
-    init: () => window.proxyEditorKit?.init?.(),
-    open: (scope, index, view) => window.proxyEditorKit?.open?.(scope, index, view),
+    init: () => {
+      // The kit may have finished loading after this module. Bind the existing
+      // account closures in either order; init is idempotent across retries.
+      window.proxyEditorKit.mount(proxyDependencies);
+      window.proxyEditorKit.init();
+    },
+    open: (scope, index, view) => window.proxyEditorKit.open(scope, index, view),
     sync: () => window.proxyEditorKit?.sync?.()
   };
   // 注意：refreshCookies 不在此处导出到 window——console-bootstrap.js 的
@@ -411,12 +424,6 @@
   // （2026-11 审查收敛：此前三个出口指向两种行为，排障时误导）。
   // 代理编辑器的全局函数（editProxy / applyProxyEditor 等 HTML onclick
   // 契约）随代理段一并迁至 proxy-editor.js（QUA-P1-4）。
-  window.proxyEditorKit?.mount({
-    isLoaded: () => cookiesLoaded,
-    collect: collectCookieAccounts,
-    accounts: () => COOKIE_ACCOUNTS,
-    render: renderCookieAccounts
-  });
   Object.assign(window, {
     updateCredentialStrategy,
     loadCookieAccounts,

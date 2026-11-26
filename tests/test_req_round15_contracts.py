@@ -15,15 +15,18 @@
 - REQ-P3-9：预填充先行帧独立闸门（签名先到不再丢失 prefill）。
 - REQ-P3-10：usage 数值字段统一清洗（溢出 / NaN / bool 一律视为缺失）。
 """
+from settings_fixture import saved_settings
 import asyncio
 import json
 import time
+import tracemalloc
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 
 from google.genai import types
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
 import config
 from claude_protocol import (
@@ -39,6 +42,7 @@ from json_encoding import (
 from models import OpenAIRequest
 from runtime_state import app_state
 from upstreams import cookie_delivery, cookie_proxy, express_sdk
+from upstreams.cookie_response import extract_events
 
 MODEL = "gemini-3.6-flash"
 
@@ -80,8 +84,7 @@ class Round15Harness(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(app_state, "get_settings", side_effect=lambda: dict(self.settings)),
             mock.patch.object(app_state, "get_effective_settings",
                               side_effect=lambda model, base=None: (dict(self.settings) if base is None else dict(base))),
-            mock.patch.object(app_state, "get_setting",
-                              side_effect=lambda key, default=None: self.settings.get(key, default)),
+            saved_settings(app_state, self.settings),
         ):
             patch.start()
             self.addCleanup(patch.stop)
@@ -162,13 +165,31 @@ class OffloopJSONResponseTests(unittest.IsolatedAsyncioTestCase):
     """REQ-P2-2：大负载 JSON 响应移出事件循环序列化，字节与直路一致。"""
 
     async def test_large_payload_rendered_offloop_matches_direct_path(self):
-        big = {"choices": [{"message": {"content": "x" * (3 * 1024 * 1024)}}]}
+        size = 3 * 1024 * 1024
+        big = {"choices": [{"message": {"content": "x" * size + '中文🌱\n"'}}],
+               "values": [True, None, 1.25]}
         self.assertGreater(estimate_json_chars(big), LARGE_RESPONSE_CHARS)
-        direct = JSONResponse(content=big)
-        offloop = await json_response_offloop(big)
+        options = {"status_code": 201, "headers": {"X-Resume-Id": "test"}}
+        background = BackgroundTask(mock.AsyncMock())
+        direct = JSONResponse(content=big, **options)
+        tracemalloc.start()
+        try:
+            offloop = await json_response_offloop(big, background=background, **options)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
         self.assertEqual(offloop.body, direct.body)
-        self.assertEqual(offloop.status_code, 200)
-        self.assertEqual(offloop.media_type, direct.media_type)
+        self.assertEqual(offloop.status_code, direct.status_code)
+        self.assertEqual(offloop.raw_headers, direct.raw_headers)
+        self.assertIs(offloop.background, background)
+        self.assertLess(peak, 2 * size)
+
+    async def test_large_response_rejects_non_finite_json_values_and_keys(self):
+        fill = "x" * LARGE_RESPONSE_CHARS
+        for invalid in (float("nan"), float("inf"), float("-inf")):
+            for big in ({"text": fill, "n": invalid}, {"text": fill, invalid: "key"}):
+                with self.subTest(number=invalid), self.assertRaises(ValueError):
+                    await json_response_offloop(big)
 
     async def test_small_payload_stays_on_direct_path(self):
         small = {"a": "x" * 100, "b": [1, 2, {"c": "y"}]}
@@ -376,7 +397,7 @@ class ImageCollectDisconnectTests(Round15Harness):
 
         gen = SimpleNamespace(
             fastapi_request=SimpleNamespace(is_disconnected=mock.AsyncMock(return_value=False)),
-            response_id="rid", model_display=MODEL, base_model_name=MODEL,
+            response_id="rid", model_display=MODEL, base_model_name=MODEL, response_created=0,
             project_id="p", request_obj=request(), record=None, account_id=None,
             retry_max=0, backoff_sec=0, jitter_sec=0, cookie_str="SAPISID=x",
             client_kwargs={}, prefill_active=False, force_builtin_search=False,
@@ -424,6 +445,82 @@ class PrefillGateTests(Round15Harness):
                                          settings={"inject_prefill": "PREFIX: "})
         self.assertEqual(content(body).count("PREFIX:"), 1)
         self.assertEqual(content(body), "PREFIX:answer body more")
+
+
+class CookieTrueStreamSourceMetadataTests(Round15Harness):
+    def _metadata(self, body):
+        deltas = [choice["delta"] for chunk in chunks(body) for choice in chunk.get("choices", [])]
+        return next(delta["extra_content"]["google"] for delta in deltas
+                    if "ordinary_parts" in delta.get("extra_content", {}).get("google", {}))
+
+    async def _stream_parts(self, parts, *, prefill="", strip_thoughts=False):
+        wire = {"results": [{"data": {"candidates": [{"content": {"parts": parts}, "finishReason": "STOP"}]}}]}
+
+        async def events(*args, **kwargs):
+            for event in extract_events(wire):
+                yield event
+
+        with mock.patch.object(cookie_proxy.mc, "resolve_thinking", return_value={
+            "mode": "level", "level": "LOW", "include_thoughts": not strip_thoughts,
+        }):
+            result, body = await self.cookie(request(stream=True), events,
+                                             settings={"inject_prefill": prefill, "fake_streaming": False})
+        self.assertEqual(result.status_code, 200)
+        return body
+
+    async def test_stripped_thought_does_not_replace_visible_metadata_or_escape(self):
+        body = await self._stream_parts([
+            {"text": "visible", "thoughtSignature": "QQ=="},
+            {"text": "hidden-throughout", "thought": True, "thoughtSignature": "Qg=="},
+            {"functionCall": {"id": "example-call", "name": "f", "args": {}}},
+            {"text": " tail", "thoughtSignature": "Qw=="},
+        ], strip_thoughts=True)
+        self.assertNotIn("hidden-throughout", body)
+        self.assertNotIn("reasoning_content", body)
+        self.assertEqual(content(body), "visible tail")
+        meta = self._metadata(body)
+        self.assertEqual(meta["ordinary_parts"], [
+            {"kind": "text", "text": "visible", "thought_signature": "QQ=="},
+            {"kind": "signature_only", "text": "", "thought_signature": "Qg=="},
+            {"kind": "text", "text": " tail", "thought_signature": "Qw=="},
+        ])
+        self.assertEqual(meta["part_order"], [
+            {"type": "ordinary", "index": 0}, {"type": "ordinary", "index": 1},
+            {"type": "tool_call", "index": 0}, {"type": "ordinary", "index": 2},
+        ])
+
+    async def test_trimmed_and_surviving_prefill_parts_keep_their_source_metadata(self):
+        body = await self._stream_parts([
+            {"text": "Prefix"},
+            {"text": " abc", "thoughtSignature": "QQ=="},
+            {"text": ": first", "thoughtSignature": "Qg=="},
+            {"text": " second", "thoughtSignature": "Qw=="},
+        ], prefill="Prefix abc:")
+        self.assertEqual(content(body), "Prefix abc: first second")
+        meta = self._metadata(body)
+        self.assertEqual(meta["ordinary_parts"], [
+            {"kind": "signature_only", "text": "", "thought_signature": "QQ=="},
+            {"kind": "text", "text": " first", "thought_signature": "Qg=="},
+            {"kind": "text", "text": " second", "thought_signature": "Qw=="},
+        ])
+        self.assertEqual(meta["part_order"], [{"type": "ordinary", "index": i} for i in range(3)])
+
+    async def test_prefill_buffer_retains_each_source_when_untrimmed_at_finish(self):
+        body = await self._stream_parts([
+            {"text": "Pref", "thoughtSignature": "QQ=="},
+            {"functionCall": {"id": "prefill-call", "name": "f", "args": {}}},
+            {"text": "ix", "thoughtSignature": "Qg=="},
+        ], prefill="Prefix abc:")
+        self.assertEqual(content(body), "Prefix abc:Prefix")
+        meta = self._metadata(body)
+        self.assertEqual(meta["ordinary_parts"], [
+            {"kind": "text", "text": "Pref", "thought_signature": "QQ=="},
+            {"kind": "text", "text": "ix", "thought_signature": "Qg=="},
+        ])
+        self.assertEqual(meta["part_order"], [
+            {"type": "ordinary", "index": 0}, {"type": "tool_call", "index": 0},
+            {"type": "ordinary", "index": 1},
+        ])
 
 
 class UsageCountValueTests(unittest.TestCase):

@@ -49,9 +49,11 @@ class PersistenceIntegrityTests(unittest.TestCase):
 
             state._io_lock = GateLock()
 
+            receipts = []
+
             def stale_save():
                 try:
-                    state.update_settings({"retry_max": 2})
+                    receipts.append(state.update_settings({"retry_max": 2})["retry_max"])
                 except BaseException as exc:
                     errors.append(exc)
 
@@ -66,6 +68,7 @@ class PersistenceIntegrityTests(unittest.TestCase):
                 writer.join(5)
             self.assertFalse(writer.is_alive())
             self.assertEqual(errors, [])
+            self.assertEqual(receipts, [4])
             self.assertEqual(state.get_setting("retry_max"), 4)
             self.assertEqual(json.loads(Path(runtime_state.STATE_FILE).read_text())["settings"]["retry_max"], 4)
 
@@ -135,15 +138,14 @@ class MediaIntegrityTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         image_processing.optimize_image_bytes(self.png(dimension, dimension), "image/png")
 
-    def test_unsafe_remote_images_do_not_crash_either_message_converter(self):
+    def test_required_remote_image_refused_by_optimizer_rejects_both_messages(self):
         content = [{"type": "text", "text": "keep this text"},
                    {"type": "image_url", "image_url": {"url": "https://images.example/large.png"}}]
         with mock.patch.object(message_processing, "fetch_remote_image", return_value=(self.png(20000, 20000), "image/png")):
-            sdk = message_processing.create_gemini_prompt([OpenAIMessage(role="user", content=content)])
-            wire = message_processing.openai_content_to_wire_parts(content)
-        self.assertEqual(sdk[0].parts[0].text, "keep this text")
-        self.assertEqual(len(sdk[0].parts), 1)
-        self.assertEqual(wire, [{"text": "keep this text"}])
+            with self.assertRaisesRegex(message_processing.SchemaValidationError, "image_url"):
+                message_processing.create_gemini_prompt([OpenAIMessage(role="user", content=content)])
+            with self.assertRaisesRegex(message_processing.SchemaValidationError, "image_url"):
+                message_processing.openai_content_to_wire_parts(content)
 
     def test_small_images_keep_the_original_bytes(self):
         raw = self.png(1, 1)
@@ -189,7 +191,7 @@ class MediaIntegrityTests(unittest.TestCase):
         """三条转换管线（工具回合 / 普通消息 / Cookie wire）的遍历口径锁定。
 
         2026-11 收敛 _iter_content_segments 后的特征测试：文本空值兜底、
-        裸字符串分段、实例形态归一、image_url.url=None 静默跳过。
+        裸字符串分段、实例形态归一、显式 image_url 失败时拒绝。
         """
         raw = self.png(1, 1)
         encoded = base64.b64encode(raw).decode()
@@ -210,17 +212,18 @@ class MediaIntegrityTests(unittest.TestCase):
                 [OpenAIMessage(role="user", content=[ContentPartText(type="text", text="instance text")])])
             self.assertEqual(sdk[0].parts[0].text, "instance text")
 
-            # image_url 三种历史形态统一摄取；url=None 静默跳过不炸。
+            # image_url 历史形态统一摄取；显式空图不能悄悄丢失。
             for url, expect_image in ((f"data:image/png;base64,{encoded}", True),
                                       ({"url": f"data:image/png;base64,{encoded}"}, True),
                                       ({"url": None}, False), ("", False)):
                 with self.subTest(url=repr(url)[:24]):
-                    wire = message_processing.openai_content_to_wire_parts(
-                        [{"type": "image_url", "image_url": url}])
+                    content = [{"type": "image_url", "image_url": url}]
                     if expect_image:
+                        wire = message_processing.openai_content_to_wire_parts(content)
                         self.assertEqual(wire[0]["inlineData"]["mimeType"], "image/png")
                     else:
-                        self.assertEqual(wire, [])
+                        with self.assertRaisesRegex(message_processing.SchemaValidationError, "image_url"):
+                            message_processing.openai_content_to_wire_parts(content)
 
 
 class CookieCompatibilityTests(unittest.TestCase):

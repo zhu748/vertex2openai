@@ -9,76 +9,100 @@ import json
 import math
 import time
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterator, Optional
 
-import config as app_config
+from google.genai.types import Candidate, Content, GenerateContentResponse, Part, SafetyRating
 
 from message_processing import (
     GIANT_CONTENT_SLICE,
     GIANT_CONTENT_THRESHOLD,
-    _create_safety_ratings_html,
+    safety_ratings_presentation,
     iter_giant_content,
     logprobs_payload_from_candidate,
+    sdk_ordinary_part_fields,
     parse_gemini_response_for_reasoning_and_content,
 )
 from prefill import PrefillDeduper, strip_prefill_overlap
 from response_validation import (
     map_finish_reason_to_openai,
     complete_function_arguments,
+    sdk_function_call,
+    sdk_media_payload,
 )
-from runtime_state import app_state
-from models import file_data_markdown
-from signature_store import SignatureState
 from thought_signatures import (
     attach_signature_extra,
-    build_tool_call_id,
+    PendingCallSignatures,
+    publish_tool_call_signatures,
+    stage_tool_call_id,
     ordinary_part_metadata,
     signature_bytes,
     thought_signature_extra,
 )
 
 
-def _safety_score_enabled() -> bool:
-    try:
-        return bool(app_state.get_setting("safety_score", app_config.SAFETY_SCORE))
-    except Exception:
-        return bool(app_config.SAFETY_SCORE)
+def _nonblank(value: Any) -> bool:
+    return isinstance(value, str) and bool(value) and not value.isspace()
+
+
+# Executor admission inspects only bounded, already decoded SDK fields. In
+# particular, GenerateContentResponse.text builds an aggregate of its Parts.
+_PLAIN_RESPONSE_FIELDS = {"candidates", "usage_metadata", "sdk_http_response", "create_time",
+                          "model_version", "response_id"}
+_PLAIN_CANDIDATE_FIELDS = {"content", "finish_reason", "index", "token_count", "avg_logprobs",
+                           "safety_ratings"}
+_PLAIN_PART_FIELDS = {"text", "thought"}
+_PLAIN_RESPONSE_PARTS = 32
+_PLAIN_RESPONSE_CHARS = 32 * 1024
+
+
+def completed_response_needs_media_pool(response: Any) -> bool:
+    """Only proven small plain SDK replies may share the bounded text-prep pool."""
+    if (type(response) is not GenerateContentResponse
+            or not response.model_fields_set <= _PLAIN_RESPONSE_FIELDS
+            or not response.candidates or len(response.candidates) > 4):
+        return True
+    parts_left, chars_left = _PLAIN_RESPONSE_PARTS, _PLAIN_RESPONSE_CHARS
+    for candidate in response.candidates:
+        if (type(candidate) is not Candidate or not candidate.model_fields_set <= _PLAIN_CANDIDATE_FIELDS
+                or type(candidate.content) is not Content or not candidate.content.parts):
+            return True
+        # Optional normal safety scores can decorate bounded text. Richer
+        # candidate metadata (notably logprobs) has already failed the allowlist.
+        ratings = candidate.safety_ratings or ()
+        if len(ratings) > 8 or any(type(r) is not SafetyRating or len(r.category or "") > 80
+                                   or len(r.probability or "") > 80 for r in ratings):
+            return True
+        parts_left -= len(candidate.content.parts)
+        if parts_left < 0:
+            return True
+        for part in candidate.content.parts:
+            if (type(part) is not Part or not part.model_fields_set <= _PLAIN_PART_FIELDS
+                    or part.thought or not isinstance(part.text, str)):
+                return True
+            chars_left -= len(part.text)
+            if chars_left < 0:
+                return True
+    return False
 
 
 def is_gemini_response_valid(response: Any) -> bool:
     if response is None:
         return False
-    if (
-        hasattr(response, "text")
-        and isinstance(response.text, str)
-        and response.text.strip()
-    ):
-        return True
-    if hasattr(response, "candidates") and response.candidates:
-        for cand in response.candidates:
-            if (
-                hasattr(cand, "text")
-                and isinstance(cand.text, str)
-                and cand.text.strip()
-            ):
+    for cand in getattr(response, "candidates", None) or ():
+        # An explicitly filtered candidate can legitimately have no content.
+        if map_finish_reason_to_openai(getattr(cand, "finish_reason", None), default=None) == "content_filter":
+            return True
+        for part in getattr(getattr(cand, "content", None), "parts", None) or ():
+            if (_nonblank(getattr(part, "text", None))
+                    or sdk_function_call(part) is not None
+                    or sdk_media_payload(part) is not None):
                 return True
-            if (
-                hasattr(cand, "content")
-                and hasattr(cand.content, "parts")
-                and cand.content.parts
-            ):
-                for part in cand.content.parts:
-                    if getattr(part, "function_call", None) is not None:
-                        return True
-                    if getattr(part, "inline_data", None) is not None:
-                        return True
-                    if (
-                        hasattr(part, "text")
-                        and isinstance(getattr(part, "text", None), str)
-                        and getattr(part, "text", "").strip()
-                    ):
-                        return True
-    return False
+        if _nonblank(getattr(cand, "text", None)):
+            return True
+    # The SDK's response.text re-serializes every Part and concatenates the
+    # first candidate. It cannot reveal text absent from the scan above.
+    # Legacy wrappers (including subclasses) may provide independent text.
+    return type(response) is not GenerateContentResponse and _nonblank(getattr(response, "text", None))
 
 
 class ToolCallIndexer:
@@ -97,6 +121,7 @@ class ToolCallIndexer:
         self.keep_unsigned_parts = keep_unsigned_parts
         self._next: Dict[int, int] = {}
         self._seen_tool_calls: set[int] = set()
+        self.signature_origins: dict = {}
         self._ordinary_parts: Dict[int, list] = {}
         self._part_order: Dict[int, list] = {}
 
@@ -136,6 +161,7 @@ def _build_chunk_payload(
     response_id: str,
     candidate_index: int = 0,
     indexer: Optional[ToolCallIndexer] = None,
+    *, structured_output: bool = False, created: Optional[int] = None,
 ) -> dict:
     """构造单条 OpenAI chunk 的 payload dict（不序列化）。
 
@@ -146,6 +172,7 @@ def _build_chunk_payload(
     外部调用方与测试脚本行为不变）。
     """
     delta_payload = {}
+    pending_signatures: PendingCallSignatures = []
     openai_finish_reason = None
     output_index = candidate_index
 
@@ -175,30 +202,13 @@ def _build_chunk_payload(
             and candidate.content.parts
         ):
             for part in candidate.content.parts:
-                fc = getattr(part, "function_call", None)
+                fc = sdk_function_call(part)
                 sig = signature_bytes(part, fc)
                 if fc is None:
-                    text_value = getattr(part, "text", None)
-                    if (
-                        text_value is None
-                        and getattr(part, "inline_data", None) is not None
-                    ):
-                        text_value = ""
-                    elif (
-                        text_value is None
-                        and getattr(part, "file_data", None) is not None
-                    ):
-                        text_value = file_data_markdown(part.file_data.file_uri, getattr(part.file_data, "mime_type", None))
-                    text_value = "" if text_value is None else str(text_value)
-                    if getattr(part, "inline_data", None) is not None or getattr(part, "file_data", None) is not None:
-                        kind = "image"
-                        text_value = ""
-                    elif getattr(part, "thought", None) is True:
-                        kind = "thought"
-                    elif text_value == "" and sig:
-                        kind = "signature_only"
-                    else:
-                        kind = "text"
+                    fields = sdk_ordinary_part_fields(part, sig)
+                    if fields is None:
+                        continue
+                    kind, text_value = fields
                     metadata = ordinary_part_metadata(kind, text_value, sig, thought=getattr(part, "thought", None) is True)
                     # Restored private text has no upstream Part signature to
                     # replay. Repeating its entire accumulated text in metadata
@@ -225,15 +235,7 @@ def _build_chunk_payload(
                 )
                 tc = {
                     "index": tc_index,
-                    "id": build_tool_call_id(
-                        fc,
-                        part,
-                        missing_state=(
-                            SignatureState.UNSIGNED_FOLLOWER
-                            if tc_index > 0
-                            else SignatureState.UNKNOWN
-                        ),
-                    ),
+                    "id": stage_tool_call_id(pending_signatures, fc, sig, unsigned_follower=tc_index > 0),
                     "type": "function",
                     "function": {
                         "name": fc.name,
@@ -263,13 +265,9 @@ def _build_chunk_payload(
         )
 
         # Only append safety ratings to the final chunk.
-        if (
-            openai_finish_reason
-            and _safety_score_enabled()
-            and hasattr(candidate, "safety_ratings")
-            and candidate.safety_ratings
-        ):
-            normal_text += _create_safety_ratings_html(candidate.safety_ratings)
+        if openai_finish_reason:
+            normal_text += safety_ratings_presentation(
+                getattr(candidate, "safety_ratings", None), structured_output=structured_output)
 
         if reasoning_text:
             delta_payload["reasoning_content"] = reasoning_text
@@ -340,10 +338,13 @@ def _build_chunk_payload(
     chunk_data = {
         "id": response_id,
         "object": "chat.completion.chunk",
-        "created": int(time.time()),
+        "created": int(time.time()) if created is None else created,
         "model": model_name,
         "choices": [choice_item],
     }
+    # Only this complete, accepted chunk can supply replay fallback records.
+    if pending_signatures:
+        publish_tool_call_signatures(pending_signatures)
     return chunk_data
 
 
@@ -353,58 +354,67 @@ def convert_chunk_to_openai(
     response_id: str,
     candidate_index: int = 0,
     indexer: Optional[ToolCallIndexer] = None,
+    *, created: Optional[int] = None,
 ) -> str:
     """单条 Gemini chunk → OpenAI SSE 帧（对外保持字符串返回，兼容既有调用方）。"""
-    return f"data: {json.dumps(_build_chunk_payload(chunk, model_name, response_id, candidate_index, indexer), ensure_ascii=False)}\n\n"
+    return f"data: {json.dumps(_build_chunk_payload(chunk, model_name, response_id, candidate_index, indexer, created=created), ensure_ascii=False)}\n\n"
+
+
+def _large_delta_fields(choice: dict) -> tuple[str, ...]:
+    delta = choice.get("delta")
+    if not isinstance(delta, dict):
+        return ()
+    reasoning, content = delta.get("reasoning_content"), delta.get("content")
+    if isinstance(reasoning, str) and len(reasoning) > GIANT_CONTENT_THRESHOLD:
+        # Carry ordinary visible text after the exposed reasoning, as the
+        # fake-stream path does. All other delta metadata is still sent once.
+        return ("reasoning_content", "content") if isinstance(content, str) else ("reasoning_content",)
+    return ("content",) if isinstance(content, str) and len(content) > GIANT_CONTENT_THRESHOLD else ()
+
+
+def iter_giant_chunk_payload(chunk_payload: dict) -> Iterator[dict]:
+    """Split large true-stream content on demand; never stage unconsumed slices."""
+    choices = chunk_payload.get("choices") if isinstance(chunk_payload, dict) else None
+    if not isinstance(choices, (list, tuple)):
+        yield chunk_payload
+        return
+    needs_split = False
+    for choice in choices:
+        if not isinstance(choice, dict):
+            yield chunk_payload  # Unexpected envelope: never drop or partly replay it.
+            return
+        if _large_delta_fields(choice):
+            needs_split = True
+    if not needs_split:
+        yield chunk_payload  # Normal chunks (including usage-only) keep identity.
+        return
+
+    # The SDK pipeline normally passes one choice per payload. Do not drop
+    # sibling choices if the input is a combined OpenAI envelope.
+    for position, choice in enumerate(choices):
+        fields = _large_delta_fields(choice)
+        if not fields:
+            yield {**chunk_payload, "choices": [choice]}
+            continue
+        source = choice["delta"]
+        first_delta = {k: v for k, v in source.items() if k not in fields}
+        last_fields = {k: v for k, v in choice.items() if k not in ("index", "delta", "finish_reason")}
+        for field in fields:
+            text = source[field]
+            last_piece = (len(text) - 1) // GIANT_CONTENT_SLICE if len(text) > GIANT_CONTENT_THRESHOLD else 0
+            for i, piece in enumerate(iter_giant_content(text, threshold=GIANT_CONTENT_THRESHOLD, size=GIANT_CONTENT_SLICE)):
+                delta = {**first_delta, field: piece} if field == fields[0] and i == 0 else {field: piece}
+                last = field == fields[-1] and i == last_piece
+                sub_choice = {"index": choice.get("index", position), "delta": delta,
+                              "finish_reason": choice.get("finish_reason") if last else None}
+                if last:
+                    sub_choice.update(last_fields)
+                yield {**chunk_payload, "choices": [sub_choice]}
 
 
 def split_giant_chunk_payload(chunk_payload: dict) -> list[dict]:
-    """真流式巨帧防护：delta.content 超阈值的 chunk 拆成多个增量帧。
-
-    生图模型被强制假流式，正常不走这里；但文本模型叠加
-    responseModalities（或未来任何直出 inline_data 的路径）会把整张
-    4K base64 塞进单个 delta，json.dumps + f"data:..." + ASGI encode
-    瞬间三份全量拷贝足以 OOMKill 512MB 容器。拆分后：
-    - 各帧 delta.content 为 256KiB 切片，拼接与原 content 逐字节一致；
-    - 其余 delta 键（role/reasoning_content/tool_calls…）保留在首帧；
-    - finish_reason 只挂在尾帧（官方帧序语义：中间帧必须为 null）；
-    - 未超阈值的 payload 原样单元素返回（零行为变化）。
-    """
-    try:
-        choices = chunk_payload.get("choices") or []
-        if not choices:
-            return [chunk_payload]
-        choice = choices[0]
-        delta = choice.get("delta") or {}
-        content = delta.get("content")
-        if not isinstance(content, str) or len(content) <= GIANT_CONTENT_THRESHOLD:
-            return [chunk_payload]
-        # 切片惰性产出：不物化整张切片表（那又是一份全量拷贝），
-        # 总片数由长度直接算出，用于判定首尾帧。
-        total = max(1, -(-len(content) // GIANT_CONTENT_SLICE))
-        payloads = []
-        for i, piece in enumerate(iter_giant_content(content, size=GIANT_CONTENT_SLICE)):
-            first, last = i == 0, i == total - 1
-            sub_delta = ({k: v for k, v in delta.items() if k != "content"} if first else {})
-            sub_delta["content"] = piece
-            sub_choice = {
-                "index": choice.get("index", 0),
-                "delta": sub_delta,
-                # OpenAI 帧序：中间帧 finish_reason 必须为 null，尾帧承接原值。
-                "finish_reason": choice.get("finish_reason") if last else None,
-            }
-            for extra_key in (k for k in choice if k not in ("index", "delta", "finish_reason")):
-                if last:
-                    sub_choice[extra_key] = choice[extra_key]
-            sub_payload = {
-                k: (v if k != "choices" else [sub_choice])
-                for k, v in chunk_payload.items()
-            }
-            payloads.append(sub_payload)
-        return payloads
-    except Exception:
-        # 防护层绝不能改变正常帧语义：任何结构意外都回退原帧。
-        return [chunk_payload]
+    """Compatibility list API; the streaming pipeline uses the lazy iterator."""
+    return list(iter_giant_chunk_payload(chunk_payload))
 
 
 async def _chunk_openai_response_dict_for_sse(
@@ -412,11 +422,12 @@ async def _chunk_openai_response_dict_for_sse(
     response_id_override: Optional[str] = None,
     model_name_override: Optional[str] = None,
 ):
-    resp_id = response_id_override or openai_response_dict.get(
-        "id", f"chatcmpl-fakestream-{int(time.time())}-{uuid.uuid4().hex[:12]}"
-    )
+    created_time = openai_response_dict.get("created")
+    if created_time is None:
+        created_time = int(time.time())
+    resp_id = (response_id_override or openai_response_dict.get("id")
+               or f"chatcmpl-fakestream-{created_time}-{uuid.uuid4().hex[:12]}")
     model_name = model_name_override or openai_response_dict.get("model", "unknown")
-    created_time = openai_response_dict.get("created", int(time.time()))
 
     choices = openai_response_dict.get("choices", [])
     if not choices:
@@ -424,25 +435,32 @@ async def _chunk_openai_response_dict_for_sse(
         yield "data: [DONE]\n\n"
         return
 
-    for choice_idx, choice in enumerate(choices):
+    # SDK stream accumulators index their choice arrays by choice.index. Keep
+    # vendor IDs (zero is valid), but introduce choices in ascending order.
+    indexed = ((pos if choice.get("index") is None else choice["index"], choice)
+               for pos, choice in enumerate(choices))
+    for choice_idx, choice in sorted(indexed, key=lambda pair: pair[0]):
         message = choice.get("message", {})
         final_finish_reason = choice.get("finish_reason", "stop")
         # 假流式首帧同样补 role:"assistant"，与真流式/Cookie 通道及 OpenAI
         # 官方帧序对齐。默认参数绑定避免闭包延迟绑定（B023）。
         first_delta_pending = {"v": True}
 
-        def _sse(delta: dict, _first: bool=first_delta_pending, _choice_idx: int=choice_idx):
+        def _sse(delta: dict, *, finish_reason: Optional[str] = None,
+                 logprobs: Optional[dict] = None, _first: dict = first_delta_pending,
+                 _choice_idx: int = choice_idx) -> str:
             if _first["v"]:
                 delta = {"role": "assistant", **delta}
                 _first["v"] = False
+            item = {"index": _choice_idx, "delta": delta, "finish_reason": finish_reason}
+            if logprobs is not None:
+                item["logprobs"] = logprobs
             payload = {
                 "id": resp_id,
                 "object": "chat.completion.chunk",
                 "created": created_time,
                 "model": model_name,
-                "choices": [
-                    {"index": _choice_idx, "delta": delta, "finish_reason": None}
-                ],
+                "choices": [item],
             }
             return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
@@ -455,8 +473,10 @@ async def _chunk_openai_response_dict_for_sse(
         reasoning_content = message.get("reasoning_content", "")
         actual_content = message.get("content")
         if reasoning_content:
-            yield _sse({"reasoning_content": reasoning_content})
-            await asyncio.sleep(0.01)
+            pause = 0.0 if len(reasoning_content) > GIANT_CONTENT_THRESHOLD else 0.01
+            for piece in iter_giant_content(reasoning_content):
+                yield _sse({"reasoning_content": piece})
+                await asyncio.sleep(pause)
 
         if actual_content is not None:
             content_to_chunk = actual_content
@@ -526,7 +546,6 @@ async def _chunk_openai_response_dict_for_sse(
                     "tool_calls": [
                         {
                             "index": tc_item_idx,
-                            "id": tool_call_item["id"],
                             "function": {
                                 "arguments": tool_call_item["function"]["arguments"]
                             },
@@ -536,7 +555,8 @@ async def _chunk_openai_response_dict_for_sse(
             )
             await asyncio.sleep(0.01)
 
-        yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model_name, 'choices': [{'index': choice_idx, 'delta': {}, 'finish_reason': final_finish_reason}]})}\n\n"
+        # The aggregate belongs to this choice, not every synthetic text slice.
+        yield _sse({}, finish_reason=final_finish_reason, logprobs=choice.get("logprobs"))
 
     yield "data: [DONE]\n\n"
 
@@ -588,7 +608,7 @@ def _dedup_chunk_payload(
         # 没有可放出的正文：若 chunk 还有其他信息（角色/思考/finish 等）则去掉 content 保留其余
         if content is not None:
             delta.pop("content", None)
-        if delta or has_finish:
+        if delta or has_finish or "logprobs" in choice:
             choice["delta"] = delta
             return payload
         return None  # 纯 content 且被暂存 → 整条跳过
@@ -599,3 +619,45 @@ def _dedup_chunk_payload(
         print(f"⚠️ [预填充去重] 处理异常（{e}），后续内容原样透传。")
         deduper.done = True
         return payload
+
+
+class ChoicePrefills:
+    """One independent prefill per actual upstream choice, scoped to this attempt."""
+
+    def __init__(self, text: str, response_id: str, model: str, created: int) -> None:
+        self.text = text
+        self.envelope = {"id": response_id, "object": "chat.completion.chunk", "model": model, "created": created}
+        self._dedupers: dict[int, PrefillDeduper] = {}
+        self._sent: set[int] = set()
+
+    def apply(self, payload: dict) -> Optional[dict]:
+        choice = payload["choices"][0]
+        index = choice["index"]
+        if index not in self._dedupers:
+            if not choice["delta"].get("content"):
+                return payload
+            self._dedupers[index] = PrefillDeduper(self.text)
+        return _dedup_chunk_payload(payload, self._dedupers[index])
+
+    def received_text(self, index: Optional[int] = None) -> bool:
+        # A genuine upstream echo can be completely consumed by deduplication.
+        # Never treat the configured prefix itself as evidence of a reply.
+        return bool(self._dedupers) if index is None else index in self._dedupers
+
+    def _frame(self, index: int, delta: dict) -> str:
+        choice = {"index": index, "delta": delta, "finish_reason": None}
+        payload = dict(self.envelope, choices=[choice])
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    def first(self, index: int) -> Optional[str]:
+        if index in self._sent:
+            return None
+        self._sent.add(index)
+        return self._frame(index, {"role": "assistant", "content": self.text})
+
+    def flush(self) -> Iterator[tuple[str, int]]:
+        for index, deduper in self._dedupers.items():
+            if tail := deduper.flush():
+                if prefix := self.first(index):
+                    yield prefix, 0
+                yield self._frame(index, {"content": tail}), len(tail)

@@ -2,6 +2,44 @@
 (() => {
   const snapshots = new Map(),
     accountOpen = new Map();
+  const settingsGroups = ['runtime', 'proxy', 'fingerprint', 'express-fingerprint'];
+  // Keep the pre-edit expectation for a genuine conflict, even after another reload.
+  const conflicts = new Map();
+  const settingKey = (id) => (id === 'proxy-input' ? 'proxy_urls' : id.replaceAll('-', '_'));
+  function sameSetting(id, left, right) {
+    if (id === 'proxy-input')
+      return JSON.stringify(proxyDraft(left)) === JSON.stringify(proxyDraft(right));
+    if (id === 'keepalive_url' || id === 'express-ua-custom') return left.trim() === right.trim();
+    if ($(id)?.type === 'number' && left !== '' && right !== '')
+      return Number(left) === Number(right);
+    return left === right;
+  }
+  function serverValue(id) {
+    const name = $(id).closest('[data-draft-group]').dataset.draftGroup;
+    return snapshots.get(name)?.find((field) => field.id === id)?.value ?? value($(id));
+  }
+  function settingOrigin(id, base = serverValue(id)) {
+    const key = settingKey(id);
+    return (
+      conflicts.get(key) || { base, expected: settingsExpectation(GLOBAL_SETTINGS, [key])[key] }
+    );
+  }
+  function restoreSetting(id, local, origin) {
+    const server = serverValue(id),
+      key = settingKey(id);
+    conflicts.delete(key);
+    if (sameSetting(id, local, server) || sameSetting(id, local, origin.base)) {
+      setV(id, server); // converged, or the user undid the original edit
+    } else {
+      if (!sameSetting(id, server, origin.base)) conflicts.set(key, origin);
+      setV(id, local);
+    }
+  }
+  function guardSettings(expected) {
+    return Object.fromEntries(
+      Object.entries(expected).map(([key, latest]) => [key, conflicts.get(key)?.expected || latest])
+    );
+  }
   const groups = () => [...document.querySelectorAll('[data-draft-group]')];
   const group = (name) => document.querySelector(`[data-draft-group="${name}"]`);
   const controls = (el) =>
@@ -78,9 +116,20 @@
           (n, item, i) => n + (JSON.stringify(item) !== JSON.stringify(baseline[i])),
           0
         ) + Math.max(0, baseline.length - current.length);
-      bar.querySelector('[role=status]').textContent = dirty
-        ? `${count} 项修改未保存`
-        : '修改已保存';
+      let conflictCount = 0;
+      if (settingsGroups.includes(name)) {
+        current.forEach((field, i) => {
+          const key = settingKey(field.id);
+          if (!conflicts.has(key)) return;
+          if (sameSetting(field.id, field.value, baseline[i].value)) conflicts.delete(key);
+          else conflictCount++;
+        });
+      }
+      bar.querySelector('[role=status]').textContent = conflictCount
+        ? `${count} 项修改未保存，其中 ${conflictCount} 项也被另一页面修改。可撤销本区修改，再按新配置编辑。`
+        : dirty
+          ? `${count} 项修改未保存`
+          : '修改已保存';
       bar.classList.toggle('is-dirty', !!dirty);
       bar.querySelector('[data-discard]').disabled = !dirty;
     }
@@ -100,19 +149,27 @@
     return Object.fromEntries(
       groups()
         .filter((el) => changed(el.dataset.draftGroup))
-        .map((el) => [el.dataset.draftGroup, read(el)])
+        .map((el) => {
+          const name = el.dataset.draftGroup,
+            current = read(el);
+          if (!settingsGroups.includes(name)) return [name, current];
+          const baseline = snapshots.get(name);
+          const edits = current.flatMap((field, i) =>
+            sameSetting(field.id, field.value, baseline[i].value)
+              ? []
+              : [{ ...field, origin: settingOrigin(field.id, baseline[i].value) }]
+          );
+          return [name, edits];
+        })
     );
   }
   function loaded(drafts = {}) {
-    for (const name of ['runtime', 'proxy', 'fingerprint', 'express-fingerprint']) {
-      saved(name);
-      for (const field of drafts?.[name] || []) {
-        const el = $(field.id);
-        if (el) {
-          if (el.type === 'checkbox') el.checked = field.value;
-          else el.value = field.value;
-        }
-      }
+    conflicts.clear();
+    for (const name of settingsGroups) {
+      const el = group(name);
+      if (!el) continue;
+      snapshots.set(name, read(el)); // the latest server values remain the discard target
+      for (const field of drafts?.[name] || []) restoreSetting(field.id, field.value, field.origin);
     }
     updateExpressCustomVis();
     updateProxyDraft();
@@ -180,7 +237,7 @@
       if (
         container.classList.contains('model-scope-section') &&
         $('model-sel').value !== '__global__' &&
-        !modelEdits.has(input.id)
+        (!modelFieldEdit(input.id) || modelFieldEdit(input.id).kind === 'inherit')
       )
         continue;
       if (!input.checkValidity()) {
@@ -338,6 +395,9 @@
   window.consoleForms = {
     saved,
     rebaseKeys,
+    guardSettings,
+    settingOrigin,
+    restoreSetting,
     capture,
     loaded,
     refresh,

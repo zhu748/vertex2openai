@@ -14,6 +14,7 @@ socks_test.go 内验证，不在此文件重复。
 """
 
 import sys
+import tracemalloc
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -30,7 +31,7 @@ from request_errors import (
 )
 from signature_store import SignatureRecord, SignatureState, SignatureStore
 from thought_signatures import merge_by_order
-from usage import estimate_token_count
+from usage import CJK_CHAR_RE, estimate_token_count
 
 
 class MergeByOrderContracts(unittest.TestCase):
@@ -116,6 +117,24 @@ class EstimateTextTokensContracts(unittest.TestCase):
         self.assertEqual(estimate_text_tokens("ABCDE"), estimate_token_count("ABCDE"))
         # 下限 1 语义保留在本层
         self.assertEqual(estimate_text_tokens("A"), 1)
+
+    def test_windowed_counts_preserve_ranges_and_global_rounding(self):
+        edges = "\u2e7f\u2e80\u9fff\ua000\uabff\uac00\ud7af\ud7b0\uf8ff\uf900\ufaff\ufb00\uff00\uffef\ufff0"
+        for pad in (0, 1, 4094, 4095, 4096, 4097, 8191):
+            text = "x" * pad + edges + "🌱汉A한ｶ" * 1001
+            cjk = len(CJK_CHAR_RE.findall(text))
+            self.assertEqual(estimate_token_count(text), cjk + (len(text) - cjk + 3) // 4)
+        self.assertEqual(estimate_token_count("x" * 20001), 5001)
+
+    def test_dense_cjk_fallback_does_not_allocate_a_match_per_character_at_once(self):
+        text = "中文" * 100_000
+        tracemalloc.start()
+        try:
+            self.assertEqual(estimate_text_tokens(text), len(text))
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 1024 * 1024)
 
 
 class EnvLayerContracts(unittest.TestCase):

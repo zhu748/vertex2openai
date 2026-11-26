@@ -231,6 +231,32 @@ class ManagementTests(StateFixture, unittest.TestCase):
                              ("POST", "/api/proxy/parse")):
             self.assertEqual(self.client.request(method, path, json={}).status_code, 401)
 
+    def test_replacement_key_without_stale_project_is_the_only_automatic_probe_target(self):
+        from routes import credentials_api
+
+        self.login()
+        sibling = {"key": "other-fixture", "project_id": "other-project", "project_source": "auto", "detected_at": 23}
+        app_state.set_express_keys([{"key": "old-fixture", "project_id": "previous-project",
+                                     "project_source": "auto", "detected_at": 12}, sibling])
+        fresh = {"key": "replacement-fixture", "project_id": "", "project_source": "", "detected_at": 0}
+        # The collector sends this shape only for a replaced, auto-detected row.
+        # No real probe starts; capture its ordinary eligibility and pinning decisions.
+        with (mock.patch.object(credentials_api.express_key_probe, "probe_all", new=mock.Mock()) as probe,
+              mock.patch.object(credentials_api, "start_background_task") as start):
+            response = self.client.post("/api/express-keys", json={"keys": [fresh, sibling]})
+            self.assertEqual(response.status_code, 200, response.text)
+            probe.assert_called_once_with(keys=["replacement-fixture"])
+            start.assert_called_once_with(probe.return_value)
+            row = response.json()["keys"][0]
+            self.assertEqual(resolve_express_model_path("gemini-test", {"express_location": "global"}, row["project_id"]),
+                             "gemini-test")
+            probe.reset_mock()
+            fresh.update(project_id="explicit-project", project_source="manual")
+            response = self.client.post("/api/express-keys", json={"keys": [fresh, sibling]})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["keys"][0]["project_id"], "explicit-project")
+            probe.assert_not_called()
+
     def test_cookie_edit_preserves_secret_and_settings_without_echoing_it(self):
         self.login()
         body = {"accounts": [{"cookie": "SAPISID=private-one; SID=private-sid", "project_id": "p1",

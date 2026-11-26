@@ -7,6 +7,7 @@
 
 全部离线：纯函数直调 + MockTransport 透传 + 路由直调（capsys 断言日志）。
 """
+from settings_fixture import saved_settings
 import asyncio
 import io
 import json
@@ -212,8 +213,7 @@ class SearchVariantPassthroughTests(unittest.TestCase):
                               types.SimpleNamespace(get=lambda factory, proxy_uri=None: self.upstream)),
             mock.patch.object(gemini_native.app_state, "get_settings",
                               side_effect=lambda: self.settings.copy()),
-            mock.patch.object(gemini_native.app_state, "get_setting",
-                              side_effect=lambda key, default=None: self.settings.get(key, default)),
+            saved_settings(gemini_native.app_state, self.settings),
         ]
         for patch in patches:
             patch.start()
@@ -287,6 +287,46 @@ class ImageSizeVariantPassthroughTests(SearchVariantPassthroughTests):
         body = json.loads(sent.content)
         self.assertEqual(body["generationConfig"]["imageConfig"]["imageSize"], "4K")
         self.assertIn("contents", body)  # 原字段保留
+
+    def test_every_spelling_of_explicit_image_size_keeps_original_bytes(self):
+        for g in ("generation_config", "generationConfig"):
+            for i in ("image_config", "imageConfig"):
+                for size in ("image_size", "imageSize"):
+                    raw = json.dumps({g: {i: {size: "1K"}}, "contents": []}, indent=3).encode()
+                    with self.subTest(g=g, i=i, size=size):
+                        result = self.client.post(
+                            "/v1beta/models/gemini-3.1-flash-image-4k:generateContent",
+                            headers={"x-goog-api-key": "client-key", "content-type": "application/json"},
+                            content=raw)
+                        self.assertEqual(result.status_code, 200)
+                        self.assertEqual(self.requests[-1].content, raw)
+
+    def test_alias_inserts_only_the_missing_size_in_existing_spelling(self):
+        req = {"generation_config": {"image_config": {"aspect_ratio": "1:1"}, "max_output_tokens": 20}}
+        result = self.client.post("/v1beta/models/gemini-3.1-flash-image-4k:generateContent",
+                                  headers={"x-goog-api-key": "client-key"}, json=req)
+        self.assertEqual(result.status_code, 200)
+        req["generation_config"]["image_config"]["image_size"] = "4K"
+        self.assertEqual(json.loads(self.requests[-1].content), req)
+
+    def test_ambiguous_image_alias_is_a_native_error_before_dispatch(self):
+        for cfg in ({"generation_config": {}, "generationConfig": {}},
+                    {"generation_config": {"image_config": {}, "imageConfig": {}}},
+                    {"generation_config": {"image_config": {"image_size": "", "imageSize": "1K"}}}):
+            with self.subTest(cfg=cfg):
+                result = self.client.post("/v1beta/models/gemini-3.1-flash-image-4k:generateContent",
+                                          headers={"x-goog-api-key": "client-key"}, json=cfg)
+                self.assertEqual(result.status_code, 400)
+                self.assertEqual(result.json()["error"]["status"], "INVALID_ARGUMENT")
+        self.assertEqual(self.requests, [])
+
+    def test_plain_express_still_forwards_snake_cached_context_verbatim(self):
+        raw = b'{ "cached_content":"cachedContents/abc", "system_instruction": {"parts":[{"text":"ok"}]} }'
+        result = self.client.post("/v1beta/models/gemini-test:generateContent",
+                                  headers={"x-goog-api-key": "client-key", "content-type": "application/json"},
+                                  content=raw)
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(self.requests[-1].content, raw)
 
     def test_explicit_image_size_wins_over_suffix(self):
         response = self.client.post(

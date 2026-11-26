@@ -28,7 +28,7 @@ class NativeImageAdmissionTests(unittest.IsolatedAsyncioTestCase):
         self.global_before = admission.generation_limiter.active
         self.image_before = admission.image_limiter.active
         self.settings = mock.patch.object(
-            admission.app_state, "get_setting",
+            admission.app_state, "get_committed_setting",
             side_effect=lambda key, default=None: 1 if key == "image_max_concurrency" else default,
         )
         self.settings.start()

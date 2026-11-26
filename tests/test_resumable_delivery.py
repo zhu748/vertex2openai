@@ -9,6 +9,7 @@ from unittest import mock
 
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from admission import ManagedStreamingResponse
 from models import OpenAIRequest
 from request_connection import ClientConnection
 import resumable
@@ -78,6 +79,117 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.headers["x-resumable-replay"], "1")
                 self.assertIs(await self.store.get(self.stream_id), buf)
 
+    async def test_expired_route_keeps_response_close_owned_after_its_pump_exits(self):
+        reading, closing, release, closed = (asyncio.Event() for _ in range(4))
+
+        async def old_source():
+            reading.set()
+            await asyncio.Event().wait()
+            yield resumable.DONE_FRAME
+
+        async def close_old():
+            closing.set()
+            await release.wait()
+            closed.set()
+
+        async def new_source():
+            yield resumable.DONE_FRAME
+
+        responses = [ManagedStreamingResponse(old_source(), cleanup=close_old),
+                     StreamingResponse(new_source())]
+        connection = ClientConnection()
+        initial = request()
+        initial.scope = {"state": {"client_connection": connection}}
+        with mock.patch.object(chat_api, "_call_upstream", side_effect=responses) as upstream, \
+                mock.patch.object(chat_api, "resumable_enabled", return_value=True), \
+                mock.patch.object(chat_api, "image_bypass_enabled", return_value=False):
+            try:
+                first = await chat_api.chat_completions(initial, self.obj, self.key)
+                await asyncio.wait_for(reading.wait(), 1)
+                receipt = first.headers["x-resume-id"]
+                old = await self.store.get_exact(receipt)
+                connection.finish(True)
+                old.last_disconnect_monotonic -= old.last_disconnect_grace_seconds + 1
+                stale = await chat_api.chat_completions(request({"x-resume-id": receipt}), self.obj, self.key)
+                self.assertEqual(stale.status_code, 410)
+                await asyncio.wait_for(closing.wait(), 1)
+                with mock.patch.object(resumable, "SETUP_CLOSE_TIMEOUT_SECONDS", 0.02):
+                    busy = await chat_api.chat_completions(request(), self.obj, self.key)
+                self.assertEqual(busy.status_code, 503)
+                self.assertEqual(upstream.await_count, 1)
+            finally:
+                release.set()
+            await asyncio.wait_for(closed.wait(), 1)
+            first, follower = await asyncio.gather(*(
+                chat_api.chat_completions(request(), self.obj, self.key) for _ in range(2)))
+            self.assertEqual([first.status_code, follower.status_code], [200, 200])
+            self.assertEqual(first.headers["x-resume-id"], follower.headers["x-resume-id"])
+            self.assertNotEqual(first.headers["x-resume-id"], receipt)
+            self.assertEqual(upstream.await_count, 2)
+
+    async def test_naturally_finished_route_keeps_owned_close_under_eviction_pressure(self):
+        for reclaim in ("capacity", "ttl"):
+            with self.subTest(reclaim=reclaim):
+                await self.store.aclose()
+                reading, finish, closing, release, closed = (asyncio.Event() for _ in range(5))
+
+                async def old_source():
+                    reading.set()
+                    await finish.wait()
+                    yield resumable.DONE_FRAME
+
+                async def close_old():
+                    closing.set()
+                    await release.wait()
+                    closed.set()
+
+                async def new_source():
+                    yield resumable.DONE_FRAME
+
+                responses = [ManagedStreamingResponse(old_source(), cleanup=close_old),
+                             StreamingResponse(new_source())]
+                connection = ClientConnection()
+                initial = request()
+                initial.scope = {"state": {"client_connection": connection}}
+                with mock.patch.object(chat_api, "_call_upstream", side_effect=responses) as upstream, \
+                        mock.patch.object(chat_api, "resumable_enabled", return_value=True), \
+                        mock.patch.object(chat_api, "image_bypass_enabled", return_value=False), \
+                        mock.patch.object(resumable, "max_streams", return_value=1), \
+                        mock.patch.object(resumable, "disconnect_grace_seconds", return_value=10), \
+                        mock.patch.object(resumable, "SETUP_CLOSE_TIMEOUT_SECONDS", 0.02):
+                    try:
+                        first = await chat_api.chat_completions(initial, self.obj, self.key)
+                        await asyncio.wait_for(reading.wait(), 1)
+                        old = await self.store.get_exact(first.headers["x-resume-id"])
+                        connection.finish(True)
+                        old.last_disconnect_monotonic -= 11
+                        finish.set()  # End naturally before the grace task can retire it.
+                        await asyncio.wait_for(closing.wait(), 1)
+                        self.assertEqual(old.status, "done")
+                        self.assertTrue(old.resume_expired())
+
+                        if reclaim == "capacity":
+                            unrelated = OpenAIRequest(model="another-test", messages=[], stream=True)
+                            pressure = await chat_api.chat_completions(request(), unrelated, self.key)
+                            self.assertEqual(pressure.status_code, 503)
+                        else:
+                            old.finished_monotonic -= 3600
+                            self.assertEqual(await self.store.sweep(), 0)
+
+                        busy = await chat_api.chat_completions(request(), self.obj, self.key)
+                        self.assertEqual(busy.status_code, 503)
+                        self.assertEqual(upstream.await_count, 1)
+                    finally:
+                        release.set()
+                    await asyncio.wait_for(closed.wait(), 1)
+                    if reclaim == "ttl":
+                        self.assertEqual(await self.store.sweep(), 1)
+                    fresh = await chat_api.chat_completions(request(), self.obj, self.key)
+                    self.assertEqual(fresh.status_code, 200)
+                    self.assertNotEqual(fresh.headers["x-resume-id"], old.id)
+                    self.assertEqual(upstream.await_count, 2)
+                    self.assertIsNone(await self.store.get_exact(old.id))
+
     async def test_missing_resume_buffer_does_not_generate_and_skip_prefix(self):
         with mock.patch.object(chat_api, "_call_upstream", side_effect=AssertionError("unexpected generation")) as upstream:
             response = await chat_api._resumable_stream(
@@ -115,6 +227,19 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(OSError):
             await send_response(response, fail=True)
         self.assertFalse(buf.fully_delivered)
+
+    async def test_large_json_poll_only_acknowledges_after_successful_send(self):
+        buf, _ = await self.store.create_if_absent("large-poll", kind="json")
+        payload = {"image": "A" * (2 * 1024 * 1024), "caption": "🌱"}
+        await buf.finish(payload=payload)
+        response = await chat_api.resumable_poll(buf.id, request(), self.key, 0, 200, 0)
+        self.assertEqual(json.loads(response.body)["payload"], payload)
+        self.assertEqual(response.headers["x-resume-id"], buf.id)
+        with self.assertRaises(OSError):
+            await send_response(response, fail=True)
+        self.assertFalse(buf.fully_delivered)
+        await send_response(response)
+        self.assertTrue(buf.fully_delivered)
 
     async def test_json_response_is_acknowledged_after_asgi_send(self):
         self.obj.stream = False
@@ -192,21 +317,24 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
             buf = await self.store.get(self.stream_id)
             follower = await chat_api._resumable_stream(request(), self.obj, self.key)
             release.set()
-            with self.assertRaisesRegex(Exception, "quota exhausted"):
-                await asyncio.wait_for(first, 1)
+            first_http = await asyncio.wait_for(first, 1)
+            self.assertEqual(first_http.status_code, 429)
+            self.assertIn("quota exhausted", first_http.body.decode())
             frames = "".join([frame async for frame in follower.body_iterator])
         self.assertEqual(upstream.await_count, 1)
         self.assertIn('"code": 429', frames)
         self.assertIn("data: [DONE]", frames)
         self.assertEqual(buf.status_code, 429)
-        self.assertIsNone(await self.store.get(self.stream_id))
+        self.assertIs(await self.store.get(self.stream_id), buf)
 
     async def test_setup_http_error_is_returned_unchanged(self):
         original = JSONResponse({"error": {"code": 403, "message": "permission denied"}}, status_code=403)
         with mock.patch.object(chat_api, "_call_upstream", return_value=original):
             response = await chat_api._resumable_stream(request(), self.obj, self.key)
-        self.assertIs(response, original)
-        self.assertIsNone(await self.store.get(self.stream_id))
+        self.assertEqual((response.status_code, response.body), (original.status_code, original.body))
+        buf = await self.store.get(self.stream_id)
+        self.assertEqual(response.headers["x-resume-id"], buf.id)
+        self.assertFalse(buf.fully_delivered)
 
     async def test_shutdown_stops_setup_task_and_wakes_followers(self):
         started, closed = asyncio.Event(), asyncio.Event()
@@ -248,32 +376,57 @@ class BufferLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.store = resumable.ResumableStore()
         self.addAsyncCleanup(self.store.aclose)
 
-    async def test_delivered_buffers_without_idempotency_key_use_short_window(self):
-        """PRF-P2-6：完整交付 + 无幂等键的缓冲用短窗口（默认 120s），
-        显式幂等键（cid-）与未完整交付的缓冲仍按完整 TTL 保留。"""
-        with mock.patch.object(resumable, "ttl_seconds", return_value=1800.0), \
-                mock.patch.object(resumable, "delivered_ttl_seconds", return_value=120.0):
-            fingerprint_buf, _ = await self.store.create_if_absent("req-fingerprint", kind="stream")
-            await fingerprint_buf.finish("done")
-            fingerprint_buf.mark_delivered()
+    async def test_sweep_retains_delivered_explicit_requests_not_transport_ids(self):
+        async def resolve(headers, fingerprint):
+            buf, new, _, _ = await resumable.resolve_buffer(
+                self.store, request(headers), "key", fingerprint, model="m", kind="stream")
+            return buf, new
 
-            idempotent_buf, _ = await self.store.create_if_absent("cid-idempotent", kind="stream")
-            await idempotent_buf.finish("done")
-            idempotent_buf.mark_delivered()
+        with mock.patch.object(resumable, "ttl_seconds", return_value=1800), \
+                mock.patch.object(resumable, "delivered_ttl_seconds", return_value=120):
+            cases = [
+                ({"idempotency-key": "chosen"}, True, True),
+                ({"x-idempotency-key": "alias"}, True, True),
+                ({"x-request-id": "transport-only"}, True, False),
+                ({}, True, False),
+                ({}, False, True),
+            ]
+            first = []
+            for i, (headers, delivered, _) in enumerate(cases):
+                buf, new = await resolve(headers, str(i))
+                self.assertTrue(new)
+                self.assertTrue(buf.id.startswith("rid-"))
+                await buf.finish()
+                if delivered:
+                    buf.mark_delivered()
+                buf.finished_monotonic = time.monotonic() - 150
+                first.append(buf)
 
-            undelivered_buf, _ = await self.store.create_if_absent("req-undelivered", kind="stream")
-            await undelivered_buf.finish("done")
-            # 未完整交付（客户端没读完）：续传价值本体，按完整 TTL 保留。
+            self.assertEqual(await self.store.sweep(), 2)
+            for i, (headers, _, retained) in enumerate(cases):
+                with self.subTest(headers=headers, case=i):
+                    self.assertEqual(await self.store.get_exact(first[i].id) is first[i], retained)
+                    replay, new = await resolve(headers, str(i))
+                    self.assertEqual(new, not retained)
+                    self.assertEqual(replay is first[i], retained)
 
-            # 推进 5 分钟（> 短窗口 120s、< 完整 TTL 1800s）后清扫。
-            for buf in (fingerprint_buf, idempotent_buf, undelivered_buf):
-                buf.finished_at = time.time() - 300
-                buf.last_access = time.time() - 300
-            removed = await self.store.sweep()
-            self.assertEqual(removed, 1)
-            self.assertIsNone(await self.store.get_exact(fingerprint_buf.id))   # 短窗口已过：回收
-            self.assertIsNotNone(await self.store.get_exact(idempotent_buf.id))  # 幂等键：完整 TTL
-            self.assertIsNotNone(await self.store.get_exact(undelivered_buf.id))  # 未交付：完整 TTL
+            for buf in first:
+                buf.finished_monotonic = time.monotonic() - 1801
+            self.assertEqual(await self.store.sweep(), 3)
+            for i in (0, 1):
+                _, new = await resolve(cases[i][0], str(i))
+                self.assertTrue(new)
+
+    async def test_blank_idempotency_header_does_not_turn_fingerprint_into_idempotency_key(self):
+        async def resolve():
+            return await resumable.resolve_buffer(self.store, request({"idempotency-key": "   "}),
+                                                  "key", "body", model="m", kind="json")
+        original, _, _, _ = await resolve()
+        await original.finish(payload={"answer": "original"})
+        original.mark_delivered()
+        replacement, new, _, _ = await resolve()
+        self.assertTrue(new)
+        self.assertNotEqual(original.id, replacement.id)
 
     async def test_evicted_json_cannot_be_overwritten_by_late_success(self):
         buf, _ = await self.store.create_if_absent("late-json", kind="json")
@@ -484,30 +637,30 @@ class GraceExpiryTests(unittest.IsolatedAsyncioTestCase):
         req = SimpleNamespace(headers={}, query_params={},
                               scope={"state": {"client_connection": connection}})
         obj = OpenAIRequest(model="gemini-test", messages=[], stream=False)
-        cancelled = asyncio.Event()
+        entered, cancelled = asyncio.Event(), asyncio.Event()
 
         async def upstream(*args):
             try:
+                entered.set()
                 await asyncio.Event().wait()   # 模拟挂起的整取上游调用
             except asyncio.CancelledError:
                 cancelled.set()
                 raise
 
-        async def disconnect_soon():
-            await asyncio.sleep(0.02)
-            connection.finish(True)
-
         with mock.patch.object(chat_api, "_call_upstream", side_effect=upstream) as call, \
              mock.patch.object(resumable, "disconnect_grace_seconds", return_value=0.05):
-            disconnector = asyncio.create_task(disconnect_soon())
-            response = await asyncio.wait_for(
-                chat_api._resumable_json(req, obj, "test-key"), 2)
-            await disconnector
+            reader = asyncio.create_task(chat_api._resumable_json(req, obj, "test-key"))
+            await asyncio.wait_for(entered.wait(), 1)
+            connection.finish(True)
+            response = await asyncio.wait_for(reader, 1)
         await asyncio.wait_for(cancelled.wait(), 1)
-        self.assertEqual(call.await_count, 1)   # 单次调用即取消，无重试风暴
-        body = json.loads(response.body)
-        self.assertEqual(response.status_code, 410)
-        self.assertIn("续传窗口", body["error"]["message"])
+        self.assertEqual(call.await_count, 1)
+        # 499 ends only the disconnected reader; 410 belongs to the buffer
+        # after the independent reconnect window expires.
+        self.assertEqual(response.status_code, 499)
+        buf = await self.store.get_exact(response.headers["x-resume-id"])
+        self.assertEqual(buf.status_code, 410)
+        self.assertIn("续传窗口", buf.payload["error"]["message"])
 
 
 if __name__ == "__main__":

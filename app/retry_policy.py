@@ -13,6 +13,7 @@ from curl_cffi.requests.exceptions import ConnectionError as CurlConnectionError
 
 import config as app_config
 from response_validation import AntiTruncationError, IncompleteResponseError
+from generation_policy import generation_setting, retry_settings_snapshot
 from runtime_state import app_state
 from upstream_errors import error_status
 from request_tracking import retry_wait
@@ -74,10 +75,10 @@ AUTH_OR_BILLING_MARKERS = (
 )
 
 
-def _retry_setting(key: str, number_type: type[Number], maximum: Number) -> Number:
+def _retry_setting(settings: dict, key: str, number_type: type[Number], maximum: Number) -> Number:
     default = app_config.DEFAULT_SETTINGS[key]
     try:
-        value = number_type(app_state.get_setting(key, default))
+        value = number_type(settings.get(key, default))
     except (TypeError, ValueError, OverflowError):
         value = number_type(default)
     if isinstance(value, float) and not math.isfinite(value):
@@ -90,10 +91,11 @@ def get_retry_settings() -> tuple[int, float, float]:
 
     retry_max 表示失败后的重试次数，总尝试次数为 retry_max + 1。
     """
+    settings = retry_settings_snapshot(app_state)
     return (
-        _retry_setting("retry_max", int, 50),
-        _retry_setting("retry_backoff_seconds", float, 120.0),
-        _retry_setting("retry_jitter_seconds", float, 60.0),
+        _retry_setting(settings, "retry_max", int, 50),
+        _retry_setting(settings, "retry_backoff_seconds", float, 120.0),
+        _retry_setting(settings, "retry_jitter_seconds", float, 60.0),
     )
 
 
@@ -162,6 +164,71 @@ def is_auth_or_billing_error(error: object) -> bool:
     return any(marker in low for marker in AUTH_OR_BILLING_MARKERS)
 
 
+def retry_after_seconds(value: Optional[str]) -> Optional[float]:
+    """A valid Retry-After is a minimum, including HTTP dates (past = zero)."""
+    if not isinstance(value, str) or not value or not value.isascii() or not value.isprintable():
+        return None
+    try:
+        delay = float(value)
+    except (ValueError, OverflowError):
+        try:
+            return max(0.0, parsedate_to_datetime(value).timestamp() - time.time())
+        except (TypeError, ValueError, OverflowError, OSError):
+            return None
+    # An outsize nonnegative integer is a real advisory, never an invitation
+    # to retry after the default few seconds. Non-numeric literals are invalid.
+    if delay == math.inf and value.strip().isdigit():
+        return delay
+    return delay if math.isfinite(delay) and delay >= 0 else None
+
+
+def bounded_sse_advisory(value: object) -> Optional[str]:
+    """Only complete, valid ASCII hints go on the SSE wire; never truncate a delay."""
+    if isinstance(value, str) and len(value) <= 128 and retry_after_seconds(value) is not None:
+        return value
+    return None
+
+
+def response_retry_after(response) -> Optional[str]:
+    """Return only an advisory safe to propagate to another protocol or caller."""
+    value = getattr(response, "headers", {}).get("retry-after")
+    return value if retry_after_seconds(value) is not None else None
+
+
+def response_requests_delay(response) -> bool:
+    """An immediate fallback is a retry too, even if its channel or wire shape changes."""
+    return bool(retry_after_seconds(getattr(response, "headers", {}).get("retry-after")))
+
+
+def exception_retry_after(error: Exception) -> Optional[str]:
+    headers = getattr(getattr(error, "response", None), "headers", None)
+    return headers.get("retry-after") if headers is not None else None
+
+
+def advisory_headers(error: Exception) -> dict[str, str]:
+    value = exception_retry_after(error)
+    return {"retry-after": value} if retry_after_seconds(value) is not None else {}
+
+
+def note_retry_deadline(request, deadline: float) -> float:
+    """Record the encompassing route budget for deferred SDK generators too."""
+    scope = getattr(request, "scope", None)
+    if isinstance(scope, dict):
+        state = scope.setdefault("state", {})
+        deadline = min(state.get("upstream_retry_deadline", deadline), deadline)
+        state["upstream_retry_deadline"] = deadline
+    return deadline
+
+
+def advisory_fits(value: Optional[str], request, *, deadline: Optional[float] = None) -> bool:
+    seconds = retry_after_seconds(value)
+    if seconds is None:
+        return True
+    if deadline is None:
+        deadline = getattr(request, "scope", {}).get("state", {}).get("upstream_retry_deadline")
+    return seconds <= 120 and (deadline is None or seconds < deadline - time.monotonic())
+
+
 def _retry_delay_value(retry_after: Optional[str], default: float, attempt: int = 0, jitter: float = 1.0, *, identity_rotates: bool = True) -> float:
     """计算一次重试的等待秒数。
 
@@ -175,7 +242,7 @@ def _retry_delay_value(retry_after: Optional[str], default: float, attempt: int 
       [base - jitter/2, base + jitter/2] 内均匀采样，且不低于 0；
     - retry_after：上游 Retry-After（秒数或 HTTP 日期）。
     - identity_rotates（2026-11 P2-5）：本次重试是否**轮换身份**。
-      True（Express 通道，每次重试换 Key）：上一身份的 429 对新身份没有约束力，
+      True 是既有的已知换身份策略；Express 实际可能重用同一 Key，故显式传 False。
       仍钳位到 [0, base + jitter/2]——更短的服务器提示照常生效，更长的不再拖住重试。
       False（Cookie 通道，重试循环复用同一 Cookie）：上游的 Retry-After 对同一
       身份仍有约束力，上限放宽为 max(窗口上限, Retry-After)——旧实现无条件
@@ -184,7 +251,7 @@ def _retry_delay_value(retry_after: Optional[str], default: float, attempt: int 
     """
     base = max(0.0, default)
     try:
-        mode = str(app_state.get_setting("retry_backoff_mode", "fixed") or "fixed").strip().lower()
+        mode = str(generation_setting(app_state, "retry_backoff_mode", "fixed") or "fixed").strip().lower()
     except Exception:
         mode = "fixed"
     if mode == "exponential":
@@ -225,8 +292,8 @@ def retry_delay(retry_after: Optional[str], default: float, attempt: int = 0, ji
 
 
 def exception_retry_delay(error: Exception, default: float, attempt: int = 0, jitter: float = 1.0, *, identity_rotates: bool = True) -> float:
-    headers = getattr(getattr(error, "response", None), "headers", None)
-    return retry_delay(headers.get("retry-after") if headers is not None else None, default, attempt, jitter, error=error, identity_rotates=identity_rotates)
+    return retry_delay(exception_retry_after(error), default, attempt, jitter,
+                       error=error, identity_rotates=identity_rotates)
 
 
 async def wait_for_retry(request, delay: float) -> bool:

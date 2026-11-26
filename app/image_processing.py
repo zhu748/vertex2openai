@@ -3,12 +3,12 @@
 import base64
 import io
 import re
-import threading
 import time
 from typing import Optional, Tuple
 
 import config as app_config
 import httpx
+from image_client_pool import ImageClientPool
 from media_tasks import check_media_budget
 from proxy_tls import build_httpx_proxy
 from runtime_state import app_state, get_effective_proxy_url, get_effective_proxy_urls
@@ -19,15 +19,10 @@ except ImportError:
     Image = None
 
 
-def optimize_image_bytes(
-    image_data: bytes, original_mime: str, max_size_bytes: int = None
-) -> Tuple[bytes, str]:
-    """输入图片压缩引擎：可在控制台配置开关/边长/质量/体积阈值。
-    超过阈值的图会限制最长边并重采样，避免多轮修图卡死。"""
-    check_media_budget()
+def _input_pixels(image_data: bytes) -> int | None:
+    """Read dimensions without decoding pixels and apply the hard safety limit."""
     if Image is None:
-        return image_data, original_mime
-
+        return None
     # 安全预检独立于压缩开关和压缩体积阈值。PIL 在打开极大图片时就会
     # 抛 DecompressionBombError；不能让普通解析失败的「回传原图」兜底
     # 把它吞掉，否则数百 MP 的低熵小文件会绕过后续像素检查。
@@ -38,11 +33,33 @@ def optimize_image_bytes(
     except Image.DecompressionBombError as exc:
         raise ValueError("输入图片像素数超过 PIL 安全上限，已拒绝处理。") from exc
     except Exception:
-        return image_data, original_mime
+        return None
     if pixel_count > 2 * _MAX_INPUT_PIXELS:
         raise ValueError(
             f"输入图片像素数 {dimensions} 超过安全上限"
             f"（{2 * _MAX_INPUT_PIXELS // 1_000_000}MP），已拒绝处理")
+
+    return pixel_count
+
+
+def can_replay_image_verbatim(image_data: bytes) -> bool:
+    """A signed image may be reused unchanged, but never safety-downsampled."""
+    try:
+        pixels = _input_pixels(image_data)
+    except ValueError:
+        return False
+    return pixels is not None and pixels <= _MAX_INPUT_PIXELS
+
+
+def optimize_image_bytes(
+    image_data: bytes, original_mime: str, max_size_bytes: int = None
+) -> Tuple[bytes, str]:
+    """输入图片压缩引擎：可在控制台配置开关/边长/质量/体积阈值。
+    超过阈值的图会限制最长边并重采样，避免多轮修图卡死。"""
+    check_media_budget()
+    pixel_count = _input_pixels(image_data)
+    if pixel_count is None:
+        return image_data, original_mime
 
     # 逐键读取（无深拷贝）：旧实现每张图都 get_settings() 锁内深拷贝整个
     # 设置树（含全部 model_overrides），多图消息按图数放大（2026-10 优化）。
@@ -89,11 +106,10 @@ def optimize_image_bytes(
             #     省掉白底 + 掩码 paste 的两份全量；
             #   - 全透明（alpha 恒 0）→ 结果本就是纯白，直接建白底；
             #   - 真半透明 → 才做白底 + alpha 掩码 paste（此时才物化掩码）。
-            if img.mode == "P":
-                if "transparency" in img.info:
-                    img = img.convert("RGBA")
-                else:
-                    img = img.convert("RGB")
+            # PNG tRNS supplies an invisible palette entry or color key, even
+            # for RGB/L images that do not expose an explicit alpha band.
+            if img.mode in ("P", "RGB", "L") and "transparency" in img.info:
+                img = img.convert("LA" if img.mode == "L" else "RGBA")
             if img.mode in ("RGBA", "LA"):
                 # 多波段 getextrema() 直接取末波段（A）极值，不物化整条
                 # 24MB 级的掩码通道；只有真半透明分支才需要掩码做 paste。
@@ -200,48 +216,25 @@ def _is_blocked_host(host: str) -> bool:
         return True
 
 
-# PRF-P2-3：按（代理, 证书）签名共享的同步 httpx.Client 池。旧实现每张
-# 远程图新建客户端——多图消息首回复时间线性劣化，每张多付一次
-# TCP/TLS 握手（100-300ms）。httpx.Client 线程安全；超时在请求级传入，
-# 不受共享影响。签名组合有限（无代理 / 全局代理 / 若千 Key 级代理）。
-_IMAGE_CLIENTS: dict = {}
-_IMAGE_CLIENTS_LOCK = threading.Lock()
-_IMAGE_CLIENTS_MAX = 16
+_image_clients = ImageClientPool(capacity=16)
 
 
 def reset_image_clients() -> None:
-    """关闭并清空共享图片客户端池（测试隔离用）。"""
-    with _IMAGE_CLIENTS_LOCK:
-        clients = list(_IMAGE_CLIENTS.values())
-        _IMAGE_CLIENTS.clear()
-    for client in clients:
-        try:
-            client.close()
-        except Exception:
-            pass
+    _image_clients.reset()
 
 
-def _shared_image_client(proxy_url):
-    verify = app_config.SSL_CERT_FILE or True
-    key = (proxy_url or "", app_config.SSL_CERT_FILE or "")
-    with _IMAGE_CLIENTS_LOCK:
-        client = _IMAGE_CLIENTS.get(key)
-        if client is not None:
-            return client
-        client_args = {"timeout": 10.0, "follow_redirects": False, "trust_env": False}
+def _lease_image_client(proxy_url, remaining):
+    cert_file = app_config.SSL_CERT_FILE
+
+    def make_client():
+        opts = {"timeout": 10.0, "follow_redirects": False, "trust_env": False}
         if proxy_url:
-            client_args["proxy"] = build_httpx_proxy(proxy_url, verify=verify)
-        if getattr(app_config, "SSL_CERT_FILE", None):
-            client_args["verify"] = app_config.SSL_CERT_FILE
-        client = httpx.Client(**client_args)
-        if len(_IMAGE_CLIENTS) >= _IMAGE_CLIENTS_MAX:
-            oldest_key = next(iter(_IMAGE_CLIENTS))
-            try:
-                _IMAGE_CLIENTS.pop(oldest_key).close()
-            except Exception:
-                pass
-        _IMAGE_CLIENTS[key] = client
-        return client
+            opts["proxy"] = build_httpx_proxy(proxy_url, verify=cert_file or True)
+        if cert_file:
+            opts["verify"] = cert_file
+        return httpx.Client(**opts)
+
+    return _image_clients.lease((proxy_url or "", cert_file or ""), make_client, remaining)
 
 
 def fetch_remote_image(url: str, timeout: float = 10.0) -> Optional[Tuple[bytes, str]]:
@@ -262,7 +255,7 @@ def fetch_remote_image(url: str, timeout: float = 10.0) -> Optional[Tuple[bytes,
     try:
         return chain.run_sync(lambda raw, resolved: _fetch_remote_image_once(url, timeout, resolved, deadline=deadline))
     except Exception as exc:
-        print(f"⚠️ [图片处理] 获取远程图片失败，已跳过：{url[:120]}，原因：{type(exc).__name__}")
+        print(f"⚠️ [图片处理] 获取远程图片失败：{type(exc).__name__}")
         return None
 
 
@@ -289,36 +282,38 @@ def _fetch_remote_image_once(url, timeout, proxy_url, *, deadline=None):
     original_url, address = destination(url)
 
     # PRF-P2-3：共享客户端（按代理/证书签名池化）；每请求超时在请求级传入。
-    client = _shared_image_client(proxy_url)
-    for _ in range(MAX_REMOTE_IMAGE_REDIRECTS + 1):
-        # Pin the checked address for direct and proxy connections,
-        # preserving Host and TLS SNI. DNS cannot change between the
-        # safety check and the actual connection (DNS rebinding).
-        pinned_url = original_url.copy_with(host=address)
-        image_headers = dict(_IMAGE_FETCH_HEADERS, Host=original_url.netloc.decode("ascii"))
-        with client.stream(
-            "GET",
-            pinned_url,
-            headers=image_headers,
-            timeout=remaining(),
-            extensions={"sni_hostname": original_url.raw_host.decode("ascii")},
-        ) as resp:
-            if resp.is_redirect:
-                # 每跳复查，且重定向响应体无需下载。
-                location = resp.headers.get("location", "")
-                original_url, address = destination(str(original_url.join(location)) if location else "")
-                continue
+    with _lease_image_client(proxy_url, remaining) as client:
+        for _ in range(MAX_REMOTE_IMAGE_REDIRECTS + 1):
+            # Pin the checked address for direct and proxy connections,
+            # preserving Host and TLS SNI. DNS cannot change between the
+            # safety check and the actual connection (DNS rebinding).
+            pinned_url = original_url.copy_with(host=address)
+            image_headers = dict(_IMAGE_FETCH_HEADERS, Host=original_url.netloc.decode("ascii"))
+            with client.stream(
+                "GET",
+                pinned_url,
+                headers=image_headers,
+                timeout=remaining(),
+                extensions={"sni_hostname": original_url.raw_host.decode("ascii")},
+            ) as resp:
+                if resp.is_redirect:
+                    # 每跳复查，且重定向响应体无需下载。
+                    location = resp.headers.get("location", "")
+                    original_url, address = destination(str(original_url.join(location)) if location else "")
+                    continue
 
-            resp.raise_for_status()
-            mime = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
-            if mime and not mime.startswith("image/"):
-                raise ValueError(f"响应不是图片（content-type={mime}）")
-            data = bytearray()
-            for chunk in resp.iter_bytes():
-                remaining()
-                if len(data) + len(chunk) > MAX_REMOTE_IMAGE_BYTES:
-                    raise ValueError(f"图片超过 {MAX_REMOTE_IMAGE_BYTES // (1024 * 1024)}MB 上限")
-                data.extend(chunk)
-            remaining()
-            return bytes(data), mime or "image/jpeg"
+                resp.raise_for_status()
+                mime = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+                if mime and not mime.startswith("image/"):
+                    raise ValueError(f"响应不是图片（content-type={mime}）")
+                # getvalue() reuses the BytesIO backing storage on CPython; the
+                # subsequent close does not invalidate the immutable result.
+                with io.BytesIO() as data:
+                    for chunk in resp.iter_bytes():
+                        remaining()
+                        if data.tell() + len(chunk) > MAX_REMOTE_IMAGE_BYTES:
+                            raise ValueError(f"图片超过 {MAX_REMOTE_IMAGE_BYTES // (1024 * 1024)}MB 上限")
+                        data.write(chunk)
+                    remaining()
+                    return data.getvalue(), mime or "image/jpeg"
     raise ValueError("重定向次数过多")

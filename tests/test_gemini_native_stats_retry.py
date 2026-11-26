@@ -2,7 +2,9 @@
 
 通过实际 FastAPI 路由和统计中间件发请求，上游完全使用 MockTransport。
 """
+from settings_fixture import saved_settings
 import asyncio
+import codecs
 import time
 import types
 import unittest
@@ -65,8 +67,7 @@ class NativeStatsRetryTests(unittest.TestCase):
                               types.SimpleNamespace(get=lambda factory, proxy_uri=None: self.upstream)),
             mock.patch.object(gemini_native.app_state, "get_settings",
                               side_effect=lambda: self.settings.copy()),
-            mock.patch.object(gemini_native.app_state, "get_setting",
-                              side_effect=lambda key, default=None: self.settings.get(key, default)),
+            saved_settings(gemini_native.app_state, self.settings),
         ]
         for patch in patches:
             patch.start()
@@ -102,6 +103,105 @@ class NativeStatsRetryTests(unittest.TestCase):
                     self.assertEqual(self.post(action, prefix).status_code, 200)
                     count += 1
                     self.assert_stats(total=count, success=count)
+
+    def test_mixed_sse_terminators_are_relayed_byte_exactly(self):
+        first = b'data: {"candidates":[{"content":{"parts":[{"text":"hello"}]}}]}\n\r\n'
+        final = b'data: {"candidates":[{"finishReason":"STOP"}]}\r\n\r'
+
+        async def stream():
+            for part in (first[:-1], first[-1:] + final[:-1], final[-1:]):
+                yield part
+
+        self.responder = lambda _: httpx.Response(
+            200, content=stream(), headers={"content-type": "text/event-stream"})
+        response = self.post("streamGenerateContent?alt=sse")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(first + final, response.content)
+        self.assert_stats()
+
+    def test_initial_split_bom_preserves_content_in_direct_and_buffered_delivery(self):
+        bom = codecs.BOM_UTF8
+        event = COMPLETE_SSE.replace(b"ok", b"kept" + bom + b"text")
+
+        async def stream():
+            for piece in (b"", bom[:1], bom[1:2], bom[2:] + event):
+                yield piece
+
+        self.responder = lambda _: httpx.Response(
+            200, content=stream(), headers={"content-type": "text/event-stream"})
+        with mock.patch.object(gemini_native, "resumable_enabled", return_value=True):
+            for buffered in ("0", "1"):
+                with self.subTest(buffered=buffered):
+                    response = self.post("streamGenerateContent?alt=sse",
+                                         headers={"x-goog-api-key": "client-key", "x-resumable": buffered})
+                    self.assertEqual(response.status_code, 200)
+                    self.assertIn(event, response.content)
+                    self.assertNotIn(b'"error"', response.content)
+                    self.assertEqual(response.content.count(bom), 1)  # only model-authored text
+                    if buffered == "1":
+                        rid = response.headers["x-resume-id"].encode()
+                        self.assertIn(b"id: " + rid + b":0\n" + event, response.content)
+        self.assertEqual(len(self.requests), 2)
+
+    def test_positive_503_advisory_preserves_native_http_error_without_exit_switch(self):
+        self.settings.update(retry_max=0)
+        payload = {"error": {"code": 503, "message": "original advised error"}}
+        for action in ("generateContent", "streamGenerateContent?alt=sse"):
+            with self.subTest(action=action):
+                self.requests.clear()
+                self.responder = lambda _: httpx.Response(503, headers={"retry-after": "45"}, json=payload)
+                with mock.patch("proxy_failover.get_effective_proxy_uris_for_account",
+                                return_value=["http://first.test", "http://second.test"]):
+                    response = self.post(action, headers={"x-goog-api-key": "client-key", "x-resumable": "0"})
+                self.assertEqual((response.status_code, response.json(), response.headers["retry-after"]),
+                                 (503, payload, "45"))
+                self.assertEqual(len(self.requests), 1)
+
+    def test_native_pinned_failure_respects_minimum_wait_before_attempting_bare_path(self):
+        self.settings.update(retry_max=0, express_location="global")
+        payload = {"error": {"code": 404, "message": "Publisher model was not found"}}
+        for hint, hold in (("45", True), ("Fri, 01 Jan 2100 00:00:00 GMT", True),
+                           ("0", False), ("invalid", False), (None, False)):
+            for action in ("generateContent", "streamGenerateContent?alt=sse"):
+                with self.subTest(hint=hint, action=action):
+                    self.requests.clear()
+                    def respond(request):
+                        if "/projects/" in request.url.path:
+                            return httpx.Response(404, headers={"retry-after": hint} if hint else {}, json=payload)
+                        return httpx.Response(200, content=COMPLETE_SSE, headers={"content-type": "text/event-stream"})
+                    self.responder = respond
+                    result = self.post(action, headers={"x-goog-api-key": "client-key", "x-resumable": "0"})
+                    self.assertEqual(result.status_code, 404 if hold else 200)
+                    self.assertEqual(len(self.requests), 1 if hold else 2)
+                    if hold:
+                        self.assertEqual(result.headers["retry-after"], hint)
+                        self.assertEqual(result.json(), payload)
+
+    def test_slow_native_sse_never_loses_real_error_to_malformed_advisory(self):
+        payload = b'{"error":{"code":429,"message":"original quota","status":"RESOURCE_EXHAUSTED"}}'
+        class Slow(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                await asyncio.sleep(0.3)  # cross the fast HTTP error window
+                yield payload
+        self.settings.update(retry_max=0)
+        for hint, expected in ((b"45", b"45"), (b"0", b"0"),
+                               (b"Fri, 01 Jan 2100 00:00:00 GMT", b"Fri, 01 Jan 2100 00:00:00 GMT"),
+                               (None, None), (b"not-a-date", None), (b"9" * 140, None), (b"tempor\xe9", None)):
+            with self.subTest(hint=hint):
+                self.requests.clear()
+                headers = [(b"content-type", b"application/json")]
+                if hint is not None:
+                    headers.append((b"retry-after", hint))
+                self.responder = lambda _: httpx.Response(429, headers=headers, stream=Slow())
+                result = self.post("streamGenerateContent?alt=sse",
+                                   headers={"x-goog-api-key": "client-key", "x-resumable": "0"})
+                self.assertEqual((result.status_code, len(self.requests)), (200, 1))
+                lines = result.content.splitlines()
+                self.assertEqual([line for line in lines if line.startswith(b": upstream-status")],
+                                 [b": upstream-status 429"])
+                self.assertEqual([line for line in lines if line.startswith(b": retry-after")],
+                                 [] if expected is None else [b": retry-after " + expected])
+                self.assertEqual([line[6:] for line in lines if line.startswith(b"data: ")], [payload])
 
     def test_single_key_429_retries_for_both_formats(self):
         for action in ("generateContent", "streamGenerateContent"):
@@ -196,9 +296,9 @@ class NativeStatsRetryTests(unittest.TestCase):
     def test_configured_backoff_and_retry_after(self):
         self.settings["retry_backoff_seconds"] = 7
         self.settings["retry_jitter_seconds"] = 1  # 固定 7s ± 0.5s 抖动，不随次数增长
-        # 长提示（300s）钳位到窗口上限 7.5；短提示（0.25s）原样采纳
+        # 超过本地等待上限的提示原样返回，不把 300s 缩短到 7.5s 再重发。
         for header, expected in ((None, 7), ("0.25", 0.25), ("invalid", 7),
-                                 ("-1", 7), ("NaN", 7), ("Infinity", 7), ("300", 7.5)):
+                                 ("-1", 7), ("NaN", 7), ("Infinity", 7), ("300", None)):
             with self.subTest(retry_after=header):
                 self.requests.clear()
 
@@ -210,7 +310,13 @@ class NativeStatsRetryTests(unittest.TestCase):
 
                 self.responder = responder
                 with mock.patch.object(native_passthrough, "_wait_for_retry", return_value=True) as wait:
-                    self.assertEqual(self.post().status_code, 200)
+                    response = self.post()
+                    if expected is None:
+                        self.assertEqual(response.status_code, 429)
+                        self.assertEqual(response.headers["retry-after"], header)
+                        wait.assert_not_awaited()
+                        continue
+                    self.assertEqual(response.status_code, 200)
                     delay = wait.await_args.args[1]
                     if expected == 7:
                         # 固定间隔 7s ± 0.5s 抖动窗口
@@ -218,7 +324,7 @@ class NativeStatsRetryTests(unittest.TestCase):
                         self.assertLessEqual(delay, 7.5)
                     else:
                         self.assertEqual(delay, expected)
-        self.assert_stats(total=7, success=7, retries=7)
+        self.assert_stats(total=7, success=6, error=1, retries=6)
 
     def test_server_errors_use_same_retry_budget(self):
         for status in (500, 502, 503, 504):

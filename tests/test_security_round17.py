@@ -488,8 +488,8 @@ class ProxyTestPrivateGateTests(unittest.TestCase):
         self.assertEqual(response.json()["code"], "disabled")
 
 
-class FingerprintWeakWindowTests(unittest.TestCase):
-    """PRF-P2-5：超长串折叠只取首尾窗口，稳定性与区分度。"""
+class FingerprintFullContentTests(unittest.TestCase):
+    """长输入摘要必须覆盖全部内容：中段修改也是不同请求。"""
 
     @staticmethod
     def _fingerprint(text):
@@ -498,23 +498,22 @@ class FingerprintWeakWindowTests(unittest.TestCase):
         return _request_fingerprint(OpenAIRequest(model="m", messages=[
             {"role": "user", "content": text}]))
 
-    def test_weak_window_stable_for_identical_requests(self):
+    def test_full_digest_stable_for_identical_requests(self):
         big = "QUJD" * 30_000  # 120KB > 64KB 窗口
         self.assertEqual(self._fingerprint(big), self._fingerprint(big))
 
-    def test_weak_window_distinguishes_different_ends(self):
+    def test_full_digest_distinguishes_different_ends(self):
         a = "A" * 100_000
         b = "B" * 100_000
         self.assertNotEqual(self._fingerprint(a), self._fingerprint(b))
 
-    def test_weak_window_documented_collision_semantics(self):
-        # 同首尾同长度、仅中段不同：折叠后同指纹（文档化的取舍——
-        # 指纹是去重键而非安全边界，语义等同「重复请求」）。
+    def test_full_digest_distinguishes_different_middles(self):
+        # 同首尾同长度、仅中段不同，不得复用错误的生成。
         head, tail = "A" * 4096, "B" * 4096
         first = head + "C" * 70_000 + tail   # 总长 > 64KB，进入窗口折叠
         second = head + "D" * 70_000 + tail
         self.assertGreater(len(first), 64 * 1024)
-        self.assertEqual(self._fingerprint(first), self._fingerprint(second))
+        self.assertNotEqual(self._fingerprint(first), self._fingerprint(second))
 
     def test_below_window_still_full_digest(self):
         # 64KB 以下仍是全量摘要：中段一个字符的差异即可区分。

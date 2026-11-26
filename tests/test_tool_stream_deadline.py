@@ -1,4 +1,5 @@
 """Tool generation progress must release the deadline; silent queues must not."""
+from settings_fixture import saved_settings
 import asyncio
 import copy
 import json
@@ -58,6 +59,24 @@ class AssemblyTests(unittest.TestCase):
         self.assertIsNone(parts(out)[0].function_call.partial_args)
         stream.validate_end()
 
+    def test_empty_and_omitted_initial_ids_share_only_the_anonymous_slot(self):
+        for initial in (None, ""):
+            for final in (None, "", "provider-id"):
+                with self.subTest(initial=initial, final=final):
+                    stream = ToolStreamAssembler()
+                    self.assertFalse(parts(stream.restore_sdk(chunk(call(id=initial, name="reply", will_continue=True)))))
+                    out = stream.restore_sdk(chunk(call(id=final, partial_args=[fragment("$.text", "answer")])))
+                    completed = parts(out)[0].function_call
+                    self.assertEqual(completed.id or None, final or None)
+                    self.assertEqual(completed.args, {"text": "answer"})
+                    stream.validate_end()
+        # A named but unidentified second call cannot join a differently named active call.
+        for missing in ("", None):
+            stream = ToolStreamAssembler()
+            stream.restore_sdk(chunk(call(id="existing", name="one", will_continue=True)))
+            with self.assertRaises(IncompleteResponseError):
+                stream.restore_sdk(chunk(call(id=missing, name="another", will_continue=True)))
+
     def test_path_only_close_nested_arrays_scalars_and_split_surrogates(self):
         stream = ToolStreamAssembler()
         items = [fragment("$.rows[0].name", "\ud83d", continuing=True),
@@ -70,6 +89,61 @@ class AssemblyTests(unittest.TestCase):
         result = stream.restore_sdk(chunk(call(name="reply", partial_args=items), finish="STOP"))
         self.assertEqual(parts(result)[0].function_call.args,
                          {"rows": [{"name": "😺", "ok": False}, {"n": 0}], "odd.key": None, "empty": ""})
+
+    def test_nested_field_order_and_array_index_order_are_independent(self):
+        items = [fragment("$.z[1].b", "B"), fragment("$.a", "A"), fragment("$.z[0]", "0"),
+                 fragment("$.z[1].a", "a")]
+        out = ToolStreamAssembler().restore_sdk(chunk(call(name="fn", partial_args=items)))
+        args = parts(out)[0].function_call.args
+        self.assertEqual(json.dumps(args), '{"z": ["0", {"b": "B", "a": "a"}], "a": "A"}')
+        with self.assertRaises(IncompleteResponseError):
+            ToolStreamAssembler().restore_sdk(chunk(call(name="fn", partial_args=items[:2])))
+
+    def test_quoted_property_names_follow_jsonpath_escaping(self):
+        for path, key in ((r'$["section\/name"]', "section/name"), (r"$['section\/name']", "section/name"),
+                          (r"$['section\\/name']", "section\\/name"), (r"$['it\'s']", "it's"),
+                          (r"""$['say"hi']""", 'say"hi'), (r'$["say\"hi"]', 'say"hi'),
+                          (r"$['\u0022\u0027']", "\"'"), (r"$['a\tb']", "a\tb")):
+            with self.subTest(path=path):
+                result = ToolStreamAssembler().restore_sdk(chunk(call(name="reply", partial_args=[fragment(path, "x")])))
+                self.assertEqual(parts(result)[0].function_call.args, {key: "x"})
+
+    def test_escaped_and_literal_unicode_keys_merge_before_duplicate_check(self):
+        stream = ToolStreamAssembler()
+        continued = [fragment(r"$['\uD83D\uDE3A']", "one", continuing=True),
+                     fragment('$["😺"]', "two"), fragment('$["é"]', "precomposed"),
+                     fragment('$["e\u0301"]', "decomposed")]
+        result = stream.restore_sdk(chunk(call(name="reply", partial_args=continued)))
+        self.assertEqual(parts(result)[0].function_call.args,
+                         {"😺": "onetwo", "é": "precomposed", "e\u0301": "decomposed"})
+        with self.assertRaises(IncompleteResponseError):
+            stream.restore_sdk(chunk(call(name="reply", partial_args=[
+                fragment(r'$["\uD83D\uDE3A"]', "first"), fragment("$['😺']", "duplicate")])))
+
+    def test_shorthand_and_quoted_names_share_exact_unicode_keys(self):
+        # Non-ASCII scalars can begin a shorthand, including emoji, marks,
+        # control characters above ASCII, and the extremes of the scalar ranges.
+        for key in ("_arg9", "A0", "😺9", "\u0301tag", "a🟢", "\x80", "\ud7ff", "\ue000", "\U0010ffff"):
+            with self.subTest(key=key):
+                items = [fragment("$.rows[0]." + key, "a", continuing=True),
+                         fragment("$.rows[0][" + json.dumps(key) + "]", "b")]
+                out = ToolStreamAssembler().restore_sdk(chunk(call(name="reply", partial_args=items)))
+                self.assertEqual(parts(out)[0].function_call.args, {"rows": [{key: "ab"}]})
+
+        distinct = [fragment("$.é", "composed"), fragment("$.e\u0301", "decomposed")]
+        out = ToolStreamAssembler().restore_sdk(chunk(call(name="reply", partial_args=distinct)))
+        self.assertEqual(parts(out)[0].function_call.args, {"é": "composed", "e\u0301": "decomposed"})
+
+    def test_invalid_ascii_and_surrogates_remain_invalid_shorthand(self):
+        for name in ("0abc", "ab-c", "a b", "a\tb", "*", "abc*", "$", "a/b", "a\x7f", "\ud800", "a\udfff"):
+            with self.subTest(name=name), self.assertRaises(IncompleteResponseError):
+                ToolStreamAssembler().restore_sdk(chunk(call(name="reply", partial_args=[fragment("$.rows." + name, "x")])))
+
+    def test_quoted_property_names_reject_python_escapes_and_invalid_surrogates(self):
+        for path in (r"$['a\x41']", r'$["a\v"]', r"""$['a\"']""", r"""$["a\'"]""",
+                     r"$['\uD83D']", r'$["\uDE3A"]', '$["line\nbreak"]'):
+            with self.subTest(path=path), self.assertRaises(IncompleteResponseError):
+                ToolStreamAssembler().restore_sdk(chunk(call(name="reply", partial_args=[fragment(path, "x")])))
 
     def test_parallel_ids_and_interleaved_parts_keep_topology_and_signatures(self):
         stream = ToolStreamAssembler()
@@ -152,8 +226,7 @@ class DeadlineTests(unittest.IsolatedAsyncioTestCase):
                          "retry_max": 1, "retry_backoff_seconds": 0, "retry_jitter_seconds": 0}
         for patch in (mock.patch.object(api_helpers, "timeout_seconds", return_value=.03),
                       mock.patch.object(api_helpers, "stats", self.stats),
-                      mock.patch.object(api_helpers.app_state, "get_setting",
-                                        side_effect=lambda k, d=None: self.settings.get(k, d))):
+                      saved_settings(api_helpers.app_state, self.settings)):
             patch.start()
             self.addCleanup(patch.stop)
 
@@ -292,6 +365,26 @@ class DeadlineTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.aio.aclose()
             client.close()
+
+    async def test_fake_stream_parallel_call_string_deltas_match_nonstream(self):
+        self.settings["fake_streaming"] = True
+
+        async def generate(**kwargs):
+            return chunk(call(id="call_a", name="reply", args={"text": "one"}),
+                         call(id="call_b", name="reply", args={"text": "two"}), finish="STOP")
+
+        full = json.loads(await self.run_stream(generate, stream=False))
+        expected = full["choices"][0]["message"]["tool_calls"]
+        self.assertEqual([tc["id"] for tc in expected], ["call_a", "call_b"])
+        assembled = {}
+        for delta in tool_calls(await self.run_stream(generate)):
+            # OpenAI clients append string deltas, including the ID and function name.
+            item = assembled.setdefault(delta["index"], {"id": "", "function": {"name": "", "arguments": ""}})
+            item["id"] += delta.get("id", "")
+            for field in ("name", "arguments"):
+                item["function"][field] += delta["function"].get(field, "")
+        self.assertEqual([assembled[i] for i in range(len(assembled))],
+                         [{"id": tc["id"], "function": tc["function"]} for tc in expected])
 
     async def test_nonstream_fake_stream_disabled_tools_and_unsupported_models_keep_existing_path(self):
         cases = [("gemini-4-argon", False, False, "required"),

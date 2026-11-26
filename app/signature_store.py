@@ -7,10 +7,12 @@ record has three possible states because ``None`` alone is ambiguous:
 * ``SIGNED``: this exact function-call part carried a signature.
 * ``UNSIGNED_FOLLOWER``: this was a later call in a parallel batch and must stay
   unsigned when replayed.
+* ``AMBIGUOUS``: different live turns claimed this ID; never guess either one.
 * ``UNKNOWN``: signature topology was lost; validation may need the documented
   skip sentinel for the first call of a step.
 """
 
+import hashlib
 import threading
 import time
 from collections import OrderedDict
@@ -54,6 +56,7 @@ class SignatureState(str, Enum):
     SIGNED = "signed"
     UNSIGNED_FOLLOWER = "unsigned_follower"
     UNKNOWN = "unknown"
+    AMBIGUOUS = "ambiguous"
 
 
 @dataclass(frozen=True)
@@ -68,6 +71,9 @@ class SignatureRecord:
             raise ValueError("unsigned/unknown signature records cannot carry bytes")
 
 
+CacheKey = str | bytes  # Public IDs are strings; private exact-origin keys are digests.
+
+
 class SignatureStore:
     """Thread-safe tool_call_id -> :class:`SignatureRecord` TTL/LRU cache."""
 
@@ -75,22 +81,40 @@ class SignatureStore:
         self._ttl = ttl_seconds
         self._max = max_entries
         self._lock = threading.Lock()
-        self._data: OrderedDict[str, tuple[float, SignatureRecord]] = OrderedDict()
+        self._data: OrderedDict[CacheKey, tuple[float, SignatureRecord]] = OrderedDict()
         # Reads reorder the LRU, while absolute expiry follows the last write.
-        self._expiry: OrderedDict[str, float] = OrderedDict()
+        self._expiry: OrderedDict[CacheKey, float] = OrderedDict()
+        # An LRU miss need not mean "never issued". Remember only digests of
+        # evicted live keys; beyond this second bound, fail closed on new keys
+        # until the forgotten quarantine expires.
+        self._displaced: OrderedDict[bytes, float] = OrderedDict()
+        self._displaced_conflicts: set[bytes] = set()  # Only tags already in _displaced.
+        self._unknown_until = float("-inf")
 
-    def put_record(self, call_id: str, record: SignatureRecord) -> None:
+    @staticmethod
+    def _tag(key: CacheKey) -> bytes:
+        raw = b"s" + key.encode("utf-8", "surrogatepass") if isinstance(key, str) else b"b" + key
+        return hashlib.blake2b(raw, digest_size=16).digest()
+
+    def put_record(self, call_id: CacheKey, record: SignatureRecord) -> None:
         if not call_id:
             return
         with self._lock:
             now = time.monotonic()
+            prev = self._data.get(call_id)
+            if prev is not None and now - prev[0] <= self._ttl:
+                if prev[1] != record:
+                    record = SignatureRecord(SignatureState.AMBIGUOUS)
+            elif (now <= self._unknown_until or
+                  self._displaced and now <= self._displaced.get(self._tag(call_id), float("-inf"))):
+                record = SignatureRecord(SignatureState.AMBIGUOUS)
             self._data[call_id] = (now, record)
             self._data.move_to_end(call_id)
             self._expiry[call_id] = now
             self._expiry.move_to_end(call_id)
             self._evict(now)
 
-    def register_call_signature(self, call_id: str, signature: Optional[bytes],
+    def register_call_signature(self, call_id: CacheKey, signature: Optional[bytes],
                                 *, unsigned_follower: bool = False) -> None:
         """QUA-P2-2（2026-11 审查收敛）：工具调用签名三态写入的单一入口。
 
@@ -107,19 +131,26 @@ class SignatureStore:
         else:
             self.put_unknown(call_id)
 
-    def put_unsigned_follower(self, call_id: str) -> None:
+    def put_unsigned_follower(self, call_id: CacheKey) -> None:
         self.put_record(call_id, SignatureRecord(SignatureState.UNSIGNED_FOLLOWER))
 
-    def put_unknown(self, call_id: str) -> None:
+    def put_unknown(self, call_id: CacheKey) -> None:
         self.put_record(call_id, SignatureRecord(SignatureState.UNKNOWN))
 
-    def get_record(self, call_id: str) -> Optional[SignatureRecord]:
+    def get_record(self, call_id: CacheKey) -> Optional[SignatureRecord]:
         if not call_id:
             return None
         with self._lock:
             now = time.monotonic()
             item = self._data.get(call_id)
             if item is None:
+                if self._displaced_conflicts:
+                    tag = self._tag(call_id)
+                    if tag in self._displaced_conflicts and now <= self._displaced[tag]:
+                        # A retained live conflict is not an unknown cache miss.
+                        # Never mint a validator fallback for either the bare ID
+                        # or an indistinguishable private origin.
+                        return SignatureRecord(SignatureState.AMBIGUOUS)
                 return None
             ts, record = item
             if now - ts > self._ttl:
@@ -137,9 +168,21 @@ class SignatureStore:
                 self._data.pop(oldest_key, None)
                 continue
             break
+        while self._displaced and now > next(iter(self._displaced.values())):
+            tag, _ = self._displaced.popitem(last=False)
+            self._displaced_conflicts.discard(tag)
         while len(self._data) > self._max:
-            oldest_key, _ = self._data.popitem(last=False)
+            oldest_key, (_, evicted) = self._data.popitem(last=False)
             self._expiry.pop(oldest_key, None)
+            tag = self._tag(oldest_key)
+            self._displaced[tag] = now + self._ttl
+            self._displaced.move_to_end(tag)
+            if evicted.state is SignatureState.AMBIGUOUS:
+                self._displaced_conflicts.add(tag)
+        while len(self._displaced) > self._max:
+            tag, until = self._displaced.popitem(last=False)
+            self._displaced_conflicts.discard(tag)
+            self._unknown_until = max(self._unknown_until, until)
 
 
 signature_store = SignatureStore()
