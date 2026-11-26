@@ -110,6 +110,73 @@ class ResponsesMediaError(ResponsesProjectionError):
         super().__init__("Media output is not supported by this Responses endpoint.")
 
 
+# These native payloads are separate Part kinds, not metadata on text or on a
+# client function call. Their signatures cannot be replayed on a blank Part.
+_RESPONSES_NATIVE_ARMS = (
+    ("executableCode", "executable_code", (("language", None, "LANGUAGE_UNSPECIFIED"), ("code", None, ""))),
+    ("codeExecutionResult", "code_execution_result", (("outcome", None, "OUTCOME_UNSPECIFIED"), ("output", None, ""))),
+    ("toolCall", "tool_call", (("toolType", "tool_type", "TOOL_TYPE_UNSPECIFIED"), ("args", None, {}))),
+    ("toolResponse", "tool_response", (("toolType", "tool_type", "TOOL_TYPE_UNSPECIFIED"), ("response", None, {}))),
+    ("functionResponse", "function_response", (("name", None, ""), ("response", None, {}),
+        ("willContinue", "will_continue", False), ("scheduling", None, "SCHEDULING_UNSPECIFIED"))),
+)
+
+
+def _part_fields(source, wire, attribute):
+    if isinstance(source, dict):
+        value = source.get(wire)
+        return (value, source[attribute]) if attribute and attribute in source else (value,)
+    return (getattr(source, attribute or wire, None),)
+
+
+def _nondefault_payload(source, wire, attribute, default):
+    for value in _part_fields(source, wire, attribute):
+        if value is None:
+            continue
+        if default is False:
+            if value is not False:
+                return True
+        elif value != default and not (isinstance(default, str) and value == ""):
+            return True
+    return False
+
+
+def _response_result_media(value):
+    for parts in _part_fields(value, "parts", None):
+        if parts is None:
+            continue
+        if not isinstance(parts, list):
+            return True
+        for part in parts:
+            if isinstance(value, dict) and not isinstance(part, dict):
+                return True
+            for wire, attr, field, sdk_field, default in (
+                    ("inlineData", "inline_data", "data", None, "" if isinstance(part, dict) else b""),
+                    ("fileData", "file_data", "fileUri", "file_uri", "")):
+                for media in _part_fields(part, wire, attr):
+                    if (media is not None and isinstance(part, dict) and not isinstance(media, dict)
+                            or _nondefault_payload(media, field, sdk_field, default)):
+                        return True
+    return False
+
+
+def require_responses_supported_part(part) -> None:
+    """Reject unsupported source data before projecting any carrier or tool batch.
+
+    SDK Parts and Studio JSON have the same relevant fields. An empty/null
+    message, zero enum, empty map or empty media shell is not a payload.
+    """
+    for wire, attribute, fields in _RESPONSES_NATIVE_ARMS:
+        for value in _part_fields(part, wire, attribute):
+            if value is None:
+                continue
+            if (isinstance(part, dict) and not isinstance(value, dict)
+                    or _nondefault_payload(value, "id", None, "")
+                    or any(_nondefault_payload(value, *field) for field in fields)
+                    or wire == "functionResponse" and _response_result_media(value)):
+                raise ResponsesProjectionError("Native tool or code output is not supported by this Responses endpoint.")
+
+
 class ToolStreamError(IncompleteResponseError):
     """Local tool-fragment validation failure, never evidence of a bad proxy."""
 

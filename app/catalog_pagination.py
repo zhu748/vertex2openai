@@ -1,7 +1,7 @@
 """Protocol-specific page boundaries over the already-authorized model directory."""
 import base64
 from hashlib import blake2s
-from itertools import chain
+from collections.abc import Mapping
 
 
 class CatalogPageError(ValueError):
@@ -28,7 +28,8 @@ def _size(raw: str | None, *, google: bool) -> int:
     raise CatalogPageError("pageSize 必须是非负的 int32 整数。" if google else "limit 必须为 1 至 1000 的整数。")
 
 
-def gemini_model_page(ids: list[str], query, *, can_count_tokens: bool) -> tuple[list[str], str | None]:
+def gemini_model_page(methods_by_id: Mapping[str, int], query) -> tuple[list[str], str | None]:
+    ids = list(methods_by_id)
     size = _size(_param(query, "pageSize", "page_size"), google=True)
     token = _param(query, "pageToken", "page_token")
     if not token and len(ids) <= size:
@@ -37,12 +38,18 @@ def gemini_model_page(ids: list[str], query, *, can_count_tokens: bool) -> tuple
     # Stateless across workers. Bind the offset to the same ordered catalog,
     # advertised capabilities and effective request settings. A hot reload must
     # not silently skip/duplicate entries. This checksum is not authorization.
-    digest = blake2s(digest_size=16, person=b"v2omdl01")
-    digest.update(size.to_bytes(4, "big") + bytes([can_count_tokens]))
-    for item in chain((query.get("filter", ""),), ids):
-        encoded = item.encode("utf-8", "surrogatepass")
+    digest = blake2s(digest_size=16, person=b"v2omdl02")
+    digest.update(size.to_bytes(4, "big"))
+
+    def bind(value: str):
+        encoded = value.encode("utf-8", "surrogatepass")
         digest.update(len(encoded).to_bytes(4, "big"))
         digest.update(encoded)
+
+    bind(query.get("filter", ""))
+    for model_id, methods in methods_by_id.items():
+        bind(model_id)
+        digest.update(bytes([methods]))
 
     def cursor(offset: int) -> str:
         raw = offset.to_bytes(4, "big")

@@ -3,6 +3,7 @@ import asyncio
 import json
 import time
 import unittest
+from contextlib import contextmanager
 from unittest.mock import Mock, patch
 
 import httpx
@@ -72,6 +73,13 @@ class NativeSetupReceiptTests(unittest.IsolatedAsyncioTestCase):
     def signed_next(self):
         self.response = lambda: httpx.Response(
             200, content=SIGNED + SUCCESS, headers={"content-type": "text/event-stream"})
+
+    @contextmanager
+    def live_outlets(self, mode, key_count, has_cookie):
+        with (patch.object(gemini_native.app_state, "get_channel_mode", return_value=mode) as channel,
+              patch.object(app.state.express_key_manager, "get_total_keys", return_value=key_count) as keys,
+              patch.object(credential_manager, "has_cookie_record", return_value=has_cookie) as cookies):
+            yield channel, keys, cookies
 
     def configure_capacity(self):
         self.success_next()
@@ -215,6 +223,224 @@ class NativeSetupReceiptTests(unittest.IsolatedAsyncioTestCase):
             cookie.assert_not_awaited()
         self.assertEqual(self.respond.call_count, 1)
         self.assertEqual(len(self.store._buffers), 1)
+
+    async def test_implicit_keyed_retries_preserve_wire_and_http_receipts_without_live_outlets(self):
+        first_key = [(b"idempotency-key", b"one-generation")]
+        outlet_changes = (("api_key", 0, False), ("web_proxy", 1, True), ("mixed", 0, True))
+        for signed in (False, True):
+            await self.store.aclose()
+            self.respond.reset_mock()
+            if signed:
+                self.signed_next()
+            first = await self.completed(first_key)
+            self.assertEqual(first.messages[0]["status"], 200 if signed else 429)
+            if signed:
+                self.assertIn(b'"thoughtSignature":"AP9maXh0dXJl"', self.body(first))
+            else:
+                self.assert_http_error(first)
+            old, = self.store._buffers.values()
+            self.assertTrue(old.fully_delivered)
+            before = (tuple(old.events), dict(self.store._requests), self.store._bytes_used)
+            with (patch.object(self.store, "get_or_create_request", wraps=self.store.get_or_create_request) as admit,
+                  patch.object(cookie_native, "handle_native_request", wraps=cookie_native.handle_native_request) as cookie):
+                for mode, *outlets in outlet_changes:
+                    for spelling in (b"idempotency-key", b"x-idempotency-key"):
+                        with self.subTest(signed=signed, mode=mode, spelling=spelling), self.live_outlets(mode, *outlets) as checks:
+                            again = await self.completed([(spelling, b"one-generation")])
+                            self.assertEqual((again.messages[0]["status"], again.receipt),
+                                             (first.messages[0]["status"], first.receipt))
+                            self.assertEqual(dict(again.messages[0]["headers"])[b"x-resumable-replay"], b"1")
+                            self.assertNotIn(b"[DONE]", self.body(again))
+                            if signed:
+                                self.assertEqual(self.body(again), self.body(first))
+                            else:
+                                self.assert_http_error(again)
+                            for check in checks:
+                                check.assert_not_called()
+                cookie.assert_not_awaited()
+                admit.assert_not_awaited()
+            self.respond.assert_called_once()
+            self.assertEqual((tuple(old.events), dict(self.store._requests), self.store._bytes_used), before)
+            self.assertEqual((old.has_live_delivery, generation_limiter.active), (False, 0))
+
+    async def test_implicit_live_follower_joins_one_original_provider_after_mode_change(self):
+        for key in ([], [(b"idempotency-key", b"live-generation")]):
+            with self.subTest(keyed=bool(key)):
+                await self.store.aclose()
+                self.respond.reset_mock()
+                reading, release, started = (asyncio.Event() for _ in range(3))
+                closed = Mock()
+
+                class Body(httpx.AsyncByteStream):
+                    async def __aiter__(self):
+                        reading.set()
+                        await release.wait()
+                        yield SIGNED + SUCCESS
+
+                    async def aclose(self):
+                        closed()
+
+                self.response = lambda: httpx.Response(200, stream=Body(), headers={"content-type": "text/event-stream"})
+                leader, follower = self.peer(key), self.peer(key)
+
+                async def header(message):
+                    if message["type"] == "http.response.start":
+                        started.set()
+
+                a = asyncio.create_task(leader.run())
+                b = None
+                try:
+                    await asyncio.wait_for(reading.wait(), 2)
+                    with self.live_outlets("web_proxy", 0, True) as checks:
+                        b = asyncio.create_task(follower.run(header))
+                        await asyncio.wait_for(started.wait(), 2)
+                        old, = self.store._buffers.values()
+                        self.assertEqual((len(old.clients), old.done, generation_limiter.active), (2, False, 1))
+                        for check in checks:
+                            check.assert_not_called()
+                finally:
+                    release.set()
+                    await asyncio.wait_for(asyncio.gather(a, *([b] if b else [])), 2)
+                self.assertEqual((leader.messages[0]["status"], follower.messages[0]["status"]), (200, 200))
+                self.assertEqual((leader.receipt, follower.receipt, self.body(leader)),
+                                 (old.id, old.id, self.body(follower)))
+                self.assertIn(b'"thoughtSignature":"AP9maXh0dXJl"', self.body(follower))
+                self.assertTrue(old.fully_delivered)
+                self.assertFalse(old.has_live_delivery)
+                self.respond.assert_called_once()
+                closed.assert_called_once()
+                self.assertEqual(generation_limiter.active, 0)
+
+    async def test_unkeyed_retry_uses_live_policy_only_after_original_http_result_was_delivered(self):
+        self.configure_capacity()
+        first = self.peer()
+
+        async def lose_final(message):
+            if message["type"] == "http.response.body":
+                await first.drop()
+
+        lease = generation_limiter.reserve()
+        try:
+            await asyncio.wait_for(first.run(lose_final), 2)
+        finally:
+            lease.release()
+        old, = self.store._buffers.values()
+        self.assertEqual((first.receipt, old.fully_delivered, old.status_code), (old.id, False, 503))
+        with self.live_outlets("web_proxy", 1, True) as checks:
+            delivered = await self.completed()
+            self.assertEqual((delivered.messages[0]["status"], delivered.receipt, json.loads(self.body(delivered))),
+                             (503, old.id, old.payload))
+            self.assertTrue(old.fully_delivered)
+            for check in checks:
+                check.assert_not_called()
+            fresh = await self.completed()
+            self.assertEqual(fresh.messages[0]["status"], 400)  # Fresh Cookie native SSE still cannot buffer.
+            self.assertNotIn(b"x-resume-id", dict(fresh.messages[0]["headers"]))
+        self.respond.assert_not_called()
+        self.assertEqual(list(self.store._buffers), [old.id])
+        healthy = await self.completed()
+        self.assertEqual(healthy.messages[0]["status"], 200)
+        self.assertNotEqual(healthy.receipt, old.id)
+        self.respond.assert_called_once()
+
+    async def test_stale_implicit_retry_does_not_touch_or_retire_the_old_receipt_ahead_of_dispatch(self):
+        key = [(b"idempotency-key", b"stale-generation")]
+        first = self.peer(key)
+
+        async def lose_final(message):
+            if message["type"] == "http.response.body":
+                await first.drop()
+
+        with patch.object(resumable, "disconnect_grace_seconds", return_value=0):
+            await asyncio.wait_for(first.run(lose_final), 2)
+        old, = self.store._buffers.values()
+        self.assertTrue(old.resume_expired())
+        before = (old.last_access, old._retired_by, dict(self.store._requests), self.store._bytes_used)
+        with self.live_outlets("api_key", 0, False):
+            failed = await self.completed(key)
+            self.assertEqual(failed.messages[0]["status"], 403)
+            self.assertNotIn(b"x-resume-id", dict(failed.messages[0]["headers"]))
+            self.assertEqual((old.last_access, old._retired_by, dict(self.store._requests), self.store._bytes_used), before)
+            stale = await self.completed([(b"x-resume-id", first.receipt.encode())])
+            self.assertEqual(stale.messages[0]["status"], 410)
+        self.success_next()
+        fresh = await self.completed(key)
+        self.assertEqual(fresh.messages[0]["status"], 200)
+        self.assertNotEqual(fresh.receipt, old.id)
+        self.assertEqual(self.respond.call_count, 2)
+
+    async def test_implicit_probe_misses_do_not_allocate_readers_or_override_identity_and_policy(self):
+        self.signed_next()
+        model = "projects/fixture/locations/global/publishers/google/models/gemini-test"
+        path = f"/v1beta/models/{model}:streamGenerateContent"
+        payload = {"contents": [{"parts": [{"text": "hello"}]}]}
+        key = (b"idempotency-key", b"scoped-operation")
+        opt = (b"x-resumable", b"true")
+
+        def peer(*, target=path, url_query=b"alt=sse&fixture=a%20b", headers=(opt, key), auth=None, wire_prefix=b""):
+            current = Peer(target, query=url_query, payload=payload, headers=headers)
+            current.body = wire_prefix + current.body
+            if auth is not None:
+                current.scope["headers"] = [(k, v) for k, v in current.scope["headers"] if k != b"authorization"]
+                current.scope["headers"].append((b"authorization", b"Bearer " + auth))
+            return current
+
+        first = peer()
+        await asyncio.wait_for(first.run(), 2)
+        old, = self.store._buffers.values()
+        cursor = (b"x-resume-id", first.receipt.encode())
+
+        async def check(request, status):
+            await asyncio.wait_for(request.run(), 2)
+            self.assertEqual(request.messages[0]["status"], status)
+            if status != 200:
+                self.assertNotIn(b"x-resume-id", dict(request.messages[0]["headers"]))
+                self.assertNotIn(SIGNED, self.body(request))
+
+        for headers in ((key,), ((opt[0], b"false"), key)):
+            direct = peer(headers=headers)
+            await check(direct, 200)
+            self.assertNotIn(b"x-resume-id", dict(direct.messages[0]["headers"]))
+            self.assertIn(SIGNED, self.body(direct))
+        self.assertEqual(list(self.store._buffers), [old.id])
+
+        with (self.live_outlets("api_key", 0, False),
+              patch.object(self.store, "get_or_create_request", wraps=self.store.get_or_create_request) as admit):
+            equivalent = peer(target=path.replace("/v1beta/", "/v1/", 1), url_query=b"fixture=a+b&alt=sse")
+            await check(equivalent, 200)
+            self.assertEqual((equivalent.receipt, self.body(equivalent)), (first.receipt, self.body(first)))
+            original = (old.last_access, tuple(old.events), dict(self.store._requests), self.store._bytes_used)
+            for kwargs, status in (
+                    ({"headers": (opt, (key[0], b"unrelated"))}, 403), ({"headers": (key,)}, 403),
+                    ({"headers": ((opt[0], b"false"), key)}, 403),
+                    ({"headers": ((opt[0], b"false"), cursor)}, 400),
+                    ({"target": path.replace("/fixture/", "/different/")}, 403),
+                    ({"url_query": b"alt=sse&fixture=different"}, 403), ({"wire_prefix": b" "}, 403),
+                    ({"url_query": b"alt=json&fixture=a+b"}, 400), ({"auth": b"bad"}, 401)):
+                with self.subTest(kwargs=kwargs):
+                    await check(peer(**kwargs), status)
+            with patch.object(gemini_native, "API_KEY", "rotated"):
+                await check(peer(auth=b"rotated"), 403)
+                await check(peer(auth=b"rotated", headers=(cursor,)), 404)
+            for setting, value in (("resumable_enabled", False), ("image_bypass_enabled", True)):
+                with patch.object(gemini_native, setting, return_value=value):
+                    await check(peer(), 403)
+                    await check(peer(headers=(cursor,)), 409)
+            with patch.object(old, "owner_key_digest", "different"):
+                await check(peer(), 404)
+            with patch.object(old, "fingerprint_key", "different"):
+                await check(peer(), 409)
+            with patch.object(old, "kind", "stream"):
+                await check(peer(), 403)
+            self.assertEqual((old.last_access, tuple(old.events), dict(self.store._requests), self.store._bytes_used),
+                             original)
+            old.finished_monotonic = time.monotonic() - 24 * 60 * 60
+            self.assertEqual(await self.store.sweep(), 1)
+            await check(peer(), 403)
+            await check(peer(headers=(cursor,)), 404)
+            self.assertFalse(self.store._buffers)
+            admit.assert_not_awaited()
+        self.assertEqual(self.respond.call_count, 3)  # first buffered reply and two explicit direct requests
 
     async def test_replay_first_still_checks_auth_identity_cursor_and_policy(self):
         self.signed_next()

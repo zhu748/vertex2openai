@@ -50,6 +50,7 @@ from starlette.requests import ClientDisconnect
 
 from admission import GenerationCapacityError, ManagedStreamingResponse
 from auth import constant_time_equal, extract_candidate_key
+from catalog_availability import CatalogAvailability, NativeMethods
 from catalog_pagination import CatalogPageError, gemini_model_page
 from config import API_KEY
 from express_fingerprint import sdk_label
@@ -97,6 +98,7 @@ from upstreams.native_catalog import (  # noqa: F401
 from upstreams.native_passthrough import (  # noqa: F401
     NativeAPIError,
     native_expects_one_candidate,
+    native_replay_fingerprint,
     NativeStreamError,
     _NativeStreamState,
     _close_upstream,
@@ -277,6 +279,19 @@ def _passthrough_endpoint():
         if requested and not sse:
             return _native_error(400, "原生续传需要 streamGenerateContent?alt=sse。")
 
+        buffer_allowed = requested and resumable_enabled() and not image_bypass_enabled(model_id)
+        fingerprint = None
+        if buffer_allowed:
+            # A cursor or eligible retry of a retained generation needs no live
+            # provider. A miss does not reserve anything or redirect fresh work.
+            fingerprint = native_replay_fingerprint(model, action, query, raw_body)
+            replay = await _resumable_native(request, _auth, model, action, query, raw_body,
+                                             fingerprint=fingerprint, allow_admit=False)
+            if replay is not None:
+                track_configure(model=requested_model, protocol="gemini", channel="express", stream=True,
+                                mode="stream")
+                return replay
+
         # 通道选择（尊重控制台的通道模式开关，与 chat_api 的选路语义对齐）：
         # - web_proxy（Cookie 模式）：配置了 Cookie 账号就走 Cookie 通道**协议级桥接**
         #   （cookie_native：原生 JSON → batchGraphql 转码，响应重组回原生形状），
@@ -286,8 +301,6 @@ def _passthrough_endpoint():
         # - api_key / mixed：有 Key 优先字节级透传（最保真）；没有 Key 但配了
         #   Cookie 时回退 Cookie 桥接——旧实现在此直接 403，导致仅配 Cookie 的
         #   部署无法使用 Gemini 原生生态客户端。
-        # An explicit cursor reads an existing generation. Live provider
-        # availability is only relevant when admitting a new generation.
         if not explicit:
             # getattr 防御：单测的 SimpleNamespace 可能不带 app。
             express_manager = getattr(getattr(request, "app", None), "state", None)
@@ -335,10 +348,11 @@ def _passthrough_endpoint():
             print(f"🔁 [Gemini 透传] {model}:{action} | {'流式' if is_stream else '非流式'}"
                   f" | 原生协议透传（Express 通道）")
         try:
-            if requested and resumable_enabled() and not image_bypass_enabled(model_id):
-                return await _resumable_native(request, _auth, model, action, query, raw_body)
             if explicit:
                 return _native_error(409, "当前请求不支持续传；如需重新生成，请移除续传 ID 与游标。")
+            if buffer_allowed:
+                return await _resumable_native(request, _auth, model, action, query, raw_body,
+                                               fingerprint=fingerprint)
             async def execute():
                 return await _run_direct(request, action, lambda: _passthrough_request(
                     request, model, action, query, raw_body))
@@ -381,17 +395,12 @@ for _prefix in ("/v1beta", "/v1"):
     )
 
 
-async def _catalog_capabilities(request: Request) -> tuple[list[str], bool]:
-    has_keys = request.app.state.express_key_manager.get_total_keys() > 0
-    if not has_keys:
-        from credential_manager import credential_manager
-
-        # Generation can fall back to Cookie in every mode. A global project
-        # can complete a Cookie account just as it does on the native POST.
-        has_global_project = bool((app_state.get_project_id() or "").strip())
-        if not credential_manager.has_cookie_record(require_project=not has_global_project):
-            return [], False
-    return _native_catalog_ids(await get_express_models()), has_keys
+async def _catalog_methods(request: Request) -> dict[str, NativeMethods]:
+    availability = CatalogAvailability.read(app_state, request.app.state.express_key_manager)
+    if not (availability.native_count_tokens or availability.native_cookie_projects):
+        return {}
+    return {model: methods for model in _native_catalog_ids(await get_express_models())
+            if (methods := availability.native_methods(model))}
 
 
 @router.get("/v1beta/models")
@@ -403,13 +412,12 @@ async def native_list_models(fastapi_request: Request,
     （透传侧 _strip_search_variant 会剥后缀并注入 google_search 工具，
     目录与实际能力一致）。抗截断后缀仍仅限 OpenAI 兼容端点。
     """
-    ids, has_keys = await _catalog_capabilities(fastapi_request)
+    methods_by_id = await _catalog_methods(fastapi_request)
     try:
-        page, token = gemini_model_page(ids, getattr(fastapi_request, "query_params", {}),
-                                        can_count_tokens=has_keys)
+        page, token = gemini_model_page(methods_by_id, getattr(fastapi_request, "query_params", {}))
     except CatalogPageError as exc:
         return _native_error(400, str(exc), "INVALID_ARGUMENT")
-    result = {"models": [_native_model_entry(mid, can_count_tokens=has_keys) for mid in page]}
+    result = {"models": [_native_model_entry(mid, methods=methods_by_id[mid]) for mid in page]}
     if token:
         result["nextPageToken"] = token
     return result
@@ -418,8 +426,7 @@ async def native_list_models(fastapi_request: Request,
 @router.get("/v1beta/models/{model_action:path}")
 async def native_get_model(model_action: str, fastapi_request: Request,
                            _auth: str = Depends(get_gemini_auth)):
-    # 与 native_list_models 一致：未配置任何通道时不返回模型详情
-    # （旧实现缺这个检查，无 Key 也照常返回目录条目，与列表行为矛盾）。
+    # Use the same per-model methods as native_list_models.
     # The SDK sends the exact name from models.list. The route already
     # consumes its outer "models/" prefix; any remaining one is part of the
     # configured ID and cannot be stripped as it is on generation paths.
@@ -427,8 +434,8 @@ async def native_get_model(model_action: str, fastapi_request: Request,
     action = suffix.strip()
     if action:
         return _native_error(400, f"GET 不支持 :{action}，请用 POST。")
-    ids, has_keys = await _catalog_capabilities(fastapi_request)
-    if model_action in ids:
-        return _native_model_entry(model_action, can_count_tokens=has_keys)
+    methods_by_id = await _catalog_methods(fastapi_request)
+    if methods := methods_by_id.get(model_action):
+        return _native_model_entry(model_action, methods=methods)
     return _native_error(404, f"Model {model_action} not found.", status_detail="NOT_FOUND")
 

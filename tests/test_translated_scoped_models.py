@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 from google import genai
-from google.genai import types
+from google.genai import errors, types
 
 from channel_capabilities import cookie_model_scope
 from credential_manager import COOKIE_AUTH_FAILURE_THRESHOLD, COOKIE_COOLDOWN_SECONDS, credential_manager
@@ -15,7 +15,7 @@ from first_reply import timeout_seconds
 from main import app
 from model_capabilities import get_profile, supports_transport
 from model_resource import model_id_for_policy
-from routes import claude_api
+from routes import claude_api, gemini_native, models_api
 from runtime_state import AppState, app_state
 from test_req_round15_contracts import Round15Harness
 from upstreams import cookie_delivery, cookie_native, cookie_proxy, express_sdk, native_passthrough
@@ -142,6 +142,202 @@ class TranslatedScopedModelRoutes(Round15Harness):
             return await self.client.post(f"/v1beta/models/{model}:generateContent",
                                           json={"contents": [{"parts": [{"text": "Read the temperature."}]}]})
         return await self.client.post(path, json={**body, "model": model})
+
+    def catalog_fixture(self, catalog):
+        for module, name in ((models_api, "get_express_models"),
+                             (gemini_native, "get_express_models"), (claude_api, "_available_models")):
+            self.enterContext(patch.object(module, name, AsyncMock(side_effect=lambda: list(catalog))))
+        sdk = genai.Client(api_key="test-key", http_options=types.HttpOptions(
+            base_url="http://local", api_version="v1beta",
+            async_client_args={"transport": httpx.ASGITransport(app=app)},
+            retry_options=types.HttpRetryOptions(attempts=1)))
+        self.addCleanup(sdk.close)
+        self.addAsyncCleanup(sdk.aio.aclose)
+        return sdk
+
+    async def catalogs(self, sdk):
+        headers = {"anthropic-version": "2023-06-01"}
+        # Every protocol must be discovery-only even when rotation is enabled.
+        with (patch.object(credential_manager, "_select", side_effect=AssertionError("credential reservation")),
+              patch.object(self.key_manager, "get_express_record", side_effect=AssertionError("key reservation"))):
+            self.wire.clear()
+            openai = await self.client.get("/v1/models")
+            claude = await self.client.get("/v1/models?limit=100", headers=headers)
+            pager = await sdk.aio.models.list(config={"page_size": 2})
+            native = {model.name.removeprefix("models/"): model async for model in pager}
+
+            entries = {}
+            for kind, response, request_headers in (("openai", openai, {}), ("claude", claude, headers)):
+                self.assertEqual(response.status_code, 200, response.text)
+                found = {entry["id"]: entry for entry in response.json()["data"]}
+                for model_id in found:
+                    retrieved = await self.client.get("/v1/models/" + model_id, headers=request_headers)
+                    self.assertEqual(retrieved.status_code, 200, retrieved.text)
+                    self.assertEqual(retrieved.json()["id"], model_id)
+                    if kind == "claude":
+                        self.assertEqual(retrieved.json()["display_name"], found[model_id]["display_name"])
+                entries[kind] = found
+
+            for model in native.values():
+                retrieved = await sdk.aio.models.get(model=model.name)
+                self.assertEqual(retrieved.model_dump(), model.model_dump())
+            self.assertEqual(self.wire, [])
+        return entries["openai"], entries["claude"], native
+
+    async def test_discovery_tracks_exact_projection_and_native_count_only(self):
+        match = resource()
+        mismatch = resource(project="other")
+        regional = resource(location="us-west2")
+        opaque = "endpoints/configured-fixture"
+        raw = [MODEL, match, mismatch, regional, opaque]
+        sdk = self.catalog_fixture(raw)
+        self.settings.update(roundrobin=True, cross_channel_fallback=True)
+        self.channel = "web_proxy"
+        # A disabled matching row or a shared project on an incomplete row
+        # cannot override the populated project of the complete enabled pool.
+        self.cookie_rows.extend((self.cookie_record("disabled", "other", enabled=False),
+                                 self.cookie_record("incomplete", "")))
+        app_state.get_project_id.return_value = "other"
+        translated, claude, native = await self.catalogs(sdk)
+        supported = {MODEL, match, MODEL + "-search", match + "-search"}
+        self.assertEqual(set(translated), supported)
+        self.assertEqual({model for model in claude if not model.startswith("claude-")}, supported)
+        self.assertTrue(any(model.startswith("claude-") for model in claude))
+
+        for name in (MODEL, match):
+            self.assertEqual(native[name].supported_actions, ["generateContent", "streamGenerateContent", "countTokens"])
+            self.wire.clear()
+            output = await sdk.aio.models.generate_content(model=native[name].name, contents="offline")
+            self.assertEqual(output.text, "A fixture reply.")
+            self.assertEqual([body["model"] for _, body in self.wire], [match])
+            self.wire.clear()
+            chunks = await sdk.aio.models.generate_content_stream(model=native[name].name, contents="offline")
+            self.assertEqual("".join([chunk.text or "" async for chunk in chunks]), "A fixture reply.")
+            self.assertEqual([body["model"] for _, body in self.wire], [match])
+        for bad in (mismatch, regional, opaque):
+            with self.subTest(bad=bad):
+                self.assertEqual(native[bad].supported_actions, ["countTokens"])
+                for headers in ({}, {"anthropic-version": "2023-06-01"}):
+                    missing = await self.client.get("/v1/models/" + bad, headers=headers)
+                    self.assertEqual(missing.status_code, 404, missing.text)
+                for protocol in ("chat", "messages", "responses", "native"):
+                    denied = await self.send(protocol, bad)
+                    self.assertEqual(denied.status_code, 400, denied.text)
+                    self.assertEqual(self.wire, [])
+                with self.assertRaises(errors.ClientError) as failed:
+                    stream = await sdk.aio.models.generate_content_stream(model=native[bad].name, contents="offline")
+                    await anext(stream)
+                self.assertEqual(failed.exception.code, 400)
+                self.assertEqual(self.wire, [])
+                count = await sdk.aio.models.count_tokens(model=native[bad].name, contents="offline")
+                self.assertEqual(count.total_tokens, 12)
+                self.assertEqual([path for path, _ in self.wire], ["/v1beta1/" + bad + ":countTokens"])
+
+        # Removing the Key removes the count-only row entirely, not just the method.
+        self.express_rows.clear()
+        _, _, native = await self.catalogs(sdk)
+        self.assertEqual(set(native), supported)
+        with self.assertRaises(errors.ClientError) as missing:
+            await sdk.aio.models.get(model="models/" + mismatch)
+        self.assertEqual((missing.exception.code, missing.exception.status), (404, "NOT_FOUND"))
+
+    async def test_discovery_matches_existing_fallback_and_legacy_project_contracts(self):
+        match = resource()
+        raw = [MODEL, match]
+        sdk = self.catalog_fixture(raw)
+        key = dict(self.express_rows[0])
+        complete = self.cookie_record("complete", PROJECT)
+        incomplete = self.cookie_record("incomplete", "")
+        cases = [
+            ("api_key", [], [complete], False, False, True),
+            ("api_key", [], [complete], True, True, True),
+            ("web_proxy", [key], [], False, False, True),
+            ("web_proxy", [key], [], True, True, True),
+            ("web_proxy", [], [incomplete], True, False, True),
+            ("mixed", [], [incomplete], True, False, True),
+            ("mixed", [], [complete], False, True, True),
+            ("mixed", [], [], True, False, False),
+        ]
+        app_state.get_project_id.return_value = PROJECT
+        self.settings["roundrobin"] = True
+        variants = {MODEL, match, MODEL + "-search", match + "-search"}
+        for self.channel, keys, cookies, fallback, translated_ok, native_ok in cases:
+            with self.subTest(channel=self.channel, keys=len(keys), cookies=len(cookies), fallback=fallback):
+                self.express_rows[:] = keys
+                self.cookie_rows[:] = cookies
+                self.settings["cross_channel_fallback"] = fallback
+                openai, claude, native = await self.catalogs(sdk)
+                self.assertEqual(set(openai), variants if translated_ok else set())
+                self.assertEqual({k for k in claude if not k.startswith("claude-")}, set(openai))
+                self.assertEqual(any(k.startswith("claude-") for k in claude), translated_ok)
+                self.assertEqual(set(native), variants if native_ok else set())
+                results = [await self.send(kind, match) for kind in ("chat", "messages", "responses", "native")]
+                self.assertEqual([resp.status_code == 200 for resp in results],
+                                 [translated_ok, translated_ok, translated_ok, native_ok])
+
+    async def test_claude_discovery_and_execution_choose_eligible_scoped_text_leaf(self):
+        self.channel = "web_proxy"
+        good = resource(model="gemini-3.6-pro")
+        unsupported = resource(project="other", model="gemini-4.8-pro")
+        opaque = "projects/opaque/locations/global/endpoints/gemini-999-pro"
+        raw = [unsupported, good, resource(model="gemini-3.1-flash-image"), opaque]
+        sdk = self.catalog_fixture(raw)
+        alias = "claude-opus-4-1"
+        _, claude, _ = await self.catalogs(sdk)
+        self.assertEqual(claude[alias]["display_name"], f"Claude 别名 （映射 {good}）")
+        response = await self.send("messages", alias)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["model"], alias)
+        self.assertEqual([body["model"] for _, body in self.wire], [good])
+        self.wire.clear()
+        headers = {"anthropic-version": "2023-06-01"}
+        counted = await self.client.post("/v1/messages/count_tokens", headers=headers,
+                                         json={"model": alias, "messages": PROMPT})
+        self.assertEqual((counted.status_code, counted.json()), (200, {"input_tokens": 12}))
+        self.assertEqual([path for path, _ in self.wire], ["/v1beta1/" + good + ":countTokens"])
+
+        raw.remove(good)
+        _, claude, _ = await self.catalogs(sdk)
+        self.assertNotIn(alias, claude)  # no hardcoded or opaque substitute for discovery
+        missing = await self.client.get("/v1/models/" + alias, headers=headers)
+        self.assertEqual((missing.status_code, missing.json()["error"]["type"]), (404, "not_found_error"))
+        rejected = await self.send("messages", alias)
+        self.assertEqual(rejected.status_code, 400, rejected.text)
+        self.assertEqual(self.wire, [])
+
+        # Express can still address an explicitly configured opaque locator;
+        # do not infer that it is a Claude text target from its final segment.
+        self.channel = "api_key"
+        raw[:] = [opaque]
+        translated, claude, _ = await self.catalogs(sdk)
+        self.assertIn(opaque, translated)
+        self.assertIn(opaque, claude)
+        self.assertNotIn(alias, claude)
+        explicit = await self.send("messages", opaque)
+        self.assertEqual(explicit.status_code, 200, explicit.text)
+        self.assertEqual([path for path, _ in self.wire], ["/v1beta1/" + opaque + ":generateContent"])
+
+    async def test_native_cursor_binds_methods_even_when_ids_and_key_presence_are_unchanged(self):
+        first_scope = resource(project="a-first")
+        last_scope = resource(project="z-last")
+        sdk = self.catalog_fixture([first_scope, last_scope])
+        self.channel = "web_proxy"
+        self.cookie_rows[:] = [self.cookie_record("first", "a-first")]
+        first = await sdk.aio.models.list(config={"page_size": 1})
+        self.assertEqual(first.page[0].supported_actions, ["generateContent", "streamGenerateContent", "countTokens"])
+        token = (await self.client.get("/v1beta/models?pageSize=1")).json()["nextPageToken"]
+        params = {"page_size": 1, "page_token": token}
+        second = await sdk.aio.models.list(config=params)
+        self.assertNotEqual(first.page[0].name, second.page[0].name)
+        original = [model.name async for model in await sdk.aio.models.list(config={"page_size": 1})]
+        self.cookie_rows[:] = [self.cookie_record("last", "z-last")]
+        changed = [model.name async for model in await sdk.aio.models.list(config={"page_size": 1})]
+        self.assertEqual(original, changed)
+        self.assertEqual((await sdk.aio.models.get(model=first.page[0].name)).supported_actions, ["countTokens"])
+        with self.assertRaises(errors.ClientError) as stale:
+            await sdk.aio.models.list(config=params)
+        self.assertEqual((stale.exception.code, stale.exception.status), (400, "INVALID_ARGUMENT"))
+        self.assertEqual(self.wire, [])
 
     async def test_claude_alias_metadata_and_generation_keep_the_same_scoped_target(self):
         flash = resource()

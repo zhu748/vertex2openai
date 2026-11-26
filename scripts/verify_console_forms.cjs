@@ -13,7 +13,7 @@ async function main(){
  const virtualConsole=new VirtualConsole();virtualConsole.on('jsdomError',e=>errors.push(e.message));
  const dom=new JSDOM(fs.readFileSync(path.join(root,'app/templates/dashboard.html'),'utf8'),{url:'http://console.test/',runScripts:'dangerously',pretendToBeVisual:true,virtualConsole});
  const w=dom.window,d=w.document;
- const settings={thinking_g3_level:'low',native_thinking_mode:'request',first_reply_timeout_seconds:15,image_size:'4K',image_aspect_ratio:'16:9',sampling_policy:'auto',default_top_p:null,default_temperature:null,default_max_tokens:null,roundrobin:false,proxy_urls:[],cookie_impersonate:'chrome',express_ua_profile:'sdk',retry_max:10,retry_backoff_seconds:5,retry_jitter_seconds:1,request_timeout_seconds:1800,upstream_max_concurrency:32,resumable_enabled:true,resumable_disconnect_grace_seconds:10,resumable_ttl_seconds:1800,resumable_max_streams:200,resumable_max_buffer_mb:64,resumable_max_total_mb:256,keepalive_interval:60,img_compress_enabled:true,img_compress_max_dim:1536,img_compress_max_mb:1.5,img_compress_quality:85,fake_streaming_interval:1,prefill_mode:'smart',express_location:'global'};
+ const settings={thinking_g3_level:'low',native_thinking_mode:'request',first_reply_timeout_seconds:15,image_size:'4K',image_aspect_ratio:'16:9',sampling_policy:'auto',default_top_p:null,default_temperature:null,default_max_tokens:null,roundrobin:false,retry_backoff_mode:'fixed',image_max_concurrency:1,proxy_urls:[],cookie_impersonate:'chrome',express_ua_profile:'sdk',retry_max:10,retry_backoff_seconds:5,retry_jitter_seconds:1,request_timeout_seconds:1800,upstream_max_concurrency:32,resumable_enabled:true,resumable_disconnect_grace_seconds:10,resumable_ttl_seconds:1800,resumable_max_streams:200,resumable_max_buffer_mb:64,resumable_max_total_mb:256,keepalive_interval:60,img_compress_enabled:true,img_compress_max_dim:1536,img_compress_max_mb:1.5,img_compress_quality:85,fake_streaming_interval:1,prefill_mode:'smart',express_location:'global'};
  const overrides={},builtins={text:{anti_truncation_mode:'both'}};
  settings.cookie_auto_refresh=true;settings.cookie_refresh_interval_seconds=600;
  let mode='mixed';
@@ -345,6 +345,37 @@ async function main(){
   edit('retry_max','13');d.querySelector('button[onclick*="saveSettings"]').click();await tick();
   assert.equal(settings.retry_max,13);assert.equal(w.consoleForms.dirty(),false);
   check('Runtime draft reload preservation, save and undo');
+
+  {
+   const saveRuntime=async()=>{d.querySelector('button[onclick*="saveSettings"]').click();await tick();};
+   const writes=()=>requests.filter(r=>r.path==='/api/settings'&&r.method==='POST');
+   assert.equal(el('retry_backoff_mode').value,'fixed');
+   assert.equal(el('image_max_concurrency').value,'1');
+   edit('retry_backoff_mode','exponential');edit('image_max_concurrency','3');
+   await w.loadParams();
+   assert.equal(el('retry_backoff_mode').value,'exponential');
+   assert.equal(el('image_max_concurrency').value,'3');
+   assert.match(el('runtime-save-bar').textContent,/2 项修改未保存/);
+   await saveRuntime();
+   assert.deepEqual(writes().at(-1).body,{retry_backoff_mode:'exponential',image_max_concurrency:3,
+     _expected:{retry_backoff_mode:{present:true,value:'fixed'},image_max_concurrency:{present:true,value:1}}});
+   assert.equal(w.consoleForms.dirty(),false);
+   edit('image_max_concurrency','65');
+   const before=writes().length;
+   await saveRuntime();
+   assert.equal(writes().length,before);
+   assert.equal(el('image_max_concurrency').getAttribute('aria-invalid'),'true');
+   w.consoleForms.discard('runtime');
+   assert.equal(el('image_max_concurrency').value,'3');
+   edit('image_max_concurrency','');
+   await saveRuntime();
+   assert.deepEqual(writes().at(-1).body,{image_max_concurrency:1,
+     _expected:{image_max_concurrency:{present:true,value:3}}});
+   edit('retry_backoff_mode','fixed');
+   await saveRuntime();
+   assert.equal(w.consoleForms.dirty(),false);
+   check('Retry modes and image concurrency are runtime drafts; saves are sparse, validated and discardable');
+  }
 
   {
    const original={express_location:settings.express_location,keepalive_url:settings.keepalive_url};

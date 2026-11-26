@@ -1307,7 +1307,10 @@ def _assemble_whole_response(gen: "CookieGeneration", st: _WholeBodyState) -> "R
             if finish_reason in ("stop", "tool_calls"):
                 require_unique_tool_call_ids(call.get("id") for call in st.tool_calls)
             for i, call in enumerate(st.tool_calls):
-                st.tool_calls[i] = openai_tool_call(gen.response_id, i, call)
+                # The internal Responses proposal carries original bytes but
+                # only its public endpoint can commit a scoped receipt.
+                st.tool_calls[i] = openai_tool_call(gen.response_id, i, call,
+                                                   register_signature=not typed_output)
         if got_output:
             credential_manager.record_cookie_success(gen.account_id, credential=gen.record)
             # 预填充智能兼容：去重后把预填充文本拼回输出开头

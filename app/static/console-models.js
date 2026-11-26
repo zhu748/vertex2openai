@@ -21,6 +21,7 @@ const RUNTIME_NUMERIC_DEFAULTS = {
   resumable_max_streams: 200,
   request_timeout_seconds: 1800,
   upstream_max_concurrency: 32,
+  image_max_concurrency: 1,
   resumable_max_buffer_mb: 64,
   resumable_max_total_mb: 256,
   keepalive_interval: 60,
@@ -183,6 +184,7 @@ async function loadParams() {
       'express_location',
       'keepalive_url'
     ].forEach((k) => setV(k, s[k]));
+    setV('retry_backoff_mode', s.retry_backoff_mode || 'fixed');
     [
       'img_compress_enabled',
       'fake_streaming',
@@ -911,6 +913,7 @@ async function saveSettings() {
     cookie_structured_output: $('cookie_structured_output').checked,
     debug_outbound: $('debug_outbound').checked,
     prefill_mode: $('prefill_mode').value,
+    retry_backoff_mode: $('retry_backoff_mode').value,
     express_location: $('express_location').value,
     prefill_suppress_thinking: $('prefill_suppress_thinking').checked,
     resumable_enabled: $('resumable_enabled').checked,

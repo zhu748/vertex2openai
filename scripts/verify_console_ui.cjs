@@ -1214,6 +1214,39 @@ async function main() {
       await editor.locator('button[onclick*="saveSettings"]').click();
       return await saved;
     }
+    assert.equal(await runtimeA.inputValue('#retry_backoff_mode'),'fixed');
+    assert.equal(await runtimeA.inputValue('#image_max_concurrency'),'1');
+    await runtimeA.selectOption('#retry_backoff_mode','exponential');
+    await runtimeA.fill('#image_max_concurrency','3');
+    const resources=await saveRuntime(runtimeA);
+    assert.equal(resources.status(),200);
+    assert.deepEqual(resources.request().postDataJSON(),{retry_backoff_mode:'exponential',image_max_concurrency:3,
+      _expected:{retry_backoff_mode:{present:true,value:'fixed'},image_max_concurrency:{present:true,value:1}}});
+    assert.equal((await resources.json()).image_max_concurrency,3);
+    await runtimeA.waitForFunction(()=>!consoleForms.dirty());
+
+    await runtimeB.fill('#image_max_concurrency','2');
+    const capConflict=await saveRuntime(runtimeB);
+    assert.equal(capConflict.status(),409);
+    assert.equal((await capConflict.json()).field,'image_max_concurrency');
+    await runtimeB.waitForFunction(()=>!document.querySelector('button[onclick*="saveSettings"]').disabled);
+    await runtimeB.evaluate(()=>loadParams());
+    assert.equal(await runtimeB.inputValue('#retry_backoff_mode'),'exponential');
+    assert.equal(await runtimeB.inputValue('#image_max_concurrency'),'2');
+    await runtimeB.locator('[data-draft-group=runtime] [data-discard]').click();
+    assert.equal(await runtimeB.inputValue('#image_max_concurrency'),'3');
+    await runtimeB.reload();
+    await runtimeB.waitForFunction(()=>settingsLoaded && capabilitiesLoaded);
+    assert.equal(await runtimeB.inputValue('#retry_backoff_mode'),'exponential');
+    assert.equal(await runtimeB.inputValue('#image_max_concurrency'),'3');
+    await runtimeB.fill('#image_max_concurrency','');
+    await runtimeB.selectOption('#retry_backoff_mode','fixed');
+    const clearedCap=await saveRuntime(runtimeB);
+    assert.equal(clearedCap.status(),200);
+    assert.deepEqual(clearedCap.request().postDataJSON(),{retry_backoff_mode:'fixed',image_max_concurrency:1,
+      _expected:{retry_backoff_mode:{present:true,value:'exponential'},image_max_concurrency:{present:true,value:3}}});
+    await runtimeB.waitForFunction(()=>!consoleForms.dirty());
+    check('退避模式和生图并发使用真实 API 保存并重新加载；并发冲突保留草稿，清空后恢复默认上限');
     await runtimeA.fill('#retry_max',String(oldRetry+1));
     assert.equal((await saveRuntime(runtimeA)).status(),200);
     await runtimeB.fill('#keepalive_interval',String(oldKeepalive+5));

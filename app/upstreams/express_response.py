@@ -27,6 +27,7 @@ from response_validation import (
     IncompleteResponseError, ResponsesMediaError, ResponsesTextCallOwner, StreamToolCallIds,
     map_finish_reason_to_openai,
     complete_function_arguments,
+    require_responses_supported_part,
     responses_partial_call,
     sdk_function_call,
     sdk_media_payload,
@@ -105,6 +106,7 @@ def responses_sdk_source(response: GenerateContentResponse, private_text_name: s
     for index, part in enumerate(parts):
         if sdk_media_payload(part) is not None:
             raise ResponsesMediaError()
+        require_responses_supported_part(part)
         if incomplete and (fc := sdk_function_call(part)) is not None:
             fragmented = responses_partial_call(fc)
             if not (owner and owner.owns(fc.name, fc.id, fc.will_continue, fragmented)):

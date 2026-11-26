@@ -270,11 +270,15 @@ def _sdk_stream_error_payload(e: Exception) -> str:
 async def _convert_completed_response(response: Any, request: OpenAIRequest) -> dict:
     # Both paths keep the worker deadline, cancellation and slot-until-done
     # contract; large, unknown and media shapes still use the media executor.
+    responses = request._completion_target == "responses"
     return await run_media_task(
         convert_to_openai_format, response, request.model,
         # Neither structured Chat text nor typed Responses items may be
         # decorated with the gateway's safety score HTML.
-        structured_output=(wants_json_output(request) or request._completion_target == "responses"),
+        structured_output=wants_json_output(request) or responses,
+        # Responses uses opaque call IDs and its own scoped delivery receipt.
+        # The internal Chat proposal is not a delivered call-ID observation.
+        register_tool_signatures=not responses,
         heavy=completed_response_needs_media_pool(response),
     )
 

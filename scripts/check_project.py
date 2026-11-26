@@ -8,8 +8,15 @@ STATE_DIR + sys.path 样板随之删除。静态与架构检查仍各自独立�
 from pathlib import Path
 import subprocess
 import sys
+from typing import NamedTuple
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class _Check(NamedTuple):
+    name: str
+    args: list[str]
+    timeout: int = 120
 
 # ENG-P3-10（2026-11 审查）：入口韧性——compileall 对缺失目录静默 rc=0
 # 通过（形同跳过）；脚本类检查的目标文件缺失时 subprocess 抛
@@ -36,44 +43,49 @@ def main() -> int:
             print(f"  - {label}", file=sys.stderr)
         return 1
     checks = [
-        ("语法", ["-m", "compileall", "-q", "app", "tests", "scripts", ".github/scripts"]),
+        _Check("语法", ["-m", "compileall", "-q", "app", "tests", "scripts", ".github/scripts"]),
         # ENG-P3-13（2026-11 收尾）：在原有骨架上扩入 B（bugbear）与安全的 UP（pyupgrade）
         # 规则族——B023/B904/B007/B017/B905 已全部清零；UP006/UP035/UP045（合计约
         # 390 处注解风格改写）按审查「逐步扩」的意见继续分批，不在本次范围。
         # tests/ 的 B023 豁免：测试夹具中「闭包捕获循环变量」是参数化 mock 的
         # 合法模式（92 处，均在同迭代内消费），无延迟绑定风险。
-        ("静态检查", ["-m", "ruff", "check", "app", "tests", "scripts",
+        _Check("静态检查", ["-m", "ruff", "check", "app", "tests", "scripts",
             "--select", "E9,F63,F7,F82,B012,B023,B007,B017,B904,B905,F401,F811,F841,"
                        "UP009,UP012,UP015,UP017,UP034,UP037,UP041",
             "--per-file-ignores", "tests/**:B023"]),
         # QUA-P2-5 第一阶段闸（R13）：upstreams 家族全量注解；第二阶段（R14）
         # 纳入核心管线工具（first_reply / streaming / tool_stream /
         # message_processing / usage）；其余目录按「纯逻辑模块先行」逐步纳入。
-        ("注解闸（upstreams+管线工具）", ["-m", "ruff", "check", "app/upstreams",
+        _Check("注解闸（upstreams+管线工具）", ["-m", "ruff", "check", "app/upstreams",
             "app/first_reply.py", "app/streaming.py", "app/tool_stream.py",
             "app/message_processing.py", "app/usage.py",
             "--select", "ANN001,ANN201"]),
         # QUA-P3-2 复杂度闸：max-complexity=40（R14 起零基线——四个超标
         # 函数全部拆分完毕），只挡新增；后续目标 35（extract_events 40 /
         # _claude_stream_response 37 待拆）。
-        ("复杂度闸（C901≤40）", ["-m", "ruff", "check", "app", "--select", "C901",
+        _Check("复杂度闸（C901≤40）", ["-m", "ruff", "check", "app", "--select", "C901",
                                 "--config", "lint.mccabe.max-complexity=40"]),
-        ("工作流", [".github/scripts/check_workflows.py"]),
-        ("模块边界", ["scripts/check_architecture.py"]),
+        _Check("工作流", [".github/scripts/check_workflows.py"]),
+        _Check("模块边界", ["scripts/check_architecture.py"]),
         # QUA-P2-10：裸 print 只降不升（基线化存量 262 处，新代码用 logger.log）。
-        ("print 基线", ["scripts/check_print_baseline.py"]),
-        ("单元测试", ["-m", "pytest", "tests/", "-q"]),
+        _Check("print 基线", ["scripts/check_print_baseline.py"]),
+        # 完整测试集在本地离线验证中已超过 120 秒，保留单独且有限的余量。
+        _Check("单元测试", ["-m", "pytest", "tests/", "-q"], timeout=240),
+        _Check("SDK 档案兼容", ["scripts/probe_sdk_channel_profiles.py"]),
     ]
-    checks.append(("SDK 档案兼容", ["scripts/probe_sdk_channel_profiles.py"]))
     failures = []
-    for name, args in checks:
+    for name, args, timeout in checks:
         print(f"\n检查：{name}", flush=True)
         try:
             result = subprocess.run([sys.executable, *args], cwd=ROOT,
-                                    capture_output=True, text=True, timeout=120)
-        except subprocess.TimeoutExpired:
+                                    capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
             failures.append(name)
-            print("检查超时", file=sys.stderr)
+            for output, stream in ((exc.stdout, sys.stdout), (exc.stderr, sys.stderr)):
+                if output:
+                    partial = output.decode(errors="replace") if isinstance(output, bytes) else output
+                    print(partial.rstrip("\n"), file=stream)
+            print(f"{name}检查超时（{timeout} 秒）", file=sys.stderr)
             continue
         except FileNotFoundError as exc:
             # 防御：预检已覆盖已知目标，这里兜底未来新增的检查项。

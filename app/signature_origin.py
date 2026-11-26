@@ -568,7 +568,10 @@ def bind_signature_origins(request, api_key):
                 witness = m._responses_item_witness
                 ordinary = (_responses_ordinary_tag(google, tool_text, m.reasoning_content, budget)
                             if lineage is not None else b"")
-                if witness is None and not ordinary and (lineage is None or lineage.legacy_only):
+                legacy = witness is None and not ordinary and (lineage is None or lineage.legacy_only)
+                if legacy and lineage is not None:
+                    legacy = not _responses_legacy_contradicts(keys, calls, budget)
+                if legacy:
                     m._signature_slots = keys
                 if lineage is not None:
                     item_key = _responses_item_key(keys, witness, lineage.key, ordinary)
@@ -582,8 +585,7 @@ def bind_signature_origins(request, api_key):
                         lineage = ResponsesLineage(item_key, issued.destination, False,
                                                    lineage.signed_ordinary or bool(ordinary))
                     else:
-                        lineage = ResponsesLineage(None, legacy_only=lineage.legacy_only and witness is None
-                                                   and not ordinary)
+                        lineage = ResponsesLineage(None, legacy_only=legacy)
                 prefix = _hash(b"tool-step-v1", prefix, *tags)
                 continue
             prefix = _hash(b"tool-message-v2", prefix, _history_tag(m, budget))
@@ -633,9 +635,9 @@ def publish_responses_item_origins(keys: tuple[bytes, ...], signatures: tuple[by
     """Commit the legacy origin and the exact whole-batch receipt after delivery."""
     exact = lineage.permits(destination)
     # Keep the old projection for histories with no item IDs. A delivered
-    # reply under a broken witnessed lineage or one with signed ordinary
-    # Parts may collide with such a reply, but cannot certify the weaker
-    # alias: it does not bind those original bytes or their positions.
+    # reply under a broken witnessed or contradicted legacy lineage, or one
+    # with signed ordinary Parts, may collide with such a reply but cannot
+    # certify the weaker alias: it does not bind those bytes or positions.
     weak = ordinary == b"" and not lineage.signed_ordinary and (exact or lineage.legacy_only)
     signature_store.register_origin_batch(keys, signatures if weak else None, destination)
     if not exact or not (key := _responses_item_key(keys, witness, lineage.key, ordinary)):
@@ -673,6 +675,11 @@ def _responses_slot_bounds(data, count):
     return bounds if offset == len(data) else ()
 
 
+def _responses_carrier_original(call, encoded, budget):
+    budget.consume(_signature_size(encoded))
+    return ordinary_signature(signature_from_extra(call, strict_encoding=True)[0])
+
+
 def _responses_carriers_match(data, calls, budget):
     bounds = _responses_slot_bounds(data, len(calls))
     if not bounds:
@@ -681,13 +688,29 @@ def _responses_carriers_match(data, calls, budget):
     for call, (start, end) in zip(calls, bounds, strict=True):
         encoded = google_metadata(call).get("thought_signature")
         if encoded:
-            budget.consume(_signature_size(encoded))
-            original = ordinary_signature(signature_from_extra(call, strict_encoding=True)[0])
+            original = _responses_carrier_original(call, encoded, budget)
             # Absent bytes are exactly what a thin client needs to recover.
             # Supplied originals must agree, even for an unsigned slot.
             if original is not None and original != view[start:end]:
                 return False
     return True
+
+
+def _responses_legacy_contradicts(keys, calls, budget):
+    """Only a positive scoped record can contradict an explicit ID-less echo."""
+    for key, call in zip(keys, calls, strict=True):
+        if not (encoded := google_metadata(call).get("thought_signature")):
+            continue
+        record = signature_store.get_record(key)
+        if (record is None or record.destination in (None, UNTRUSTED)
+                or record.state not in (SignatureState.SIGNED, SignatureState.UNSIGNED_FOLLOWER)):
+            continue
+        original = _responses_carrier_original(call, encoded, budget)
+        if original is not None and original != record.signature:
+            # This does not establish the origin of the caller's bytes. It
+            # only rules out combining them with the legacy batch and suffix.
+            return True
+    return False
 
 
 def responses_item_record(scope: bytes | None, count: int, index: int) -> SignatureRecord:

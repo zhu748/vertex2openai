@@ -14,7 +14,8 @@ from message_processing import iter_giant_content
 from protojson import standard_base64
 
 from response_validation import (IncompleteResponseError, ResponsesMediaError, StreamToolCallIds, complete_function_arguments,
-                                 has_finish_reason, responses_partial_call, responses_prompt_block_reason, validate_generation_finish_reason)
+                                 has_finish_reason, require_responses_supported_part, responses_partial_call,
+                                 responses_prompt_block_reason, validate_generation_finish_reason)
 from json_stream import MAX_JSON_OBJECT_BYTES, JsonObjects as _JsonObjects
 from signature_store import signature_store
 from upstreams.cookie_candidate_metadata import native_candidate_metadata, native_prompt_feedback
@@ -79,13 +80,15 @@ def apply_wire_signature(data: dict, ordinary_metadata: list, part_order: list) 
     return signature
 
 
-def openai_tool_call(response_id: str, call_index: int, call: dict, *, include_arguments: bool = True) -> dict:
+def openai_tool_call(response_id: str, call_index: int, call: dict, *, include_arguments: bool = True,
+                     register_signature: bool = True) -> dict:
     name, args = call["name"], call.get("args") or {}
     call_id = call.get("id") or _stable_cookie_tool_call_id(response_id, call_index, name, args)
     signature = _provider_signature_bytes(call.get("thought_signature"))
     # QUA-P2-2：三态拓扑写入收敛到 register_call_signature 单一入口。
-    signature_store.register_call_signature(
-        call_id, signature, unsigned_follower=call_index > 0)
+    if register_signature:
+        signature_store.register_call_signature(
+            call_id, signature, unsigned_follower=call_index > 0)
     payload = {
         "id": call_id,
         "type": "function",
@@ -439,6 +442,8 @@ def extract_events(obj: dict, *, preserve_parts: bool = False, strip_thoughts: b
 
             for part in parts:
                 part = _wire_object(part, "part", allow_null=False)
+                if responses_output:
+                    require_responses_supported_part(part)
                 text = part.get("text", "")
                 if text is not None and not isinstance(text, str):
                     raise IncompleteResponseError("上游 part.text 必须是字符串。")

@@ -1007,7 +1007,8 @@ def parse_gemini_response_for_reasoning_and_content(
 
 
 def process_gemini_response_to_openai_dict(
-    gemini_response_obj: Any, request_model_str: str, *, structured_output: bool = False
+    gemini_response_obj: Any, request_model_str: str, *, structured_output: bool = False,
+    register_tool_signatures: bool = True,
 ) -> Dict[str, Any]:
     choices = []
     pending_signatures: PendingCallSignatures = []
@@ -1133,7 +1134,7 @@ def process_gemini_response_to_openai_dict(
 
     usage_data = map_usage(getattr(gemini_response_obj, "usage_metadata", None))
     # A later invalid part or candidate rejects the whole reply, including its IDs.
-    if pending_signatures:
+    if register_tool_signatures and pending_signatures:
         publish_tool_call_signatures(pending_signatures)
     return {
         "id": base_id,
@@ -1145,5 +1146,7 @@ def process_gemini_response_to_openai_dict(
     }
 
 
-def convert_to_openai_format(gemini_response: Any, model: str, *, structured_output: bool = False) -> Dict[str, Any]:
-    return process_gemini_response_to_openai_dict(gemini_response, model, structured_output=structured_output)
+def convert_to_openai_format(gemini_response: Any, model: str, *, structured_output: bool = False,
+                             register_tool_signatures: bool = True) -> Dict[str, Any]:
+    return process_gemini_response_to_openai_dict(gemini_response, model, structured_output=structured_output,
+                                                  register_tool_signatures=register_tool_signatures)

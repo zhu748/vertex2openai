@@ -11,6 +11,7 @@ from unittest.mock import patch
 from starlette.requests import ClientDisconnect
 
 import config
+import signature_origin
 import signature_store
 from test_claude_omitted_signature_projection import new_cache
 from test_replay_http_delivery import Peer
@@ -344,6 +345,120 @@ class ResponsesItemWitnessTests(SchemaRouteHarness):
                     await self.assert_descendant(prompt, first, thin_item(child), (*FIRST, None), stream=stream)
                     await self.assert_descendant(prompt, first, no_item_id(thin_item(child)),
                                                  (*FIRST, b"legacy"), stream=stream)
+
+    async def test_idless_known_contradiction_vetoes_inferred_sibling_descendant_and_publication(self):
+        for self.channel in ("api_key", "web_proxy"):
+            for stream in (False, True):
+                with self.subTest(channel=self.channel, stream=stream), ExitStack() as stack:
+                    new_cache(stack)
+                    prompt = "Keep an ID-less tool history when all known originals agree."
+                    other = await self.issue(prompt + " Independent.", stream, SECOND)
+                    parents = [no_item_id(thin_item(item)) for item in await self.issue(prompt, stream, FIRST)]
+                    child_signature = b"child generated with the first parent"
+                    child, = await self.generate(continuation(prompt, parents), stream,
+                                                 assistant("legacy-child", child_signature))
+                    leaf = no_item_id(thin_item(child))
+                    await self.assert_descendant(prompt, parents, leaf, (*FIRST, child_signature), stream=stream)
+
+                    # Compare originals, not whether the client normalized Base64.
+                    unpadded = base64.urlsafe_b64encode(FIRST[0]).decode().rstrip("=")
+                    equivalent = [{**parents[0], "extra_content": {"google": {"thought_signature": unpadded}}},
+                                  parents[1]]
+                    await self.assert_descendant(prompt, equivalent, leaf, (*FIRST, child_signature), stream=stream)
+
+                    # The unique scoped record is for a different genuine
+                    # original. The echo wins on its own slot, not on others.
+                    changed = [{**parents[0], "extra_content": other[0]["extra_content"]}, parents[1]]
+                    await self.assert_descendant(prompt, changed, leaf, (SECOND[0], None, None), stream=stream)
+                    await self.assert_descendant(prompt, changed, no_item_id(child),
+                                                 (SECOND[0], None, child_signature), stream=stream)
+
+                    new_signature = b"child generated under the contradiction"
+                    altered, = await self.generate(continuation(prompt, changed), stream,
+                                                   assistant("altered-child", new_signature))
+                    self.assertEqual([signature(p) for p in calls_in_wire(self.sent[-1], "functionCall")],
+                                     [SECOND[0], None])
+                    self.assertEqual(base64.b64decode(altered["extra_content"]["google"]["thought_signature"]),
+                                     new_signature)
+                    for history, expected in ((parents, FIRST), (changed, (SECOND[0], None))):
+                        await self.assert_descendant(prompt, history, no_item_id(thin_item(altered)),
+                                                     (*expected, None), stream=stream)
+                        await self.assert_descendant(prompt, history, no_item_id(altered),
+                                                     (*expected, new_signature), stream=stream)
+
+                    # Nothing in those lookups invalidated the clean child.
+                    await self.assert_descendant(prompt, parents, leaf, (*FIRST, child_signature), stream=stream)
+                    # A delivered generation under contradictory ancestry must
+                    # fence a colliding weak alias even if its final bytes agree.
+                    # An attempted but unconfirmed final ASGI send cannot do so.
+                    self.reply = assistant("legacy-child", child_signature)
+                    lost = Peer(PATH, payload=request(input=continuation(prompt, changed), stream=stream))
+
+                    async def drop_final(message):
+                        if message["type"] == "http.response.body" and not message.get("more_body"):
+                            await lost.drop()
+
+                    await asyncio.wait_for(lost.run(drop_final), 2)
+                    await self.assert_descendant(prompt, parents, leaf, (*FIRST, child_signature), stream=stream)
+                    await self.generate(continuation(prompt, changed), stream,
+                                        assistant("legacy-child", child_signature))
+                    await self.assert_descendant(prompt, parents, leaf, (*FIRST, None), stream=stream)
+
+    async def test_idless_new_original_on_a_proven_unsigned_follower_vetoes_inference(self):
+        for self.channel in ("api_key", "web_proxy"):
+            for stream in (False, True):
+                with self.subTest(channel=self.channel, stream=stream), ExitStack() as stack:
+                    new_cache(stack)
+                    prompt = "Distinguish an observed unsigned follower from a miss."
+                    parents = [no_item_id(thin_item(item)) for item in
+                               await self.issue(prompt, stream, (FIRST[0], None))]
+                    child, = await self.generate(continuation(prompt, parents), stream,
+                                                 assistant("child", b"unsigned ancestor"))
+                    leaf = no_item_id(thin_item(child))
+                    await self.assert_descendant(prompt, parents, leaf, (FIRST[0], None, b"unsigned ancestor"),
+                                                 stream=stream)
+                    changed = [parents[0], {**parents[1], "extra_content": {
+                        "google": {"thought_signature": base64.b64encode(SECOND[1]).decode()}}}]
+                    await self.assert_descendant(prompt, changed, leaf, (None, SECOND[1], None), stream=stream)
+
+    async def test_idless_nondiagnostic_records_do_not_assert_a_contradiction(self):
+        for self.channel in ("api_key", "web_proxy"):
+            for stream in (False, True):
+                for unavailable in ("different prefix", "unsigned first", "ambiguous"):
+                    with self.subTest(channel=self.channel, stream=stream, unavailable=unavailable), ExitStack() as stack:
+                        new_cache(stack)
+                        prompt = "An explicit carrier with no unique diagnostic record."
+                        issued = await self.issue(prompt, stream, (
+                            None if unavailable == "unsigned first" else FIRST[0], FIRST[1]))
+                        if unavailable == "different prefix":
+                            prompt += " This is another conversation."
+                        elif unavailable == "ambiguous":
+                            await self.issue(prompt, stream, (b"another issued original", FIRST[1]))
+                        parents = [no_item_id(thin_item(item)) for item in issued]
+                        parents[0]["extra_content"] = {"google": {
+                            "thought_signature": base64.b64encode(SECOND[0]).decode()}}
+                        child, = await self.generate(continuation(prompt, parents), stream,
+                                                     assistant("child", b"legacy best effort"))
+                        sibling = None if unavailable == "different prefix" else FIRST[1]
+                        await self.assert_descendant(prompt, parents, no_item_id(thin_item(child)),
+                                                     (SECOND[0], sibling, b"legacy best effort"), stream=stream)
+
+    async def test_idless_explicit_originals_can_exceed_only_the_private_comparison_budget(self):
+        for self.channel in ("api_key", "web_proxy"):
+            with self.subTest(channel=self.channel), ExitStack() as stack:
+                new_cache(stack)
+                prompt = "Bound historical carrier comparisons, not protocol delivery."
+                original = b"\xff" * 1024
+                first = await self.issue(prompt, False, (original, FIRST[1]))
+                parents = [no_item_id(thin_item(item)) for item in first]
+                child, = await self.generate(continuation(prompt, parents), False, assistant("child", b"original child"))
+                leaf = no_item_id(thin_item(child))
+                carried = [no_item_id(first[0]), parents[1]]
+                await self.assert_descendant(prompt, carried, leaf, (original, FIRST[1], b"original child"), stream=False)
+                with patch.object(signature_origin, "_MAX_TEXT", 1024):
+                    await self.assert_descendant(prompt, carried, leaf, (original, None, None), stream=False)
+                # Exhausting proof work for a lookup does not change the cache.
+                await self.assert_descendant(prompt, parents, leaf, (original, FIRST[1], b"original child"), stream=False)
 
     async def test_different_adapters_to_same_qualified_destination_keep_lineage(self):
         self.settings["express_location"] = "global"

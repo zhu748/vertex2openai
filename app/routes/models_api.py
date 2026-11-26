@@ -3,6 +3,7 @@ from typing import List, Dict, Any, Set, Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 
 from auth import extract_candidate_key, validate_api_key
+from catalog_availability import CatalogAvailability
 from model_loader import get_express_models
 from runtime_state import app_state
 from model_catalog import catalog_variant_ids
@@ -51,7 +52,7 @@ async def list_models(fastapi_request: Request, api_key: str = Depends(get_model
 
     # Anthropic 客户端：返回 Anthropic List Models 格式（claude 别名 + Gemini 模型）
     if claude_api.is_anthropic_client(fastapi_request):
-        return await claude_api.anthropic_model_list(fastapi_request.query_params)
+        return await claude_api.anthropic_model_list(fastapi_request.query_params, express_key_manager_instance)
 
     return {"object": "list", "data": await openai_model_entries(express_key_manager_instance)}
 
@@ -72,7 +73,7 @@ async def retrieve_model(model_id: str, fastapi_request: Request,
     express_key_manager_instance = fastapi_request.app.state.express_key_manager
 
     if claude_api.is_anthropic_client(fastapi_request):
-        data = await claude_api.anthropic_models_data()
+        data = await claude_api.anthropic_models_data(express_key_manager_instance)
         for entry in data.get("data") or []:
             if isinstance(entry, dict) and entry.get("id") == model_id:
                 return entry
@@ -89,11 +90,10 @@ async def retrieve_model(model_id: str, fastapi_request: Request,
 
 async def openai_model_entries(express_key_manager_instance) -> List[Dict[str, Any]]:
     """OpenAI 格式模型目录（列表 /v1/models 与检索 /v1/models/{id} 共用）。"""
-    # 混合模式也可以仅启用 Cookie；模型目录与独立 Cookie 模式保持一致。
-    has_web_proxy = app_state.get_channel_mode() in ("web_proxy", "mixed")
-    has_express_key = express_key_manager_instance.get_total_keys() > 0
-
-    raw_models = await get_express_models() if (has_express_key or has_web_proxy) else []
+    availability = CatalogAvailability.read(app_state, express_key_manager_instance)
+    if not (availability.translated_express or availability.translated_cookie_projects):
+        return []
+    raw_models = await get_express_models()
 
     # 设置基底只取一次（旧实现每个模型都 get_effective_settings → 全量
     # deepcopy 整个设置树，N 个模型 = N 次深拷贝；现在每模型只剩浅拷贝）。
@@ -104,8 +104,7 @@ async def openai_model_entries(express_key_manager_instance) -> List[Dict[str, A
     current_time = int(time.time())
 
     def add_model(base_id: str):
-        # 展开口径单一事实源：model_catalog.catalog_variant_ids（OpenAI /
-        # Anthropic / Gemini 原生三套目录共用，变体集合保持一致）。
+        # OpenAI 与 Anthropic 共用相同的翻译协议变体规则。
         plain_id, _ = split_model_alias(base_id)
         effective = app_state.get_effective_settings(plain_id, base=settings_base)
         for final_id in catalog_variant_ids(base_id, effective):
@@ -123,6 +122,7 @@ async def openai_model_entries(express_key_manager_instance) -> List[Dict[str, A
             processed_ids.add(final_id)
 
     for model_id in raw_models:
-        add_model(model_id)
+        if availability.supports_translated(model_id):
+            add_model(model_id)
 
     return sorted(final_model_list, key=lambda item: item["id"])

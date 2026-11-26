@@ -784,20 +784,29 @@ def _acknowledge_native_http(response: Response, request: Request, buf: Resumabl
     return response
 
 
-async def _resumable_native(request: Request, api_key: str, model: str, action: str, query: str, payload: bytes):
+def native_replay_fingerprint(model: str, action: str, query: str, payload: bytes) -> str:
     # 指纹用原始请求体的 sha256：旧实现把已解析的 payload（可达 32MiB，
     # 含 base64 图片）重新 json.dumps 一遍，大请求数百毫秒纯 CPU。
     # 语义同步收窄为「原样重发命中同一缓冲」（与 chat_api 指纹的注释口径
     # 一致）；同一客户端重发的字节序列相同，命中行为不变。
-    fingerprint = "native:" + json.dumps(
+    return "native:" + json.dumps(
         [model, action, sorted(parse_qs(query).items()),
          hashlib.sha256(payload).hexdigest()], sort_keys=True,
         ensure_ascii=False, separators=(",", ":"))
+
+
+async def _resumable_native(request: Request, api_key: str, model: str, action: str, query: str, payload: bytes,
+                            *, fingerprint: Optional[str] = None, allow_admit: bool = True) -> Optional[Response]:
+    if fingerprint is None:
+        fingerprint = native_replay_fingerprint(model, action, query, payload)
     try:
-        buf, new, start, _source = await resolve_buffer(
-            resumable_store, request, api_key, fingerprint, model=model, kind="native")
+        resolved = await resolve_buffer(resumable_store, request, api_key, fingerprint, model=model,
+                                        kind="native", allow_admit=allow_admit)
     except (ResumeRequestError, BufferCapacityError) as exc:
         return _native_error(exc.code, str(exc))
+    if resolved is None:
+        return None  # a lookup cannot allocate a buffer for a fresh request
+    buf, new, start, _source = resolved
 
     async def close_response(response: Response):
         # getattr 默认值不能急切求值：传入无 body_iterator 的 Response 时

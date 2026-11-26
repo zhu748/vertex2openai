@@ -10,6 +10,7 @@ import json
 from typing import Optional
 
 import config as app_config
+from catalog_availability import NativeMethods
 from express_endpoint import resolve_express_model_path
 from runtime_state import app_state
 from schema_validation import SchemaValidationError
@@ -22,7 +23,8 @@ EXPRESS_BASE = app_config.VERTEX_BASE_URL or "https://aiplatform.googleapis.com"
 EXPRESS_API_VERSION = "v1beta1"
 
 
-def _native_model_entry(model_id: str, *, can_count_tokens: bool = True) -> dict:
+def _native_model_entry(model_id: str, *, methods: NativeMethods = (
+        NativeMethods.GENERATE | NativeMethods.COUNT_TOKENS)) -> dict:
     """Gemini 原生 models.list / models.get 共用的目录条目。"""
     lowered = model_id.lower()
     if lowered.endswith("-search"):
@@ -33,16 +35,16 @@ def _native_model_entry(model_id: str, *, can_count_tokens: bool = True) -> dict
         from model_capabilities import image_resolution_suffix
         tier = image_resolution_suffix(model_id)[1]
         variant_note = f"（生图分辨率变体：等价 imageConfig.imageSize={tier}）" if tier else ""
-    methods = ["generateContent", "streamGenerateContent"]
-    if can_count_tokens:
-        methods.append("countTokens")
+    actions = ["generateContent", "streamGenerateContent"] if methods & NativeMethods.GENERATE else []
+    if methods & NativeMethods.COUNT_TOKENS:
+        actions.append("countTokens")
     return {
         "name": f"models/{model_id}",
         "displayName": model_id,
         "description": f"Vertex Express 模型（经 vertex2openai 透传）：{model_id}{variant_note}",
         "inputTokenLimit": 1048576,
         "outputTokenLimit": 65536,
-        "supportedGenerationMethods": methods,
+        "supportedGenerationMethods": actions,
     }
 
 

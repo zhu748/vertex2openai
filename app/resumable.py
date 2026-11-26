@@ -102,8 +102,9 @@ def resume_intent(request, *, default_on: bool) -> tuple[bool, bool]:
     return default_on or explicit or preference in ("1", "true", "yes"), explicit
 
 
-async def resolve_buffer(store, request, api_key: str, fingerprint: str, *, model: str, kind: str):
-    """Resolve an immutable generation, or atomically admit a new request."""
+async def resolve_buffer(store, request, api_key: str, fingerprint: str, *, model: str, kind: str,
+                         allow_admit: bool = True):
+    """Resolve a generation, or admit a new request only after dispatch is authorized."""
     request_key, source = compute_stream_id(request.headers, api_key, fingerprint)
     fingerprint_key, _ = compute_stream_id({}, api_key, fingerprint)
     owner_key_digest = hashlib.sha256((api_key or "").encode("utf-8")).hexdigest() if api_key else ""
@@ -126,6 +127,13 @@ async def resolve_buffer(store, request, api_key: str, fingerprint: str, *, mode
             raise ResumeRequestError(409, f"续传起点 {start} 超过缓冲末尾 {buf.next_seq}。")
         _track_buffer(buf, False, request, start)
         return buf, False, start, source
+    if not allow_admit:
+        buf = await store.lookup_request_retry(request_key, kind=kind, fingerprint_key=fingerprint_key,
+                                               owner_key_digest=owner_key_digest)
+        if buf is None:
+            return None
+        _track_buffer(buf, False, request)
+        return buf, False, 0, source
     buf, new = await store.get_or_create_request(
         request_key, model=model, kind=kind, fingerprint_key=fingerprint_key,
         idempotent=_explicit_request_key(request_key))
@@ -919,6 +927,22 @@ class ResumableStore:
         # Merely looking up a receipt cannot record authorized client activity.
         async with self._lock:
             return self._buffers.get(stream_id)
+
+    async def lookup_request_retry(self, request_key: str, *, kind: str, fingerprint_key: str,
+                                   owner_key_digest: str) -> Optional[ResumableBuffer]:
+        """Find an existing retry before dispatch, without admitting or retiring anything."""
+        async with self._lock:
+            buf = self._buffers.get(self._requests.get(request_key, ""))
+            if buf is None or buf.kind != kind:
+                return None
+            if buf.request_key != request_key or buf.owner_key_digest != owner_key_digest:
+                raise ResumeRequestError(404, "续传缓冲不存在或已过期；重新生成请移除续传 ID 与游标。")
+            if buf.fingerprint_key != fingerprint_key:
+                raise ResumeRequestError(409, "续传请求体与原请求不一致。")
+            if buf.resume_expired() or (buf.fully_delivered and not _explicit_request_key(request_key)):
+                return None
+            # resolve_buffer attaches the reader without an intervening suspension.
+            return buf
 
     async def get_or_create_request(self, request_key: str, *, model: str, kind: str,
                                     fingerprint_key: str, idempotent: bool = False):

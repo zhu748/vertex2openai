@@ -37,6 +37,7 @@ import re
 import secrets
 from typing import Any, Optional
 
+from model_capabilities import split_model_alias
 from model_resource import model_id_for_policy
 from models import OpenAIMessage, OpenAIRequest
 from tool_arguments import parse_tool_arguments
@@ -168,6 +169,13 @@ def _is_chat_model(name: str) -> bool:
     """排除生图 / 视频等非对话模型：claude-* 只能映射到文本对话模型。"""
     n = name.lower()
     return not any(k in n for k in ("image", "nano-banana", "imagen", "veo", "embedding", "aqa", "live"))
+
+
+def is_claude_catalog_alias_target(model: str) -> bool:
+    """A known conversation model, not an opaque path or synthetic transport."""
+    leaf = model_id_for_policy(model).lower()
+    return ("/" not in leaf and leaf.startswith("gemini-") and _is_chat_model(leaf)
+            and split_model_alias(leaf)[1] is None)
 
 
 def _pick_family_model(family: str, models: list[str]) -> Optional[str]:
@@ -1577,14 +1585,12 @@ def estimate_request_tokens(body: dict) -> int:
 # Anthropic 格式模型目录（Anthropic 客户端访问 /v1/models 时切换格式）
 # ============================================================
 
-def anthropic_models_payload(available_models: list, catalog_variants: Optional[list] = None) -> dict:
+def anthropic_models_payload(available_models: list, catalog_variants: Optional[list] = None, *,
+                             alias_targets: Optional[dict[str, str]] = None) -> dict:
     """Anthropic List Models 响应：claude 别名 + 内部 Gemini 模型并列展示。
 
-    catalog_variants 为 None 时按旧口径直接列 available_models（单测直调）；
-    生产路径由 claude_api.anthropic_models_data 传入与 OpenAI /v1/models
-    同源展开的变体目录（-search / 已开启的抗截断后缀）——请求侧
-    resolve_claude_model 对非 claude-* 名字原样透传，这些变体在 Claude
-    协议下同样可用，目录应当如实反映。
+    生产调用传入可选路变体和已解析的 Claude 别名；空映射表示没有
+    已知可用的别名。单参数调用保留根据原始模型名展开的旧格式。
     """
     from datetime import datetime
 
@@ -1600,12 +1606,12 @@ def anthropic_models_payload(available_models: list, catalog_variants: Optional[
                          "type": "model", "created_at": now})
 
     for alias in CANONICAL_CLAUDE_MODELS:
-        # A hot-reloaded catalog can displace the built-in default. Use the
-        # Messages/count_tokens resolver so list and retrieval describe it.
-        _, target = resolve_claude_model(alias, available_models)
-        add(alias, f"Claude 别名 （映射 {target}）")
+        target = (resolve_claude_model(alias, available_models)[1] if alias_targets is None
+                  else alias_targets.get(alias))
+        if target:
+            add(alias, f"Claude 别名 （映射 {target}）")
     for model in (catalog_variants if catalog_variants is not None else available_models):
-        if isinstance(model, str):
+        if isinstance(model, str) and (alias_targets is None or model not in CANONICAL_CLAUDE_MODELS):
             add(model, model)
 
     return {

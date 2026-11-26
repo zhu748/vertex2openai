@@ -102,7 +102,7 @@ class AnthropicCatalogTests(unittest.IsolatedAsyncioTestCase):
                                side_effect=lambda: dict(settings or {})), \
              mock.patch.object(claude_api.app_state, "get_effective_settings",
                                side_effect=lambda model, base=None: dict(settings or {})):
-            return await claude_api.anthropic_models_data()
+            return await claude_api.anthropic_models_data(SimpleNamespace(get_total_keys=lambda: 1))
 
     async def test_variants_listed_alongside_aliases(self):
         data = await self._data(AVAILABLE, {"anti_truncation_mode": "stream"})

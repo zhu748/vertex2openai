@@ -50,6 +50,7 @@ from signature_origin import DeliveredOrigin, bind_signature_origins
 from claude_signature_projection import OmittedClaudeProjection, bind_omitted_claude_projection
 from auth import constant_time_equal, extract_candidate_key
 from claude_protocol import (
+    CANONICAL_CLAUDE_MODELS,
     ClaudeRequestError,
     ClaudeStreamState,
     PING_EVENT,
@@ -59,11 +60,13 @@ from claude_protocol import (
     anthropic_to_openai_request,
     estimate_request_tokens,
     error_event,
+    is_claude_catalog_alias_target,
     new_message_id,
     new_request_id,
     openai_completion_to_anthropic,
     resolve_claude_model,
 )
+from catalog_availability import CatalogAvailability
 from catalog_pagination import CatalogPageError, anthropic_model_page
 from config import API_KEY
 from express_endpoint import resolve_express_model_path
@@ -171,6 +174,24 @@ async def _available_models() -> list:
         return list(await get_express_models() or [])
     except Exception:
         return []
+
+
+def _reachable_alias_candidates(available: list, policy: CatalogAvailability) -> list[str]:
+    return [model for model in available if isinstance(model, str)
+            and is_claude_catalog_alias_target(model) and policy.supports_translated(model)]
+
+
+async def _resolve_request_model(model: str, request: Request) -> tuple[str, str]:
+    if not model.strip().lower().startswith("claude"):
+        return resolve_claude_model(model)
+    available = await _available_models()
+    manager = getattr(getattr(getattr(request, "app", None), "state", None), "express_key_manager", None)
+    if manager is None:
+        return resolve_claude_model(model, available)
+    reachable = _reachable_alias_candidates(available, CatalogAvailability.read(app_state, manager))
+    # Explicit legacy alias requests retain the old path when no configured
+    # target is known to be reachable. Do not advertise an unverified target.
+    return resolve_claude_model(model, reachable or available)
 
 
 def _openai_error_message(payload: Optional[dict], fallback: str) -> str:
@@ -410,7 +431,7 @@ async def claude_messages(fastapi_request: Request, api_key: str = Depends(get_c
     if "max_tokens" not in body:
         return claude_error(400, "invalid_request_error", "max_tokens is required")
 
-    display_model, internal_model = resolve_claude_model(raw_model, await _available_models())
+    display_model, internal_model = await _resolve_request_model(raw_model, fastapi_request)
     try:
         request_obj = anthropic_to_openai_request(body, internal_model)
         validate_model_response_format(request_obj, label="output_config.format")
@@ -655,7 +676,7 @@ async def claude_count_tokens(fastapi_request: Request, api_key: str = Depends(g
         return claude_error(400, "invalid_request_error", "model is required")
 
     async def count():
-        display_model, internal_model = resolve_claude_model(raw_model, await _available_models())
+        display_model, internal_model = await _resolve_request_model(raw_model, fastapi_request)
         request_obj = anthropic_to_openai_request(body, internal_model, require_max_tokens=False)
         exact = await _express_exact_input_tokens(request_obj, fastapi_request, internal_model)
         return display_model, internal_model, exact
@@ -722,7 +743,7 @@ def is_anthropic_client(fastapi_request: Request) -> bool:
     return False
 
 
-async def anthropic_models_data() -> dict:
+async def anthropic_models_data(express_key_manager) -> dict:
     """Anthropic 模型目录数据体（列表 /v1/models 与单模型检索共用）。
 
     变体目录与 OpenAI /v1/models 同源展开（model_catalog.catalog_variant_ids
@@ -733,18 +754,25 @@ async def anthropic_models_data() -> dict:
     from model_catalog import catalog_variant_ids
     from model_capabilities import split_model_alias
 
+    policy = CatalogAvailability.read(app_state, express_key_manager)
+    if not (policy.translated_express or policy.translated_cookie_projects):
+        return anthropic_models_payload([], [], alias_targets={})
     available = await _available_models()
+    candidates = _reachable_alias_candidates(available, policy)
+    targets = ({alias: resolve_claude_model(alias, candidates)[1] for alias in CANONICAL_CLAUDE_MODELS}
+               if candidates else {})
     settings_base = app_state.get_settings()
     variants: list[str] = []
     for model_id in available:
-        plain_id, _ = split_model_alias(model_id)
-        effective = app_state.get_effective_settings(plain_id, base=settings_base)
-        variants.extend(catalog_variant_ids(model_id, effective))
-    return anthropic_models_payload(available, variants)
+        if policy.supports_translated(model_id):
+            plain_id, _ = split_model_alias(model_id)
+            effective = app_state.get_effective_settings(plain_id, base=settings_base)
+            variants.extend(catalog_variant_ids(model_id, effective))
+    return anthropic_models_payload(available, variants, alias_targets=targets)
 
 
-async def anthropic_model_list(query_params) -> JSONResponse:
-    data = await anthropic_models_data()
+async def anthropic_model_list(query_params, express_key_manager) -> JSONResponse:
+    data = await anthropic_models_data(express_key_manager)
     try:
         page = anthropic_model_page(data["data"], query_params)
     except CatalogPageError as exc:

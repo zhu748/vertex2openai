@@ -36,7 +36,7 @@ _SETTING_NUMERIC_RANGE = {
     "request_timeout_seconds": (30, config.MAX_TIMEOUT_SECONDS),
     "upstream_max_concurrency": (1, 1000),
     # 生图并发闸门：4K 生图单次峰值 RSS 可达 150-200MB，512MB 容器
-    # 并发叠加即 OOMKill；默认 2，内存充裕的部署可调大
+    # 并发叠加即 OOMKill；默认 1，内存充裕的部署可调大
     "image_max_concurrency": (1, 64),
     "keepalive_interval": (5, 86400),
     # Cookie 短期令牌轮换间隔：Google 实测节奏 600s，下限 300 防误配成高频打点
