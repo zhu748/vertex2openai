@@ -19,6 +19,7 @@ from models import OpenAIRequest
 from request_tracking import configure as track_configure
 from runtime_state import app_state
 from schema_validation import SchemaValidationError
+from signature_destination import publisher_destination, studio_model_resource
 from upstream_errors import create_openai_error_response
 from upstreams.base import BaseUpstream
 from channel_capabilities import cookie_feature_error
@@ -90,10 +91,15 @@ class CookieGeneration:
     is_stream: bool
     is_image: bool
     response_created: int = field(init=False)
+    signature_destination: bytes = field(init=False)
 
     def __post_init__(self) -> None:
         # The attempt timer can restart on retry; the OpenAI completion cannot.
         self.response_created = int(self.start_time)
+        # Proxy or native-tool fallback never changes this generation's
+        # Studio host, project, region or upstream model resource.
+        self.signature_destination = publisher_destination(studio_model_resource(
+            self.project_id, mc.strip_image_resolution_suffix(self.base_model_name)))
 
     async def response(self) -> Response:
         """按请求形态分发到 cookie_delivery 的四条交付路径。"""

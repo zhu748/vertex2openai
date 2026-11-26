@@ -2,6 +2,7 @@
 from collections.abc import Iterator, Sequence
 
 import config as app_config
+from claude_signature_projection import omitted_signature_record
 from models import OpenAIMessage, normalize_content_part
 from parallel_result_order import order_parallel_results
 from signature_origin import origin_slot
@@ -42,14 +43,24 @@ def first_wire_call_index(message: OpenAIMessage) -> int:
     return 0
 
 
-def history_call_signature(message, index, current_required, literal_ids, *, first):
+def history_call_signature(message, index, current_required, literal_ids, *, first, destination=None,
+                           defer_recovery=False):
     call = message.tool_calls[index]
     ident = str(call.get("id") or "")
-    explicit, _ = signature_from_extra(call, strict_encoding=app_config.GEMINI_STRICT_THOUGHT_SIGNATURES)
+    strict = app_config.GEMINI_STRICT_THOUGHT_SIGNATURES
+    explicit, _ = signature_from_extra(call, strict_encoding=strict)
+    scope = origin_slot(message, index)
+    required = current_required and first
+    literal = ident in literal_ids
+    omitted = omitted_signature_record(message, index) if not defer_recovery or strict else None
+    if defer_recovery and strict and required:
+        # Preserve existing pre-flight errors for strict clients. The actual
+        # send still rechecks the selected destination and current record.
+        resolve_tool_call_signature(ident, required, explicit, not first, scope,
+                                    literal_id=literal, origin_record=omitted)
     return resolve_tool_call_signature(
-        ident, require_signature=current_required and first, explicit_signature=explicit,
-        explicit_unsigned=not first, origin_key=origin_slot(message, index),
-        literal_id=ident in literal_ids,
+        ident, required, explicit, not first, scope, literal_id=literal,
+        destination=destination, origin_record=omitted, defer_recovery=defer_recovery,
     )
 
 
@@ -89,7 +100,8 @@ def gemini_history_with_ids(
             continue
         literal_ids = frozenset(ident for n, call in enumerate(calls) if
                                 (ident := historical_literal_id(call, origin_slot(message, n),
-                                                                message._claude_literal_tool_ids)) is not None)
+                                                                message._claude_literal_tool_ids,
+                                                                opaque_ids=message._opaque_tool_call_ids)) is not None)
         yield message, literal_ids
         if len(calls) < 2 and not literal_ids:
             continue

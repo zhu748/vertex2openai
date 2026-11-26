@@ -11,8 +11,8 @@ import base64
 import binascii
 
 import signature_origin as origins
-from signature_store import SKIP_VALIDATOR_SENTINELS, SignatureState
-from thought_signatures import attach_signature_extra, google_metadata
+from signature_store import SKIP_VALIDATOR_SENTINELS, SignatureRecord, SignatureState
+from thought_signatures import google_metadata
 
 
 def _scope(metadata):
@@ -33,6 +33,7 @@ def _scope(metadata):
 
 _MAX_PUBLIC_TEXT_BLOCKS = origins._MAX_BLOCKS
 _LENGTH_BYTES = 4
+_PUBLIC_FINISH = {"tool_calls": "tool_use", "length": "max_tokens", "content_filter": "refusal"}
 
 
 def _batch_key(scope, slots, shape):
@@ -62,19 +63,20 @@ def _request_shape(message):
     return shape.digest()
 
 
-def _unpack(data, count):
+def _unpack_slot(data, count, slot):
     """Length-delimited bytes; empty slots are observably unsigned."""
-    items, offset = [], 0
-    for _ in range(count):
+    item, offset = None, 0
+    for i in range(count):
         if offset + _LENGTH_BYTES > len(data):
             return None
         size = int.from_bytes(data[offset:offset + _LENGTH_BYTES], "big")
         offset += _LENGTH_BYTES
         if size > origins._MAX_SIGNATURE_BYTES or offset + size > len(data):
             return None
-        items.append(data[offset:offset + size])
+        if i == slot:
+            item = data[offset:offset + size]
         offset += size
-    return items if offset == len(data) else None
+    return item if offset == len(data) else None
 
 
 def bind_omitted_claude_projection(request, metadata):
@@ -91,22 +93,26 @@ def bind_omitted_claude_projection(request, metadata):
             continue
         slots = message._signature_slots
         shape = _request_shape(message) if scope is not None and slots else None
-        record = origins.signature_store.get_record(_batch_key(scope, slots, shape)) if shape is not None else None
         # Do not try a standard origin keyed only to the now missing thinking
         # (nor any bare call-ID alias) if the omitted projection lacks proof.
         message._signature_slots = ()
-        if record is None or record.state is not SignatureState.SIGNED:
-            continue
-        signatures = _unpack(record.signature, len(message.tool_calls))
-        if signatures is None:
-            continue
-        restored = []
-        for call, signature in zip(message.tool_calls, signatures, strict=True):
-            call = dict(call)
-            if signature:
-                attach_signature_extra(call, signature)
-            restored.append(call)
-        message.tool_calls = restored
+        # Keep inferred values private until the actual outbound attempt. Do
+        # not make recovered bytes look like a genuine caller-carried field.
+        message._omitted_signature_key = _batch_key(scope, slots, shape) if shape is not None else None
+
+
+def omitted_signature_record(message, index):
+    key = message._omitted_signature_key
+    if not key:
+        return None
+    record = origins.signature_store.get_record(key)
+    if record is None or record.state is not SignatureState.SIGNED:
+        return record
+    sig = _unpack_slot(record.signature, len(message.tool_calls), index)
+    if sig is None:
+        return SignatureRecord(SignatureState.AMBIGUOUS)
+    state = SignatureState.SIGNED if sig else SignatureState.UNSIGNED_FOLLOWER
+    return SignatureRecord(state, sig or None, record.destination)
 
 
 class OmittedClaudeProjection:
@@ -122,7 +128,9 @@ class OmittedClaudeProjection:
         self._blocks = 0
         self._proof = None
         self._withheld = False
+        self._plain_topology = True
         self._source = None
+        self._destination = None
         self._buffered_after_tool = False
         self._ordered_count = None
         # Per-call base64 tail padding is charged in addition to the raw
@@ -135,6 +143,10 @@ class OmittedClaudeProjection:
 
     def withhold(self):
         self._withheld = True
+
+    def set_destination(self, destination):
+        """Only a terminal-validated upstream producer may call this observer."""
+        self._destination = destination
 
     def source(self, source_id):
         if not isinstance(source_id, str) or not source_id or len(source_id) > 256:
@@ -166,6 +178,7 @@ class OmittedClaudeProjection:
                 return
             self._ordered_count = count
         if not origins._plain_metadata(value, count):
+            self._plain_topology = False
             self.withhold()
 
     def reserve_signature(self, size):
@@ -201,10 +214,11 @@ class OmittedClaudeProjection:
         # Text itself is recorded at the point of actual serialization.
 
     def prepare_json(self, original, translated):
-        if not self.prefix or translated.get("stop_reason") != "tool_use":
+        if not self.prefix:
             return
         choice = original["choices"][0]  # Already validated by the public translator.
-        if choice["finish_reason"] != "tool_calls":
+        finish = choice["finish_reason"]
+        if finish not in _PUBLIC_FINISH or translated.get("stop_reason") != _PUBLIC_FINISH[finish]:
             return
         message = choice["message"]
         calls = message.get("tool_calls") or []
@@ -228,14 +242,20 @@ class OmittedClaudeProjection:
         if any(call.get("id") != public["id"] for call, public in zip(calls, public_tools, strict=True)):
             return
         self.prepare(
-            (call["id"], call["function"]["name"], call["function"].get("arguments"), call)
-            for call in calls
+            ((call["id"], call["function"]["name"], call["function"].get("arguments"), call) for call in calls),
+            finish_reason=finish,
         )
 
-    def prepare(self, calls):
+    def prepare(self, calls, *, finish_reason="tool_calls"):
         """Pair the actual emitted calls with their internal per-part metadata."""
         if not self.prefix:
             return
+        terminal_fence = origins.is_unrestorable_tool_terminal(finish_reason)
+        if terminal_fence:
+            if not self._plain_topology:
+                self.discard()
+                return
+            self.withhold()
         tags, signatures, seen = [], [], set()
         size, text = self.text.result()
         budget = origins._Budget()
@@ -246,9 +266,9 @@ class OmittedClaudeProjection:
                 if (not isinstance(ident, str) or not ident or ident in seen
                         or len(tags) >= origins._MAX_CALLS):
                     raise ValueError
-                if arguments is None:
-                    arguments = "{}"
                 payload = {"id": ident, "function": {"name": name, "arguments": arguments}}
+                if terminal_fence and not origins.is_complete_terminal_call(payload, len(tags)):
+                    raise ValueError
                 tags.append(origins._call_tag(payload, budget))
                 seen.add(ident)
                 if not self._withheld:
@@ -295,7 +315,7 @@ class OmittedClaudeProjection:
             if data is None:
                 origins.mark_unrestorable_origin(key)
             else:
-                origins.signature_store.register_call_signature(key, data)
+                origins.signature_store.register_call_signature(key, data, destination=self._destination)
         self.discard()
 
     @property

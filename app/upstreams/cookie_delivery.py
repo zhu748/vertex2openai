@@ -37,7 +37,8 @@ from logger import stats
 from json_encoding import LargeJSONResponse
 from message_processing import iter_giant_content, safety_ratings_presentation
 from models import wants_json_output
-from signature_origin import OriginBatch, publish_completed_origins
+from signature_destination import UNQUALIFIED, note_accepted_destination
+from signature_origin import OriginBatch, is_unrestorable_tool_terminal, publish_completed_origins
 from prefill import PrefillDeduper, strip_prefill_overlap
 from request_tracking import (
     upstream_attempt,
@@ -1017,8 +1018,13 @@ async def _finalize_cookie_stream(gen: "CookieGeneration", st: _StreamAttemptSta
                              _stream_usage_fragments(usage_prefix, st.ordinary_metadata))
         yield make_usage_chunk(gen.response_id, gen.model_display, usage, created=gen.response_created)
 
-    if finish_reason == "tool_calls" and not gen.prefill_text and not st.pending_safety_html:
-        st.signature_origin.finish_plain_parts(st.ordinary_metadata, st.part_order)
+    destination = getattr(gen, "signature_destination", UNQUALIFIED)
+    note_accepted_destination(gen.request_obj, destination)
+    if (finish_reason == "tool_calls" or is_unrestorable_tool_terminal(finish_reason)) and (
+            not gen.prefill_text and not st.pending_safety_html):
+        st.signature_origin.finish_plain_parts(st.ordinary_metadata, st.part_order, finish_reason=finish_reason,
+                                               stage_terminal=gen.request_obj._stage_terminal_signature_fence,
+                                               destination=destination)
     yield "data: [DONE]\n\n"
 
     elapsed = time.time() - gen.start_time
@@ -1328,7 +1334,10 @@ def _assemble_whole_response(gen: "CookieGeneration", st: _WholeBodyState) -> "R
     response_class = LargeJSONResponse if gen.is_image else JSONResponse
     response = response_class(content=payload)
     if not gen.request_obj.stream:
-        publish_completed_origins(gen.request_obj._signature_output_prefix, payload["choices"])
+        note_accepted_destination(gen.request_obj, gen.signature_destination)
+        publish_completed_origins(gen.request_obj._signature_output_prefix, payload["choices"],
+                                  stage_terminal=gen.request_obj._stage_terminal_signature_fence,
+                                  destination=gen.signature_destination)
     return response
 
 
@@ -1407,6 +1416,9 @@ async def deliver_collect_response(gen: "CookieGeneration") -> "Response":
                 continue
 
             if response is not None:
+                if response.status_code in (401, 403):
+                    # Use the credential actually sent, not a possible replacement of this row.
+                    credential_manager.record_cookie_auth_failure(gen.account_id, credential=gen.record)
                 elapsed = time.time() - gen.start_time
                 print(
                     f"❌ [Studio] {gen.base_model_name} | HTTP {response.status_code} | {elapsed:.1f}s"
@@ -1513,7 +1525,10 @@ async def deliver_buffered_frames(gen: "CookieGeneration") -> AsyncIterator[str]
                 payload, include_usage=gen.want_usage
             ).body_iterator:
                 if frame == "data: [DONE]\n\n":
-                    publish_completed_origins(gen.request_obj._signature_output_prefix, payload["choices"])
+                    note_accepted_destination(gen.request_obj, gen.signature_destination)
+                    publish_completed_origins(gen.request_obj._signature_output_prefix, payload["choices"],
+                                              stage_terminal=gen.request_obj._stage_terminal_signature_fence,
+                                              destination=gen.signature_destination)
                 yield frame
     except asyncio.CancelledError:
         raise

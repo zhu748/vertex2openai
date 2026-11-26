@@ -35,7 +35,9 @@ def normalize_content_part(part: Any) -> Any:
 class OpenAIMessage(BaseModel):
     _signature_slots: tuple[bytes, ...] = PrivateAttr(default=())
     _signature_scoped: bool = PrivateAttr(default=False)
+    _omitted_signature_key: bytes | None = PrivateAttr(default=None)
     _claude_literal_tool_ids: bool = PrivateAttr(default=False)
+    _opaque_tool_call_ids: bool = PrivateAttr(default=False)
     _signature_observed_reasoning: tuple[int, bytes] | None = PrivateAttr(default=None)
     role: str
     content: str | list[ContentPartText | ContentPartImage | dict[str, Any]] | None = None
@@ -87,6 +89,8 @@ class OpenAIMessage(BaseModel):
 class OpenAIRequest(BaseModel):
     _signature_output_prefix: bytes | None = PrivateAttr(default=None)
     _signature_origin_cutoff: int | None = PrivateAttr(default=None)
+    _stage_terminal_signature_fence: Callable[[str, tuple[bytes, ...]], None] | None = PrivateAttr(default=None)
+    _signature_output_destination: Callable[[bytes], None] | None = PrivateAttr(default=None)
     model: str
     messages: list[OpenAIMessage]
     # Legacy field accepted for compatibility; only an enabled model suffix

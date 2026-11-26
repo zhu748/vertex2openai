@@ -355,6 +355,7 @@ class ExpressSDKUpstream(BaseUpstream):
             retry_target_factory=retry_target_factory,
             text_transport=text_transport,
             credential_describer=_describe_current_credential,
+            bind_signature_replay=True,
         )
 
 

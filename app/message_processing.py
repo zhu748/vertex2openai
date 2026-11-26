@@ -8,7 +8,7 @@ import re
 import time
 import uuid
 from collections.abc import Iterator
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import config as app_config
 from google.genai import types
@@ -47,6 +47,9 @@ from thought_signatures import (
     thought_signature_extra,
 )
 from usage import map_usage
+
+if TYPE_CHECKING:
+    from signature_replay import SDKSignatureReplay
 
 SUPPORTED_ROLES = ["user", "model", "function"]
 
@@ -420,7 +423,8 @@ def _tool_result_parts(
 
 
 def _assistant_tool_parts(
-    message: OpenAIMessage, require_sig: bool, history: ManagedImageHistory | None = None, *, literal_ids: frozenset[str] = frozenset()
+    message: OpenAIMessage, require_sig: bool, history: ManagedImageHistory | None = None, *,
+    literal_ids: frozenset[str] = frozenset(), signature_replay: "SDKSignatureReplay | None" = None,
 ) -> list[types.Part]:
     """Restore parallel calls, their signatures and the original ordinary-part order."""
     parts = []
@@ -431,8 +435,9 @@ def _assistant_tool_parts(
         function_name = function_call_data.get("name", "unknown")
         arguments_str = function_call_data.get("arguments", "{}")
         parsed_arguments = parse_tool_arguments(arguments_str, label="tool_call.function.arguments")
+        deferred = signature_replay is not None and signature_replay.eligible(message, tool_index)
         real_tool_id, thought_sig_bytes = history_call_signature(
-            message, tool_index, require_sig, literal_ids, first=tool_index == first)
+            message, tool_index, require_sig, literal_ids, first=tool_index == first, defer_recovery=deferred)
 
         fc_kwargs = {"name": function_name, "args": parsed_arguments}
         if real_tool_id:
@@ -451,6 +456,9 @@ def _assistant_tool_parts(
             fc_part = types.Part.from_function_call(
                 name=function_name, args=parsed_arguments
             )
+        else:
+            if deferred and not thought_sig_bytes:
+                signature_replay.watch(fc_part, message, tool_index, require_sig, literal_ids, tool_index == first)
         tool_parts.append(fc_part)
 
     ordinary_parts = _restored_ordinary_parts(message, history)
@@ -609,7 +617,7 @@ def _merge_gemini_turns(
 
 
 def create_gemini_prompt(
-    messages: List[OpenAIMessage], model_name: str = ""
+    messages: List[OpenAIMessage], model_name: str = "", *, signature_replay: "SDKSignatureReplay | None" = None,
 ) -> List[types.Content]:
     """Convert OpenAI messages to Gemini contents, preserving tool/signature boundaries."""
     print("🔄 [消息转换] 正在将 OpenAI 格式消息转换为 Gemini contents。")
@@ -630,7 +638,9 @@ def create_gemini_prompt(
                 if call_id and call_name:
                     tool_name_by_id[call_id] = call_name
                     tool_name_by_id[replay_tool_call_id(call_id, literal_ids)] = call_name
-            role, parts = "model", _assistant_tool_parts(message, require_sig and i >= turn_start, history, literal_ids=literal_ids)
+            role, parts = "model", _assistant_tool_parts(
+                message, require_sig and i >= turn_start, history, literal_ids=literal_ids,
+                signature_replay=signature_replay)
         else:
             role, parts = _ordinary_message_parts(message, history if message.role in ("assistant", "model") else None)
         if parts:

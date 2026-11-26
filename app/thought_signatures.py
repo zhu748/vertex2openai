@@ -334,10 +334,15 @@ def replay_tool_call_id(call_id: str, literal_ids=frozenset()) -> str:
     return call_id if call_id in literal_ids else _split_legacy_call_id(call_id)[0]
 
 
-def historical_literal_id(call: dict, origin_key: bytes | None, claude_ids: bool) -> str | None:
+def historical_literal_id(call: dict, origin_key: bytes | None, claude_ids: bool, *,
+                          opaque_ids: bool = False) -> str | None:
     """Prove the interpretation of a full ID before decoding any legacy suffix."""
     ident = call.get("id")
-    if not isinstance(ident, str) or LEGACY_THOUGHT_SEP not in ident:
+    if not isinstance(ident, str) or not ident:
+        return None
+    if opaque_ids:
+        return ident  # This protocol never encoded a signature in call_id.
+    if LEGACY_THOUGHT_SEP not in ident:
         return None
     if claude_ids:
         return ident if _legacy_components(ident)[1] is not None else None
@@ -361,18 +366,21 @@ def resolve_tool_call_signature(
     explicit_unsigned: bool = False,
     origin_key: bytes | None = None,
     *, literal_id: bool = False,
+    destination: bytes | None = None,
+    origin_record=None,
+    defer_recovery: bool = False,
 ) -> Tuple[str, Optional[bytes]]:
     """Prefer genuine carried bytes, then a proven origin. Never upgrade a placeholder to proof."""
     ident = str(tool_call_id or "")
-    known = None
+    known = origin_record
     if not literal_id and origin_key and LEGACY_THOUGHT_SEP in ident:
         # Also defend direct resolver callers that didn't precompute the ID set
         # used to correlate adjacent functionResponse parts.
-        known = signature_store.get_record(origin_key)
+        known = known or signature_store.get_record(origin_key)
         literal_id = known is not None
     real_id, legacy_sig = (ident, None) if literal_id else _split_legacy_call_id(ident)
     sig = _original_signature(explicit_signature) or _original_signature(legacy_sig)
-    if sig is not None:
+    if sig is not None or defer_recovery:
         return real_id, sig
 
     required = require_signature and not explicit_unsigned
@@ -390,6 +398,12 @@ def resolve_tool_call_signature(
         record = signature_store.get_record(real_id) if not explicit_unsigned else None
 
     if record is not None:
+        if destination is not None and record.destination is not None and destination != record.destination:
+            # A local origin from another route is evidence against guessing.
+            # Leave it unsigned in compatibility mode, not a new bypass.
+            if strict:
+                _missing_required()
+            return real_id, None
         if record.state is SignatureState.SIGNED and (sig := _original_signature(record.signature)):
             return real_id, sig
         if record.state is SignatureState.UNSIGNED_FOLLOWER:

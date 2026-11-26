@@ -290,10 +290,11 @@ _FILE = _proto_shape("file_uri mime_type display_name")
 _RESPONSE_PART = _proto_shape(inline_data=_BLOB, file_data=_FILE)
 _PARTIAL_ARG = _proto_shape("json_path bool_value null_value number_value string_value will_continue")
 _PART = _proto_shape(
-    "thought_signature part_metadata code_execution_result executable_code speech_metadata "
-    "audio_transcription media_processing",
+    "thought_signature part_metadata code_execution_result executable_code speech_metadata media_processing",
     inline_data=_BLOB, file_data=_FILE,
     media_resolution=_proto_shape("num_tokens"), video_metadata=_proto_shape("start_offset end_offset"),
+    audio_transcription=_proto_shape("language_code speaker_label start_offset end_offset",
+                                     words=(_proto_shape("start_offset end_offset"),)),
     function_call=_proto_shape("will_continue", partial_args=(_PARTIAL_ARG,)),
     function_response=_proto_shape("will_continue", parts=(_RESPONSE_PART,)),
     tool_call=_proto_shape("tool_type"), tool_response=_proto_shape("tool_type"),

@@ -46,7 +46,7 @@ from starlette.background import BackgroundTask
 from starlette.requests import ClientDisconnect
 
 from admission import GenerationCapacityError, ManagedStreamingResponse
-from signature_origin import bind_signature_origins
+from signature_origin import TerminalOriginFence, bind_signature_origins
 from claude_signature_projection import OmittedClaudeProjection, bind_omitted_claude_projection
 from auth import constant_time_equal, extract_candidate_key
 from claude_protocol import (
@@ -309,8 +309,11 @@ def _claude_stream_response(response: StreamingResponse, display_model: str, *,
                 for event in state.finish_events():
                     yield event
                 delivered = True
-                if wire_done and state.projection is not None:
-                    await state.projection.publish()
+                if wire_done:
+                    if state.projection is not None:
+                        await state.projection.publish()
+                    if state.terminal_fence is not None:
+                        await state.terminal_fence.publish(state.finish)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -321,6 +324,8 @@ def _claude_stream_response(response: StreamingResponse, display_model: str, *,
         finally:
             if state.projection is not None:
                 state.projection.discard()
+            if state.terminal_fence is not None:
+                state.terminal_fence.discard()
             # 与 OpenAI 通道的完成日志同构：显示模型（claude-* 或原样 gemini-*）
             # | 耗时 | tokens；上游内部管线已按内部模型名打过 📊/✅，这里补齐
             # Claude 协议视角的收尾行。
@@ -404,16 +409,24 @@ async def claude_messages(fastapi_request: Request, api_key: str = Depends(get_c
     bind_signature_origins(request_obj, api_key)
     omit_thinking = anthropic_omit_thinking(body)
     projection = None
+    terminal_fence = None
     if omit_thinking:
         projection = OmittedClaudeProjection(request_obj._signature_output_prefix, body.get("metadata"))
+        request_obj._signature_output_destination = projection.set_destination
         # The OpenAI wire projection contains reasoning the public Claude
         # response has explicitly omitted. Never register it as delivered.
         request_obj._signature_output_prefix = None
         bind_omitted_claude_projection(request_obj, body.get("metadata"))
+    elif request_obj._signature_output_prefix:
+        # Unlike the internal Chat delivery, this translator can still refuse
+        # or abandon a reply before a real public Messages result exists.
+        terminal_fence = TerminalOriginFence()
+        request_obj._stage_terminal_signature_fence = terminal_fence.stage
     request_started = time.monotonic()
     stream_state = None
     if request_obj.stream:
-        stream_state = ClaudeStreamState(display_model, omit_thinking=omit_thinking, projection=projection)
+        stream_state = ClaudeStreamState(display_model, omit_thinking=omit_thinking, projection=projection,
+                                        terminal_fence=terminal_fence)
         request_obj._select_buffered_order = stream_state.select_buffered_order
 
     track_configure(model=display_model, protocol="claude",
@@ -468,6 +481,10 @@ async def claude_messages(fastapi_request: Request, api_key: str = Depends(get_c
             projection.prepare_json(payload, anthropic_payload)
             if projection.ready:
                 background = BackgroundTask(projection.publish)
+        elif (terminal_fence is not None and terminal_fence.ready
+              and anthropic_payload["stop_reason"] in ("max_tokens", "refusal")):
+            terminal_fence.confirm_batch(sum(block["type"] == "tool_use" for block in anthropic_payload["content"]))
+            background = BackgroundTask(terminal_fence.publish, payload["choices"][0]["finish_reason"])
         return response_class(content=anthropic_payload, background=background)
 
     # ---- 流式：OpenAI SSE 帧 → Anthropic SSE 事件 ----

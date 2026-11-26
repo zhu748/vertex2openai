@@ -239,20 +239,22 @@ class FailoverSDKClient:
     def __getattr__(self, name):
         return getattr(self.client, name)
 
-    async def generate_content(self, **kwargs):
+    async def generate_content(self, *, _actual_attempt=None, **kwargs):
         async def operation(raw, resolved):
             self.client = self.factory(raw, resolved)
-            return await self.client.aio.models.generate_content(**kwargs)
+            actual = _actual_attempt(self.client, kwargs) if _actual_attempt else kwargs
+            return await self.client.aio.models.generate_content(**actual)
         return await self.chain.run(operation)
 
-    async def generate_content_stream(self, **kwargs):
+    async def generate_content_stream(self, *, _actual_attempt=None, **kwargs):
         async def events():
             async def start(raw, resolved):
                 from first_reply import sdk_has_reply
                 from response_validation import IncompleteResponseError, has_finish_reason
 
                 self.client = self.factory(raw, resolved)
-                source = await self.client.aio.models.generate_content_stream(**kwargs)
+                actual = _actual_attempt(self.client, kwargs) if _actual_attempt else kwargs
+                source = await self.client.aio.models.generate_content_stream(**actual)
                 prefix, size = deque(), 0
                 try:
                     async for chunk in source:

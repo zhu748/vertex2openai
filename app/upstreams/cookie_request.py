@@ -26,6 +26,7 @@ from models import OpenAIRequest, normalize_content_part
 from ordinary_history import exact_ordinary_slots
 from runtime_state import app_state
 from schema_validation import SchemaValidationError, sanitize_for_gemini
+from signature_destination import publisher_destination, studio_model_resource
 from thought_signatures import (
     ordinary_signature,
     replay_tool_call_id,
@@ -394,7 +395,8 @@ def _merge_cookie_turns(contents: list[dict]) -> list[dict]:
     return merged
 
 
-def _convert_messages_to_contents(messages: list, model_name: str = "", native_tools: bool = True) -> tuple:
+def _convert_messages_to_contents(messages: list, model_name: str = "", native_tools: bool = True, *,
+                                  destination: bytes | None = None) -> tuple:
     """OpenAI messages → batchGraphql contents.
 
     Native mode emits camelCase ``functionCall`` / ``functionResponse`` Parts.
@@ -493,7 +495,8 @@ def _convert_messages_to_contents(messages: list, model_name: str = "", native_t
             for tool_index, tc in enumerate(tool_calls):
                 fn = (tc or {}).get("function") or {}
                 call_id, signature = history_call_signature(
-                    msg, tool_index, require_sig and i >= turn_start, literal_ids, first=tool_index == first)
+                    msg, tool_index, require_sig and i >= turn_start, literal_ids,
+                    first=tool_index == first, destination=destination)
                 part = {
                     "functionCall": {
                         "name": str(fn.get("name") or "unknown"),
@@ -577,10 +580,11 @@ def build_request_body(
     # 原样发送会 404）；幂等——调用方（cookie_proxy 解析处）已剥过也不受
     # 影响。档位由 resolve_image_size 从请求原始模型名解析（2026-11）。
     model_name = mc.strip_image_resolution_suffix(model_name)
+    model_path = studio_model_resource(project_id, model_name)
     contents, system_text = _convert_messages_to_contents(
-        request.messages, model_name=model_name, native_tools=native_tools
+        request.messages, model_name=model_name, native_tools=native_tools,
+        destination=publisher_destination(model_path),
     )
-    model_path = f"projects/{project_id}/locations/global/publishers/google/models/{model_name}"
 
     settings = app_state.get_effective_settings(model_name)
     profile = mc.apply_sampling_policy(mc.get_profile(model_name), settings)

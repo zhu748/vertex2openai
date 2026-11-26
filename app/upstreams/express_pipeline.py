@@ -39,7 +39,10 @@ from message_processing import (
     convert_to_openai_format,
 )
 from models import OpenAIMessage, OpenAIRequest, wants_json_output
+from proxy_failover import FailoverSDKClient
+from signature_destination import UNQUALIFIED, note_accepted_destination, sdk_destination
 from signature_origin import observe_stream_origin, publish_completed_origins, publish_stream_origins
+from signature_replay import SDKSignatureReplay
 from request_tracking import (
     attempt_started_at,
     record_usage,
@@ -254,7 +257,8 @@ def _sdk_stream_error_payload(e: Exception) -> str:
     if len(msg) > MAX_ERROR_MESSAGE_CHARS:
         msg = msg[:MAX_ERROR_MESSAGE_CHARS] + "..."
     code, _ = extract_upstream_error(e)
-    payload = create_openai_error_response(code, msg, "server_error")
+    payload = (create_openai_error_response(400, msg, "invalid_request_error") if isinstance(e, SchemaValidationError)
+               else create_openai_error_response(code, msg, "server_error"))
     if hint := advisory_headers(e).get("retry-after"):
         payload["error"]["retry_after"] = hint  # response headers have already been committed
     return json.dumps(payload)
@@ -269,6 +273,29 @@ async def _convert_completed_response(response: Any, request: OpenAIRequest) -> 
     )
 
 
+class _SDKAttempt:
+    """The facade can select another raw client just before sending."""
+
+    def __init__(self, replay: SDKSignatureReplay | None) -> None:
+        self.destination = UNQUALIFIED
+        self.replay = replay
+
+    def _prepare(self, client: Any, kwargs: dict) -> dict:
+        self.destination = sdk_destination(client, kwargs["model"], kwargs["config"])
+        if self.replay is None:
+            return kwargs
+        contents = self.replay.for_destination(kwargs["contents"], self.destination)
+        return {**kwargs, "contents": contents} if contents is not kwargs["contents"] else kwargs
+
+    def send(self, client: Any, model: str, contents: list[types.Content], config: dict, *, stream: bool = False) -> Any:
+        models = client.aio.models
+        generate = models.generate_content_stream if stream else models.generate_content
+        kwargs = {"model": model, "contents": contents, "config": config}
+        if isinstance(client, FailoverSDKClient):
+            return generate(_actual_attempt=self._prepare, **kwargs)
+        return generate(**self._prepare(client, kwargs))
+
+
 async def _fake_stream_response_frames(
     raw_gemini_response: Any,
     request_obj: OpenAIRequest,
@@ -276,6 +303,7 @@ async def _fake_stream_response_frames(
     prefill_text: str,
     text_transport: Optional[TextTransport],
     fake_stream_started: float,
+    destination: bytes = UNQUALIFIED,
 ) -> AsyncIterator[str]:
     """假流式的响应校验、转换与 SSE 发射（拆分自 gemini_fake_stream_generator）。
 
@@ -317,7 +345,10 @@ async def _fake_stream_response_frames(
                     openai_response_dict.get("usage", {}),
                     created=openai_response_dict["created"],
                 )
-            publish_completed_origins(request_obj._signature_output_prefix, openai_response_dict["choices"])
+            note_accepted_destination(request_obj, destination)
+            publish_completed_origins(request_obj._signature_output_prefix, openai_response_dict["choices"],
+                                      stage_terminal=request_obj._stage_terminal_signature_fence,
+                                      destination=destination)
         yield chunk_sse
     # 发射完毕先断开本帧对 25MB+ content 的最后一处本地引用（走引用
     # 计数即时释放主体），再触发 GC 回收引用环。
@@ -347,6 +378,7 @@ async def gemini_fake_stream_generator(
     retry_target_factory: Optional[Callable] = None,
     text_transport: Optional[TextTransport] = None,
     credential_describer: Optional[Callable[[], str]] = None,
+    signature_replay: Optional[SDKSignatureReplay] = None,
 ) -> AsyncIterator[str]:
     print(
         f"🌊 [假流式] 已开始调用 Gemini 模型 {model_for_api_call}，客户端请求模型名为 {request_obj.model}。"
@@ -374,6 +406,7 @@ async def gemini_fake_stream_generator(
     last_error = None
     retry_pending = False
     heartbeat_due = 0.0
+    route = _SDKAttempt(signature_replay)
 
     try:
         attempt = 0
@@ -403,10 +436,9 @@ async def gemini_fake_stream_generator(
             api_call_task = asyncio.create_task(
                 timed_call(
                     request_obj.model,
-                    gemini_client_instance.aio.models.generate_content(
-                        model=model_for_api_call,
-                        contents=prompt_for_api_call,
-                        config=gen_config_dict_for_api_call,
+                    route.send(
+                        gemini_client_instance, model_for_api_call, prompt_for_api_call,
+                        gen_config_dict_for_api_call,
                     ),
                     # 整取（假流式）不参与首回复计时。
                     whole_call=True,
@@ -517,6 +549,7 @@ async def gemini_fake_stream_generator(
             prefill_text=prefill_text,
             text_transport=text_transport,
             fake_stream_started=fake_stream_started,
+            destination=route.destination,
         )
         raw_gemini_response = None
         api_call_task = None
@@ -718,6 +751,7 @@ class SDKGeneration:
     retry_target_factory: Optional[Callable]
     text_transport: Optional[TextTransport]
     credential_describer: Optional[Callable[[], str]]
+    signature_replay: Optional[SDKSignatureReplay] = None
     warned_credentials: set = field(default_factory=set)
     # REQ-P1-1（2026-11 审查）：本轮已确认失败的 location 钉定路径集合。
     # 换 Key 重试会把 model_to_call 重新置回该 Key 的钉定路径，若不记忆，
@@ -766,6 +800,7 @@ class SDKGeneration:
                 retry_target_factory=self.retry_target_factory,
                 text_transport=self.text_transport,
                 credential_describer=self.credential_describer,
+                signature_replay=self.signature_replay,
             )
         else:
             # Ask for real generation progress even when a preset puts the
@@ -871,16 +906,16 @@ class SDKGeneration:
                 first_reply = FirstReplyGuard(
                     self.request_obj.model, seconds=fr_seconds
                 )
+                route = _SDKAttempt(self.signature_replay)
                 stream_gen_obj = await first_reply.wait(
-                    self.current_client.aio.models.generate_content_stream(
-                        model=self.model_to_call,
-                        contents=self.actual_prompt_for_call,
-                        config=self.gen_config_dict,
+                    route.send(
+                        self.current_client, self.model_to_call, self.actual_prompt_for_call,
+                        self.gen_config_dict, stream=True,
                     )
                 )
                 async for frame in self._emit_attempt_frames(
                     first_reply, stream_gen_obj, attempt, attempt_started,
-                    stream_started,
+                    stream_started, route=route,
                 ):
                     has_yielded = True
                     yield frame
@@ -992,7 +1027,7 @@ class SDKGeneration:
 
     async def _emit_attempt_frames(
         self, first_reply: FirstReplyGuard, stream_gen_obj: Any, attempt: int, attempt_started: float,
-        stream_started: float,
+        stream_started: float, *, route: _SDKAttempt,
     ):
         """单次尝试的帧发射（QUA-P1-1 拆分自 stream_frames）。
 
@@ -1194,7 +1229,9 @@ class SDKGeneration:
                 created=self.stream_created,
             )
 
-        publish_stream_origins(tool_indexer.signature_origins)
+        note_accepted_destination(self.request_obj, route.destination)
+        publish_stream_origins(tool_indexer.signature_origins, stage_terminal=self.request_obj._stage_terminal_signature_fence,
+                               destination=route.destination)
         yield "data: [DONE]\n\n"
         print(
             f"✅ [Express] {self.request_obj.model} | 流式传输顺利完毕 | 耗时 {time.monotonic() - stream_started:.1f}s"
@@ -1255,6 +1292,7 @@ class SDKGeneration:
         attempt = 0
         retry_pending = False
         last_error = None
+        route = _SDKAttempt(self.signature_replay)
         while attempt <= max_retries:
             if await _request_disconnected(self.fastapi_request):
                 print(
@@ -1277,10 +1315,9 @@ class SDKGeneration:
                 upstream_attempt()
                 response_obj_call = await timed_call(
                     self.request_obj.model,
-                    self.current_client.aio.models.generate_content(
-                        model=self.model_to_call,
-                        contents=self.actual_prompt_for_call,
-                        config=self.gen_config_dict,
+                    route.send(
+                        self.current_client, self.model_to_call, self.actual_prompt_for_call,
+                        self.gen_config_dict,
                     ),
                     # 整取（非流式）不参与首回复计时。
                     whole_call=True,
@@ -1293,6 +1330,9 @@ class SDKGeneration:
                     f"非流式请求模型 {self.model_to_call} 已安全终止。"
                 )
                 raise
+            except SchemaValidationError as exc:
+                return JSONResponse(status_code=400, content=create_openai_error_response(
+                    400, str(exc), "invalid_request_error"))
             except Exception as e_call:
                 last_error = e_call
                 if (
@@ -1409,7 +1449,10 @@ class SDKGeneration:
             result = LargeJSONResponse(content=openai_response_content)
         else:
             result = JSONResponse(content=openai_response_content)
-        publish_completed_origins(self.request_obj._signature_output_prefix, openai_response_content["choices"])
+        note_accepted_destination(self.request_obj, route.destination)
+        publish_completed_origins(self.request_obj._signature_output_prefix, openai_response_content["choices"],
+                                  stage_terminal=self.request_obj._stage_terminal_signature_fence,
+                                  destination=route.destination)
         print(f"✅ [Express] {self.request_obj.model} | 非流式响应完成")
         return result
 
@@ -1428,11 +1471,21 @@ async def execute_gemini_call(
     retry_target_factory: Optional[Callable] = None,
     text_transport: Optional[TextTransport] = None,
     credential_describer: Optional[Callable[[], str]] = None,
+    bind_signature_replay: bool = False,
 ) -> Response:
     """Prepare the prompt once, then delegate delivery to a request-local context."""
+    replay = SDKSignatureReplay() if bind_signature_replay else None
+
+    def prepare_prompt(messages: list[OpenAIMessage]) -> list[types.Content]:
+        if replay is None:
+            return prompt_func(messages)
+        contents = prompt_func(messages, signature_replay=replay)
+        replay.bind(contents)
+        return contents
+
     try:
         actual_prompt_for_call = await run_media_task(
-            prompt_func, request_obj.messages, heavy=prompt_needs_media_pool(request_obj.messages)
+            prepare_prompt, request_obj.messages, heavy=prompt_needs_media_pool(request_obj.messages),
         )
     except SchemaValidationError as exc:
         return JSONResponse(status_code=400, content=create_openai_error_response(400, str(exc), "invalid_request_error"))
@@ -1453,5 +1506,6 @@ async def execute_gemini_call(
         retry_target_factory=retry_target_factory,
         text_transport=text_transport,
         credential_describer=credential_describer,
+        signature_replay=replay,
     )
     return await generation.response()

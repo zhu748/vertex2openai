@@ -7,7 +7,7 @@ import anyio
 import console_auth
 from generation_policy import generation_settings_scope
 from request_connection import BodyTooLargeError, ClientConnection, ConnectionReceiver
-from request_errors import (MAX_GENERATION_BODY_BYTES, body_too_large_response,
+from request_errors import (MAX_GENERATION_BODY_BYTES, MAX_RESPONSES_REQUEST_BYTES, body_too_large_response,
                             declared_body_exceeds, ingress_error_response)
 from request_ingress import IngressError, IngressReceive, current_ingress, early_generation_auth
 from request_tracking import PayloadObserver, current_trace, request_registry
@@ -223,7 +223,7 @@ class StatsMiddleware:
         path = scope.get("path", "")
         method = scope.get("method", "")
         tracked = scope["type"] == "http" and method == "POST" and (
-            path == "/v1/chat/completions" or path == "/v1/messages"
+            path in ("/v1/chat/completions", "/v1/responses", "/v1/messages")
             or path.startswith(("/v1/messages/", "/v1/models/", "/v1beta/models/")))
         declared_length = next((value.decode("latin-1") for key, value in scope.get("headers", [])
                                 if key == b"content-length"), "")
@@ -262,9 +262,10 @@ class StatsMiddleware:
                 return await _serve_poll(self.app, scope, receive, send)
             return await self.app(scope, receive, send)
         stats.increment_total()
-        if declared_body_exceeds(declared_length, MAX_CHAT_BODY_BYTES):
+        limit = MAX_RESPONSES_REQUEST_BYTES if path == "/v1/responses" else MAX_CHAT_BODY_BYTES
+        if declared_body_exceeds(declared_length, limit):
             stats.add_error()
-            await body_too_large_response(path, MAX_CHAT_BODY_BYTES)(scope, receive, send)
+            await body_too_large_response(path, limit)(scope, receive, send)
             return
         trace = request_registry.create(path)
         token = current_trace.set(trace)
@@ -278,7 +279,7 @@ class StatsMiddleware:
         connection = ClientConnection()
         scope.setdefault("state", {})["client_connection"] = connection
         receiver = ConnectionReceiver(receive, connection, lambda: trace.end_connection(disconnected=True),
-                                      max_body_bytes=MAX_CHAT_BODY_BYTES)
+                                      max_body_bytes=limit)
 
         async def relay(message):
             nonlocal started, observer, send_failed, error_counted
@@ -322,7 +323,7 @@ class StatsMiddleware:
                 body_gate = _BodyReadGate(_large_body_reads)
             ingress = IngressReceive(
                 body_gate.wrap(receive) if body_gate is not None else receive,
-                MAX_CHAT_BODY_BYTES)
+                limit)
             ingress_token = current_ingress.set(ingress)
             receiver.receive = ingress
             with generation_settings_scope():
@@ -339,7 +340,7 @@ class StatsMiddleware:
             if started or send_failed:
                 raise
             print(f"⚠️ [体积限制] {path}：{exc}")
-            response = body_too_large_response(path, MAX_CHAT_BODY_BYTES)
+            response = body_too_large_response(path, limit)
             await response(scope, receive, relay)
             return
         except (asyncio.CancelledError, ClientDisconnect):

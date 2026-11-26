@@ -12,7 +12,7 @@ from claude_protocol import ClaudeStreamState
 from claude_signature_projection import OmittedClaudeProjection
 from fastapi.responses import StreamingResponse
 from routes.claude_api import _claude_stream_response
-from signature_store import SignatureStore
+from signature_store import SignatureState, SignatureStore
 from test_claude_buffered_tool_order import read_events, reconstruct
 from test_schema_contract_fidelity import SchemaRouteHarness
 from upstreams import cookie_response
@@ -81,6 +81,8 @@ class ClaudeOmittedSignatureRoutes(SchemaRouteHarness):
                 for turn in wire["contents"] for p in turn["parts"] if "functionCall" in p]
 
     async def test_real_calls_replay_unchanged_in_six_modes(self):
+        self.settings["express_location"] = "global"
+        self.key_manager.get_express_record = lambda **_: {"key": "test-key", "project_id": "fixture"}
         for channel in ("api_key", "web_proxy"):
             for mode in ("json", "fake", "stream"):
                 with self.subTest(channel=channel, mode=mode), ExitStack() as stack:
@@ -202,3 +204,52 @@ class ClaudeProjectionTerminals(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(events[-1]["type"], "error" if fault == "error" else "message_stop")
                 self.assertEqual(len(cache._data), 1 if fault is None else 0)
                 self.assertFalse(projection.ready)
+
+    async def test_non_success_fence_only_after_the_complete_public_message(self):
+        for omitted in (False, True):
+            for fault in (None, "no-done", "error", "cancel", "trailing", "different-source", "malformed", "blank"):
+                with self.subTest(omitted=omitted, fault=fault), ExitStack() as stack:
+                    cache = new_cache(stack)
+                    prefix = b"already scoped prefix"
+                    projection = OmittedClaudeProjection(prefix, {}) if omitted else None
+                    fence = None if omitted else signature_origin.TerminalOriginFence()
+                    state = ClaudeStreamState("display", omit_thinking=omitted,
+                                              projection=projection, terminal_fence=fence)
+                    arguments = {"malformed": "{", "blank": ""}.get(fault, "{}")
+                    call = {"index": 0, "id": "fixture-slot", "type": "function",
+                            "function": {"name": "weather", "arguments": arguments},
+                            "extra_content": {"google": {"thought_signature": "YmFkLWZvci1yZXBsYXk="}}}
+
+                    def frame(delta, reason=None, source_id="one-reply"):
+                        return "data: " + json.dumps({"id": source_id, "choices": [
+                            {"index": 0, "delta": delta, "finish_reason": reason}]}) + "\n\n"
+
+                    async def source(fault=fault, fence=fence, call=call, prefix=prefix, frame=frame):
+                        yield frame({"tool_calls": [call]})
+                        yield frame({}, "length", "other-reply" if fault == "different-source" else "one-reply")
+                        if fault == "trailing":
+                            yield frame({"content": "not part of this reply"})
+                        if fence is not None:
+                            # Read-ahead alone does not confirm the public reply.
+                            signature_origin.publish_completed_origins(prefix, [
+                                {"finish_reason": "length", "message": {"tool_calls": [call]}},
+                            ], stage_terminal=fence.stage)
+                        if fault == "error":
+                            yield 'data: {"error":{"code":502,"message":"simulated upstream fail"}}\n\n'
+                        if fault != "no-done":
+                            yield "data: [DONE]\n\n"
+
+                    result = _claude_stream_response(StreamingResponse(source()), "display",
+                                                     omit_thinking=omitted, state=state)
+                    records = []
+                    async for event in result.body_iterator:
+                        records.extend(read_events(event))
+                        if fault == "cancel" and records[-1]["type"] == "message_stop":
+                            self.assertEqual(len(cache._data), 0)
+                            await result.body_iterator.aclose()
+                            break
+                    self.assertEqual(records[-1]["type"], "error" if fault == "error" else "message_stop")
+                    self.assertEqual([record.state for _, record in cache._data.values()],
+                                     [SignatureState.AMBIGUOUS] if fault is None else [])
+                    pending = projection if omitted else fence
+                    self.assertFalse(pending.ready)

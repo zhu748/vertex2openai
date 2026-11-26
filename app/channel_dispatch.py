@@ -13,8 +13,10 @@ from collections import deque
 from contextlib import suppress
 from typing import Optional
 
+import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from google.genai.errors import APIError as GenAIAPIError
 from starlette.requests import ClientDisconnect
 
 from admission import SETUP_FAST_WINDOW_SECONDS, ManagedStreamingResponse
@@ -22,7 +24,7 @@ from channel_capabilities import cookie_feature_error
 from credential_manager import CookiePoolCoolingDown, credential_manager
 from logger import stats
 from models import OpenAIRequest
-from retry_policy import (bounded_sse_advisory, exception_retry_after, note_retry_deadline,
+from retry_policy import (advisory_headers, bounded_sse_advisory, exception_retry_after, note_retry_deadline,
                           response_requests_delay, response_retry_after, retry_after_seconds)
 from request_connection import ClientConnection
 from stream_cleanup import await_owned_close
@@ -43,6 +45,8 @@ _DONE_FRAME_BYTES = DONE_FRAME.encode("ascii")
 _TERMINAL_FINALIZE_TIMEOUT_SECONDS = 0.25
 _FALLBACK_PREFIX_MAX_BYTES = 2 * 1024 * 1024
 _FALLBACK_PREFIX_MAX_FRAMES = 128
+_EXPRESS_JSON_FAILURES = (GenAIAPIError, httpx.HTTPStatusError, httpx.NetworkError,
+                          httpx.RemoteProtocolError, httpx.TimeoutException)
 
 # ============================================================
 # 跨通道兜底重试（对齐上游 bad-woman/vertex2openai 的 Key ↔ Cookie 互备）
@@ -375,12 +379,13 @@ async def _apply_json_fallback(
     fastapi_request: Request,
     primary_channel: str,
     deadline: float,
+    *, fallback_channel: Optional[str] = None,
 ):
     """非流式请求：主通道返回可兜底错误时，用另一通道再试一次。"""
     if not _fallback_eligible_response(result, 200):
         return result
     code = getattr(result, "status_code", 200)
-    fallback_channel = _other_channel(fastapi_request, primary_channel, request_obj)
+    fallback_channel = fallback_channel or _other_channel(fastapi_request, primary_channel, request_obj)
     if fallback_channel is None:
         return result
     alt = await _try_channel_fallback(
@@ -497,8 +502,24 @@ async def _dispatch_upstream(request_obj: OpenAIRequest, fastapi_request: Reques
             response = ManagedStreamingResponse(prepared_frames(), media_type="text/event-stream", cleanup=close_setup)
     else:
         async def generate_json():
+            fallback_channel = None
+            try:
+                primary = await prepare()
+            except _EXPRESS_JSON_FAILURES as exc:
+                # Express JSON raises transport/HTTP errors instead of returning
+                # them. Only normalize a supported failure for an actual standby.
+                if _primary_channel() != "express":
+                    raise
+                code, message = extract_upstream_error(exc)
+                if not _fallback_eligible_code(code) or retry_after_seconds(exception_retry_after(exc)):
+                    raise
+                fallback_channel = _other_channel(fastapi_request, "express", request_obj)
+                if fallback_channel is None:
+                    raise
+                primary = JSONResponse(create_openai_error_response(code, message, "upstream_error"),
+                                       status_code=code, headers=advisory_headers(exc))
             return await _apply_json_fallback(
-                await prepare(), request_obj, fastapi_request, _primary_channel(), deadline)
+                primary, request_obj, fastapi_request, _primary_channel(), deadline, fallback_channel=fallback_channel)
 
         # DetachedRequest forwards .scope and thus exposes the original
         # connection too. Its buffer, not this request, owns cancellation.

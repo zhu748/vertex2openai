@@ -169,7 +169,8 @@ def validate_openai_request(request, *, sdk_schema=False):
             if call_index == strict_first:
                 # Resolve before headers, credentials, or an upstream request, even in
                 # streaming mode. The adapter applies the same policy on actual replay.
-                literal = historical_literal_id(call, origin_slot(message, call_index), message._claude_literal_tool_ids)
+                literal = historical_literal_id(call, origin_slot(message, call_index), message._claude_literal_tool_ids,
+                                                opaque_ids=message._opaque_tool_call_ids)
                 history_call_signature(message, call_index, True, (literal,) if literal is not None else (), first=True)
         for part_index, part in enumerate(message.content if isinstance(message.content, list) else ()):
             part = normalize_content_part(part)

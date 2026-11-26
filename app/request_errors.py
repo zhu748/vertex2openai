@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 # 请求（含数张 4K 图的 base64）。消费方保留自己的模块级别名（测试按
 # 模块 patch），值改动只改这里。
 MAX_GENERATION_BODY_BYTES = 32 * 1024 * 1024
+MAX_RESPONSES_REQUEST_BYTES = 8 * 1024 * 1024  # Text/function only; no inline media.
 
 # QUA-P2-1（2026-11 审查收敛）：请求边界错误的三协议分派单一来源。
 # 此前 ingress/body_too_large/validation 三个函数各自重复同一套
@@ -111,6 +112,6 @@ def validation_error_response(path: str, errors: list) -> JSONResponse:
     if kind == "openai":
         # OpenAI 客户端按 422 识别校验失败；管理端点保留 detail 列表形状。
         return _no_store(build(422, message, detail=details,
-                               with_error=path == "/v1/chat/completions",
+                               with_error=path in ("/v1/chat/completions", "/v1/responses"),
                                openai_code=422, param=field or None))
     return _no_store(build(400, message))

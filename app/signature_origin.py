@@ -12,7 +12,7 @@ import secrets
 from models import ContentPartText
 from parallel_result_order import order_parallel_results
 from signature_store import SignatureRecord, SignatureState, signature_store
-from thought_signatures import historical_literal_id, replay_tool_call_id, signature_from_extra
+from thought_signatures import historical_literal_id, ordinary_signature, replay_tool_call_id
 
 
 _KEY = secrets.token_bytes(32)
@@ -390,7 +390,8 @@ def _proof_history(messages, stop):
         # caller has bound the just-yielded assistant slots.
         literals = frozenset(marked for index, call in enumerate(calls)
                              if (marked := historical_literal_id(
-                                 call, origin_slot(message, index), message._claude_literal_tool_ids)) is not None)
+                                 call, origin_slot(message, index), message._claude_literal_tool_ids,
+                                 opaque_ids=message._opaque_tool_call_ids)) is not None)
 
         def result_key(value, literals=literals):
             return replay_tool_call_id(value, literals) if isinstance(value, str) and len(value) <= _MAX_ID_BYTES else ""
@@ -421,6 +422,7 @@ def bind_signature_origins(request, api_key):
                 isolated = True
             m = request.messages[i] = m.model_copy()
             m._signature_slots = ()
+            m._omitted_signature_key = None
             m._signature_scoped = True
             has_tools = True
     if not has_tools:
@@ -470,6 +472,69 @@ def mark_unrestorable_origin(key):
     signature_store.put_record(key, _UNRESTORABLE_ORIGIN)
 
 
+def is_unrestorable_tool_terminal(finish):
+    """Accepted public stop reasons that cannot authorize tool replay bytes."""
+    return finish in ("length", "content_filter")
+
+
+def is_complete_terminal_call(call, index):
+    """Representation check; the existing bounded call tag also parses the arguments."""
+    fn = call["function"]
+    raw, position = fn.get("arguments"), call.get("index", index)
+    return (isinstance(call["id"], str) and bool(call["id"].strip())
+            and isinstance(fn["name"], str) and bool(fn["name"].strip())
+            and (isinstance(raw, dict) or isinstance(raw, str) and bool(raw.strip()))
+            and type(position) is int and position == index)
+
+
+class TerminalOriginFence:
+    """A translating route may defer one negative batch until public delivery.
+
+    These are only bounded, exact origin digests from the accepted producer
+    attempt, never the original signatures, arguments, or any message text.
+    """
+
+    def __init__(self):
+        self._pending = None
+        self._source = None
+        self._valid = True
+
+    def source(self, source_id):
+        if not isinstance(source_id, str) or not source_id or len(source_id) > 256:
+            self.discard()
+        elif self._source is None:
+            self._source = source_id
+        elif self._source != source_id:
+            self.discard()
+
+    def stage(self, finish, keys):
+        if (not self._valid or self._pending is not None or not is_unrestorable_tool_terminal(finish)
+                or not 0 < len(keys) <= _MAX_CALLS or any(not isinstance(k, bytes) or len(k) != 32 for k in keys)):
+            self.discard()
+        else:
+            self._pending = finish, keys
+
+    def confirm_batch(self, count):
+        if self._pending is None or len(self._pending[1]) != count:
+            self.discard()
+
+    @property
+    def ready(self):
+        return self._pending is not None
+
+    def discard(self):
+        self._valid = False
+        self._pending = None
+        self._source = None
+
+    async def publish(self, finish):
+        pending = self._pending
+        self.discard()
+        if pending is not None and pending[0] == finish:
+            for key in pending[1]:
+                mark_unrestorable_origin(key)
+
+
 class OriginBatch:
     """Collect the public identity separately from the originals it can carry."""
     def __init__(self, prefix):
@@ -480,7 +545,8 @@ class OriginBatch:
         self.budget = _Budget()
         self.signature_bytes_left = _MAX_BATCH_SIGNATURE_BYTES
         self.withheld = False
-        self.stream_terminal = False
+        self.stream_terminal = None
+        self.can_fence_terminal = True
         self.text = VisibleText()
         self.reasoning = VisibleText()
 
@@ -496,6 +562,10 @@ class OriginBatch:
         self.withheld = True
         self.signatures.clear()
 
+    def reject_topology(self):
+        self.can_fence_terminal = False
+        self.withhold()
+
     def add(self, call):
         if not self.prefix:
             return
@@ -506,6 +576,8 @@ class OriginBatch:
             ident = _hash(b"tool-id-v1", call["id"].encode())
             if ident in self.ids:
                 raise _Unsupported
+            if self.can_fence_terminal:
+                self.can_fence_terminal = is_complete_terminal_call(call, len(self.tags))
         except (TypeError, AttributeError, KeyError, ValueError, OverflowError, RecursionError):
             self.discard()
             return
@@ -516,7 +588,7 @@ class OriginBatch:
         try:
             encoded = ((call.get("extra_content") or {}).get("google") or {}).get("thought_signature")
             _signature_size(encoded)
-            signature, _ = signature_from_extra(call)
+            signature = ordinary_signature(encoded)
             self.signature_bytes_left -= len(signature or b"")
             if self.signature_bytes_left < 0 or len(signature or b"") > _MAX_SIGNATURE_BYTES:
                 raise _Unsupported
@@ -524,7 +596,7 @@ class OriginBatch:
         except (TypeError, AttributeError, KeyError, ValueError, OverflowError, RecursionError):
             self.withhold()
 
-    def finish_plain_parts(self, parts, order):
+    def finish_plain_parts(self, parts, order, *, finish_reason="tool_calls", stage_terminal=None, destination=None):
         if not self.prefix or len(parts) > _MAX_BLOCKS:
             self.discard()
             return
@@ -535,46 +607,58 @@ class OriginBatch:
             elif kind == "signature_only" and text == "" and p.get("thought_signature"):
                 # This carrier has no public text and cannot be confused
                 # with a visible image or another unresolved Part.
-                self.withhold()
+                self.reject_topology()
             else:
                 self.discard()
                 return
         if not _plain_metadata({"google": {"ordinary_parts": parts, "part_order": order}}, len(self.tags)):
-            self.withhold()
-        self.finish()
+            self.reject_topology()
+        self.finish(finish_reason=finish_reason, stage_terminal=stage_terminal, destination=destination)
 
-    def finish(self):
+    def finish(self, *, finish_reason="tool_calls", stage_terminal=None, destination=None):
+        terminal_fence = is_unrestorable_tool_terminal(finish_reason)
+        if finish_reason != "tool_calls" and not terminal_fence:
+            self.discard()
+            return
         ts, text = self.text.result()
         rs, reasoning = self.reasoning.result()
-        if ts < 0 or rs < 0 or ts + rs > self.budget.remaining:
+        if (ts < 0 or rs < 0 or ts + rs > self.budget.remaining
+                or terminal_fence and not self.can_fence_terminal):
             self.discard()
             return
         prefix = _step_prefix(self.prefix, text, reasoning) if self.prefix else None
         keys = _slot_keys(prefix, self.tags)
-        for i, key in enumerate(keys):
-            if self.withheld:
+        if terminal_fence and stage_terminal is not None:
+            if keys:
+                stage_terminal(finish_reason, keys)
+        elif self.withheld or terminal_fence:
+            for key in keys:
                 mark_unrestorable_origin(key)
-            else:
-                signature_store.register_call_signature(key, self.signatures[i], unsigned_follower=i > 0)
+        elif keys:
+            signature_store.register_origin_batch(keys, self.signatures, destination)
         self.discard()
 
 
-def publish_completed_origins(prefix, choices):
+def publish_completed_origins(prefix, choices, *, stage_terminal=None, destination=None):
     if not prefix or len(choices) > 8:
         return
     for choice in choices:
         message = choice.get("message") or {}
         calls = message.get("tool_calls") or ()
-        if choice.get("finish_reason") != "tool_calls" or not 0 < len(calls) <= _MAX_CALLS:
+        finish = choice.get("finish_reason")
+        terminal_fence = is_unrestorable_tool_terminal(finish)
+        if (finish != "tool_calls" and not terminal_fence) or not 0 < len(calls) <= _MAX_CALLS:
             continue
         origin = OriginBatch(prefix)
-        if not _plain_metadata(message.get("extra_content"), len(calls)):
+        if terminal_fence:
             origin.withhold()
+        if not _plain_metadata(message.get("extra_content"), len(calls)):
+            origin.reject_topology()
         origin.text.feed(message.get("content"))
         origin.reasoning.feed(message.get("reasoning_content"))
         for call in calls:
             origin.add(call)
-        origin.finish()
+        origin.finish(finish_reason=finish, stage_terminal=stage_terminal, destination=destination)
 
 
 def observe_stream_origin(batches, prefix, choice):
@@ -588,27 +672,36 @@ def observe_stream_origin(batches, prefix, choice):
         origin = batches[index] = OriginBatch(prefix)
     if not origin.prefix:
         return
+    finish = choice.get("finish_reason")
+    if is_unrestorable_tool_terminal(origin.stream_terminal):
+        if (finish not in (None, origin.stream_terminal) or delta.get("tool_calls")
+                or delta.get("content") or delta.get("reasoning_content")):
+            origin.discard()
+        return
+    terminal_fence = is_unrestorable_tool_terminal(finish)
+    if terminal_fence:
+        origin.withhold()
     if origin.tags and (delta.get("content") or delta.get("reasoning_content")):
         # Thin flattened fields cannot distinguish source text after a tool.
-        origin.withhold()
+        origin.reject_topology()
     origin.text.feed(delta.get("content"))
     origin.reasoning.feed(delta.get("reasoning_content"))
     calls = delta.get("tool_calls") or ()
     if not _plain_metadata(delta.get("extra_content"), len(origin.tags) + len(calls)):
-        origin.withhold()
+        origin.reject_topology()
     if len(calls) > _MAX_CALLS:
         origin.discard()
     if origin.prefix:
         for call in calls:
             origin.add(call)
-    if choice.get("finish_reason") == "tool_calls":
-        origin.stream_terminal = True
-    elif choice.get("finish_reason"):
+    if finish == "tool_calls" or terminal_fence:
+        origin.stream_terminal = finish
+    elif finish:
         origin.discard()
 
 
-def publish_stream_origins(batches):
+def publish_stream_origins(batches, *, stage_terminal=None, destination=None):
     """Commit after the whole stream is accepted, not while processing a finish frame."""
     for origin in batches.values():
         if origin.stream_terminal:
-            origin.finish()
+            origin.finish(finish_reason=origin.stream_terminal, stage_terminal=stage_terminal, destination=destination)

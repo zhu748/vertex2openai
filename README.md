@@ -9,7 +9,7 @@ app_port: 7860
 
 # Vertex2OpenAI Express Adapter
 
-Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风格的 `/v1/chat/completions` 与 `/v1/models` 接口，对内支持两条上游通道调用 **Google Agent Platform（原 Vertex AI）的 Gemini 模型**：
+Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风格的 `/v1/chat/completions`、`/v1/models` 和[无状态 Responses 子集](#openai-responses-无状态子集)，对内支持两条上游通道调用 **Google Agent Platform（原 Vertex AI）的 Gemini 模型**：
 
 - **Express API Key（标准模式）**：用官方 `google-genai` SDK + `VERTEX_EXPRESS_API_KEY` 调用。
 - **Cookie 直连反代模式**：用 Google Cloud 控制台 Cookie + Project ID 直连控制台私有 `batchGraphql` 接口（无需浏览器）。
@@ -24,7 +24,7 @@ Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风
   - 支持只使用单个 / 多个 Key、单个 / 多个 Cookie，或 Key + Cookie 同时启用，统一随机或轮询调度。
   - Express API Key：多 Key 随机或轮询调用官方 SDK。
   - Cookie 直连反代：Cookie + SAPISIDHASH 直连 `batchGraphql`，走网页端配额（含最新预览模型），真流式、防 60s 超时。**注意：走的是私有接口，见下方风险提示。**
-- **OpenAI 兼容接口**：`GET /v1/models`、`POST /v1/chat/completions`。
+- **OpenAI 兼容接口**：`GET /v1/models`、`POST /v1/chat/completions`，以及无状态文本与函数工具版 `POST /v1/responses`。
 - **Claude（Anthropic）兼容接口**：`POST /v1/messages`、`POST /v1/messages/count_tokens`、
   `GET /api/hello`；`GET /v1/models` 按请求头自动切换 Anthropic 目录格式。
 - **管理控制台（浅色风格，本地静态资源，免前端构建）**
@@ -592,7 +592,33 @@ OpenAI 兼容端点通过 `extra_content.google` 携带 Gemini 原始思考签�
 
 如果 harness 会剥离扩展字段，请保留原始工具 ID、名称、参数和顺序。对使用同一认证凭据及内部模型、历史由纯文本/工具轮次组成、当前 assistant 轮含工具调用（可以先有普通正文或公开思考文本）的情况，代理会按完整历史前缀、准确的可见正文/思考和整个有序批次恢复各自的签名，包括确有签名的并行后续调用。不同会话复用同一 ID 不会互取签名。媒体、缺失的思考、不能无歧义表示的交错顺序，以及过大或被改写的历史不保证恢复；同一可见来源对应不同签名时，代理不会选「最近一次」或为冲突额外补哨兵，严格上游可能拒绝。跨实例、重启或缓存过期仍应依靠客户端原样保留的扩展字段。
 
+如果能确定出站的 Vertex 模型资源路径，缓存恢复还要匹配实际成功的上游项目、区域及模型。重试换项目、回退裸模型或切到无法核实的端点时，不沿用已绑定的缓存签名，也不为这类不匹配添加跳过哨兵；默认把未签名的调用发给上游，由上游决定是否接受。拥有同一完整资源路径的 Studio 和标准模式仍可互通；两边都无法确定资源时只保留旧的进程内尽力恢复，不能视为同项目连续性证明。此规则也适用于 Claude `thinking.display=omitted` 的缓存恢复，不改写客户端明确回传的原始签名或工具 ID。
+
 如果上游给出的不透明工具 ID 恰好与旧格式 `前缀__thought__规范base64` 完全相同，OpenAI 回复会在该条工具调用的 `extra_content.vertex2openai.literal_call_id_sha256_v1` 标记原 ID。请原样回传**整个工具调用的 `extra_content`**，不要只提取签名：这样即使缓存过期，调用和紧随其后的工具结果也能保留原 ID。该标记只说明 ID 的编码方式，不包含思考签名，也不证明调用者身份；必需签名本身仍应保存在 `extra_content.google.thought_signature`。普通 ID 和标准 Claude 输出不添加标记。对于未带标记、也找不到缓存依据的 OpenAI 历史，仍兼容旧 ID 格式。标准 Claude 的 `tool_use.id` 始终按不透明 ID 处理；即使缓存失效，调用和对应工具结果也保留原 ID，不会把 ID 后缀当成 Gemini 签名。
+
+---
+
+## OpenAI Responses 无状态子集
+
+`POST /v1/responses` 使用 `Authorization: Bearer <API_KEY>`。它采用 Responses 的 `input` / `output` 协议，不是 Chat Completions 的 `messages` / `choices` 别名。请求示例：
+
+```json
+{
+  "model": "gemini-3-flash-preview",
+  "store": false,
+  "instructions": "根据输入列出颜色。",
+  "input": "蓝、红、蓝。",
+  "tools": [{"type": "function", "name": "count_colors",
+             "parameters": {"type": "object"}, "strict": false}],
+  "stream": true
+}
+```
+
+- 支持文本 `input` 或显式历史数组（`user`、`developer`、`system`、`assistant`），普通文本和 JSON 函数工具（`type:"function"`）。支持 `instructions`、`max_output_tokens`、`temperature`、`top_p`、`reasoning.effort`（按现有 Gemini 模型规则映射）、`tool_choice` 的 `auto/none/required` 或点名一个已声明函数。函数参数默认尽力遵循声明，不承诺 OpenAI 严格解码；显式 `strict:true` 不支持。启用函数时不支持 `parallel_tool_calls:false`。
+- 工具续轮请把上一轮的输入与 `response.output` 按原顺序带回，再追加每个 `{"type":"function_call_output","call_id":"…","output":"…"}`。结果通过收到的 `call_id` 匹配；函数输出项的 `id`（`fc_…`）不是调用 ID。输出必须是字符串，属于同一批的结果可按任意完成顺序提交，不能遗漏或重复。
+- 建议原样回传输出项的完整 `extra_content`。其中的 `google.thought_signature` 是 Gemini 原始字节的 Base64，工具独占一轮时可能还携带 `vertex2openai.assistant_extra_content`。可见思考若由当前通道返回，会投影成 `reasoning_text`；此端点不会生成或接受 OpenAI 的 `encrypted_content`。客户端丢弃扩展时，仅同进程、同认证与模型、完整可见历史和调用批次精确匹配才可能恢复已交付签名。找不到时，默认保留原始 `call_id`，不伪造签名或补跳过哨兵；上游仍可能拒绝。该默认不影响已开启的严格签名校验。
+- `stream:true` 是**缓冲 SSE**：先发 Responses 的创建事件和等待心跳，待上游完成后才发送已验证的正文与工具事件，不保证逐 token 即时到达。成功终点为 `response.completed`；截断/过滤使用 `response.incomplete`，不输出未完成调用；慢错误使用 `response.failed`。它不发送 Chat 的 `[DONE]`，也不提供 Chat 续传。用量沿用所选通道的统计，若已启用 Cookie 缺失用量估算则沿用该估算。
+- 始终无状态：省略 `store` 也按 `false`，不支持响应检索、`previous_response_id`、`conversation`、后台模式、WebSocket、断点续传或幂等键。也不支持图像/音频/文件、内置工具、自由格式 `type:"custom"`、JSON 输出格式、OpenAI 思考摘要或其他带值的未实现参数。请求体和上游中间 JSON 回复各限 8 MiB。**这不等于完整 OpenAI Responses 或 Codex 客户端兼容。**
 
 ---
 
@@ -1061,7 +1087,8 @@ SSE 心跳与元数据不会重置计时，退避仍由 `retry_backoff_seconds` 
 模型已回复后的读取仍受原网络超时（SDK 默认 600 秒）及总期限约束。日志中的返回事件数不代表正文 token 数量。
 
 `GET /v1/resumable/{id}?from=<seq>&limit=200&wait=10` 返回事件分片；非流式缓冲在 `done=true` 时提供
-`payload` 和上游 `status_code`。响应头已对跨域浏览器暴露。JSON、轮询和 SSE 交付标记均在实际 ASGI
+`payload` 和上游 `status_code`。如果该 JSON 错误回执留有有效且不超过 128 字符的 `Retry-After`，轮询结果还会提供
+`retry_after` 字段（秒数或 HTTP 日期的原始字符串）。响应头已对跨域浏览器暴露。JSON、轮询和 SSE 交付标记均在实际 ASGI
 发送成功后更新；这不是客户端应用层收件确认。
 
 Gemini 原生 `streamGenerateContent?alt=sse` 默认增加安全的事件间注释保活，并检查事件和候选结束标记。

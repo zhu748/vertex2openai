@@ -100,7 +100,8 @@ def test_unrepresentable_choices_do_not_publish_and_budgets_never_truncate(store
     p = request()._signature_output_prefix
     for c in ({"content": [{"type": "image_url"}]}, {"reasoning_content": "![Image](inline data)"}):
         publish(p, [call("a", sig=b"ineligible")], **c)
-    origin.publish_completed_origins(p, [{"finish_reason": "length", "message": {"tool_calls": [call("a", sig=b"short")]}}])
+    origin.publish_completed_origins(p, [{"finish_reason": "length", "message": {
+        "tool_calls": [call("a", arguments='{"unexpected partial JSON"', sig=b"short")]}}])
     publish(p, [call("same", sig=b"one"), call("same", arguments="{}", sig=b"two")])
     assert not store._data
     duplicate = request(calls=[call("same"), call("same", arguments="{}")])
@@ -132,6 +133,28 @@ def test_accepted_unrestorable_origin_is_remembered_even_if_the_signed_variant_a
     assert replay(request(calls=turn)) == [None]
 
 
+@pytest.mark.parametrize("finish", ["length", "content_filter"])
+def test_non_success_only_fences_complete_and_identifiable_terminal_batch(store, finish):
+    prefix = request()._signature_output_prefix
+    public = request(calls=[call("a")])
+    key = origin.origin_slot(public.messages[-1], 0)
+    publish(prefix, [call("a", sig=b"prior")])
+    published = set(store._data)
+    for arguments in (None, "", "  ", "[0]", '{"symbol":0', '{"symbol":NaN}'):
+        choice = {"finish_reason": finish, "message": {"tool_calls": [call("a", arguments=arguments, sig=b"bad")]}}
+        origin.publish_completed_origins(prefix, [choice])
+        assert replay(public) == [b"prior"]
+        assert set(store._data) == published
+    good = call("a", sig=b"different but not authorized")
+    choice = {"finish_reason": finish, "message": {"tool_calls": [{**good, "index": 8}]}}
+    origin.publish_completed_origins(prefix, [choice])
+    assert replay(public) == [b"prior"]
+    choice["message"]["tool_calls"] = [good]
+    origin.publish_completed_origins(prefix, [choice])
+    assert store.get_record(key).state is SignatureState.AMBIGUOUS
+    assert replay(public) == [None]
+
+
 def test_stream_needs_normal_terminal_and_cannot_publish_text_or_partial_subset(store):
     prefix = request()._signature_output_prefix
     batches = {}
@@ -154,8 +177,10 @@ def test_stream_needs_normal_terminal_and_cannot_publish_text_or_partial_subset(
 
 def test_private_origin_cannot_be_supplied_as_a_request_field(store):
     obj = OpenAIRequest.model_validate({"model": MODEL, "tools": TOOLS, "_signature_output_prefix": "spoof",
+        "_stage_terminal_signature_fence": "spoof",
         "messages": [*PREFIX, {"role": "assistant", "tool_calls": [call("a")], "_signature_slots": ["spoof"]}]})
     assert obj._signature_output_prefix is None
+    assert obj._stage_terminal_signature_fence is None
     origin.bind_signature_origins(obj, "tenant-one")
     assert origin.origin_slot(obj.messages[-1], 0) == b""
 
@@ -163,6 +188,10 @@ def test_private_origin_cannot_be_supplied_as_a_request_field(store):
 class OriginRoutes(SchemaRouteHarness):
     async def test_interleaved_cross_protocol_turns_restore_both_own_signatures_on_real_wire(self):
         self.settings["max_retries"] = 0
+        self.settings["express_location"] = "global"
+        # The Studio fixture is project-scoped. Pin Express to that exact
+        # publisher resource when checking migration across adapters.
+        self.key_manager.get_express_record = lambda **_: {"key": "test-key", "project_id": "fixture"}
         for channel in ("api_key", "web_proxy"):
             for protocol in ("openai", "claude"):
                 for mode in ("json", "fake", "stream"):

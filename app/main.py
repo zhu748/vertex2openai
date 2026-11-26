@@ -24,6 +24,7 @@ from routes import (
     gemini_native,
     generated_images,
     models_api,
+    responses_api,
     settings_api,
     system_api,
 )
@@ -115,6 +116,7 @@ for router in (
     credentials_api.router,
     models_api.router,
     chat_api.router,
+    responses_api.router,
     claude_api.router,
     gemini_native.router,
     generated_images.router,

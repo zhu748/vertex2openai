@@ -42,7 +42,7 @@ from tool_arguments import parse_tool_arguments
 from tool_policy import validate_model_tool_choice
 from response_validation import IncompleteResponseError
 from thought_signatures import google_metadata, ordinary_part_metadata
-from signature_origin import VisibleText
+from signature_origin import VisibleText, is_unrestorable_tool_terminal
 from schema_validation import SchemaValidationError, validate_json_schema, sanitize_for_gemini, validate_tool_name_identity, validate_tool_strict
 
 # ============================================================
@@ -1081,11 +1081,12 @@ class ClaudeStreamState:
     """
 
     def __init__(self, display_model: str, message_id: Optional[str] = None,
-                 omit_thinking: bool = False, projection=None):
+                 omit_thinking: bool = False, projection=None, terminal_fence=None):
         self.model = display_model
         self.id = message_id or new_message_id()
         self.omit_thinking = omit_thinking
         self.projection = projection
+        self.terminal_fence = terminal_fence
         self._next_index = 0
         self._open: Optional[dict] = None       # 当前打开的块 {"kind","index",...}
         self._tools: dict[int, dict] = {}        # OpenAI tool index → {id,name,parts}（按到达序）
@@ -1219,12 +1220,16 @@ class ClaudeStreamState:
         choice = choices[0] if isinstance(choices[0], dict) else {}
         delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
         projection = self.projection
-        if projection is not None and projection.prefix:
-            projection.source(payload.get("id"))
+        if self.terminal_fence is not None or projection is not None and projection.prefix:
             choice_index = choice.get("index", 0)
-            if (len(choices) != 1 or type(choice_index) is not int or choice_index != 0 or self.finish
-                    or self._tools and (delta.get("content") or delta.get("reasoning_content"))):
-                projection.discard()
+            valid = (len(choices) == 1 and type(choice_index) is int and choice_index == 0 and not self.finish
+                     and not (self._tools and (delta.get("content") or delta.get("reasoning_content"))))
+            for proof in (projection, self.terminal_fence):
+                if proof is not None:
+                    if valid:
+                        proof.source(payload.get("id"))
+                    else:
+                        proof.discard()
         if self._buffered_source:
             if payload.get("id") == self._buffered_source[0]:
                 if self._consume_buffered_choice(choice, delta):
@@ -1378,19 +1383,24 @@ class ClaudeStreamState:
         # Validate all calls before emitting any executable tool block. Truncated
         # streams retain their raw partial JSON and their max_tokens/refusal stop.
         calls = []
+        terminal_without_bytes = is_unrestorable_tool_terminal(self.finish)
         for known in self._tools.values():
             if not known["name"].strip():
                 raise IncompleteResponseError("上游流式工具调用缺少函数名称。")
-            args = "".join(known["parts"]).strip() or "{}"
-            if self.finish not in ("length", "content_filter"):
-                _parse_tool_arguments(args)
+            args = "".join(known["parts"]).strip()
+            if not terminal_without_bytes:
+                _parse_tool_arguments(args or "{}")
             calls.append((known, args))
+        if terminal_without_bytes and self.terminal_fence is not None:
+            # The remaining tuples exactly correspond to the shown public
+            # tool events. Do not commit an upstream-only or partial batch.
+            self.terminal_fence.confirm_batch(len(calls))
         if self.projection is not None:
-            if (self.finish == "tool_calls" and not self._buffered_blocks
+            if ((self.finish == "tool_calls" or terminal_without_bytes) and not self._buffered_blocks
                     and list(self._tools) == list(range(len(self._tools)))):
                 self.projection.prepare(
-                    (known["id"], known["name"], args, {"extra_content": {"google": known}})
-                    for known, args in calls
+                    ((known["id"], known["name"], args if terminal_without_bytes else args or "{}",
+                      {"extra_content": {"google": known}}) for known, args in calls), finish_reason=self.finish,
                 )
             else:
                 self.projection.discard()
@@ -1406,7 +1416,7 @@ class ClaudeStreamState:
                 events.extend(self._close_block())
         self._buffered_blocks = self._buffered_source = None
         for known, args in calls:
-            events.extend(self._complete_tool_events(known["id"] or new_tool_id(), known["name"], args))
+            events.extend(self._complete_tool_events(known["id"] or new_tool_id(), known["name"], args or "{}"))
         self._tools.clear()
         self._tool_ids.clear()
         self._tool_bytes = 0

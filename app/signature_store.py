@@ -66,6 +66,7 @@ class SignatureState(str, Enum):
 class SignatureRecord:
     state: SignatureState
     signature: Optional[bytes] = None
+    destination: Optional[bytes] = None
 
     def __post_init__(self) -> None:
         if self.state is SignatureState.SIGNED and not self.signature:
@@ -171,7 +172,8 @@ class SignatureStore:
     def _payload_size(key: CacheKey, record: SignatureRecord) -> int:
         # Overestimates Unicode storage and shared signature references. Fixed
         # Python object/index overhead is independently bounded by the count.
-        return len(key) * (4 if isinstance(key, str) else 1) + len(record.signature or b"")
+        return (len(key) * (4 if isinstance(key, str) else 1)
+                + len(record.signature or b"") + len(record.destination or b""))
 
     def _drop(self, key: CacheKey) -> Optional[SignatureRecord]:
         item = self._data.pop(key, None)
@@ -201,31 +203,42 @@ class SignatureStore:
         if not call_id:
             return
         with self._lock:
-            now = time.monotonic()
-            prev = self._data.get(call_id)
-            if prev is not None and now - prev[0] <= self._ttl:
-                if prev[1] != record:
-                    record = SignatureRecord(SignatureState.AMBIGUOUS)
-            elif self._was_displaced(call_id, now):
+            self._put_record(call_id, record, time.monotonic())
+
+    def _put_record(self, call_id: CacheKey, record: SignatureRecord, now: float) -> None:
+        prev = self._data.get(call_id)
+        if prev is not None and now - prev[0] <= self._ttl:
+            if prev[1] != record:
                 record = SignatureRecord(SignatureState.AMBIGUOUS)
-            if self._payload_size(call_id, record) > self._max_bytes:
-                # An unretainable original is not evidence for some other
-                # origin. Keep a bounded no-bytes marker without flushing the
-                # cache to make room for something that could never fit.
-                record = SignatureRecord(SignatureState.AMBIGUOUS)
-            self._drop(call_id)
-            size = self._payload_size(call_id, record)
-            if size > self._max_bytes:
-                self._remember_displaced(call_id, now, record.state)
-                self._evict(now)
-                return
-            self._resident_bytes += size
-            self._data[call_id] = (now, record)
-            self._expiry[call_id] = now
+        elif self._was_displaced(call_id, now):
+            record = SignatureRecord(SignatureState.AMBIGUOUS)
+        if self._payload_size(call_id, record) > self._max_bytes:
+            # An unretainable original is not evidence for some other origin.
+            record = SignatureRecord(SignatureState.AMBIGUOUS)
+        self._drop(call_id)
+        size = self._payload_size(call_id, record)
+        if size > self._max_bytes:
+            self._remember_displaced(call_id, now, record.state)
             self._evict(now)
+            return
+        self._resident_bytes += size
+        self._data[call_id] = (now, record)
+        self._expiry[call_id] = now
+        self._evict(now)
+
+    def register_origin_batch(self, keys, signatures, destination) -> None:
+        # Do not key by destination: identical visible batches produced in
+        # different projects are indistinguishable to a metadata-thin caller.
+        with self._lock:
+            now = time.monotonic()
+            for i, (key, sig) in enumerate(zip(keys, signatures, strict=True)):
+                state = (SignatureState.SIGNED if sig else SignatureState.UNSIGNED_FOLLOWER
+                         if i else SignatureState.UNKNOWN)
+                self._put_record(key, SignatureRecord(state, sig, destination), now)
 
     def register_call_signature(self, call_id: CacheKey, signature: Optional[bytes],
-                                *, unsigned_follower: bool = False) -> None:
+                                *, unsigned_follower: bool = False,
+                                destination: Optional[bytes] = None) -> None:
         """QUA-P2-2（2026-11 审查收敛）：工具调用签名三态写入的单一入口。
 
         此前 thought_signatures.build_tool_call_id 与
@@ -235,7 +248,7 @@ class SignatureStore:
         「是否同批后续调用」的判定，拓扑语义归本模块单点维护。
         """
         if signature:
-            self.put_record(call_id, SignatureRecord(SignatureState.SIGNED, signature))
+            self.put_record(call_id, SignatureRecord(SignatureState.SIGNED, signature, destination))
         elif unsigned_follower:
             self.put_unsigned_follower(call_id)
         else:

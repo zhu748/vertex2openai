@@ -23,7 +23,7 @@ import traceback
 # 引入运行状态管理器与多通道分发策略
 from runtime_state import app_state
 from credential_manager import credential_manager  # noqa: F401  # 测试 seam：对象属性 patch 的访问面
-from retry_policy import advisory_headers, response_retry_after
+from retry_policy import advisory_headers, bounded_sse_advisory, response_retry_after
 from upstream_errors import error_status, extract_upstream_error, create_openai_error_response
 from logger import stats
 from streaming import SSE_NO_BUFFER_HEADERS
@@ -524,6 +524,9 @@ async def _poll_result(buf, start, poll_limit, poll_wait, connection, headers):
     if buf.kind == "json" and buf.done:
         # JSON 没有事件分片；轮询必须实际交付正文，不能只报告 done。
         content.update(payload=buf.payload, status_code=buf.status_code)
+        # The GET itself succeeded; the advisory belongs to its retained error.
+        if buf.status == "error" and (hint := bounded_sse_advisory(buf.json_retry_after)) is not None:
+            content["retry_after"] = hint
     # REQ-P2-2：轮询一次可拉 500 帧（巨帧可达数 MB），大响应离环序列化。
     return await json_response_offloop(
         content=content,
