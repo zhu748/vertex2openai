@@ -302,7 +302,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         upstream.assert_not_called()
         self.assertEqual(frames, [resumable.HEARTBEAT_FRAME])
 
-    async def test_setup_failure_preserves_error_code_for_existing_followers(self):
+    async def check_setup_failure(self, *, committed):
         started, release = asyncio.Event(), asyncio.Event()
         error = Exception("quota exhausted")
         error.code = 429
@@ -312,21 +312,39 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
             await release.wait()
             raise error
 
-        with mock.patch.object(chat_api, "_call_upstream", side_effect=setup) as upstream:
+        # Select the HTTP branch without asking a loaded event loop to schedule
+        # this follower inside production's 50ms window. In the slow case both
+        # response envelopes exist before the provider is allowed to fail.
+        with mock.patch.object(chat_api, "SETUP_FAST_WINDOW_SECONDS", 0 if committed else float("inf")), \
+                mock.patch.object(chat_api, "_call_upstream", side_effect=setup) as upstream:
             first = asyncio.create_task(chat_api._resumable_stream(request(), self.obj, self.key))
-            await asyncio.wait_for(started.wait(), 1)
-            buf = await self.store.get(self.stream_id)
-            follower = await chat_api._resumable_stream(request(), self.obj, self.key)
-            release.set()
+            try:
+                await asyncio.wait_for(started.wait(), 2)
+                buf = await self.store.get(self.stream_id)
+                follower = await chat_api._resumable_stream(request(), self.obj, self.key)
+                if committed:
+                    await asyncio.wait_for(asyncio.shield(first), 2)
+                else:
+                    self.assertFalse(first.done())
+            finally:
+                release.set()
             first_http = await asyncio.wait_for(first, 1)
-            self.assertEqual(first_http.status_code, 429)
-            self.assertIn("quota exhausted", first_http.body.decode())
-            frames = "".join([frame async for frame in follower.body_iterator])
+            self.assertEqual((first_http.status_code, follower.status_code), (200 if committed else 429, 200))
+            if not committed:
+                self.assertIn("quota exhausted", first_http.body.decode())
+            for reader in ((first_http, follower) if committed else (follower,)):
+                frames = "".join([frame async for frame in reader.body_iterator])
+                self.assertIn('"code": 429', frames)
+                self.assertIn("data: [DONE]", frames)
         self.assertEqual(upstream.await_count, 1)
-        self.assertIn('"code": 429', frames)
-        self.assertIn("data: [DONE]", frames)
         self.assertEqual(buf.status_code, 429)
         self.assertIs(await self.store.get(self.stream_id), buf)
+
+    async def test_setup_failure_preserves_error_code_for_existing_followers(self):
+        await self.check_setup_failure(committed=False)
+
+    async def test_setup_failure_after_leader_already_committed_preserves_error_for_both_readers(self):
+        await self.check_setup_failure(committed=True)
 
     async def test_setup_http_error_is_returned_unchanged(self):
         original = JSONResponse({"error": {"code": 403, "message": "permission denied"}}, status_code=403)

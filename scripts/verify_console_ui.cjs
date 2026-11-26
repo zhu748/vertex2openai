@@ -1345,6 +1345,85 @@ async function main() {
     check('模型专属与全局默认的同字段草稿经重复加载与切换页仍保留原始比较，撤销后可重新编辑');
     await modelA.close();await modelB.close();
     check('模型参数双标签页：过期保存与清除都返回 409，保留草稿并允许基于最新值清除');
+
+    const draftPage=await context.newPage();
+    await draftPage.setViewportSize({width:390,height:844});
+    await draftPage.goto(origin+'/#runtime');
+    await draftPage.waitForFunction(()=>settingsLoaded && capabilitiesLoaded);
+    const configWrites=[];
+    draftPage.on('request',request=>{
+      const pathname=new URL(request.url()).pathname;
+      if((pathname==='/api/settings'||pathname.startsWith('/api/model-overrides/'))&&request.method()!=='GET')
+        configWrites.push(request.postDataJSON());
+    });
+    const unloadBlocked=()=>draftPage.evaluate(()=>{
+      const event=new Event('beforeunload',{cancelable:true});
+      window.dispatchEvent(event);return event.defaultPrevented;
+    });
+    assert.equal((await draftPage.request.post(origin+'/api/settings',{data:{retry_max:10,retry_backoff_seconds:5}})).status(),200);
+    await draftPage.evaluate(()=>loadParams());
+    await draftPage.fill('#retry_backoff_seconds','5.00');await draftPage.fill('#retry_max','');
+    assert.equal(await draftPage.locator('#runtime-save-bar [role=status]').textContent(),'修改已保存');
+    assert.equal(await unloadBlocked(),false);
+    await draftPage.locator('button[onclick*="saveSettings"]').click();
+    assert.match(await draftPage.textContent('#toast'),/没有需要保存/);assert.equal(configWrites.length,0);
+    const retryInput=draftPage.locator('#retry_max');
+    await retryInput.fill('1');await retryInput.press('End');await retryInput.press('e');
+    assert.equal(await retryInput.evaluate(input=>input.validity.badInput),true);
+    assert.equal(await unloadBlocked(),true);
+    await draftPage.locator('button[onclick*="saveSettings"]').click();
+    assert.equal(await retryInput.getAttribute('aria-invalid'),'true');assert.equal(configWrites.length,0);
+    await retryInput.fill('');assert.equal(await unloadBlocked(),false);
+    assert.equal((await draftPage.request.post(origin+'/api/settings',{data:{retry_max:12}})).status(),200);
+    await draftPage.evaluate(()=>loadParams());
+    await retryInput.fill('');
+    const resetNumeric=await saveRuntime(draftPage);
+    assert.equal(resetNumeric.status(),200);
+    assert.deepEqual(resetNumeric.request().postDataJSON(),{retry_max:10,_expected:{retry_max:{present:true,value:12}}});
+    await draftPage.waitForFunction(()=>!consoleForms.dirty());
+    check('数值等价格式和默认空值不会误报草稿；未完成输入仍受校验，明确恢复默认值只写一个字段');
+
+    const orphanModels=new Set();
+    await draftPage.route('**/api/capabilities',async route=>{
+      const original=await route.fetch(), payload=await original.json();
+      await route.fulfill({response:original,json:{...payload,models:payload.models.filter(model=>!orphanModels.has(model))}});
+    });
+    await draftPage.selectOption('#mobile-nav','params');
+    for(const [model,value] of [['gemini-4-argon','restore this draft'],['gemini-4-carbon','discard this draft']]){
+      await draftPage.selectOption('#model-sel',model);
+      await draftPage.fill('#inject_prefill',value);
+      orphanModels.add(model);
+    }
+    await draftPage.evaluate(()=>loadParams());
+    assert.equal(await draftPage.inputValue('#model-sel'),'__global__');
+    assert.equal(await draftPage.locator('#model-sel option[value="gemini-4-argon"]').count(),0);
+    const orphanNotice=draftPage.locator('#orphaned-model-drafts');
+    assert.equal(await orphanNotice.isVisible(),true);
+    assert.match(await orphanNotice.getByRole('status').textContent(),/2 个/);
+    assert.equal(await draftPage.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+    assert.equal(await unloadBlocked(),true);
+    const beforeOrphans=configWrites.length;
+    await draftPage.click('#btn-scope-save');
+    assert.match(await draftPage.textContent('#toast'),/没有需要保存/);
+    await orphanNotice.getByRole('button',{name:'撤销 gemini-4-carbon 的草稿'}).click();
+    assert.match(await orphanNotice.getByRole('status').textContent(),/1 个/);
+    assert.equal(await unloadBlocked(),true);assert.equal(configWrites.length,beforeOrphans);
+    orphanModels.clear();
+    await orphanNotice.getByRole('button',{name:'重新加载模型列表'}).click();
+    await orphanNotice.waitFor({state:'hidden'});
+    await draftPage.waitForFunction(()=>!document.querySelector('#model-sel').matches(':disabled'));
+    assert.equal(await draftPage.evaluate(()=>document.activeElement.id),'model-sel');
+    assert.match(await draftPage.locator('#model-sel option[value="gemini-4-argon"]').textContent(),/草稿/);
+    assert.doesNotMatch(await draftPage.locator('#model-sel option[value="gemini-4-carbon"]').textContent(),/草稿/);
+    await draftPage.selectOption('#model-sel','gemini-4-argon');
+    assert.equal(await draftPage.inputValue('#inject_prefill'),'restore this draft');
+    const recovered=await saveModelScope(draftPage,'/api/model-overrides/gemini-4-argon');
+    assert.equal(recovered.status(),200);
+    assert.deepEqual(recovered.request().postDataJSON(),{inject_prefill:'restore this draft',_expected:{inject_prefill:{present:false}}});
+    await draftPage.waitForFunction(()=>!consoleForms.dirty());
+    await draftPage.close();
+    check('手机上可查看并逐个撤销已下架模型的草稿；模型恢复后继续编辑且只写入原作用域');
+
     const beforeLogout=page.url();
     await page.route('**/api/logout',route=>route.fulfill({status:503,json:{error:'测试退出失败'}}));
     pending=responseFor('/api/logout');

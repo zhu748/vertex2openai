@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 
 import httpx
 
-from admission import generation_limiter
+from admission import generation_limiter, image_limiter
 from credential_manager import credential_manager
 from main import app
 from proxy_failover import ProxyChain
@@ -50,8 +50,8 @@ class NativeSetupReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.response = lambda: httpx.Response(200, content=SUCCESS, headers={"content-type": "text/event-stream"})
 
     @staticmethod
-    def peer(extra=(), **kw):
-        return Peer("/v1beta/models/gemini-test:streamGenerateContent", query=b"alt=sse",
+    def peer(extra=(), *, model="gemini-test", **kw):
+        return Peer(f"/v1beta/models/{model}:streamGenerateContent", query=b"alt=sse",
                     payload={"contents": [{"parts": [{"text": "hello"}]}]},
                     headers=[(b"x-resumable", b"true"), *extra], **kw)
 
@@ -72,6 +72,116 @@ class NativeSetupReceiptTests(unittest.IsolatedAsyncioTestCase):
     def signed_next(self):
         self.response = lambda: httpx.Response(
             200, content=SIGNED + SUCCESS, headers={"content-type": "text/event-stream"})
+
+    def configure_capacity(self):
+        self.success_next()
+        self.enterContext(patch.object(gemini_native, "image_bypass_enabled", return_value=False))
+        original = gemini_native.app_state.get_committed_setting
+        self.enterContext(patch.object(gemini_native.app_state, "get_committed_setting", side_effect=lambda k, d=None:
+            1 if k in {"upstream_max_concurrency", "image_max_concurrency"} else original(k, d)))
+
+    async def test_local_generation_and_image_admission_preserve_a_real_http_receipt_until_delivery(self):
+        self.configure_capacity()
+        for model, limiter in (("gemini-test", generation_limiter), ("gemini-2.5-flash-image", image_limiter)):
+            for lost, keyed in ((False, False), (True, False), (False, True), (True, True)):
+                with self.subTest(model=model, lost=lost, keyed=keyed):
+                    await self.store.aclose()
+                    self.respond.reset_mock()
+                    key = [(b"idempotency-key", b"local-capacity")] if keyed else ()
+                    expected = {"error": {"code": 503, "message": limiter.full_message, "status": "UNAVAILABLE"}}
+                    first = self.peer(key, model=model)
+
+                    async def lose_final(message):
+                        if lost and message["type"] == "http.response.body":
+                            await first.drop()
+
+                    lease = limiter.reserve()
+                    try:
+                        await asyncio.wait_for(first.run(lose_final), 2)
+                    finally:
+                        lease.release()
+                    old, = self.store._buffers.values()
+                    self.assertEqual((first.messages[0]["status"], first.receipt), (503, old.id))
+                    self.assertNotIn(b"x-resumable-replay", dict(first.messages[0]["headers"]))
+                    self.assertEqual((old.status_code, old.fully_delivered, old.has_live_delivery, old.payload),
+                                     (503, not lost, False, expected))
+                    if not lost:
+                        self.assertEqual(json.loads(self.body(first)), expected)
+                    self.respond.assert_not_called()
+
+                    if lost or keyed:
+                        again = await self.completed(key, model=model)
+                        self.assertEqual((again.messages[0]["status"], again.receipt, json.loads(self.body(again))),
+                                         (503, old.id, expected))
+                        self.assertEqual(dict(again.messages[0]["headers"])[b"x-resumable-replay"], b"1")
+                        self.assertTrue(old.fully_delivered)
+                    fresh = await self.completed(key, model=model)
+                    if keyed:
+                        self.assertEqual((fresh.messages[0]["status"], fresh.receipt, json.loads(self.body(fresh))),
+                                         (503, old.id, expected))
+                        self.respond.assert_not_called()
+                    else:
+                        self.assertNotEqual(fresh.receipt, old.id)
+                        self.assertIn(SUCCESS, self.body(fresh))
+                        self.respond.assert_called_once()
+                    cursor = await self.completed([(b"x-resume-id", old.id.encode())], model=model)
+                    wire = self.body(cursor)
+                    self.assertEqual((cursor.messages[0]["status"], cursor.receipt), (200, old.id))
+                    self.assertEqual([line for line in wire.splitlines() if line.startswith(b"id: ")],
+                                     [f"id: {old.id}:0".encode()])
+                    self.assertEqual([json.loads(line[6:]) for line in wire.splitlines() if line.startswith(b"data: ")],
+                                     [expected])
+                    self.assertNotIn(b": upstream-status ", wire)  # rejected locally; no provider status
+                    self.assertNotIn(b"[DONE]", wire)
+                    end = await self.completed([(b"last-event-id", f"{old.id}:0".encode())], model=model)
+                    self.assertNotIn(b"data:", self.body(end))
+                    self.assertEqual(self.respond.call_count, 0 if keyed else 1)
+
+                    self.assertEqual((generation_limiter.active, image_limiter.active), (0, 0))
+
+    async def test_follower_already_committed_to_sse_gets_one_local_rejection_and_no_provider_request(self):
+        self.configure_capacity()
+        leader, follower = self.peer(), self.peer()
+        enter, proceed, headers_sent = (asyncio.Event() for _ in range(3))
+        original = native._passthrough_request
+
+        async def gated(*args):
+            enter.set()
+            await proceed.wait()
+            return await original(*args)  # real limiter is held, not a mocked exception
+
+        async def started(message):
+            if message["type"] == "http.response.start":
+                headers_sent.set()
+
+        lease = generation_limiter.reserve()
+        try:
+            with patch.object(native, "_passthrough_request", gated):
+                a = asyncio.create_task(leader.run())
+                b = None
+                try:
+                    await asyncio.wait_for(enter.wait(), 2)
+                    b = asyncio.create_task(follower.run(started))
+                    await asyncio.wait_for(headers_sent.wait(), 2)
+                finally:
+                    proceed.set()
+                    await asyncio.wait_for(asyncio.gather(a, *([b] if b else [])), 2)
+        finally:
+            lease.release()
+        self.assertEqual((leader.messages[0]["status"], follower.messages[0]["status"]), (503, 200))
+        old, = self.store._buffers.values()
+        self.assertEqual((leader.receipt, follower.receipt, old.fully_delivered, old.next_seq),
+                         (old.id, old.id, True, 1))
+        wire = self.body(follower)
+        self.assertEqual([json.loads(line[6:]) for line in wire.splitlines() if line.startswith(b"data: ")],
+                         [json.loads(self.body(leader))])
+        self.assertNotIn(b": upstream-status ", wire)
+        self.assertNotIn(b"[DONE]", wire)
+        self.respond.assert_not_called()
+        healthy = await self.completed()
+        self.assertNotEqual(healthy.receipt, old.id)
+        self.assertIn(SUCCESS, self.body(healthy))
+        self.respond.assert_called_once()
 
     async def test_explicit_cursor_replays_signed_events_without_a_current_provider(self):
         self.signed_next()

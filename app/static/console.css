@@ -260,6 +260,12 @@ body:has(#proxy-dialog[open]) { overflow: hidden; }
 .scope-picker { flex: 1; max-width: 520px; min-width: 0; }
 .scope-picker .lbl { margin-bottom: 6px; }
 .inline-notice { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; padding: 13px 16px; margin: 0 0 18px; border: 1px solid #f2d4dd; border-radius: 9px; background: #fff3f6; color: var(--danger); font-size: 12px; }
+.orphaned-model-drafts { border-color: #f3e2bc; background: #fff7e8; color: #815711; }
+.orphaned-model-drafts p { margin-top: 4px; }
+.orphaned-model-drafts ul { flex: 1 1 100%; display: grid; gap: 6px; }
+.orphaned-model-drafts li { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-width: 0; }
+.orphaned-model-drafts li span { overflow-wrap: anywhere; }
+.orphaned-model-drafts button { min-height: 44px; flex-shrink: 0; }
 .scope-description { font-size: 12px; color: var(--muted); margin: 13px 0; line-height: 1.8; }
 .scope-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; }
 #ov-hint { flex-basis: 100%; font-size: 11px; color: var(--muted); }

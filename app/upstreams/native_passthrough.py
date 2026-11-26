@@ -34,8 +34,8 @@ from upstream_errors import extract_upstream_error, google_status_detail
 from usage import merge_usage_metadata
 from protojson import int32_value
 from response_validation import FINISH_CONTENT_FILTER, IncompleteResponseError, has_finish_reason
-from admission import (count_slow_setup_failure, limit_generation, ManagedStreamingResponse, run_with_image_limit,
-                       SETUP_FAST_WINDOW_SECONDS)
+from admission import (count_slow_setup_failure, GenerationCapacityError, limit_generation, ManagedStreamingResponse,
+                       run_with_image_limit, SETUP_FAST_WINDOW_SECONDS)
 from logger import stats
 from request_tracking import upstream_attempt, upstream_chunk
 import first_reply as first_reply_module
@@ -847,6 +847,12 @@ async def _resumable_native(request: Request, api_key: str, model: str, action: 
                     return _native_error(buf.status_code, buf.error or "响应缓冲已释放。")
                 task = hold_ingress(asyncio.create_task(within_request_deadline(buf, lambda: pump(response))))
                 resumable_store.register_pump(buf.id, task, buffer=buf, close=lambda: close_response(response))
+                return response
+            except GenerationCapacityError as exc:
+                # This buffer already has readers, but no provider was contacted.
+                # Keep the local HTTP receipt and the original single native event.
+                response = _native_error(exc.code, str(exc))
+                await buf.fail_native_setup(_native_setup_payload(response), None, upstream=False)
                 return response
             except TimeoutError:
                 raise  # within_request_deadline classifies this before publishing

@@ -509,6 +509,14 @@
       </span>
       <button class="btn-ghost" onclick="runAction(this,async()=&gt;{loadNotice('params','');await loadParams();})">重新加载配置</button>
      </div>
+     <section aria-label="暂不可用的模型草稿" class="inline-notice orphaned-model-drafts" id="orphaned-model-drafts" hidden>
+      <div>
+       <strong id="orphaned-model-draft-status" role="status"></strong>
+       <p>这些草稿只保留在本页，暂不能保存。模型重新出现在列表后，可重新选择并继续编辑。</p>
+      </div>
+      <button type="button" class="btn-ghost" data-reload-model-list>重新加载模型列表</button>
+      <ul id="orphaned-model-draft-list"></ul>
+     </section>
      <nav aria-label="参数分区" class="settings-jump">
       <a href="#model-thinking">思考强度</a>
       <a href="#image-settings">生图</a>

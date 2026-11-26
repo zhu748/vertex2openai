@@ -50,6 +50,7 @@ from starlette.requests import ClientDisconnect
 
 from admission import GenerationCapacityError, ManagedStreamingResponse
 from auth import constant_time_equal, extract_candidate_key
+from catalog_pagination import CatalogPageError, gemini_model_page
 from config import API_KEY
 from express_fingerprint import sdk_label
 from logger import stats
@@ -403,7 +404,15 @@ async def native_list_models(fastapi_request: Request,
     目录与实际能力一致）。抗截断后缀仍仅限 OpenAI 兼容端点。
     """
     ids, has_keys = await _catalog_capabilities(fastapi_request)
-    return {"models": [_native_model_entry(mid, can_count_tokens=has_keys) for mid in ids]}
+    try:
+        page, token = gemini_model_page(ids, getattr(fastapi_request, "query_params", {}),
+                                        can_count_tokens=has_keys)
+    except CatalogPageError as exc:
+        return _native_error(400, str(exc), "INVALID_ARGUMENT")
+    result = {"models": [_native_model_entry(mid, can_count_tokens=has_keys) for mid in page]}
+    if token:
+        result["nextPageToken"] = token
+    return result
 
 
 @router.get("/v1beta/models/{model_action}")

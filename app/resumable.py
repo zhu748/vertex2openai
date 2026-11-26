@@ -522,14 +522,14 @@ class ResumableBuffer:
                 self._check_write_deadline_locked()
             return self._fail_locked(message, code, error_type)
 
-    async def fail_native_setup(self, payload: dict, retry_after: Optional[str]) -> None:
+    async def fail_native_setup(self, payload: dict, retry_after: Optional[str], *, upstream: bool = True) -> None:
         """Publish one bounded HTTP failure to both not-yet-started and live SSE readers."""
         async with self._cond:
             self._check_write_deadline_locked()
             if self.done:
                 return
             error = payload["error"]
-            prefix = f": upstream-status {error['code']}\n"
+            prefix = f": upstream-status {error['code']}\n" if upstream else ""
             # Only the raw SSE note is bounded; the validated HTTP hint still
             # describes the original failure for ordinary and replay callers.
             if (comment_hint := bounded_sse_advisory(retry_after)) is not None:

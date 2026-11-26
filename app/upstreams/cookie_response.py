@@ -14,7 +14,7 @@ from message_processing import iter_giant_content
 from protojson import standard_base64
 
 from response_validation import (IncompleteResponseError, StreamToolCallIds, complete_function_arguments,
-                                 has_finish_reason, validate_generation_finish_reason)
+                                 has_finish_reason, responses_prompt_block_reason, validate_generation_finish_reason)
 from json_stream import MAX_JSON_OBJECT_BYTES, JsonObjects as _JsonObjects
 from signature_store import signature_store
 from upstreams.cookie_candidate_metadata import native_candidate_metadata, native_prompt_feedback
@@ -294,6 +294,22 @@ def _prompt_block_message(feedback: Any) -> Optional[str]:
     return None
 
 
+def _prompt_feedback_events(feedback: Any, usage: Any, *, preserve_parts: bool,
+                            responses_prompt_feedback: bool) -> tuple[tuple[str, Any], ...]:
+    if responses_prompt_feedback:
+        feedback = _wire_object(feedback, "promptFeedback")
+        blocked = responses_prompt_block_reason(feedback.get("blockReason"))
+    else:
+        blocked = native_prompt_feedback(feedback) if preserve_parts else _prompt_block_message(feedback)
+    if not blocked:
+        return ()
+    event = ("blocked", blocked)
+    if (preserve_parts or responses_prompt_feedback) and isinstance(usage, dict) and usage:
+        # Both paths terminate on a prompt block. Deliver actual usage first.
+        return ("usage", usage), event
+    return (event,)
+
+
 def envelope_errors(obj: dict) -> list:
     """Only protocol fields, never 'error' keys in generated model content."""
     # Proto defaults such as error: null or {} are not real errors.
@@ -346,7 +362,8 @@ def _finish_native_part(native_part: dict, signature: str | None, *, empty_text:
 
 
 def extract_events(obj: dict, *, preserve_parts: bool = False, strip_thoughts: bool = False,
-                   boundary: CookieCandidateBoundary | None = None) -> Iterator[tuple]:
+                   boundary: CookieCandidateBoundary | None = None,
+                   responses_prompt_feedback: bool = False) -> Iterator[tuple]:
     boundary = boundary or CookieCandidateBoundary()
     obj = _wire_object(obj, "响应", allow_null=False)
     errors = envelope_errors(obj)
@@ -372,14 +389,13 @@ def extract_events(obj: dict, *, preserve_parts: bool = False, strip_thoughts: b
         # 注意：batchGraphql 每个流式块都会带 blockReason=BLOCKED_REASON_UNSPECIFIED
         # （proto 枚举默认值 = 未拦截），必须过滤掉，只透出真实拦截。
         usage = data.get("usageMetadata")
-        feedback = data.get("promptFeedback")
-        blocked = native_prompt_feedback(feedback) if preserve_parts else _prompt_block_message(feedback)
-        if blocked:
-            # The transport ends as soon as it sees the prompt block. Deliver
-            # this response's real usage first; never generate contents for it.
-            if preserve_parts and isinstance(usage, dict) and usage:
-                yield ("usage", usage)
-            yield ("blocked", blocked)
+        if block := _prompt_feedback_events(data.get("promptFeedback"), usage, preserve_parts=preserve_parts,
+                                            responses_prompt_feedback=responses_prompt_feedback):
+            yield from block
+            if responses_prompt_feedback:
+                # This is a terminal prompt outcome; neither malformed nor
+                # well-formed candidate Parts in the same record are output.
+                return
             if preserve_parts:
                 continue
 

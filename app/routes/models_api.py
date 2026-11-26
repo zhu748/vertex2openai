@@ -51,12 +51,12 @@ async def list_models(fastapi_request: Request, api_key: str = Depends(get_model
 
     # Anthropic 客户端：返回 Anthropic List Models 格式（claude 别名 + Gemini 模型）
     if claude_api.is_anthropic_client(fastapi_request):
-        return await claude_api.anthropic_model_list()
+        return await claude_api.anthropic_model_list(fastapi_request.query_params)
 
     return {"object": "list", "data": await openai_model_entries(express_key_manager_instance)}
 
 
-@router.get("/v1/models/{model_id}")
+@router.get("/v1/models/{model_id:path}")
 async def retrieve_model(model_id: str, fastapi_request: Request,
                          api_key: str = Depends(get_models_api_key)):
     """单模型检索（Anthropic models.retrieve / OpenAI models.retrieve 双格式）。
@@ -66,6 +66,8 @@ async def retrieve_model(model_id: str, fastapi_request: Request,
     OpenAI 客户端保持 HTTPException detail 形状（与列表端点同口径）。
     检索范围与各自列表口径完全一致：Anthropic 侧 claude 别名 + Gemini 模型，
     OpenAI 侧含 -search / 抗截断后缀的展开目录。
+    已配置的资源 ID 可包含斜杠；ASGI 路径已解码，仍只做精确目录匹配，
+    不解析项目、不回退到裸模型名，也不影响原生 POST 路由。
     """
     express_key_manager_instance = fastapi_request.app.state.express_key_manager
 

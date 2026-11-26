@@ -1198,10 +1198,11 @@ def _apply_whole_body_event(gen: "CookieGeneration", st: _WholeBodyState, event_
 
 
 def _whole_object_events(obj: dict, strip_thoughts: bool, text_decoder: Any,
-                         boundary: CookieCandidateBoundary) -> list:
+                         boundary: CookieCandidateBoundary, responses_prompt_feedback: bool) -> list:
     # Keep only the stable event list; a loop-local closure can retain the
     # entire raw object across the next cursor pull.
-    events = extract_events(obj, strip_thoughts=strip_thoughts, boundary=boundary)
+    events = extract_events(obj, strip_thoughts=strip_thoughts, boundary=boundary,
+                            responses_prompt_feedback=responses_prompt_feedback)
     return list(text_decoder.cookie_events(events) if text_decoder else events)
 
 
@@ -1215,7 +1216,8 @@ async def _collect_whole_body(gen: "CookieGeneration", response_text: str, text_
     st = _WholeBodyState()
     cursor = CompleteTextObjectCursor(response_text)
     boundary = CookieCandidateBoundary()
-    while st.api_error is None:
+    responses_prompt_feedback = getattr(gen.request_obj, "_completion_target", "chat") == "responses"
+    while st.api_error is None and not (responses_prompt_feedback and st.blocked_msg):
         obj = cursor.next_object()
         if obj is None:
             break
@@ -1223,9 +1225,10 @@ async def _collect_whole_body(gen: "CookieGeneration", response_text: str, text_
         # PRF-P1-1：含内联图片的对象整段解析搬媒体线程（解码 +
         # 落盘不在事件循环上）；纯文本对象保持原地零开销。
         if has_pending_inline_image(obj):
-            events = await run_media_task(_whole_object_events, obj, gen.strip_thoughts, text_decoder, boundary, heavy=True)
+            events = await run_media_task(_whole_object_events, obj, gen.strip_thoughts, text_decoder,
+                                          boundary, responses_prompt_feedback, heavy=True)
         else:
-            events = _whole_object_events(obj, gen.strip_thoughts, text_decoder, boundary)
+            events = _whole_object_events(obj, gen.strip_thoughts, text_decoder, boundary, responses_prompt_feedback)
         # 正文/工具内容已到即停止留存诊断样本（样本只服务
         # 「无正文」日志；留存会钉住含巨型 inlineData 的对象）。
         if any(et in BODY_EVENT_TYPES for et, _ in events):
@@ -1474,7 +1477,9 @@ async def deliver_collect_response(gen: "CookieGeneration") -> "Response":
                     content=_cookie_error_payload(st.api_error_status, st.api_error, retry_after=st.api_error_hint),
                 )
 
-            if text_decoder:
+            if text_decoder and not (gen.request_obj._completion_target == "responses" and st.blocked_msg):
+                # A prompt blocked before generation has no text-transport
+                # call or candidate finish for the decoder to complete.
                 text_decoder.validate_end()
 
             return _assemble_whole_response(gen, st)

@@ -139,7 +139,7 @@ async def _generate(parsed, fastapi_request):
             result = _parse_response(raw, status, hint, parsed.base)
         result.destination = destination
         if result.proof:
-            result.proof["item_predecessor"] = parsed.chat._responses_item_predecessor
+            result.proof["item_lineage"] = parsed.chat._responses_lineage
         return result
     except Exception as exc:
         code, message = extract_upstream_error(exc)
@@ -152,7 +152,7 @@ async def _publish(prefix, proof, connection, destination):
 
     def publish(_finish, keys, signatures, accepted_destination):
         publish_responses_item_origins(keys, signatures, accepted_destination, proof["item_witness"],
-                                       predecessor=proof["item_predecessor"])
+                                       lineage=proof["item_lineage"])
 
     if proof["withheld"]:
         message = proof["message"]

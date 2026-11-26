@@ -38,6 +38,42 @@ CALLS = (
     ({"functionCall": {"partialArgs": [{"jsonPath": "$.field"}], "willContinue": True}}, False),
 )
 
+# Vertex's PartialArg.delta is a oneof; google.protobuf.NullValue is present
+# when its JSON value is null. Omitted/default fields are not witnesses.
+def partial_call(*fields):
+    return {"functionCall": {"partialArgs": list(fields), "willContinue": True}}
+
+
+NULL_PART = partial_call({"jsonPath": "$.slot", "nullValue": None})
+SNAKE_NULL = {"function_call": {"partial_args": [{"json_path": "$['a.b'][0]", "null_value": None}]}}
+NULL_CONTROLS = (
+    (NULL_PART, True), (SNAKE_NULL, True), (partial_call({"jsonPath": "$.x", "nullValue": "NULL_VALUE"}), True),
+    (partial_call({"jsonPath": "$.x", "nullValue": None}, {"jsonPath": "$.y", "nullValue": None}), True),
+    ({"partMetadata": {"jsonPath": "$.x", "nullValue": None}}, False),
+    (partial_call({"nullValue": None}), False), (partial_call({"jsonPath": "$.", "nullValue": None}), False),
+    (partial_call({"jsonPath": "$.x[*]", "nullValue": None}), False),
+    (partial_call({"jsonPath": "$", "nullValue": None}), False),
+    (partial_call({"jsonPath": "$.x", "nullValue": False}), False),
+    (partial_call({"jsonPath": "$.x", "nullValue": 0}), False),
+    (partial_call({"jsonPath": "$.x", "nullValue": None, "boolValue": False}), False),
+    (partial_call({"jsonPath": "$.x", "nullValue": None, "null_value": None}), False),
+    (partial_call({"jsonPath": "$.x", "json_path": "$.y", "nullValue": None}), False),
+    (partial_call({"jsonPath": "$.x", "nullValue": None, "willContinue": True}), False),
+    (partial_call({"jsonPath": "$.x", "nullValue": None, "willContinue": "no"}), False),
+    (partial_call({"jsonPath": "$.x", "boolValue": False, "numberValue": 0}), False),
+    (partial_call({"jsonPath": "$.", "boolValue": False}), False),
+    (partial_call({"jsonPath": "$.x", "nullValue": None}, {"jsonPath": "$['x']", "nullValue": None}), False),
+    (partial_call({"jsonPath": "$.x", "nullValue": None}, {"jsonPath": "$.y", "nullValue": None},
+                  {"jsonPath": "$['y']", "nullValue": None}), False),
+    (partial_call({"jsonPath": "$.x", "nullValue": None},
+                  {"jsonPath": "$.y", "nullValue": None, "boolValue": False}), False),
+    ({"functionCall": {**NULL_PART["functionCall"], "partial_args": []}}, False),
+    ({**NULL_PART, "function_call": {}}, False),
+    (partial_call({"jsonPath": "$.x", "boolValue": False}), True),
+    (partial_call({"jsonPath": "$.x", "numberValue": 0}), True),
+    (partial_call({"jsonPath": "$.x", "stringValue": "", "willContinue": True}), True),
+)
+
 
 @pytest.mark.parametrize("part,valid", [
     (SERVER_CALL, True), (SERVER_RESPONSE, True), (INLINE, True), (FILE, True), (FUNCTION_RESULT, True),
@@ -63,7 +99,7 @@ def test_native_observers_agree_on_nontext_parts(part, valid):
     assert "first_content" not in trace.timings and "first_tool" not in trace.timings
 
 
-@pytest.mark.parametrize("part,valid", CALLS)
+@pytest.mark.parametrize("part,valid", CALLS + NULL_CONTROLS)
 def test_native_function_call_milestones_require_semantic_data(part, valid):
     payload = {"candidates": [{"content": {"parts": [part]}}]}
     assert first_reply.native_has_reply(payload) is valid
@@ -79,7 +115,7 @@ def test_native_function_call_milestones_require_semantic_data(part, valid):
 @pytest.mark.parametrize("sse", [False, True])
 @pytest.mark.parametrize("part,expected", [(SERVER_CALL, 200), (SERVER_RESPONSE, 200), (FUNCTION_RESULT, 200),
                                           *((part, 504) for part in MIME_ONLY),
-                                          *((part, 200 if valid else 504) for part, valid in CALLS)])
+                                          *((part, 200 if valid else 504) for part, valid in CALLS + NULL_CONTROLS)])
 def test_actual_native_route_delayed_tail(part, expected, sse):
     async def run():
         clock = [100.]
@@ -117,3 +153,12 @@ def test_actual_native_route_delayed_tail(part, expected, sse):
                 assert response.json()["error"]["code"] == 504
 
     asyncio.run(run())
+
+
+def test_official_sdk_explicit_null_field_is_present_and_empty_call_is_not():
+    value = types.PartialArg.model_validate({"jsonPath": "$.value", "nullValue": None})
+    absent = types.PartialArg.model_validate({"jsonPath": "$.value"})
+    for obj, valid in ((value, True), (absent, False)):
+        wire = obj.model_dump(mode="json", by_alias=True, exclude_unset=True)
+        assert ("nullValue" in wire) is valid
+        assert first_reply.native_has_reply({"candidates": [{"content": {"parts": [partial_call(wire)]}}]}) is valid

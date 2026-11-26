@@ -58,6 +58,7 @@ from response_validation import (
     has_finish_reason,
     require_complete_response,
     require_unblocked_response,
+    responses_prompt_block_reason,
     validate_generation_finish_reason,
 )
 from retry_policy import (
@@ -1409,7 +1410,22 @@ class SDKGeneration:
         if typed_output:
             # Provider usage can be genuine even when the public output fails.
             # Responses owns outcome accounting after the final public send.
-            _record_usage(response_obj_call)
+            usage = _record_usage(response_obj_call)
+            feedback = getattr(response_obj_call, "prompt_feedback", None)
+            if responses_prompt_block_reason(getattr(feedback, "block_reason", None)):
+                # This is the public projection's internal completion envelope,
+                # not assistant text or a reason to reissue the prompt. Do not
+                # process any candidate, prefill, or tool bytes on this path.
+                created = int(time.time())
+                result = JSONResponse(content={
+                    "id": f"chatcmpl-{created}-{uuid.uuid4().hex[:12]}",
+                    "object": "chat.completion", "model": self.request_obj.model, "created": created,
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": None},
+                                 "finish_reason": "content_filter"}],
+                    "usage": usage,
+                })
+                note_accepted_destination(self.request_obj, route.destination, response=result)
+                return result
         require_unblocked_response(response_obj_call)
         require_complete_response(response_obj_call)
         if self.text_transport:

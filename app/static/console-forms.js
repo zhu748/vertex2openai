@@ -11,8 +11,8 @@
     if (id === 'proxy-input')
       return JSON.stringify(proxyDraft(left)) === JSON.stringify(proxyDraft(right));
     if (id === 'keepalive_url' || id === 'express-ua-custom') return left.trim() === right.trim();
-    if ($(id)?.type === 'number' && left !== '' && right !== '')
-      return Number(left) === Number(right);
+    if (Object.hasOwn(RUNTIME_NUMERIC_DEFAULTS, id))
+      return runtimeNumericValue(id, left) === runtimeNumericValue(id, right);
     return left === right;
   }
   function serverValue(id) {
@@ -54,6 +54,13 @@
         !input.closest('.field-source')
     );
   const value = (input) => (input.type === 'checkbox' ? input.checked : input.value);
+  const readField = (input) => ({
+    id: input.id,
+    value: value(input),
+    // During an incomplete number edit Chromium exposes an empty value,
+    // which is not an intentional request to reset to the default.
+    ...(input.validity.badInput && { badInput: true })
+  });
   // Compare editable credential fields only. Probe diagnostics are saved by
   // the server and must not masquerade as unsaved edits after a row rerender.
   const keyState = (records) =>
@@ -79,9 +86,14 @@
           proxy_fallback: row.querySelector('.k-fallback').checked
         }))
       );
-    return controls(el).map((input) => ({ id: input.id, value: value(input) }));
+    return controls(el).map(readField);
   };
-  const fingerprint = (el) => JSON.stringify(read(el));
+  function sameField(name, field, previous) {
+    if (field.id !== previous?.id) return false;
+    return name === 'runtime'
+      ? !field.badInput && sameSetting(field.id, field.value, previous.value)
+      : JSON.stringify(field) === JSON.stringify(previous);
+  }
   function layout() {
     const nav = [...document.querySelectorAll('.tab-bar,.mobile-navigation')].find(
       (el) => el.getClientRects().length
@@ -98,34 +110,39 @@
     document.documentElement.style.setProperty('--model-scope-height', scopeHeight + 'px');
   }
   function changed(name) {
-    const el = group(name);
-    return el && snapshots.has(name) && fingerprint(el) !== JSON.stringify(snapshots.get(name));
+    const el = group(name),
+      baseline = snapshots.get(name);
+    if (!el || !baseline) return false;
+    const current = read(el);
+    return (
+      current.length !== baseline.length ||
+      current.some((field, i) => !sameField(name, field, baseline[i]))
+    );
   }
   function refresh(name) {
     const targets = typeof name === 'string' ? [group(name)].filter(Boolean) : groups();
     for (const el of targets) {
       const name = el.dataset.draftGroup,
-        dirty = changed(name),
-        bar = el.querySelector('.draft-toolbar');
+        bar = el.querySelector('.draft-toolbar'),
+        baseline = snapshots.get(name);
       if (!bar) continue;
-      if (!snapshots.has(name)) {
+      if (!baseline) {
         bar.querySelector('[role=status]').textContent = '配置尚未加载';
         bar.querySelector('[data-discard]').disabled = true;
         continue;
       }
-      const baseline = snapshots.get(name) || [],
-        current = read(el);
+      const current = read(el);
       const count =
-        current.reduce(
-          (n, item, i) => n + (JSON.stringify(item) !== JSON.stringify(baseline[i])),
-          0
-        ) + Math.max(0, baseline.length - current.length);
+        current.reduce((n, item, i) => n + !sameField(name, item, baseline[i]), 0) +
+        Math.max(0, baseline.length - current.length);
+      const dirty = count > 0;
       let conflictCount = 0;
       if (settingsGroups.includes(name)) {
         current.forEach((field, i) => {
           const key = settingKey(field.id);
           if (!conflicts.has(key)) return;
-          if (sameSetting(field.id, field.value, baseline[i].value)) conflicts.delete(key);
+          if (!field.badInput && sameSetting(field.id, field.value, baseline[i].value))
+            conflicts.delete(key);
           else conflictCount++;
         });
       }
@@ -149,8 +166,10 @@
     const baseline = snapshots.get(name);
     if (!baseline) return null;
     return new Set(
-      baseline
-        .filter(({ id, value: previous }) => !sameSetting(id, value($(id)), previous))
+      read(group(name))
+        .filter(
+          (field, i) => !field.badInput && !sameSetting(field.id, field.value, baseline[i].value)
+        )
         .map(({ id }) => settingKey(id))
     );
   }
@@ -171,7 +190,7 @@
     const writing = settingsWrites.get(name)?.fields;
     for (const field of current) {
       const entry = writing?.get(field.id);
-      if (entry && !sameSetting(field.id, field.value, entry.last)) {
+      if (entry && !field.badInput && !sameSetting(field.id, field.value, entry.last)) {
         entry.last = field.value;
         entry.later = {
           ...field,
@@ -218,7 +237,7 @@
           const edits = current.flatMap((field, i) => {
             const later = writing?.get(field.id)?.later;
             if (later) return [later];
-            return sameSetting(field.id, field.value, baseline[i].value)
+            return field.badInput || sameSetting(field.id, field.value, baseline[i].value)
               ? []
               : [{ ...field, origin: settingOrigin(field.id, baseline[i].value) }];
           });

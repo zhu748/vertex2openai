@@ -136,6 +136,38 @@ class NativeSDKKeepalive(SchemaRouteHarness):
                 if studio:
                     self.assertEqual(signature, "+/8=")  # private Bytes scalar is standard Base64
 
+    async def test_owned_nullable_tool_delta_roundtrips_as_present_null_and_reassembles(self):
+        from request_tracking import current_trace
+        from tool_stream import ToolStreamAssembler
+
+        def chunk(call, **part_fields):
+            return {"candidates": [{"index": 0, "content": {"role": "model",
+                    "parts": [{"functionCall": call, **part_fields}]}}]}
+
+        owner = chunk({"name": "lookup", "id": "owner", "willContinue": True}, thoughtSignature="+/8=")
+        delta = chunk({"id": "owner", "partialArgs": [{"jsonPath": "$.slot", "nullValue": None}]})
+        sent, traces = [], []
+        wire_bytes = b"".join(encoded(obj, studio=False) for obj in (owner, delta, TAIL))
+
+        def wire(_request, _count):
+            traces.append(current_trace.get())
+            return httpx.Response(200, content=wire_bytes, headers=mime(False))
+
+        async with self.provider(wire) as requests:
+            chunks = await self.receive(self.api(sent.append))
+        self.assertEqual((len(requests), len(chunks)), (1, 3))
+        self.assertEqual(b"".join(sent), PADDING + wire_bytes)
+        partial = chunks[1].candidates[0].content.parts[0].function_call.partial_args[0]
+        self.assertEqual(partial.model_dump(mode="json", by_alias=True, exclude_unset=True),
+                         {"jsonPath": "$.slot", "nullValue": None})
+        self.assertEqual(traces[0].snapshot()["tool_deltas"], 2)
+        assembler = ToolStreamAssembler()
+        restored = [assembler.restore_sdk(chunk) for chunk in chunks]
+        assembler.validate_end()
+        call = restored[1].candidates[0].content.parts[0]
+        self.assertEqual((call.function_call.name, call.function_call.id, call.function_call.args,
+                          call.thought_signature), ("lookup", "owner", {"slot": None}, b"\xfb\xff"))
+
     async def test_periodic_keepalive_waits_during_slow_setup_and_between_real_frames(self):
         for studio in (False, True):
             with self.subTest(studio=studio):

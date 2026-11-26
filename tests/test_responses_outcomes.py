@@ -213,6 +213,91 @@ class ResponsesOutcomes(SchemaRouteHarness):
                             self.assertEqual(public["output"], [])
                         self.assert_count_delta(before, success=1, error=0)
 
+    async def test_prompt_feedback_is_a_typed_terminal_on_both_channels(self):
+        self.settings["cross_channel_fallback"] = True
+        self.settings["anti_truncation_mode"] = "nonstream"
+        self.usage_metadata.update(cachedContentTokenCount=3, thoughtsTokenCount=2, totalTokenCount=14)
+        contradictory = [
+            {"text": "unexpected candidate text"},
+            {"text": "unexpected candidate thinking", "thought": True},
+            {"functionCall": {"name": "count_colors", "id": "unexpected-call", "args": {}},
+             "thoughtSignature": "Y29udHJhZGljdG9yeQ=="},
+            {"functionCall": {"name": "count_colors", "id": "partial-call", "willContinue": True}},
+        ]
+        with patch.object(channel_dispatch.credential_manager, "has_cookie_record", return_value=True):
+            for self.channel in ("web_proxy", "api_key"):
+                for phase in ("json", "early", "late"):
+                    for model, reason, self.finish_reason, self.reply in (
+                        (MODEL, "SAFETY", None, []),
+                        (MODEL, "PROHIBITED_CONTENT", "STOP", contradictory),
+                        (MODEL + "-antitruncation-nonstream", "OTHER", None, []),
+                    ):
+                        with self.subTest(channel=self.channel, phase=phase, model=model, reason=reason):
+                            self.prompt_feedback = {"blockReason": reason, "blockReasonMessage": "operator detail"}
+                            before = self.counters.get_json_stats()
+                            self.sent.clear()
+                            response = await self.post_at(request(model=model, stream=phase != "json"), phase)
+                            self.assertEqual(response.status_code, 200, response.text[:240])
+                            if phase == "json":
+                                public = response.json()
+                            else:
+                                events = event_list(response.text)
+                                self.assertEqual([e["type"] for e in events], [
+                                    "response.created", "response.in_progress", "response.incomplete",
+                                ])
+                                public = events[-1]["response"]
+                            self.assertEqual(public["status"], "incomplete")
+                            self.assertEqual(public["incomplete_details"], {"reason": "content_filter"})
+                            self.assertIsNone(public["error"])
+                            self.assertEqual(public["output"], [])
+                            self.assertEqual(public["usage"], {
+                                "input_tokens": 7, "output_tokens": 7, "total_tokens": 14,
+                                "input_tokens_details": {"cached_tokens": 3, "cache_write_tokens": 0},
+                                "output_tokens_details": {"reasoning_tokens": 2},
+                            })
+                            for marker in ("operator detail", "unexpected", "partial-call", "Y29udHJhZGljdG9yeQ=="):
+                                self.assertNotIn(marker, response.text)
+                            wire, = self.sent  # Neither retries nor standby may reissue a blocked prompt.
+                            self.assertEqual("variables" in wire, self.channel == "web_proxy")
+                            if model != MODEL:
+                                generation = wire.get("variables", wire)
+                                self.assertTrue(any(fn["name"].startswith("v2o_emit_") for tool in generation["tools"]
+                                                    for fn in tool.get("functionDeclarations", [])))
+                            self.assert_count_delta(before, success=1, error=0,
+                                                    tokens=(7, 7) if self.channel == "api_key" else (0, 0))
+
+    async def test_unknown_prompt_feedback_is_not_a_typed_block_or_ordinary_completion(self):
+        for self.channel in ("web_proxy", "api_key"):
+            for reason, expected_status in (("BLOCKED_REASON_UNSPECIFIED", 200), ("FUTURE_UNSPECIFIED", 502)):
+                with self.subTest(channel=self.channel, reason=reason):
+                    self.prompt_feedback = {"blockReason": reason, "blockReasonMessage": "operator detail"}
+                    self.reply = {"text": "A real response."}
+                    response = await self.client.post(PATH, json=request())
+                    self.assertEqual(response.status_code, expected_status, response.text[:240])
+                    self.assertNotIn("operator detail", response.text)
+                    if expected_status == 200:
+                        self.assertEqual(response.json()["output"][0]["content"][0]["text"], "A real response.")
+                    else:
+                        self.assertNotIn("FUTURE_UNSPECIFIED", response.text)
+                        self.assertNotIn("A real response.", response.text)
+
+    async def test_chat_keeps_legacy_prompt_block_presentation(self):
+        self.finish_reason, self.reply = None, []
+        self.prompt_feedback = {"blockReason": "SAFETY", "blockReasonMessage": "operator detail"}
+        for self.channel in ("web_proxy", "api_key"):
+            with self.subTest(channel=self.channel):
+                response = await self.client.post("/v1/chat/completions", json={
+                    "model": MODEL, "messages": [{"role": "user", "content": "Test the legacy notice."}],
+                })
+                if self.channel == "web_proxy":
+                    self.assertEqual(response.status_code, 200)
+                    choice, = response.json()["choices"]
+                    self.assertEqual(choice["finish_reason"], "content_filter")
+                    self.assertIn("[Studio 提示]", choice["message"]["content"])
+                else:
+                    self.assertEqual(response.status_code, 400)
+                    self.assertIn("operator detail", response.json()["error"]["message"])
+
     async def test_cookie_empty_and_blocked_output_never_estimates_the_gateway_notice(self):
         self.channel = "web_proxy"
         self.usage_metadata = None

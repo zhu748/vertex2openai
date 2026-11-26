@@ -1,12 +1,13 @@
 """校验上游响应是否被拦截、是否完整，并提供明确的错误类型。"""
 
 from hashlib import blake2s
+from math import isfinite
 from typing import Optional
 
-from google.genai.types import Language, Outcome, ToolType
+from google.genai.types import BlockedReason, Language, Outcome, ToolType
 
 from schema_validation import SchemaValidationError
-from tool_arguments import parse_tool_arguments
+from tool_arguments import MAX_ARGUMENT_FIELDS, parse_tool_arguments, partial_argument_path
 
 
 # ============================================================
@@ -208,6 +209,27 @@ def require_unblocked_response(response) -> None:
         raise SafetyBlockedError(message)
 
 
+_UNSPECIFIED_BLOCK = BlockedReason.BLOCKED_REASON_UNSPECIFIED.value
+_KNOWN_PROMPT_BLOCKS = frozenset(reason.value for reason in BlockedReason if reason.value != _UNSPECIFIED_BLOCK)
+
+
+def responses_prompt_block_reason(reason) -> str | None:
+    """Only recognized provider feedback can become a typed Responses filter."""
+    value = getattr(reason, "value", reason)
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str) or len(value) > 128 or not value.isascii():
+        raise IncompleteResponseError("上游 promptFeedback.blockReason 无效。")
+    value = value.upper()
+    if value == _UNSPECIFIED_BLOCK:
+        return None
+    # The pinned SDK itself allows unknown enum values. Don't infer either a
+    # refusal or a normal completion from an unrecognized explicit status.
+    if value not in _KNOWN_PROMPT_BLOCKS:
+        raise IncompleteResponseError("上游 promptFeedback.blockReason 无法识别。")
+    return value
+
+
 # Use concrete SDK enum values, not placeholder/unknown statuses. A successful
 # upstream execution can legitimately have no stdout (likewise for a timeout).
 _CODE_LANGUAGES = frozenset(x.value for x in Language if x != Language.LANGUAGE_UNSPECIFIED)
@@ -249,24 +271,68 @@ def sdk_media_payload(part):
     return None
 
 
-def _native_partial_arg_has_value(arg: object) -> bool:
+_PARTIAL_ARMS = (("boolValue", "bool_value"), ("numberValue", "number_value"),
+                 ("stringValue", "string_value"), ("nullValue", "null_value"))
+
+
+def _native_partial_delta(arg):
     if not isinstance(arg, dict):
-        return False
-    path = arg.get("jsonPath", arg.get("json_path"))
-    if not isinstance(path, str) or not path.startswith("$"):
-        return False
-    # These are values, not just the envelope or willContinue flag. A literal
-    # false, zero, null or empty string is still meaningful argument content.
-    return (isinstance(arg.get("boolValue", arg.get("bool_value")), bool)
-            or type(arg.get("numberValue", arg.get("number_value"))) in (int, float)
-            or isinstance(arg.get("stringValue", arg.get("string_value")), str)
-            or arg.get("nullValue", arg.get("null_value")) == "NULL_VALUE")
+        return None
+    if any(camel in arg and snake in arg for camel, snake in
+           (("jsonPath", "json_path"), ("willContinue", "will_continue"))):
+        return None
+    selected = [(camel, arg[key]) for camel, snake in _PARTIAL_ARMS for key in (camel, snake) if key in arg]
+    if len(selected) != 1:
+        return None  # multiple oneof arms (including two spellings), or just the envelope
+    kind, value = selected[0]
+    continued = arg.get("willContinue", arg.get("will_continue"))
+    if continued is not None and (type(continued) is not bool or (continued and kind != "stringValue")):
+        return None
+    # google.protobuf.NullValue is the exception to ordinary ProtoJSON null
+    # handling: an explicitly present JSON null is the selected delta. Keep
+    # the enum spelling emitted by SDKs; neither bool nor zero selects it.
+    if not (kind == "boolValue" and type(value) is bool
+            or kind == "numberValue" and (type(value) is int or type(value) is float and isfinite(value))
+            or kind == "stringValue" and isinstance(value, str)
+            or kind == "nullValue" and (value is None or value == "NULL_VALUE")):
+        return None
+    try:
+        path = partial_argument_path(arg.get("jsonPath", arg.get("json_path")))
+    except ValueError:
+        return None
+    return kind, path
+
+
+def _native_partial_args_have_reply(items: list) -> bool:
+    # A real non-null delta is independently observable as before. Newly
+    # admitting an all-null batch is narrower: every fragment must have an
+    # unambiguous typed owner and a different singular path. Do not retain a
+    # second copy of every parsed path just to mark progress. A hash collision
+    # can only suppress a witness; it never credits malformed input.
+    seen_nulls = set()
+    invalid_null_batch = False
+    for item in items:
+        if (delta := _native_partial_delta(item)) is None:
+            invalid_null_batch = True
+            continue
+        kind, path = delta
+        if kind != "nullValue":
+            return True
+        if not invalid_null_batch:
+            key = hash(path)
+            if len(seen_nulls) >= MAX_ARGUMENT_FIELDS or key in seen_nulls:
+                invalid_null_batch = True
+            else:
+                seen_nulls.add(key)
+    return bool(seen_nulls) and not invalid_null_batch
 
 
 def native_function_call_has_reply(part: dict) -> bool:
     """Observe a named call or actual incremental argument, not a proto shell."""
     call = part.get("functionCall", part.get("function_call"))
-    if not isinstance(call, dict):
+    if (not isinstance(call, dict) or "functionCall" in part and "function_call" in part
+            or "partialArgs" in call and "partial_args" in call
+            or "willContinue" in call and "will_continue" in call):
         return False
     name, call_id, args = call.get("name"), call.get("id"), call.get("args")
     partial = call.get("partialArgs", call.get("partial_args"))
@@ -274,7 +340,7 @@ def native_function_call_has_reply(part: dict) -> bool:
     if any(value is not None and not isinstance(value, kind) for value, kind in (
             (name, str), (call_id, str), (args, dict), (partial, list), (continued, bool))):
         return False
-    return bool(name and not name.isspace()) or bool(partial and any(map(_native_partial_arg_has_value, partial)))
+    return bool(name and not name.isspace()) or bool(partial and _native_partial_args_have_reply(partial))
 
 
 def _native_media_has_reply(part: dict) -> bool:

@@ -4,7 +4,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
-    from signature_origin import DirectChatOriginDelivery
+    from signature_origin import DirectChatOriginDelivery, ResponsesLineage
 
 # Define data models
 MAX_CANDIDATES = 8
@@ -96,9 +96,7 @@ class OpenAIRequest(BaseModel):
     # Set only by the public Responses projection. Its internal Chat producer
     # must deliver provider items, never compatibility text for a Chat UI.
     _completion_target: Literal["chat", "responses"] = PrivateAttr(default="chat")
-    # None: no exact predecessor chain; b"": genesis/no historical calls.
-    # A nonempty key identifies the last verified receipt, including its chain.
-    _responses_item_predecessor: bytes | None = PrivateAttr(default=None)
+    _responses_lineage: "ResponsesLineage | None" = PrivateAttr(default=None)
     _signature_output_prefix: bytes | None = PrivateAttr(default=None)
     _signature_origin_cutoff: int | None = PrivateAttr(default=None)
     _stage_signature_origin: Callable[

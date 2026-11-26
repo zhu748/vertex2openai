@@ -1,6 +1,7 @@
 """An echoed Responses item ID identifies a delivered output, not a tool call."""
 
 import asyncio
+import base64
 from contextlib import ExitStack
 import json
 from types import SimpleNamespace
@@ -161,6 +162,120 @@ class ResponsesItemWitnessTests(SchemaRouteHarness):
                 await self.generate([*history, current, result], False, {"text": "Final fixture."})
                 calls = calls_in_wire(self.sent[-1], "functionCall")
                 self.assertEqual([signature(part) for part in calls], [None, expected])
+
+    async def assert_descendant(self, prompt, parents, child, expected, *, stream):
+        result = {"type": "function_call_output", "call_id": child["call_id"], "output": "ok"}
+        await self.generate([*continuation(prompt, parents, reverse=True), child, result],
+                            stream, {"text": "Final fixture."})
+        wire, = self.sent
+        ids = [item["call_id"] for item in (*parents, child)]
+        for field in ("functionCall", "functionResponse"):
+            self.assertEqual([part[field]["id"] for part in calls_in_wire(wire, field)], ids)
+        self.assertEqual([signature(part) for part in calls_in_wire(wire, "functionCall")], list(expected))
+
+    async def test_receipt_cannot_join_explicit_bytes_from_a_different_parent(self):
+        for self.channel in ("api_key", "web_proxy"):
+            for stream in (False, True):
+                with self.subTest(channel=self.channel, stream=stream), ExitStack() as stack:
+                    new_cache(stack)
+                    prompt = "Select original bytes from two delivered parents."
+                    first = await self.issue(prompt, stream, FIRST)
+                    second = await self.issue(prompt, stream, SECOND)
+                    first_thin = [thin_item(item) for item in first]
+                    original, = await self.generate(continuation(prompt, first_thin), stream,
+                                                   assistant("child", b"child of first"))
+                    mixed = [{**first_thin[0], "extra_content": second[0]["extra_content"]}, first_thin[1]]
+                    await self.assert_descendant(prompt, mixed, thin_item(original), (SECOND[0], None, None),
+                                                 stream=stream)
+                    await self.assert_descendant(prompt, mixed, original, (SECOND[0], None, b"child of first"),
+                                                 stream=stream)
+
+                    # Base64 representation is not lineage; actual bytes are.
+                    encoded = base64.urlsafe_b64encode(FIRST[0]).decode().rstrip("=")
+                    same_bytes = [{**first_thin[0], "extra_content": {"google": {"thought_signature": encoded}}},
+                                  first_thin[1]]
+                    await self.assert_descendant(prompt, same_bytes, thin_item(original), (*FIRST, b"child of first"),
+                                                 stream=stream)
+
+                    # Creating a new child under the contradicted parent must
+                    # not grant it a receipt anchored to the first parent.
+                    altered, = await self.generate(continuation(prompt, mixed), stream,
+                                                  assistant("child", b"child of changed parent"))
+                    self.assertEqual([signature(p) for p in calls_in_wire(self.sent[-1], "functionCall")],
+                                     [SECOND[0], None])
+                    await self.assert_descendant(prompt, first_thin, thin_item(altered), (*FIRST, None), stream=stream)
+                    await self.assert_descendant(prompt, first_thin, altered, (*FIRST, b"child of changed parent"),
+                                                 stream=stream)
+                    # The weak projection cannot distinguish these two child
+                    # emissions, but the first child's exact receipt survives.
+                    await self.assert_descendant(prompt, [no_item_id(item) for item in first_thin],
+                                                 no_item_id(thin_item(altered)), (None, None, None), stream=stream)
+                    await self.assert_descendant(prompt, first_thin, thin_item(original), (*FIRST, b"child of first"),
+                                                 stream=stream)
+
+    async def test_new_explicit_signature_on_unsigned_predecessor_slot_breaks_lineage(self):
+        for self.channel in ("api_key", "web_proxy"):
+            for stream in (False, True):
+                with self.subTest(channel=self.channel, stream=stream), ExitStack() as stack:
+                    new_cache(stack)
+                    prompt = "Check an originally unsigned follower."
+                    first = [thin_item(item) for item in await self.issue(prompt, stream, (FIRST[0], None))]
+                    child, = await self.generate(continuation(prompt, first), stream, assistant("child", b"child"))
+                    await self.assert_descendant(prompt, first, thin_item(child), (FIRST[0], None, b"child"),
+                                                 stream=stream)
+                    changed = [first[0], {**first[1], "extra_content": {
+                        "google": {"thought_signature": base64.b64encode(SECOND[1]).decode()}}}]
+                    await self.assert_descendant(prompt, changed, thin_item(child), (None, SECOND[1], None),
+                                                 stream=stream)
+
+    async def test_child_at_different_destination_cannot_reuse_prior_receipt_lineage(self):
+        for source, destination in (("api_key", "web_proxy"), ("web_proxy", "api_key")):
+            for stream in (False, True):
+                for carry_parent in (False, True):
+                    with self.subTest(source=source, destination=destination, stream=stream,
+                                      carry_parent=carry_parent), ExitStack() as stack:
+                        new_cache(stack)
+                        prompt = "Do not infer bytes across a different Vertex resource."
+                        self.channel = source
+                        first = await self.issue(prompt, stream, FIRST)
+                        first_thin = [thin_item(item) for item in first]
+                        self.channel = destination
+                        history = continuation(prompt, first if carry_parent else first_thin)
+                        child, = await self.generate(history, stream, assistant("child", b"other route"))
+                        self.assertEqual([signature(part) for part in calls_in_wire(self.sent[-1], "functionCall")],
+                                         list(FIRST if carry_parent else (None, None)))
+                        await self.assert_descendant(prompt, first, thin_item(child), (*FIRST, None), stream=stream)
+                        await self.assert_descendant(prompt, first, child, (*FIRST, b"other route"), stream=stream)
+
+    async def test_all_idless_legacy_history_keeps_legacy_child_recovery(self):
+        for self.channel in ("api_key", "web_proxy"):
+            for stream in (False, True):
+                with self.subTest(channel=self.channel, stream=stream), ExitStack() as stack:
+                    new_cache(stack)
+                    prompt = "Older clients may omit every output item ID."
+                    first = [no_item_id(thin_item(item)) for item in await self.issue(prompt, stream, FIRST)]
+                    child, = await self.generate(continuation(prompt, first), stream, assistant("child", b"legacy"))
+                    await self.assert_descendant(prompt, first, thin_item(child), (*FIRST, None), stream=stream)
+                    await self.assert_descendant(prompt, first, no_item_id(thin_item(child)),
+                                                 (*FIRST, b"legacy"), stream=stream)
+
+    async def test_different_adapters_to_same_qualified_destination_keep_lineage(self):
+        self.settings["express_location"] = "global"
+        self.key_manager.get_express_record = lambda **_: {"key": "fixture-key", "project_id": "fixture"}
+        for source, destination in (("api_key", "web_proxy"), ("web_proxy", "api_key")):
+            for stream in (False, True):
+                with self.subTest(source=source, destination=destination, stream=stream), ExitStack() as stack:
+                    new_cache(stack)
+                    prompt = "Both adapters target the same qualified Vertex model."
+                    self.channel = source
+                    first = [thin_item(item) for item in await self.issue(prompt, stream, FIRST)]
+                    self.channel = destination
+                    child, = await self.generate(continuation(prompt, first), stream,
+                                                 assistant("child", b"same route"))
+                    self.assertEqual([signature(part) for part in calls_in_wire(self.sent[-1], "functionCall")],
+                                     list(FIRST))
+                    await self.assert_descendant(prompt, first, thin_item(child), (*FIRST, b"same route"),
+                                                 stream=stream)
 
     async def test_expired_predecessor_does_not_anchor_a_still_live_descendant(self):
         self.channel = "api_key"

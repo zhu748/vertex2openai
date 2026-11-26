@@ -64,6 +64,7 @@ from claude_protocol import (
     openai_completion_to_anthropic,
     resolve_claude_model,
 )
+from catalog_pagination import CatalogPageError, anthropic_model_page
 from config import API_KEY
 from express_endpoint import resolve_express_model_path
 from generation_config import function_tools, system_instruction
@@ -742,5 +743,10 @@ async def anthropic_models_data() -> dict:
     return anthropic_models_payload(available, variants)
 
 
-async def anthropic_model_list() -> JSONResponse:
-    return JSONResponse(content=await anthropic_models_data())
+async def anthropic_model_list(query_params) -> JSONResponse:
+    data = await anthropic_models_data()
+    try:
+        page = anthropic_model_page(data["data"], query_params)
+    except CatalogPageError as exc:
+        return claude_error(400, "invalid_request_error", str(exc))
+    return JSONResponse(content=page)

@@ -8,12 +8,10 @@ fragments (verified 2026-10-30: only complete tool objects arrive), so the
 Cookie channel parses complete calls directly and does not use this module.
 """
 
-import json
 from collections import deque
 from typing import Any, Optional
 from dataclasses import dataclass, field
 import math
-import re
 
 from response_validation import (
     IncompleteResponseError,
@@ -26,11 +24,7 @@ from response_validation import (
 from json_encoding import estimate_json_chars
 
 MAX_TOOL_STREAM_BYTES = 32 * 1024 * 1024
-MAX_ARGUMENT_FIELDS = 65536
-# RFC 9535 §2.5.1.1: non-ASCII scalar values are allowed regardless of
-# Unicode category. Names are compared literally, without normalization.
-_NAME_FIRST = r"A-Za-z_\x80-\ud7ff\ue000-\U0010ffff"
-_PATH_TOKEN = re.compile(rf'''\.([{_NAME_FIRST}][{_NAME_FIRST}0-9]*)|\[(0|[1-9][0-9]*)\]|\[("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')\]''')
+from tool_arguments import MAX_ARGUMENT_FIELDS, partial_argument_path
 from request_tracking import SURROGATE_RE as _SURROGATES
 
 
@@ -54,54 +48,6 @@ def _normalize_string(value: str):
         _fail("字符串包含未配对的 Unicode 代理项。")
 
 
-def _decode_quoted_name(literal: str) -> str:
-    """RFC 9535 §2.3.1.1: JSON escapes, with a matching escaped delimiter."""
-    if literal.startswith("'"):
-        def json_quote(match: re.Match) -> str:
-            token = match.group()
-            if token == r"\'":
-                return "'"
-            if token == '"':
-                return r'\"'
-            if token == r'\"':
-                raise ValueError("Invalid escape in single-quoted JSONPath name")
-            return token
-
-        # Transform only quote syntax. Consuming each backslash pair together
-        # keeps \\ and Unicode escapes intact for the JSON decoder.
-        literal = '"' + re.sub(r'\\.|"', json_quote, literal[1:-1]) + '"'
-    name = json.loads(literal)
-    # json.loads unifies a correctly escaped pair; reject unpaired surrogates.
-    if _SURROGATES.search(name):
-        raise ValueError("Invalid surrogate in JSONPath name")
-    return name
-
-
-def _path_tokens(path: str):
-    # Native partialArgs use singular JSONPaths, never selectors or wildcards.
-    if not isinstance(path, str) or not path.startswith("$") or len(path) > 8192:
-        _fail("参数路径无效。")
-    result, offset = [], 1
-    while offset < len(path):
-        match = _PATH_TOKEN.match(path, offset)
-        if not match:
-            _fail("参数路径不是受支持的单值 JSONPath。")
-        name, index, quoted = match.groups()
-        try:
-            token = name if name is not None else int(index) if index is not None else _decode_quoted_name(quoted)
-        except ValueError:
-            _fail("参数名的引号或转义无效。")
-        if isinstance(token, int) and token >= MAX_ARGUMENT_FIELDS:
-            _fail("数组索引超过上限。")
-        result.append(token)
-        if len(result) > 64:
-            _fail("参数嵌套超过上限。")
-        offset = match.end()
-    if not result or not isinstance(result[0], str):
-        _fail("函数参数必须是对象。")
-    return result
-
-
 @dataclass
 class _String:
     parts: list = field(default_factory=list)
@@ -119,7 +65,10 @@ class _Arguments:
         if self._last_tokens and item.json_path == self._last_path:
             tokens = self._last_tokens
         else:
-            tokens = self._last_tokens = tuple(_path_tokens(item.json_path))
+            try:
+                tokens = self._last_tokens = partial_argument_path(item.json_path)
+            except ValueError as exc:
+                _fail(str(exc))
             self._last_path = item.json_path
         node = self.root
         for token in tokens[:-1]:

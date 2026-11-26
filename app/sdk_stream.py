@@ -14,6 +14,19 @@ from stream_cleanup import await_owned_close
 _active_responses = ContextVar("sdk_responses", default=None)
 
 
+class SDKAttemptCancellation:
+    """Remember cancellation of this attempt, even if the transport replaced it."""
+    def __init__(self) -> None:
+        self.owner = asyncio.current_task()
+        self.initial = self.owner.cancelling()
+
+    async def check(self) -> None:
+        # Keep AnyIO's cancellation identity when an ASGI peer was lost.
+        await anyio.lowlevel.checkpoint_if_cancelled()
+        if self.owner.cancelling() > self.initial:
+            raise asyncio.CancelledError()
+
+
 class _Responses:
     def __init__(self) -> None:
         self.live: dict[httpx.Response, asyncio.Event] = {}
@@ -55,16 +68,8 @@ async def capture_sdk_response(response: httpx.Response) -> None:
 async def read_sdk_response(generate: Callable[..., Awaitable[Any]], **kwargs: Any) -> Any:
     """Own a whole SDK response before HTTPX implicitly reads and closes it."""
     responses = _Responses()
-    task = asyncio.current_task()
-    cancellations = task.cancelling()
+    cancellation = SDKAttemptCancellation()
     token = _active_responses.set(responses)
-
-    async def check_cancelled() -> None:
-        # A failed read's cleanup may replace CancelledError with a transport
-        # error. Do not let the SDK proxy facade retry the cancelled request.
-        await anyio.lowlevel.checkpoint_if_cancelled()
-        if task.cancelling() > cancellations:
-            raise asyncio.CancelledError()
 
     try:
         try:
@@ -76,9 +81,9 @@ async def read_sdk_response(generate: Callable[..., Awaitable[Any]], **kwargs: A
             except Exception as close_error:
                 error.add_note(f"SDK response cleanup also failed ({type(close_error).__name__}).")
             if isinstance(error, Exception):
-                await check_cancelled()
+                await cancellation.check()
             raise
-        await check_cancelled()
+        await cancellation.check()
         return result
     finally:
         _active_responses.reset(token)

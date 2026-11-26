@@ -23,7 +23,7 @@ async function main(){
  const cap={family:'3',thinking:{kind:'level',levels:['low','medium','high']},supports_anti_truncation:true,supports_search:true,image_sizes:['1K','2K','4K'],image_aspect_ratios:['1:1','16:9']};
  const summary={connections:1,generations:1,background:0,retry_wait:0,active:1};
  const record={id:'trace-1234567890abcdef',model:'text',protocol:'openai',channel:'express',mode:'stream',phase:'streaming',status:'running',connection:'open',created_at:Date.now()/1000,duration_ms:1000,timings:{},attempts:1,retries:0,finish_reasons:[],usage:{},events:[],logs:[]};
- let scrollPosition=0,transport=null,requestTotal=1;
+ let scrollPosition=0,transport=null,requestTotal=1,modelCatalog=['text','image'];
  Object.defineProperty(w,'scrollY',{get:()=>scrollPosition});
  w.AbortSignal=AbortSignal;w.AbortController=AbortController;w.matchMedia=()=>({matches:false});w.scrollTo=({top})=>{scrollPosition=top;};w.HTMLElement.prototype.scrollIntoView=()=>{};w.confirm=()=>true;w.prompt=()=>'console-password';
  w.CSS={escape:s=>s};w.HTMLDialogElement.prototype.showModal=function(){this.open=true;};w.HTMLDialogElement.prototype.close=function(){this.open=false;this.dispatchEvent(new w.Event('close'));};
@@ -45,7 +45,7 @@ async function main(){
   }
   if(target.pathname==='/api/settings/runtime')result={mode};
   else if(target.pathname==='/api/settings'){if(body)Object.assign(settings,Object.fromEntries(Object.entries(body).filter(([k])=>k!=='_expected')));result={...settings};}
-  else if(target.pathname==='/api/capabilities')result={models:['text','image'],capabilities:{text:{...cap,is_image:false},image:{...cap,is_image:true}},overrides:{text:{...builtins.text,...overrides.text},...Object.fromEntries(Object.entries(overrides).filter(([m])=>m!=='text'))},saved_overrides:overrides,builtin_overrides:builtins};
+  else if(target.pathname==='/api/capabilities')result={models:modelCatalog,capabilities:Object.fromEntries(modelCatalog.map(m=>[m,{...cap,is_image:m==='image'}])),overrides:{text:{...builtins.text,...overrides.text},...Object.fromEntries(Object.entries(overrides).filter(([m])=>m!=='text'))},saved_overrides:overrides,builtin_overrides:builtins};
   else if(target.pathname.startsWith('/api/model-overrides/')){const model=target.pathname.split('/').pop();if(method==='DELETE')delete overrides[model];else{const current={...overrides[model]};for(const key of body._inherit||[])delete current[key];Object.assign(current,Object.fromEntries(Object.entries(body).filter(([k])=>!['_inherit','_expected'].includes(k))));overrides[model]=current;}result={override:{...builtins[model],...overrides[model]},saved_override:{...overrides[model]}};}
   else if(target.pathname==='/api/express-keys'){if(body)keys=body.keys;result={keys};}
   else if(target.pathname==='/api/cookie-accounts'){if(body)cookies=body.accounts;result={accounts:cookies};}
@@ -767,6 +767,105 @@ async function main(){
   assert.equal(el('default_max_tokens').value,String(settings.default_max_tokens));
   assert.equal(w.consoleForms.dirty(),false);
   check('Late inheritance intent and post-reset drafts survive; unconfirmed model receipts never clear edits');
+
+  const unloadBlocked=()=>{
+   const event=new w.Event('beforeunload',{cancelable:true});
+   w.dispatchEvent(event);return event.defaultPrevented;
+  };
+  {
+   w.switchTab('runtime');
+   Object.assign(settings,{retry_max:10,retry_backoff_seconds:5});
+   await w.loadParams();
+   const runtimeStatus=el('runtime-save-bar').querySelector('[role=status]');
+   const before=requests.filter(r=>r.path==='/api/settings'&&r.method==='POST').length;
+   for(const raw of ['5.00','5e0','']){
+    edit('retry_backoff_seconds',raw);edit('retry_max','');
+    assert.equal(w.consoleForms.dirty(),false);
+    assert.equal(runtimeStatus.textContent,'修改已保存');assert.equal(unloadBlocked(),false);
+    await clickRuntime();
+    assert.equal(requests.filter(r=>r.path==='/api/settings'&&r.method==='POST').length,before);
+   }
+   settings.retry_max=13;await w.loadParams();edit('retry_max','');
+   edit('retry_backoff_seconds','5.000');
+   assert.match(runtimeStatus.textContent,/^1 项修改未保存/);assert.equal(unloadBlocked(),true);
+   w.switchTab('params');await w.loadParams();w.switchTab('runtime');
+   assert.equal(el('retry_max').value,'');
+   await clickRuntime();
+   assert.deepEqual(lastSettings(),{retry_max:10,_expected:{retry_max:{present:true,value:13}}});
+   assert.equal(w.consoleForms.dirty(),false);
+   // Clearing back to the pre-submit default during a pending write is a real edit.
+   edit('retry_max','15');
+   delayed=deferWrite('/api/settings');saving=w.saveSettings();
+   edit('retry_max','');await w.loadParams();delayed.finish();await saving;
+   assert.equal(el('retry_max').value,'');assert.equal(w.consoleForms.dirty(),true);
+   await clickRuntime();
+   assert.deepEqual(lastSettings(),{retry_max:10,_expected:{retry_max:{present:true,value:15}}});
+   assert.equal(unloadBlocked(),false);
+   check('Numeric formatting and blank defaults compare like their wire values; intentional resets survive reload and a delayed save');
+  }
+  {
+   w.switchTab('params');
+   const literal='another <draft & text>';
+   modelCatalog.push(literal);await w.loadParams();
+   settings.default_top_p=0.7;
+   await w.loadParams();edit('model-sel','text');
+   edit('default_top_p','0.700');
+   assert.equal(w.consoleForms.dirty(),false); // inherited number; formatting cannot pin it
+   w.setFieldInheritance('default_top_p',false);
+   edit('default_top_p',''); // explicit pin of null, not inheritance
+   edit('model-sel',literal);edit('inject_prefill','leave only if I choose');
+   modelCatalog=['image'];
+   const writes=()=>requests.filter(r=>r.method==='POST'||r.method==='DELETE').length;
+   const before=writes();
+   await w.loadParams();assert.equal(el('model-sel').value,'__global__');
+   const notice=el('orphaned-model-drafts');
+   const discardButtons=()=>[...notice.querySelectorAll('[data-discard-orphan-model]')];
+   assert.equal(notice.hidden,false);assert.equal(unloadBlocked(),true);
+   assert.deepEqual(discardButtons().map(b=>b.dataset.discardOrphanModel),['text',literal]);
+   assert.match(notice.textContent,/another <draft & text>/);
+   assert.equal(el('model-sel').querySelector('[value=text]'),null);
+   await save('btn-scope-save');assert.equal(writes(),before);
+   // A stale option cannot make a model missing from the received catalog writable.
+   edit('model-sel','image');
+   el('model-sel').add(new w.Option('stale','text'));
+   edit('model-sel','text');await w.saveModelOverride();await w.clearModelOverride();
+   assert.equal(writes(),before);
+   discardButtons()[1].click();
+   assert.deepEqual(discardButtons().map(b=>b.dataset.discardOrphanModel),['text']);
+   assert.equal(unloadBlocked(),true);assert.equal(writes(),before);
+   modelCatalog=['text','image',literal];
+   notice.querySelector('[data-reload-model-list]').click();await tick();
+   assert.equal(notice.hidden,true);
+   assert.equal(d.activeElement.id,'model-sel');
+   assert.match(el('model-sel').querySelector('[value=text]').textContent,/草稿/);
+   edit('model-sel',literal);assert.equal(el('scope-draft-state').classList.contains('hidden'),true);
+   assert.notEqual(el('inject_prefill').value,'leave only if I choose');
+   edit('model-sel','text');assert.equal(el('default_top_p').value,'');
+   await save('btn-scope-save');
+   assert.deepEqual(requests.filter(r=>r.path==='/api/model-overrides/text'&&r.method==='POST').at(-1).body,
+     {default_top_p:null,_expected:{default_top_p:{present:false}}});
+   assert.equal(unloadBlocked(),false);
+   edit('inject_prefill','discard me');
+   modelCatalog=['image'];await w.loadParams();discardButtons()[0].click();
+   assert.equal(notice.hidden,true);assert.equal(unloadBlocked(),false);
+   assert.equal(d.activeElement.id,'model-sel');
+   check('Unavailable model drafts stay visible, recover with the original scope and pin intent, or discard individually without writing');
+
+   modelCatalog=['text','image'];await w.loadParams();edit('model-sel','text');
+   edit('first_reply_timeout_seconds','31');
+   delayed=deferWrite('/api/model-overrides/text');saving=w.saveModelOverride();
+   edit('first_reply_timeout_seconds',''); // explicitly disable the timeout, not inherit
+   modelCatalog=['image'];await w.loadParams();
+   delayed.finish();await saving;
+   assert.equal(notice.hidden,false);assert.equal(unloadBlocked(),true);
+   modelCatalog=['text','image'];await w.loadParams();edit('model-sel','text');
+   assert.equal(el('first_reply_timeout_seconds').value,'');
+   await save('btn-scope-save');
+   assert.deepEqual(requests.filter(r=>r.path==='/api/model-overrides/text'&&r.method==='POST').at(-1).body,
+     {first_reply_timeout_seconds:0,_expected:{first_reply_timeout_seconds:{present:true,value:31}}});
+   assert.equal(unloadBlocked(),false);
+   check('A model disappearing during a pending write still retains a later explicit reset on reappearance');
+  }
 
   console.log(`${passed} groups of console DOM checks passed. Layout requires the browser suite.`);
  }finally{dom.window.close();}

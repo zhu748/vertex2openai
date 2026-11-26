@@ -253,14 +253,20 @@ class FailoverSDKClient:
             async def start(raw, resolved):
                 from first_reply import sdk_has_reply
                 from response_validation import IncompleteResponseError, has_finish_reason
-                from sdk_stream import open_sdk_stream
+                from sdk_stream import SDKAttemptCancellation, open_sdk_stream
 
+                cancellation = SDKAttemptCancellation()
                 self.client = self.factory(raw, resolved)
                 actual = _actual_attempt(self.client, kwargs) if _actual_attempt else kwargs
-                source = await open_sdk_stream(self.client.aio.models.generate_content_stream, **actual)
+                source = None
                 prefix, size = deque(), 0
                 try:
+                    source = await open_sdk_stream(self.client.aio.models.generate_content_stream, **actual)
+                    await cancellation.check()
                     async for chunk in source:
+                        # A cancelled read can also yield buffered metadata.
+                        # Don't retain it and ask for another (possibly idle) read.
+                        await cancellation.check()
                         prefix.append(chunk)
                         # Metadata is not a reply. Keep it private until real
                         # output or a terminal model decision makes replay unsafe.
@@ -272,8 +278,17 @@ class FailoverSDKClient:
                         if size > 2 * 1024 * 1024:
                             raise IncompleteResponseError("首回复前的元数据缓冲超过 2 MiB。")
                     raise IncompleteResponseError("上游连接已结束，但未收到模型回复或结束标记。")
-                except BaseException:
-                    await source.aclose()
+                except BaseException as error:
+                    if source is not None:
+                        try:
+                            await source.aclose()
+                        except Exception as close_error:
+                            error.add_note(f"SDK stream cleanup also failed ({type(close_error).__name__}).")
+                    # A read or its cleanup can replace cancellation with a
+                    # network error. This check belongs before proxy rotation,
+                    # even when the first-reply timer is off.
+                    if isinstance(error, Exception):
+                        await cancellation.check()
                     raise
             source, prefix = await self.chain.run(start)
             try:

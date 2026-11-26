@@ -4,7 +4,31 @@ let CAPS = {},
 let GLOBAL_SETTINGS = {},
   OVERRIDES = {},
   SAVED_MODEL_OVERRIDES = {},
-  BUILTIN_OVERRIDES = {};
+  BUILTIN_OVERRIDES = {},
+  MODEL_CATALOG = new Set();
+// The runtime form has always used these reset values for blank controls.
+// Keep draft comparison and the submitted wire value on the same conversion.
+const RUNTIME_NUMERIC_DEFAULTS = {
+  img_compress_max_dim: 1536,
+  img_compress_max_mb: 1.5,
+  img_compress_quality: 85,
+  retry_max: 10,
+  retry_backoff_seconds: 5,
+  retry_jitter_seconds: 1,
+  fake_streaming_interval: 1,
+  resumable_disconnect_grace_seconds: 10,
+  resumable_ttl_seconds: 1800,
+  resumable_max_streams: 200,
+  request_timeout_seconds: 1800,
+  upstream_max_concurrency: 32,
+  resumable_max_buffer_mb: 64,
+  resumable_max_total_mb: 256,
+  keepalive_interval: 60,
+  cookie_refresh_interval_seconds: 600
+};
+function runtimeNumericValue(key, raw) {
+  return raw === '' ? RUNTIME_NUMERIC_DEFAULTS[key] : Number(raw);
+}
 const PER_MODEL_KEYS = [
   'first_reply_timeout_seconds',
   'anti_truncation_mode',
@@ -90,25 +114,10 @@ async function loadParams() {
     settingsLoaded = true;
     curAR = s.image_aspect_ratio || '';
     [
-      'resumable_disconnect_grace_seconds',
-      'img_compress_max_dim',
-      'img_compress_max_mb',
-      'img_compress_quality',
-      'retry_max',
-      'retry_backoff_seconds',
-      'retry_jitter_seconds',
-      'fake_streaming_interval',
+      ...Object.keys(RUNTIME_NUMERIC_DEFAULTS),
       'prefill_mode',
       'express_location',
-      'resumable_ttl_seconds',
-      'resumable_max_streams',
-      'request_timeout_seconds',
-      'upstream_max_concurrency',
-      'resumable_max_buffer_mb',
-      'resumable_max_total_mb',
-      'keepalive_url',
-      'keepalive_interval',
-      'cookie_refresh_interval_seconds'
+      'keepalive_url'
     ].forEach((k) => setV(k, s[k]));
     [
       'img_compress_enabled',
@@ -147,18 +156,17 @@ async function loadParams() {
     OVERRIDES = c.overrides || {};
     SAVED_MODEL_OVERRIDES = c.saved_overrides || c.overrides || {};
     BUILTIN_OVERRIDES = c.builtin_overrides || {};
+    MODEL_CATALOG = new Set(
+      (c.models || []).filter((m) => m !== '__global__' && Object.hasOwn(CAPS, m) && CAPS[m])
+    );
     capabilitiesLoaded = true;
-    $('model-sel').innerHTML =
+    const select = $('model-sel');
+    select.innerHTML =
       '<option value="__global__">＊ 全局默认（对所有模型）</option>' +
-      (c.models || [])
-        .map((m) => {
-          const star = OVERRIDES[m] ? ' ★' : '';
-          return `<option value="${esc(m)}">${esc(m)}${star}</option>`;
-        })
-        .join('');
-    if ([...$('model-sel').options].some((option) => option.value === selected))
-      $('model-sel').value = selected;
+      [...MODEL_CATALOG].map((m) => `<option value="${esc(m)}">${esc(m)}</option>`).join('');
+    select.value = modelScopeAvailable(selected) ? selected : '__global__';
     renderCaps(false);
+    renderOrphanedModelDrafts();
   } else {
     loadNotice('params', '模型能力' + cRes.reason.message + '。重新加载成功后再保存模型参数。');
   }
@@ -190,6 +198,51 @@ function modelDraftConverged(key, edit, current) {
 function modelFieldEdit(key) {
   return MODEL_DRAFTS.get(renderedModel)?.get(key);
 }
+function modelScopeAvailable(model) {
+  return model === '__global__' || MODEL_CATALOG.has(model);
+}
+function renderOrphanedModelDrafts() {
+  const notice = $('orphaned-model-drafts');
+  if (!notice) return;
+  const models = [...MODEL_DRAFTS.keys()].filter((model) => !modelScopeAvailable(model));
+  const list = $('orphaned-model-draft-list');
+  notice.hidden = !models.length;
+  $('orphaned-model-draft-status').textContent = `${models.length} 个暂不在模型列表中的草稿`;
+  list.replaceChildren(
+    ...models.map((model) => {
+      const item = document.createElement('li');
+      const name = document.createElement('span');
+      const discard = document.createElement('button');
+      name.textContent = model;
+      discard.type = 'button';
+      discard.className = 'btn-ghost';
+      discard.textContent = '撤销草稿';
+      discard.setAttribute('aria-label', `撤销 ${model} 的草稿`);
+      discard.dataset.discardOrphanModel = model;
+      item.append(name, discard);
+      return item;
+    })
+  );
+}
+$('orphaned-model-drafts')?.addEventListener('click', async (event) => {
+  const button = event.target.closest('button');
+  if (button?.hasAttribute('data-reload-model-list')) {
+    await runAction(button, loadParams);
+    // Closing the notice removes its retry control from the tab order.
+    if (
+      $('orphaned-model-drafts').hidden &&
+      document.body.dataset.view === 'params' &&
+      [button, document.body].includes(document.activeElement)
+    )
+      $('model-sel').focus();
+    return;
+  }
+  const model = button?.dataset.discardOrphanModel;
+  if (!model || modelScopeAvailable(model) || !MODEL_DRAFTS.delete(model)) return;
+  MODEL_WRITES.get(model)?.later.clear();
+  renderOrphanedModelDrafts();
+  ($('orphaned-model-draft-list').querySelector('button') || $('model-sel')).focus();
+});
 function recordModelField(key, kind = 'edit') {
   if (!modelSnapshot || !renderedModel) return;
   const draft = MODEL_DRAFTS.get(renderedModel) || new Map();
@@ -449,6 +502,7 @@ function completeModelWrite(model, write, applyBaseline) {
   if (draft.size) MODEL_DRAFTS.set(model, draft);
   else MODEL_DRAFTS.delete(model);
   renderCaps(false);
+  renderOrphanedModelDrafts();
 }
 
 function applyModelReceipt(model, receipt, write, { patch = {}, inherit = [], reset = false }) {
@@ -493,7 +547,7 @@ async function saveModelOverride() {
     return;
   }
   const m = $('model-sel').value;
-  if (!m || MODEL_WRITES.has(m)) return;
+  if (!modelScopeAvailable(m) || m !== renderedModel || MODEL_WRITES.has(m)) return;
   captureModelDraft();
   const patch = {},
     expected = {},
@@ -552,7 +606,8 @@ async function clearModelOverride() {
     return;
   }
   const m = $('model-sel').value;
-  if (!m || MODEL_WRITES.has(m)) return;
+  if (m === '__global__' || !modelScopeAvailable(m) || m !== renderedModel || MODEL_WRITES.has(m))
+    return;
   if (!OVERRIDES[m]) {
     toast('该模型没有专属参数');
     return;
@@ -633,8 +688,8 @@ function renderCaps(capture = true) {
     finishModelRender(m);
     return;
   }
+  if (!modelScopeAvailable(m)) return;
   const cap = CAPS[m];
-  if (!cap) return;
   applyModelParamFields(m); // 按模型填入专属/全局参数值（含 curAR）
   $('anti_truncation_mode').disabled = !cap.supports_anti_truncation;
   $('anti-truncation-note').textContent = cap.supports_anti_truncation
@@ -727,10 +782,6 @@ function updateSamplingDisplay() {
             ? '官方建议 Gemini 3.x 保持采样默认值（可调，但改动可能致循环/降智）；留空即用模型默认。'
             : '该模型支持采样参数；留空即用模型默认。';
 }
-function numOr(id, d) {
-  const v = $(id).value.trim();
-  return v === '' ? d : Number(v);
-}
 // 说明折叠：点 ⓘ 展开/收起对应的说明块
 function hlp(el, id) {
   const b = $(id);
@@ -749,16 +800,15 @@ async function saveSettings() {
   // 模型行为字段显示的是当前编辑对象的生效值，不能在这里一并提交。
   // 一起提交会把某个模型的专属值（比如生图的注入内容）写成全局默认。
   const values = {
+    ...Object.fromEntries(
+      Object.keys(RUNTIME_NUMERIC_DEFAULTS).map((key) => [
+        key,
+        runtimeNumericValue(key, $(key).value)
+      ])
+    ),
     img_compress_enabled: $('img_compress_enabled').checked,
-    img_compress_max_dim: numOr('img_compress_max_dim', 1536),
-    img_compress_max_mb: numOr('img_compress_max_mb', 1.5),
-    img_compress_quality: numOr('img_compress_quality', 85),
-    retry_max: numOr('retry_max', 10),
-    retry_backoff_seconds: numOr('retry_backoff_seconds', 5),
-    retry_jitter_seconds: numOr('retry_jitter_seconds', 1),
     cross_channel_fallback: $('cross_channel_fallback').checked,
     fake_streaming: $('fake_streaming').checked,
-    fake_streaming_interval: numOr('fake_streaming_interval', 1),
     safety_score: $('safety_score').checked,
     cookie_debug: $('cookie_debug').checked,
     cookie_structured_output: $('cookie_structured_output').checked,
@@ -767,17 +817,8 @@ async function saveSettings() {
     express_location: $('express_location').value,
     prefill_suppress_thinking: $('prefill_suppress_thinking').checked,
     resumable_enabled: $('resumable_enabled').checked,
-    resumable_disconnect_grace_seconds: numOr('resumable_disconnect_grace_seconds', 10),
-    resumable_ttl_seconds: numOr('resumable_ttl_seconds', 1800),
-    resumable_max_streams: numOr('resumable_max_streams', 200),
-    request_timeout_seconds: numOr('request_timeout_seconds', 1800),
-    upstream_max_concurrency: numOr('upstream_max_concurrency', 32),
-    resumable_max_buffer_mb: numOr('resumable_max_buffer_mb', 64),
-    resumable_max_total_mb: numOr('resumable_max_total_mb', 256),
     keepalive_url: $('keepalive_url').value.trim(),
-    keepalive_interval: numOr('keepalive_interval', 60),
-    cookie_auto_refresh: $('cookie_auto_refresh').checked,
-    cookie_refresh_interval_seconds: numOr('cookie_refresh_interval_seconds', 600)
+    cookie_auto_refresh: $('cookie_auto_refresh').checked
   };
   const m = $('model-sel').value;
   const overriding = !!(OVERRIDES[m] && Object.keys(OVERRIDES[m]).length > 0);

@@ -9,12 +9,14 @@ import hashlib
 import json
 import re
 import secrets
+from dataclasses import dataclass
 
 from models import ContentPartText, MAX_CANDIDATES
 from parallel_result_order import order_parallel_results
 from signature_destination import UNTRUSTED
 from signature_store import SignatureRecord, SignatureState, signature_store
-from thought_signatures import historical_literal_id, ordinary_signature, replay_tool_call_id
+from thought_signatures import (google_metadata, historical_literal_id, ordinary_signature,
+                                replay_tool_call_id, signature_from_extra)
 
 
 _KEY = secrets.token_bytes(32)
@@ -174,6 +176,21 @@ def _responses_item_key(keys: tuple[bytes, ...], witness: bytes | None, predeces
     if keys and witness and predecessor is not None:
         return _hash(b"resp-origin-v2", predecessor, witness, *keys)
     return b""
+
+
+@dataclass(frozen=True)
+class ResponsesLineage:
+    # b"": no prior calls. None: a prior batch could not prove the chain.
+    key: bytes | None = b""
+    destination: bytes | None = None
+    legacy_only: bool = True
+
+    def permits(self, destination: bytes | None) -> bool:
+        # For a nonempty chain, every verified ancestor must match the
+        # resource of the actual attempt, not the originally selected channel.
+        return self.key == b"" or (
+            self.key is not None and self.destination is not None and self.destination == destination
+        )
 
 
 class VisibleText:
@@ -437,7 +454,7 @@ def bind_signature_origins(request, api_key):
     if not isinstance(api_key, str) or not api_key:
         return
     request._signature_output_prefix = None
-    request._responses_item_predecessor = None
+    request._responses_lineage = None
     has_tools = bool(request.tools)
     isolated = False
     for i, m in enumerate(request.messages):
@@ -458,9 +475,7 @@ def bind_signature_origins(request, api_key):
         budget = _Budget()
         prefix = _hash(b"tool-prefix-v2", budget.encode(api_key, _MAX_ID_BYTES),
                        budget.encode(request.model.strip(), _MAX_ID_BYTES))
-        responses = request._completion_target == "responses"
-        predecessor = b"" if responses else None
-        legacy_only = True
+        lineage = ResponsesLineage() if request._completion_target == "responses" else None
         stop = min(len(request.messages), _MAX_MESSAGES)
         cutoff = request._signature_origin_cutoff
         if cutoff is not None:
@@ -484,25 +499,26 @@ def bind_signature_origins(request, api_key):
                 prefix = _step_prefix(prefix, text_tag, reason_tag)
                 keys = _slot_keys(prefix, tags)
                 witness = m._responses_item_witness
-                item_key = _responses_item_key(keys, witness, predecessor)
-                if witness is None and legacy_only:
+                if witness is None and (lineage is None or lineage.legacy_only):
                     m._signature_slots = keys
-                elif item_key:
-                    # All slots refer to a single record. Even under eviction
-                    # the witness can never select signatures by slot alone.
-                    m._signature_slots = (item_key,) * len(keys)
-                if responses:
-                    # A syntactically complete but unknown vector is not a
-                    # receipt. Nor may a missing/unusable ancestor reset the
-                    # chain and grant an unchained positive descendant.
-                    predecessor = item_key if item_key and _responses_receipt(item_key) is not None else None
-                    legacy_only = legacy_only and witness is None
+                if lineage is not None:
+                    item_key = _responses_item_key(keys, witness, lineage.key)
+                    issued = _responses_receipt(item_key) if item_key else None
+                    if (issued is not None and lineage.permits(issued.destination)
+                            and _responses_carriers_match(issued.signature, calls, budget)):
+                        # A matching, live receipt proves the whole batch.
+                        # A contradictory explicit carrier is still sent, but
+                        # cannot combine inferred slots from another lineage.
+                        m._signature_slots = (item_key,) * len(keys)
+                        lineage = ResponsesLineage(item_key, issued.destination, False)
+                    else:
+                        lineage = ResponsesLineage(None, legacy_only=lineage.legacy_only and witness is None)
                 prefix = _hash(b"tool-step-v1", prefix, *tags)
                 continue
             prefix = _hash(b"tool-message-v2", prefix, _history_tag(m, budget))
         if cutoff is None and stop == len(request.messages):
             request._signature_output_prefix = prefix
-            request._responses_item_predecessor = predecessor
+            request._responses_lineage = lineage
     except (TypeError, AttributeError, KeyError, ValueError, OverflowError, RecursionError):
         # Only complete prefixes are valid. A previously marked earlier turn
         # still has a complete prefix; never bind the incomplete suffix.
@@ -542,10 +558,14 @@ def _commit_origin(keys, signatures, destination):
 
 def publish_responses_item_origins(keys: tuple[bytes, ...], signatures: tuple[bytes | None, ...] | None,
                                    destination: bytes | None, witness: bytes | None, *,
-                                   predecessor: bytes | None) -> None:
+                                   lineage: ResponsesLineage) -> None:
     """Commit the legacy origin and the exact whole-batch receipt after delivery."""
-    _commit_origin(keys, signatures, destination)
-    if not (key := _responses_item_key(keys, witness, predecessor)):
+    exact = lineage.permits(destination)
+    # Keep the old projection for histories with no item IDs. A delivered
+    # reply under a broken witnessed lineage may collide with such a reply,
+    # but cannot positively certify the weaker alias.
+    signature_store.register_origin_batch(keys, signatures if exact or lineage.legacy_only else None, destination)
+    if not exact or not (key := _responses_item_key(keys, witness, lineage.key)):
         return
     if signatures is None or destination is None or destination == UNTRUSTED:
         mark_unrestorable_origin(key)
@@ -559,9 +579,42 @@ def publish_responses_item_origins(keys: tuple[bytes, ...], signatures: tuple[by
 
 def _responses_receipt(scope: bytes) -> SignatureRecord | None:
     record = signature_store.get_record(scope)
-    if record is not None and record.state is SignatureState.SIGNED and record.signature:
+    if (record is not None and record.state is SignatureState.SIGNED and record.signature
+            and record.destination is not None and record.destination != UNTRUSTED):
         return record
     return None
+
+
+def _responses_slot_bounds(data, count):
+    bounds = []
+    offset = 0
+    for _ in range(count):
+        start = offset + _RECEIPT_LENGTH_BYTES
+        if start > len(data):
+            return ()
+        length = int.from_bytes(data[offset:start], "big")
+        offset = start + length
+        if length > _MAX_SIGNATURE_BYTES or offset > len(data):
+            return ()
+        bounds.append((start, offset))
+    return bounds if offset == len(data) else ()
+
+
+def _responses_carriers_match(data, calls, budget):
+    bounds = _responses_slot_bounds(data, len(calls))
+    if not bounds:
+        return False
+    view = memoryview(data)
+    for call, (start, end) in zip(calls, bounds, strict=True):
+        encoded = google_metadata(call).get("thought_signature")
+        if encoded:
+            budget.consume(_signature_size(encoded))
+            original = ordinary_signature(signature_from_extra(call, strict_encoding=True)[0])
+            # Absent bytes are exactly what a thin client needs to recover.
+            # Supplied originals must agree, even for an unsigned slot.
+            if original is not None and original != view[start:end]:
+                return False
+    return True
 
 
 def responses_item_record(scope: bytes | None, count: int, index: int) -> SignatureRecord:
@@ -571,23 +624,13 @@ def responses_item_record(scope: bytes | None, count: int, index: int) -> Signat
     record = _responses_receipt(scope)
     if record is None:
         return _UNRESTORABLE_ORIGIN
-    data = record.signature
-    start = size = offset = 0
-    for i in range(count):
-        end = offset + _RECEIPT_LENGTH_BYTES
-        if end > len(data):
-            return _UNRESTORABLE_ORIGIN
-        length = int.from_bytes(data[offset:end], "big")
-        offset = end + length
-        if length > _MAX_SIGNATURE_BYTES or offset > len(data):
-            return _UNRESTORABLE_ORIGIN
-        if i == index:
-            start, size = end, length
-    if offset != len(data):
+    bounds = _responses_slot_bounds(record.signature, count)
+    if not bounds:
         return _UNRESTORABLE_ORIGIN
-    state = (SignatureState.SIGNED if size else SignatureState.UNSIGNED_FOLLOWER if index
+    start, end = bounds[index]
+    state = (SignatureState.SIGNED if end > start else SignatureState.UNSIGNED_FOLLOWER if index
              else SignatureState.UNKNOWN)
-    return SignatureRecord(state, data[start:start + size] if size else None, record.destination)
+    return SignatureRecord(state, record.signature[start:end] or None, record.destination)
 
 
 class DeliveredOrigin:
