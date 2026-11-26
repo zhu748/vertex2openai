@@ -5,7 +5,7 @@ import config as app_config
 from claude_signature_projection import omitted_signature_record
 from models import OpenAIMessage, normalize_content_part
 from parallel_result_order import order_parallel_results
-from signature_origin import origin_slot
+from signature_origin import origin_slot, responses_item_record
 from thought_signatures import (google_metadata, historical_literal_id, merge_by_order, replay_tool_call_id,
                                 resolve_tool_call_signature, signature_from_extra)
 
@@ -52,15 +52,18 @@ def history_call_signature(message, index, current_required, literal_ids, *, fir
     scope = origin_slot(message, index)
     required = current_required and first
     literal = ident in literal_ids
-    omitted = omitted_signature_record(message, index) if not defer_recovery or strict else None
+    origin = None
+    if not defer_recovery or strict:
+        origin = (omitted_signature_record(message, index) if message._responses_item_witness is None
+                  else responses_item_record(scope, len(message.tool_calls), index))
     if defer_recovery and strict and required:
         # Preserve existing pre-flight errors for strict clients. The actual
         # send still rechecks the selected destination and current record.
         resolve_tool_call_signature(ident, required, explicit, not first, scope,
-                                    literal_id=literal, origin_record=omitted)
+                                    literal_id=literal, origin_record=origin)
     return resolve_tool_call_signature(
         ident, required, explicit, not first, scope, literal_id=literal,
-        destination=destination, origin_record=omitted, defer_recovery=defer_recovery,
+        destination=destination, origin_record=origin, defer_recovery=defer_recovery,
     )
 
 

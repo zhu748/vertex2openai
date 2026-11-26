@@ -7,10 +7,12 @@ suffix. Only digests, topology, and opaque response bytes reach the TTL/LRU.
 """
 import hashlib
 import json
+import re
 import secrets
 
 from models import ContentPartText
 from parallel_result_order import order_parallel_results
+from signature_destination import UNTRUSTED
 from signature_store import SignatureRecord, SignatureState, signature_store
 from thought_signatures import historical_literal_id, ordinary_signature, replay_tool_call_id
 
@@ -30,6 +32,8 @@ _MAX_BLOCKS = 8192
 _BLOCK_COST = 16
 _UTF8_CHUNK = 16384
 _NULL_SDK_FIELDS = frozenset(("annotations", "audio", "function_call"))
+_RESPONSES_ITEM_ID = re.compile(r"fc_[0-9a-f]{32}\Z")
+_RECEIPT_LENGTH_BYTES = 4
 
 
 class _Unsupported(ValueError):
@@ -148,6 +152,28 @@ def _slot_keys(prefix, tags):
         return ()
     batch = _hash(b"tool-batch-v1", prefix, *tags)
     return tuple(_hash(b"tool-slot-v1", batch, i.to_bytes(2, "big")) for i in range(len(tags)))
+
+
+def responses_item_token(value: object) -> bytes:
+    """Check a Responses item ID's representation, not its origin."""
+    if isinstance(value, str) and len(value) == 35 and _RESPONSES_ITEM_ID.fullmatch(value):
+        return bytes.fromhex(value[3:])
+    return b""
+
+
+def responses_item_witness(tokens: list[bytes | None]) -> bytes | None:
+    """None is the only state that permits the older, item-ID-less lookup."""
+    if all(token is None for token in tokens):
+        return None
+    if len(tokens) > _MAX_CALLS or not all(tokens) or len(set(tokens)) != len(tokens):
+        return b""
+    return _hash(b"resp-items-v1", *tokens)
+
+
+def _responses_item_key(keys: tuple[bytes, ...], witness: bytes | None) -> bytes:
+    if keys and witness:
+        return _hash(b"resp-origin-v1", witness, *keys)
+    return b""
 
 
 class VisibleText:
@@ -452,7 +478,14 @@ def bind_signature_origins(request, api_key):
                 if len({c["id"] for c in calls}) != len(calls):
                     raise _Unsupported
                 prefix = _step_prefix(prefix, text_tag, reason_tag)
-                m._signature_slots = _slot_keys(prefix, tags)
+                keys = _slot_keys(prefix, tags)
+                witness = m._responses_item_witness
+                if witness is None:
+                    m._signature_slots = keys
+                elif key := _responses_item_key(keys, witness):
+                    # All slots refer to a single record. Even under eviction
+                    # the witness can never select signatures by slot alone.
+                    m._signature_slots = (key,) * len(keys)
                 prefix = _hash(b"tool-step-v1", prefix, *tags)
                 continue
             prefix = _hash(b"tool-message-v2", prefix, _history_tag(m, budget))
@@ -493,6 +526,48 @@ def _commit_origin(keys, signatures, destination):
             mark_unrestorable_origin(key)
     else:
         signature_store.register_origin_batch(keys, signatures, destination)
+
+
+def publish_responses_item_origins(keys: tuple[bytes, ...], signatures: tuple[bytes | None, ...] | None,
+                                   destination: bytes | None, witness: bytes | None) -> None:
+    """Commit the legacy origin and the exact whole-batch receipt after delivery."""
+    _commit_origin(keys, signatures, destination)
+    if not (key := _responses_item_key(keys, witness)):
+        return
+    if signatures is None or destination is None or destination == UNTRUSTED:
+        mark_unrestorable_origin(key)
+        return
+    # OriginBatch already bounded each original and the total. One TTL/LRU
+    # entry holds every ordered slot, including genuinely unsigned slots.
+    packed = b"".join(len(raw or b"").to_bytes(_RECEIPT_LENGTH_BYTES, "big") + (raw or b"")
+                      for raw in signatures)
+    signature_store.put_record(key, SignatureRecord(SignatureState.SIGNED, packed, destination))
+
+
+def responses_item_record(scope: bytes | None, count: int, index: int) -> SignatureRecord:
+    """A present but missing or invalid witness always vetoes weaker lookup."""
+    if not scope or not 0 <= index < count <= _MAX_CALLS:
+        return _UNRESTORABLE_ORIGIN
+    record = signature_store.get_record(scope)
+    if record is None or record.state is not SignatureState.SIGNED or not record.signature:
+        return _UNRESTORABLE_ORIGIN
+    data = record.signature
+    start = size = offset = 0
+    for i in range(count):
+        end = offset + _RECEIPT_LENGTH_BYTES
+        if end > len(data):
+            return _UNRESTORABLE_ORIGIN
+        length = int.from_bytes(data[offset:end], "big")
+        offset = end + length
+        if length > _MAX_SIGNATURE_BYTES or offset > len(data):
+            return _UNRESTORABLE_ORIGIN
+        if i == index:
+            start, size = end, length
+    if offset != len(data):
+        return _UNRESTORABLE_ORIGIN
+    state = (SignatureState.SIGNED if size else SignatureState.UNSIGNED_FOLLOWER if index
+             else SignatureState.UNKNOWN)
+    return SignatureRecord(state, data[start:start + size] if size else None, record.destination)
 
 
 class DeliveredOrigin:

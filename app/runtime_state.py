@@ -14,6 +14,7 @@ import config as app_config
 from config import state_dir as _state_dir_env  # QUA-P2-7：STATE_DIR 单点定义
 import state_crypto
 from model_capabilities import _strip_known_suffixes
+from model_resource import model_id_for_policy
 from proxy_config import parse_proxy_list
 
 # S-3：允许把状态落到挂载卷，避免 docker compose 重建后设置与 Cookie 全部丢失。
@@ -1072,6 +1073,12 @@ class AppState:
             stripped = _strip_known_suffixes(key)
             if stripped != key:
                 ov = overrides.get(stripped)
+        if not isinstance(ov, dict) and (leaf := model_id_for_policy(key)) != key:
+            # The destination scope can own an explicit override, but should
+            # otherwise inherit the same defaults as its bare publisher ID.
+            ov = overrides.get(leaf)
+            if not isinstance(ov, dict):
+                ov = overrides.get(_strip_known_suffixes(leaf))
         if isinstance(ov, dict):
             for k in app_config.PER_MODEL_KEYS:
                 if k in ov:

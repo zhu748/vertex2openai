@@ -15,7 +15,7 @@ from starlette.requests import ClientDisconnect
 from admission import GenerationCapacityError, ManagedStreamingResponse, SETUP_FAST_WINDOW_SECONDS
 from auth import get_api_key
 from json_encoding import json_response_offloop
-from logger import stats
+from logger import defer_producer_outcomes, stats
 from media_tasks import run_media_task
 from request_connection import ClientConnection
 from request_errors import MAX_RESPONSES_REQUEST_BYTES, body_too_large_response, ingress_error_response
@@ -33,7 +33,12 @@ from retry_policy import advisory_headers, bounded_sse_advisory, response_retry_
 from routes.chat_api import call_upstream
 from runtime_state import app_state
 from schema_validation import SchemaValidationError, preflight_schema_contracts, validate_request_schemas
-from signature_origin import OriginBatch, bind_signature_origins, publish_completed_origins
+from signature_origin import (
+    OriginBatch,
+    bind_signature_origins,
+    publish_completed_origins,
+    publish_responses_item_origins,
+)
 from stream_cleanup import await_owned_close
 from streaming import SSE_NO_BUFFER_HEADERS, close_stream_response
 from tool_policy import validate_parallel_tool_calls
@@ -52,6 +57,7 @@ class _Result:
     headers: dict = field(default_factory=dict)
     proof: dict | None = None
     destination: bytes | None = None
+    diagnostic_fallback: bool = False
 
 
 def _failure(status, message, *, param=None, error_type="upstream_error", headers=None):
@@ -117,12 +123,15 @@ async def _generate(parsed, fastapi_request):
     # projection can publish the public tool turn after it was delivered.
     parsed.chat._signature_output_destination = accepted
     try:
-        source = await call_upstream(parsed.chat, fastapi_request)
-        if isinstance(source, StreamingResponse):
-            # The dispatcher was asked for complete JSON. Never leave a
-            # wrongly returned live owned stream or invent a successful body.
-            await await_owned_close(close_stream_response(source))
-            raise IncompleteResponseError("Expected a complete upstream JSON response.")
+        # Internal attempt outcomes, including a losing channel's proposal,
+        # cannot settle the public Responses request. Token totals still accrue.
+        with defer_producer_outcomes():
+            source = await call_upstream(parsed.chat, fastapi_request)
+            if isinstance(source, StreamingResponse):
+                # The dispatcher was asked for complete JSON. Never leave a
+                # wrongly returned live owned stream or invent a successful body.
+                await await_owned_close(close_stream_response(source))
+                raise IncompleteResponseError("Expected a complete upstream JSON response.")
         raw = getattr(source, "body", None)
         status, hint = source.status_code, response_retry_after(source)
         if isinstance(raw, bytes) and _PARSE_INLINE_BYTES < len(raw) <= MAX_RESPONSE_BYTES:
@@ -130,6 +139,7 @@ async def _generate(parsed, fastapi_request):
         else:
             result = _parse_response(raw, status, hint, parsed.base)
         result.destination = destination
+        result.diagnostic_fallback = getattr(source, "_chat_diagnostic_fallback", False) is True
         return result
     except Exception as exc:
         code, message = extract_upstream_error(exc)
@@ -139,6 +149,10 @@ async def _generate(parsed, fastapi_request):
 async def _publish(prefix, proof, connection, destination):
     if not prefix or not proof or (connection is not None and not connection.delivery_possible):
         return
+
+    def publish(_finish, keys, signatures, accepted_destination):
+        publish_responses_item_origins(keys, signatures, accepted_destination, proof["item_witness"])
+
     if proof["withheld"]:
         message = proof["message"]
         batch = OriginBatch(prefix)
@@ -149,14 +163,27 @@ async def _publish(prefix, proof, connection, destination):
         batch.reasoning.feed(message.get("reasoning_content"))
         for call in message["tool_calls"]:
             batch.add(call)
-        batch.finish()
+        batch.finish(stage_origin=publish, destination=destination)
     elif destination is not None:
-        publish_completed_origins(prefix, (proof,), destination=destination)
+        publish_completed_origins(prefix, (proof,), stage_origin=publish, destination=destination)
+
+
+async def _finish_delivery(prefix, proof, connection, destination, diagnostic_fallback):
+    if connection is not None and not connection.delivery_possible:
+        return
+    if prefix and proof:
+        await _publish(prefix, proof, connection, destination)
+    if diagnostic_fallback:
+        stats.add_error()
+    else:
+        stats.add_success()
 
 
 async def _as_json(result, prefix, connection):
-    background = (BackgroundTask(_publish, prefix, result.proof, connection, result.destination)
-                  if prefix and result.proof else None)
+    # HTTP errors are counted by the middleware. For 2xx, success (including
+    # a valid incomplete envelope) requires a verified final ASGI send.
+    background = (BackgroundTask(_finish_delivery, prefix, result.proof, connection, result.destination,
+                                 result.diagnostic_fallback) if result.status < 400 else None)
     return await json_response_offloop(result.content, status_code=result.status, headers=result.headers,
                                        background=background)
 
@@ -177,10 +204,10 @@ async def _stream(parsed, fastapi_request, prefix, connection):
             job.cancel()
         await asyncio.gather(job, return_exceptions=True)
 
-    proof = destination = None
+    delivery = None
 
     async def events():
-        nonlocal proof, destination
+        nonlocal delivery
         writer = ResponsesEvents()
         for kind in ("response.created", "response.in_progress"):
             for chunk in writer.event(kind, response=parsed.base):
@@ -198,20 +225,25 @@ async def _stream(parsed, fastapi_request, prefix, connection):
                           "invalid_prompt" if result.status == 400 else "server_error")
             failed = {**parsed.base, "status": "failed",
                       "error": {"code": event_code, "message": error["message"]}}
-            stats.add_error()
             if trace := current_trace.get():
                 trace.fail(error["message"], result.status)
             if hint := bounded_sse_advisory(result.headers.get("retry-after")):
                 yield f": retry-after {hint}\n\n".encode("ascii")
             for chunk in writer.event("response.failed", response=failed):
                 yield chunk
+            # A renderer failure before this terminal belongs to middleware;
+            # a delivered SSE error cannot also be counted as HTTP failure.
+            if connection is None or connection.delivery_possible:
+                stats.add_error()
         else:
             for chunk in writer.output(result.content):
                 yield chunk
-            proof, destination = result.proof, result.destination
+            delivery = (result.proof, result.destination, result.diagnostic_fallback)
 
-    async def publish():
-        await _publish(prefix, proof, connection, destination)
+    async def finish_delivery():
+        if delivery is not None:
+            proof, destination, diagnostic_fallback = delivery
+            await _finish_delivery(prefix, proof, connection, destination, diagnostic_fallback)
 
     try:
         done, _ = await asyncio.wait({job}, timeout=SETUP_FAST_WINDOW_SECONDS)
@@ -221,7 +253,7 @@ async def _stream(parsed, fastapi_request, prefix, connection):
                 return await _as_json(result, prefix, connection)
         response = ManagedStreamingResponse(events(), media_type="text/event-stream",
                                             headers=SSE_NO_BUFFER_HEADERS, cleanup=stop,
-                                            background=BackgroundTask(publish))
+                                            background=BackgroundTask(finish_delivery))
         response.client_connection = connection
         return response
     except BaseException:

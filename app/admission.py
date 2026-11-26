@@ -255,10 +255,19 @@ class ManagedStreamingResponse(StreamingResponse):
             def stop(gone):
                 if gone:
                     scope.cancel()
+
+            async def connected_send(message):
+                await send(message)
+                # A send can return normally after the watcher has already
+                # observed a silent peer close. Stop before the next pull: a
+                # producer polling that peer can otherwise return a false EOF.
+                if scope.cancel_called:
+                    await anyio.lowlevel.checkpoint_if_cancelled()
+
             connection.listen(stop)
             try:
                 if not connection.disconnected:
-                    await super().stream_response(send)
+                    await super().stream_response(connected_send)
             finally:
                 if stop in connection.listeners:
                     connection.listeners.remove(stop)

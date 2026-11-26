@@ -26,10 +26,21 @@ SERVER_RESPONSE = wire_part(tool_response=types.ToolResponse(tool_type=types.Too
 INLINE = wire_part(inline_data=types.Blob(mime_type="application/octet-stream", data=b"a"))
 FILE = wire_part(file_data=types.FileData(mime_type="image/png", file_uri="gs://fixture/example"))
 MIME_ONLY = ({"inlineData": {"mimeType": "audio/wav"}}, {"fileData": {"mimeType": "image/png"}})
+FUNCTION_RESULT = wire_part(function_response=types.FunctionResponse(name="lookup", response={}))
+CALLS = (
+    (wire_part(function_call=types.FunctionCall(name="lookup", args={}, id="one")), True),
+    (wire_part(function_call=types.FunctionCall(partial_args=[types.PartialArg(json_path="$.field", bool_value=False)],
+                                               will_continue=True)), True),
+    ({"functionCall": {"name": "", "args": {}, "willContinue": False}}, False),
+    ({"functionCall": {"id": "identity-only"}, "thoughtSignature": "AQI="}, False),
+    ({"functionCall": {"name": " ", "args": {}}}, False),
+    ({"functionCall": {"name": "lookup", "args": []}}, False),
+    ({"functionCall": {"partialArgs": [{"jsonPath": "$.field"}], "willContinue": True}}, False),
+)
 
 
 @pytest.mark.parametrize("part,valid", [
-    (SERVER_CALL, True), (SERVER_RESPONSE, True), (INLINE, True), (FILE, True),
+    (SERVER_CALL, True), (SERVER_RESPONSE, True), (INLINE, True), (FILE, True), (FUNCTION_RESULT, True),
     *((part, False) for part in MIME_ONLY),
     ({"toolCall": {"id": "only"}}, False),
     ({"toolCall": {"toolType": "TOOL_TYPE_UNSPECIFIED", "args": {"query": "q"}}}, False),
@@ -52,9 +63,23 @@ def test_native_observers_agree_on_nontext_parts(part, valid):
     assert "first_content" not in trace.timings and "first_tool" not in trace.timings
 
 
+@pytest.mark.parametrize("part,valid", CALLS)
+def test_native_function_call_milestones_require_semantic_data(part, valid):
+    payload = {"candidates": [{"content": {"parts": [part]}}]}
+    assert first_reply.native_has_reply(payload) is valid
+    trace = RequestTrace("/native")
+    trace.inspect_payload(payload)
+    trace.inspect_payload(payload, sent=True)
+    assert ("first_reply" in trace.timings) is valid
+    assert ("first_sent_reply" in trace.timings) is valid
+    assert ("first_tool" in trace.timings) is valid
+    assert trace.data["tool_deltas"] == int(valid)
+
+
 @pytest.mark.parametrize("sse", [False, True])
-@pytest.mark.parametrize("part,expected", [(SERVER_CALL, 200), (SERVER_RESPONSE, 200),
-                                          *((part, 504) for part in MIME_ONLY)])
+@pytest.mark.parametrize("part,expected", [(SERVER_CALL, 200), (SERVER_RESPONSE, 200), (FUNCTION_RESULT, 200),
+                                          *((part, 504) for part in MIME_ONLY),
+                                          *((part, 200 if valid else 504) for part, valid in CALLS)])
 def test_actual_native_route_delayed_tail(part, expected, sse):
     async def run():
         clock = [100.]

@@ -286,7 +286,7 @@ class ResponsesWireTests(SchemaRouteHarness):
                 self.assertEqual([signature(p) for p in model["parts"]], [SIGNATURES[1], SIGNATURES[0]])
 
 
-    async def test_delivered_unsupported_projection_vetoes_only_its_exact_older_public_origin(self):
+    async def test_delivered_unsupported_projection_fences_legacy_but_not_distinct_issued_items(self):
         for channel in ("api_key", "web_proxy"):
             self.channel = channel
             for stream in (False, True):
@@ -303,12 +303,15 @@ class ResponsesWireTests(SchemaRouteHarness):
                         self.assertEqual(accepted_a.status_code, 200, accepted_a.text[:220])
                         output_a = (event_list(accepted_a.text)[-1]["response"] if stream else accepted_a.json())["output"]
                         thin_a = [thin_item(i) for i in output_a]
+                        echoed = thin_a
 
                         # Same opaque IDs but different visible prefix must not
                         # share the negative proof either.
                         other_prompt = f"different prefix for {label}"
                         other = await self.client.post(PATH, json={**body, "input": other_prompt})
                         self.assertEqual(other.status_code, 200, other.text[:220])
+                        other_output = (event_list(other.text)[-1]["response"] if stream else other.json())["output"]
+                        thin_other = [thin_item(i) for i in other_output]
                         self.reply = {"text": "done"}
                         before = await self.client.post(PATH, json=request(input=continuation(prompt, thin_a)))
                         self.assertEqual(before.status_code, 200, before.text[:220])
@@ -342,17 +345,27 @@ class ResponsesWireTests(SchemaRouteHarness):
                             self.assertEqual(
                                 [{k: v for k, v in i.items() if k != "id"} for i in thin_b],
                                 [{k: v for k, v in i.items() if k != "id"} for i in thin_a])
-                            thin_a = thin_b
+                            echoed = thin_b
 
                         self.reply = {"text": "done"}
-                        with_prefix = await self.client.post(PATH, json=request(input=continuation(prompt, thin_a)))
+                        with_prefix = await self.client.post(PATH, json=request(input=continuation(prompt, echoed)))
                         self.assertEqual(with_prefix.status_code, 200, with_prefix.text[:220])
                         expected = [b"first A", b"second A"] if newer_result.startswith("not_") else [None, None]
                         self.assertEqual([signature(p) for p in calls_in_wire(self.sent[-1], "functionCall")], expected)
-                        other_result = await self.client.post(PATH, json=request(input=continuation(other_prompt, thin_a)))
-                        self.assertEqual(other_result.status_code, 200, other_result.text[:220])
-                        self.assertEqual([signature(p) for p in calls_in_wire(self.sent[-1], "functionCall")],
-                                         [b"first A", b"second A"])
+
+                        # Without item IDs this is still the old indistinguishable
+                        # history, fenced by B. Retaining the actual A IDs binds A.
+                        legacy = [{k: v for k, v in i.items() if k != "id"} for i in thin_a]
+                        for past_prompt, items, signatures in (
+                            (prompt, legacy, expected),
+                            (prompt, thin_a, [b"first A", b"second A"]),
+                            (other_prompt, thin_other, [b"first A", b"second A"]),
+                            (other_prompt, echoed, [None, None]),
+                        ):
+                            follow = await self.client.post(PATH, json=request(input=continuation(past_prompt, items)))
+                            self.assertEqual(follow.status_code, 200, follow.text[:220])
+                            self.assertEqual([signature(p) for p in calls_in_wire(self.sent[-1], "functionCall")],
+                                             signatures)
 
     async def test_redacted_signature_bytes_never_make_a_new_positive_public_origin(self):
         for channel in ("api_key", "web_proxy"):

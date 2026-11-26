@@ -6,6 +6,7 @@ import time
 from contextlib import suppress
 from typing import Any, AsyncIterable, AsyncIterator, Callable, Optional
 
+import anyio
 from fastapi.responses import StreamingResponse
 from stream_cleanup import await_owned_close
 
@@ -41,6 +42,10 @@ async def reads_before_deadline(iterator: AsyncIterator, deadline: float) -> Asy
             async with timer:
                 item = await anext(iterator)
         except Exception as exc:
+            # An inner receive or transport can translate a peer cancellation
+            # into EOF/error. Let an active AnyIO scope raise its own marked
+            # cancellation rather than synthesizing an unowned one.
+            await anyio.lowlevel.checkpoint_if_cancelled()
             if owner.cancelling() > cancellations:
                 raise asyncio.CancelledError() from exc
             if timer.expired() or time.monotonic() >= deadline:
@@ -49,6 +54,7 @@ async def reads_before_deadline(iterator: AsyncIterator, deadline: float) -> Asy
                 return
             raise
         if owner.cancelling() > cancellations:
+            await anyio.lowlevel.checkpoint_if_cancelled()
             raise asyncio.CancelledError()
         if timer.expired() or time.monotonic() >= deadline:
             raise StreamDeadlineExceeded()

@@ -145,6 +145,15 @@
       refresh();
     }
   }
+  function editedSettings(name) {
+    const baseline = snapshots.get(name);
+    if (!baseline) return null;
+    return new Set(
+      baseline
+        .filter(({ id, value: previous }) => !sameSetting(id, value($(id)), previous))
+        .map(({ id }) => settingKey(id))
+    );
+  }
   function beginSettingsWrite(name, keys) {
     if (settingsWrites.has(name)) return null;
     // Capture rendered values at submission, not when the receipt arrives.
@@ -455,6 +464,7 @@
   });
   window.consoleForms = {
     saved,
+    editedSettings,
     beginSettingsWrite,
     acceptSettingsWrite,
     endSettingsWrite,

@@ -73,6 +73,7 @@ from retry_policy import (
 )
 from runtime_state import app_state
 from schema_validation import SchemaValidationError
+from sdk_stream import open_sdk_stream
 from tool_stream import ToolStreamAssembler
 from streaming import DONE_FRAME, HEARTBEAT_FRAME, MAX_ERROR_MESSAGE_CHARS
 from streaming import disconnected as _request_disconnected
@@ -293,7 +294,8 @@ class _SDKAttempt:
         kwargs = {"model": model, "contents": contents, "config": config}
         if isinstance(client, FailoverSDKClient):
             return generate(_actual_attempt=self._prepare, **kwargs)
-        return generate(**self._prepare(client, kwargs))
+        actual = self._prepare(client, kwargs)
+        return open_sdk_stream(generate, **actual) if stream else generate(**actual)
 
 
 async def _fake_stream_response_frames(

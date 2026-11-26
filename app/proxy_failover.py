@@ -251,10 +251,11 @@ class FailoverSDKClient:
             async def start(raw, resolved):
                 from first_reply import sdk_has_reply
                 from response_validation import IncompleteResponseError, has_finish_reason
+                from sdk_stream import open_sdk_stream
 
                 self.client = self.factory(raw, resolved)
                 actual = _actual_attempt(self.client, kwargs) if _actual_attempt else kwargs
-                source = await self.client.aio.models.generate_content_stream(**actual)
+                source = await open_sdk_stream(self.client.aio.models.generate_content_stream, **actual)
                 prefix, size = deque(), 0
                 try:
                     async for chunk in source:

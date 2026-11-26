@@ -13,6 +13,7 @@ import json
 import time
 import traceback
 from collections.abc import Iterable, Iterator
+from contextlib import aclosing
 from itertools import chain
 
 from anti_truncation import buffered_sse
@@ -1105,8 +1106,11 @@ async def deliver_stream_frames(gen: "CookieGeneration") -> AsyncIterator[str]:
     # 立即吐一个心跳，尽快建立连接（避免首个上游调用较慢/429 时前端久等无字节）
     yield HEARTBEAT_FRAME
     try:
-        async for frame in deliver_stream_events(gen):
-            yield frame
+        # A caller may close between yields rather than during an upstream
+        # read. Keep the attempt's live client context under the same lease.
+        async with aclosing(deliver_stream_events(gen)) as frames:
+            async for frame in frames:
+                yield frame
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -1333,6 +1337,11 @@ def _assemble_whole_response(gen: "CookieGeneration", st: _WholeBodyState) -> "R
     }
     response_class = LargeJSONResponse if gen.is_image else JSONResponse
     response = response_class(content=payload)
+    if not got_output:
+        # This body's fallback prose belongs to the gateway, not the model.
+        # Consumers of the accepted object can preserve its failure accounting
+        # without classifying model text by a prefix or leaking a wire flag.
+        response._chat_diagnostic_fallback = True
     if not gen.request_obj.stream:
         note_accepted_destination(gen.request_obj, gen.signature_destination)
         publish_completed_origins(gen.request_obj._signature_output_prefix, payload["choices"],

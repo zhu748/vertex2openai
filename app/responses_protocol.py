@@ -18,6 +18,7 @@ from ordinary_history import exact_ordinary_slots
 from request_tracking import SURROGATE_RE
 from response_validation import IncompleteResponseError, MAX_TOOL_CALLS
 from schema_validation import SchemaValidationError, validate_tool_strict
+from signature_origin import responses_item_token, responses_item_witness
 from thought_signatures import google_metadata, ordinary_signature, signature_from_extra
 from tool_arguments import parse_tool_arguments
 from tool_policy import has_search_suffix
@@ -232,6 +233,7 @@ class _History:
         self.messages = ([OpenAIMessage(role="developer", content=instructions)] if instructions else [])
         self.assistant = {}
         self.extra = None
+        self.tool_item_tokens = []
         self.pending = set()
         self.in_results = False
         self.conversation = False
@@ -250,8 +252,10 @@ class _History:
         # Responses call_id never encoded a signature. Keep all IDs opaque; a
         # missing origin must not create a new legacy placeholder fallback.
         message._opaque_tool_call_ids = bool(message.tool_calls)
+        message._responses_item_witness = responses_item_witness(self.tool_item_tokens)
         self.messages.append(message)
         self.assistant, self.extra = {}, None
+        self.tool_item_tokens.clear()
         self.conversation = True
 
     def _stage(self):
@@ -309,6 +313,9 @@ class _History:
                         _field_error(f"{param}.extra_content", "assistant metadata must be carried only once")
                     self.extra = _assistant_extra({"extra_content": carried}, param)
             self.assistant.setdefault("tool_calls", []).append(call)
+            # Missing is distinct from a supplied null, unknown or otherwise
+            # unusable hint. Neither form alters the public/native call_id.
+            self.tool_item_tokens.append(responses_item_token(item["id"]) if "id" in item else None)
             self.pending.add(call_id)
         elif kind == "message":
             _fields(item, {"type", "id", "status", "role", "content", "extra_content"}, param)
@@ -620,7 +627,8 @@ def completion_to_response(completion, base):
     proof = None
     if proof_calls and not refusal:
         public_turn["tool_calls"] = proof_calls
-        proof = {"finish_reason": finish, "message": public_turn, "withheld": withheld}
+        proof = {"finish_reason": finish, "message": public_turn, "withheld": withheld,
+                 "item_witness": responses_item_witness([responses_item_token(item["id"]) for item in tool_items])}
     return output_envelope, proof
 
 

@@ -22,7 +22,7 @@ from schema_validation import SchemaValidationError
 from signature_destination import publisher_destination, studio_model_resource
 from upstream_errors import create_openai_error_response
 from upstreams.base import BaseUpstream
-from channel_capabilities import cookie_feature_error
+from channel_capabilities import cookie_feature_error, cookie_model_id
 from credential_manager import credential_manager
 from proxy_failover import ProxyChain
 from request_validation import validate_openai_request
@@ -224,6 +224,11 @@ def _prepare_cookie_generation(
     # ===== 3. 解析模型名 =====
     model_display = request_obj.model
     base_model_name, _ = split_model_alias(model_display)
+    try:
+        base_model_name = cookie_model_id(base_model_name, project_id)
+    except SchemaValidationError as exc:
+        return JSONResponse(status_code=400, content=create_openai_error_response(
+            400, str(exc), "invalid_request_error"))
     is_grounded_search = base_model_name.endswith("-search")
     if is_grounded_search:
         base_model_name = base_model_name[: -len("-search")]

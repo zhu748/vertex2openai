@@ -12,7 +12,7 @@ from stream_cleanup import await_owned_close
 import config as app_config
 from runtime_state import app_state
 from request_tracking import current_trace
-from response_validation import IncompleteResponseError, native_other_part_has_reply, sdk_function_call, sdk_media_payload
+from response_validation import IncompleteResponseError, native_part_has_reply, sdk_function_call, sdk_media_payload
 
 _active_wait = ContextVar("first_reply_wait", default=None)
 
@@ -249,11 +249,8 @@ def native_has_reply(payload: Any) -> bool:
             content = candidate.get("content") if isinstance(candidate, dict) else None
             if not isinstance(content, dict):
                 continue
-            for part in content.get("parts") or []:
-                if isinstance(part, dict) and (
-                        part.get("text") or part.get("functionCall")
-                        or native_other_part_has_reply(part)):
-                    return True
+            if any(map(native_part_has_reply, content.get("parts") or [])):
+                return True
     return False
 
 

@@ -6,6 +6,7 @@ from google.genai import types
 
 import config as app_config
 import model_capabilities as mc
+from model_resource import model_id_for_policy
 from models import OpenAIRequest, normalize_content_part, wants_json_output
 from runtime_state import app_state
 from schema_validation import sanitize_for_gemini
@@ -134,7 +135,7 @@ def _tool_choice(choice: str | dict | None) -> dict:
 
 def _configure_images(config: dict, request: OpenAIRequest, settings: dict, profile: dict) -> list[dict]:
     config["response_modalities"] = ["TEXT", "IMAGE"]
-    if "nano-banana" in request.model.lower():
+    if "nano-banana" in model_id_for_policy(request.model).lower():
         config["safety_settings"].extend(
             types.SafetySetting(category=f"HARM_CATEGORY_{name}", threshold="OFF")
             for name in _IMAGE_SAFETY_CATEGORIES

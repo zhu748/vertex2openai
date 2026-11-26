@@ -336,6 +336,31 @@ async function main(){
   assert.equal(settings.retry_max,13);assert.equal(w.consoleForms.dirty(),false);
   check('Runtime draft reload preservation, save and undo');
 
+  {
+   const original={express_location:settings.express_location,keepalive_url:settings.keepalive_url};
+   const saveRuntime=async()=>{d.querySelector('button[onclick*="saveSettings"]').click();await tick();};
+   const lastPatch=()=>requests.filter(r=>r.path==='/api/settings'&&r.method==='POST').at(-1).body;
+   settings.express_location='us-west2';
+   settings.keepalive_url='  https://maintenance.invalid/healthz  ';
+   await w.loadParams();
+   assert.equal(el('express_location').value,'us-west2');
+   assert.match(el('express_location').selectedOptions[0].textContent,/us-west2/);
+   assert.equal(el('keepalive_url').value,'https://maintenance.invalid/healthz');
+   assert.equal(w.consoleForms.dirty(),false);
+   const oldRetry=settings.retry_max;
+   edit('retry_max',String(oldRetry+1));await saveRuntime();
+   assert.deepEqual(lastPatch(),{retry_max:oldRetry+1,_expected:{retry_max:{present:true,value:oldRetry}}});
+   assert.equal(settings.express_location,'us-west2');
+   assert.equal(settings.keepalive_url,'  https://maintenance.invalid/healthz  ');
+   // Selecting the empty route intentionally is still a real edit.
+   edit('express_location','');await saveRuntime();
+   assert.deepEqual(lastPatch(),{express_location:'',_expected:{express_location:{present:true,value:'us-west2'}}});
+   assert.equal(settings.express_location,'');
+   assert.equal(w.consoleForms.dirty(),false);
+   Object.assign(settings,original);await w.loadParams();
+   check('Runtime shows saved unlisted regions, never writes untouched rendered values, and can explicitly clear a pin');
+  }
+
   assert.equal(el('cookie_auto_refresh').checked,true);
   edit('cookie_auto_refresh',true);edit('cookie_refresh_interval_seconds','900');
   assert.equal(w.consoleForms.dirty(),true);

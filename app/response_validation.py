@@ -249,14 +249,63 @@ def sdk_media_payload(part):
     return None
 
 
-def native_other_part_has_reply(part: dict) -> bool:
-    """Observe native non-text output other than client function calls. No decoding or execution."""
+def _native_partial_arg_has_value(arg: object) -> bool:
+    if not isinstance(arg, dict):
+        return False
+    path = arg.get("jsonPath", arg.get("json_path"))
+    if not isinstance(path, str) or not path.startswith("$"):
+        return False
+    # These are values, not just the envelope or willContinue flag. A literal
+    # false, zero, null or empty string is still meaningful argument content.
+    return (isinstance(arg.get("boolValue", arg.get("bool_value")), bool)
+            or type(arg.get("numberValue", arg.get("number_value"))) in (int, float)
+            or isinstance(arg.get("stringValue", arg.get("string_value")), str)
+            or arg.get("nullValue", arg.get("null_value")) == "NULL_VALUE")
+
+
+def native_function_call_has_reply(part: dict) -> bool:
+    """Observe a named call or actual incremental argument, not a proto shell."""
+    call = part.get("functionCall", part.get("function_call"))
+    if not isinstance(call, dict):
+        return False
+    name, call_id, args = call.get("name"), call.get("id"), call.get("args")
+    partial = call.get("partialArgs", call.get("partial_args"))
+    continued = call.get("willContinue", call.get("will_continue"))
+    if any(value is not None and not isinstance(value, kind) for value, kind in (
+            (name, str), (call_id, str), (args, dict), (partial, list), (continued, bool))):
+        return False
+    return bool(name and not name.isspace()) or bool(partial and any(map(_native_partial_arg_has_value, partial)))
+
+
+def _native_media_has_reply(part: dict) -> bool:
     for key, field in (("inlineData", "data"), ("fileData", "fileUri")):
         media = part.get(key)
         if isinstance(media, dict):
             value = media.get(field)
             if isinstance(value, str) and value and not value.isspace():
                 return True
+    return False
+
+
+def _native_function_response_has_reply(part: dict) -> bool:
+    result = part.get("functionResponse", part.get("function_response"))
+    if not isinstance(result, dict):
+        return False
+    name, call_id = result.get("name"), result.get("id")
+    if any(value is not None and not isinstance(value, str) for value in (name, call_id)):
+        return False
+    if not any(value and not value.isspace() for value in (name, call_id)):
+        return False
+    if isinstance(result.get("response"), dict):
+        return True
+    parts = result.get("parts")
+    return isinstance(parts, list) and any(isinstance(p, dict) and _native_media_has_reply(p) for p in parts)
+
+
+def native_other_part_has_reply(part: dict) -> bool:
+    """Observe native non-text output other than client function calls. No decoding or execution."""
+    if _native_media_has_reply(part) or _native_function_response_has_reply(part):
+        return True
     for key, field in (("toolCall", "args"), ("toolResponse", "response")):
         tool = part.get(key)
         if isinstance(tool, dict):
@@ -266,3 +315,11 @@ def native_other_part_has_reply(part: dict) -> bool:
                     and (identifier is None or isinstance(identifier, str))):
                 return True
     return native_code_part_has_reply(part)
+
+
+def native_part_has_reply(part: object) -> bool:
+    if not isinstance(part, dict):
+        return False
+    text = part.get("text")
+    return (isinstance(text, str) and bool(text)
+            or native_function_call_has_reply(part) or native_other_part_has_reply(part))

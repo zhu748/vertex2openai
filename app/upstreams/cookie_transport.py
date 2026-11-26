@@ -15,13 +15,14 @@ from cookie_auth import BATCH_GRAPHQL_URL
 from json_encoding import estimate_json_chars
 from media_tasks import run_media_task
 from http_io import UNAVAILABLE_DIAGNOSTIC, read_status_body
-from first_reply import FirstReplyGuard, FirstReplyTimeout, native_has_reply, timeout_seconds
+from first_reply import FirstReplyGuard, FirstReplyTimeout, timeout_seconds
 from request_tracking import upstream_attempt, upstream_chunk
 from response_validation import (
     IncompleteResponseError,
     PendingMetadataGate,
     ToolStreamError,
     has_finish_reason,
+    native_part_has_reply,
 )
 from retry_policy import (
     is_retryable_exception,
@@ -181,10 +182,10 @@ def is_native_tool_error_response(status_code: int, payload: str | bytes) -> boo
     return False
 
 
-def _event_has_reply(event: tuple):
+def _event_has_reply(event: tuple[str, Any]) -> bool:
     kind, data = event
     if kind == "native_part":
-        return native_has_reply({"candidates": [{"content": {"parts": [data]}}]})
+        return native_part_has_reply(data)
     return kind in ("text", "thought", "image", "thought_image", "hidden_thought", "function_call") and bool(data)
 
 
@@ -424,7 +425,7 @@ async def _execute_stream_request_generator_once(
                         "thought_signature",
                         "native_part",
                     ):
-                        has_content = True
+                        has_content = has_content or event_type != "native_part" or native_part_has_reply(data)
                         yield event_type, data
 
                     elif event_type in ("finish", "usage", "blocked", "safety", "candidate_metadata"):

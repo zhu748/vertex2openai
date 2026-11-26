@@ -11,6 +11,7 @@ from model_capabilities import (
     split_model_alias,
     supports_transport,
 )
+from model_resource import model_id_for_policy
 
 
 def listed_suffixes(model: str, settings: dict) -> tuple[str, ...]:
@@ -29,7 +30,7 @@ def search_variant_available(model_id: str) -> bool:
     Capability profiles also recognize image families without 'image' in their
     names (for example nano-banana); checking a substring alone misses them.
     """
-    lowered = (model_id or "").lower()
+    lowered = model_id_for_policy(model_id).lower()
     if "gemini" not in lowered or lowered.endswith("-search"):
         return False
     return not get_profile(lowered)["is_image"]

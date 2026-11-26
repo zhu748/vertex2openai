@@ -135,13 +135,13 @@ class ProviderDestinationRoutes(SchemaRouteHarness):
             manager.start()
             self.addCleanup(manager.stop)
 
-    async def offer(self, label, mode, dialect, calls, *, carrier=False):
+    async def offer(self, label, mode, dialect, calls, *, carrier=False, model=MODEL):
         self.wire.clear()
         self.settings["fake_streaming"] = mode == "fake"
         prompt = [{"role": "user", "content": label}]
         self.reply = sdk_parts(calls)
         path, body = _request("openai" if dialect == "openai" else "claude", "auto", stream=mode != "json")
-        body.update(model=MODEL, messages=prompt)
+        body.update(model=model, messages=prompt)
         if dialect == "omitted":
             body.update(max_tokens=2048, thinking={"type": "enabled", "budget_tokens": 1024, "display": "omitted"})
             self.reply[:0] = [{"text": "private fixture", "thought": True}, {"text": "Checking."}]
@@ -222,6 +222,30 @@ class ProviderDestinationRoutes(SchemaRouteHarness):
                         self.assert_trace(await self.replay(request, mode), ["p-a"], [pairs(calls)])
                         self.project = "p-b"
                         self.assert_trace(await self.replay(request, mode), ["p-b"], [[(i, None) for i, _, _ in calls]])
+
+    async def test_explicit_resource_keeps_only_same_spelling_and_trusted_destination_proof(self):
+        qualified = f"projects/p-a/locations/global/publishers/google/models/{MODEL}"
+        another = qualified.replace("/p-a/", "/p-b/")
+        for dialect in ("openai", "omitted"):
+            ident = "explicit-resource-" + dialect
+            calls = [(ident, "Paris", SIGNATURE)]
+            absent = [(ident, None)]
+            self.project, self.channel, self.pick_unknown_endpoint = "p-a", "web_proxy", False
+            request = await self.offer(ident, "json", dialect, calls, model=qualified)
+            self.assertEqual([row[0] for row in self.wire], ["p-a"])
+            self.assertEqual(request[1]["model"], qualified)
+            self.channel = "api_key"
+            self.assert_trace(await self.replay(request, "json"), ["p-a"], [pairs(calls)])
+            # Equal wire URLs do not imply equal public history fingerprints.
+            path, body = request
+            self.assert_trace(await self.replay((path, {**body, "model": MODEL}), "json"), ["p-a"], [absent])
+            self.assert_trace(await self.replay((path, {**body, "model": another}), "json"), ["p-b"], [absent])
+            self.pick_unknown_endpoint, self.sdk_selections = True, 0
+            trace = await self.replay(request, "json")
+            self.assert_trace(trace, ["p-a"], [absent])
+            self.assertEqual(trace[0][1], "unverified.fixture")
+            self.project, self.channel = "p-b", "web_proxy"
+            self.assertEqual(await self.replay(request, "json", code=400), [])
 
     async def test_rotation_unpin_and_actual_winner_are_checked_each_attempt(self):
         for carrier in ("openai", "omitted"):
@@ -386,3 +410,37 @@ class ProviderDestinationRoutes(SchemaRouteHarness):
                     fixture = await self.client.post("/v1/responses", json={**body, "stream": False, "input": follow})
                     self.assertEqual(fixture.status_code, 200, fixture.text[:200])
                     self.assert_trace(self.wire, [project], [[(ident, expected)]])
+
+    async def test_responses_witness_preserves_bare_best_effort_but_never_custom_inference(self):
+        self.settings["express_location"] = ""
+        for stream in (False, True):
+            for custom_source in (False, True):
+                ident = f"responses-item-{stream}-{custom_source}__thought__YQ=="
+                body = {"model": MODEL, "input": ident, "store": False, "stream": stream,
+                        "tools": [{"type": "function", "name": "weather", "parameters": {"type": "object"}}]}
+                self.pick_unknown_endpoint, self.sdk_selections = custom_source, 0
+                self.reply = sdk_parts([(ident, "Paris", SIGNATURE)])
+                source = await self.client.post("/v1/responses", json=body)
+                self.assertEqual(source.status_code, 200, source.text[:200])
+                if stream:
+                    events = [json.loads(line[6:]) for line in source.text.splitlines() if line.startswith("data: {")]
+                    self.assertEqual(events[-1]["type"], "response.completed")
+                    tool, = events[-1]["response"]["output"]
+                else:
+                    tool, = source.json()["output"]
+                for custom_target in (False, True):
+                    for carried in (False, True):
+                        with self.subTest(stream=stream, custom_source=custom_source,
+                                          custom_target=custom_target, carried=carried):
+                            self.pick_unknown_endpoint, self.sdk_selections = custom_target, 0
+                            self.reply = [{"text": "done"}]
+                            self.wire.clear()
+                            echoed = tool if carried else {k: v for k, v in tool.items() if k != "extra_content"}
+                            continued = await self.client.post("/v1/responses", json={**body, "stream": False, "input": [
+                                {"role": "user", "content": ident}, echoed,
+                                {"type": "function_call_output", "call_id": ident, "output": "done"}]})
+                            self.assertEqual(continued.status_code, 200, continued.text[:200])
+                            expected = SIGNATURE if carried or not (custom_source or custom_target) else None
+                            self.assert_trace(self.wire, [None], [[(ident, expected)]])
+                            self.assertEqual(self.wire[0][1],
+                                             "unverified.fixture" if custom_target else "aiplatform.googleapis.com")

@@ -28,7 +28,7 @@ app_state.set_express_keys([{'key':'ui-fixture-key','project_id':'fixture-projec
 app_state.set_cookie_accounts([])
 # Start disabled so checking the guard below makes a real model-specific edit.
 # Its production default is already enabled; an unchanged value is not posted.
-app_state.update_settings({'image_aspect_ratio':'16:9','express_ua_profile':'custom','express_ua_custom':'fixture-gateway/'+'x'*360,
+app_state.update_settings({'image_aspect_ratio':'16:9','express_location':'us-west2','express_ua_profile':'custom','express_ua_custom':'fixture-gateway/'+'x'*360,
                           'hide_thoughts':True,'native_thinking_mode':'request','prefill_cot_guard':False})
 stats.total_requests=32
 stats.success_requests=25
@@ -179,6 +179,8 @@ async function main() {
     assert.equal((await response.json()).override.prefill_cot_guard, true);
     await page.waitForFunction(() => !document.querySelector('#btn-scope-save').disabled);
     await openTab('runtime');
+    assert.equal(await page.inputValue('#express_location'),'us-west2');
+    assert.match(await page.locator('#express_location option:checked').textContent(),/us-west2/);
     assert.equal(await page.locator('#cross_channel_fallback').isChecked(),false);
     assert.equal(await page.locator('#cookie_structured_output').isChecked(),false);
     await page.locator('#cookie_structured_output').check();
@@ -194,7 +196,10 @@ async function main() {
     assert.ok(!('prefill_cot_guard' in response.request().postDataJSON()));
     assert.equal(response.request().postDataJSON().cookie_structured_output,true);
     assert.equal(response.request().postDataJSON().cookie_auto_refresh,undefined);
-    assert.equal((await response.json()).cookie_auto_refresh,true);
+    assert.equal(response.request().postDataJSON().express_location,undefined);
+    const runtimeReceipt=await response.json();
+    assert.equal(runtimeReceipt.cookie_auto_refresh,true);
+    assert.equal(runtimeReceipt.express_location,'us-west2');
     assert.equal(response.request().postDataJSON().cookie_refresh_interval_seconds,900);
     const upstreamSettingsPage=await context.newPage();
     await upstreamSettingsPage.goto(origin+'/#params');
@@ -1255,11 +1260,12 @@ async function main() {
     };
     await runtimeA.route('**/api/settings',heldRuntimeSave);
     await runtimeA.fill('#retry_max',String(lateBase+1));
+    await runtimeA.selectOption('#express_location','global');
     const lateSave=saveRuntime(runtimeA);
     try{
       assert.equal(await receiptCommitted,200);
       assert.equal(await runtimeA.locator('#retry_max').isDisabled(),true);
-      const newer=await runtimeB.request.post(origin+'/api/settings',{data:{retry_max:lateBase+2}});
+      const newer=await runtimeB.request.post(origin+'/api/settings',{data:{retry_max:lateBase+2,express_location:'europe-west12'}});
       assert.equal(newer.status(),200);
       await runtimeA.evaluate(()=>loadParams());
     }finally{
@@ -1268,6 +1274,8 @@ async function main() {
     assert.equal((await lateSave).status(),200);
     await runtimeA.waitForFunction(()=>!document.querySelector('#retry_max').matches(':disabled'));
     assert.equal(await runtimeA.inputValue('#retry_max'),String(lateBase+2));
+    assert.equal(await runtimeA.inputValue('#express_location'),'europe-west12');
+    assert.equal(await runtimeA.locator('#express_location option[value="us-west2"]').count(),0);
     assert.equal(await runtimeA.evaluate(()=>consoleForms.dirty()),false);
     await runtimeA.unroute('**/api/settings',heldRuntimeSave);
     check('迟到的运行设置保存回执不会覆盖重新加载已看到的最新设置；处理中仍锁定表单');

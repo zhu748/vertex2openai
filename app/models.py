@@ -38,6 +38,9 @@ class OpenAIMessage(BaseModel):
     _omitted_signature_key: bytes | None = PrivateAttr(default=None)
     _claude_literal_tool_ids: bool = PrivateAttr(default=False)
     _opaque_tool_call_ids: bool = PrivateAttr(default=False)
+    # Responses-only: None for omitted item IDs, empty bytes for an unusable
+    # supplied vector, or a keyed digest of the complete ordered item IDs.
+    _responses_item_witness: bytes | None = PrivateAttr(default=None)
     _signature_observed_reasoning: tuple[int, bytes] | None = PrivateAttr(default=None)
     role: str
     content: str | list[ContentPartText | ContentPartImage | dict[str, Any]] | None = None

@@ -18,7 +18,7 @@ current_trace = ContextVar("request_trace", default=None)
 _attempt_started = ContextVar("attempt_started", default=None)
 MAX_INSPECTION_BYTES = 2 * 1024 * 1024
 
-from response_validation import native_other_part_has_reply
+from response_validation import native_function_call_has_reply, native_other_part_has_reply
 from streaming import sse_separator
 from usage import NATIVE_USAGE_COUNTERS, merge_usage_metadata
 
@@ -333,11 +333,13 @@ class RequestTrace:
                 reasons.append(redact(choice["finish_reason"])[:100])
         for candidate in payload.get("candidates") or []:
             for part in (candidate.get("content") or {}).get("parts") or []:
-                if part.get("thought"):
-                    reasoning += len(part.get("text") or "")
-                else:
-                    content += len(part.get("text") or "")
-                tools += int(bool(part.get("functionCall")))
+                text = part.get("text")
+                if isinstance(text, str):
+                    if part.get("thought"):
+                        reasoning += len(text)
+                    else:
+                        content += len(text)
+                tools += int(native_function_call_has_reply(part))
                 other_reply = other_reply or native_other_part_has_reply(part)
             if candidate.get("finishReason"):
                 reasons.append(redact(candidate["finishReason"])[:100])

@@ -43,11 +43,16 @@ class SchemaRouteHarness(Round15Harness):
                              cross_channel_fallback=False, redirect_format_model=False)
         self.sent = []
         self.reply = {"text": "ok"}
+        self.usage_metadata = None
+        self.finish_reason = "STOP"
         def wire_response(request):
             body = json.loads(request.content)
             self.sent.append(body)
             parts = self.reply if isinstance(self.reply, list) else [self.reply]
-            candidate = {"candidates": [{"content": {"role": "model", "parts": parts}, "finishReason": "STOP"}]}
+            candidate = {"candidates": [{"content": {"role": "model", "parts": parts},
+                                         "finishReason": self.finish_reason}]}
+            if self.usage_metadata is not None:
+                candidate["usageMetadata"] = self.usage_metadata
             if "variables" in body:
                 return httpx.Response(200, json={"results": [{"data": candidate}]})
             if ":streamGenerateContent" in str(request.url):

@@ -34,10 +34,15 @@ class _OwnedHttpxStream(httpx.AsyncByteStream):
             self.finished.set()
 
 
-def own_httpx_response(response: httpx.Response) -> None:
+def own_httpx_response(response: httpx.Response) -> _OwnedHttpxStream | None:
     """Install a physical-close owner before HTTPX can close implicitly at EOF."""
-    if not response.is_closed and not isinstance(response.stream, _OwnedHttpxStream):
-        response.stream = _OwnedHttpxStream(response.stream)
+    if isinstance(response.stream, _OwnedHttpxStream):
+        return response.stream
+    if not response.is_closed:
+        stream = _OwnedHttpxStream(response.stream)
+        response.stream = stream
+        return stream
+    return None
 
 
 async def close_httpx_response(response: httpx.Response) -> None:

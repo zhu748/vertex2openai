@@ -41,6 +41,7 @@ import config as app_config
 import model_capabilities as mc
 from json_encoding import LargeJSONResponse, estimate_json_chars, iter_json_bytes
 from admission import GenerationCapacityError, limit_generation, run_with_image_limit
+from channel_capabilities import cookie_model_id
 from cookie_auth import (
     STREAM_GENERATE_OPERATION_NAME,
     build_headers,
@@ -70,6 +71,7 @@ from upstream_errors import google_status_detail
 from upstreams.cookie_candidate_metadata import check_grounding_references, merge_candidate_metadata
 from upstreams.cookie_response import RawSampler
 from upstreams.cookie_transport import (
+    _event_has_reply,
     cookie_retry_backoff_heartbeats,
     stream_events,
 )
@@ -509,17 +511,6 @@ def _sanitize_tool_config(tool_config: Any, declared_names: list[str]) -> Option
     return cleaned
 
 
-def _cookie_model_id(resource: str, project_id: str) -> str:
-    """Accept only resources equivalent to this Cookie account's Google/global model."""
-    scope, sep, model_id = resource.rpartition("/")
-    if model_id not in ("", ".", "..") and (not sep or scope in (
-            "models", "publishers/google/models",
-            f"projects/{project_id}/locations/global/publishers/google/models")):
-        return model_id
-    raise SchemaValidationError("Cookie 通道仅支持本账号项目 global 区域下的 Google 模型；"
-                                "请使用对应的模型 ID，或改用支持目标资源的通道。")
-
-
 def _require_no_continuation(parsed: dict) -> None:
     # This protocol's model cursor is distinct from the gateway's SSE receipt.
     # A new batchGraphql call cannot continue the supplied provider response.
@@ -533,7 +524,7 @@ def native_request_to_variables(parsed: dict, model_name: str, project_id: str,
 
     raises SchemaValidationError：结构化输出被策略拒绝（与 OpenAI 通道同口径）。
     """
-    model_name = _cookie_model_id(model_name, project_id)
+    model_name = cookie_model_id(model_name, project_id)
     _require_no_continuation(parsed)
     parsed = _proto_message(parsed, _REQUEST_FIELDS)
     if parsed.get("cachedContent") is not None:
@@ -855,27 +846,28 @@ async def _events_with_retry(fastapi_request: Request, record: dict, body: dict,
             stats.add_retry()
         req_headers = build_headers(cookie_str)
         async with open_upstream_client(client_kwargs) as client:
-            has_content = False
-            # stream_events deliberately flushes diagnostic prefixes before an
-            # error. They belong to this attempt, not a later successful one.
+            committed = False
+            # The inner transport may flush a signed-empty or diagnostic prefix
+            # before an error. Neither belongs to a later successful attempt.
             pending = PendingMetadataGate()
             retry_now: Any = None
             sampler = RawSampler()
             events = stream_events(
                 client, req_headers, body, sampler=sampler, model=model_name, preserve_parts=True)
             try:
-                async for status, data in events:
-                    if status in ("text", "thought", "image", "function_call", "thought_signature", "native_part"):
-                        if not has_content:
-                            for item in pending.drain():
-                                yield item
-                            has_content = True
-                        yield status, data
-                    elif status in ("finish", "usage", "blocked", "safety", "candidate_metadata"):
-                        if has_content:
-                            yield status, data
+                async for item in events:
+                    status, data = item
+                    if status in ("text", "thought", "image", "function_call", "thought_signature", "native_part",
+                                  "finish", "usage", "blocked", "safety", "candidate_metadata"):
+                        if not committed and _event_has_reply(item):
+                            committed = True
+                            for prefix in pending.drain():
+                                yield prefix
+                                del prefix
+                        if committed:
+                            yield item
                         else:
-                            pending.add((status, data), 64 + estimate_json_chars(data))
+                            pending.add(item, 64 + estimate_json_chars(data))
                     elif status == "cookie_error":
                         credential_manager.record_cookie_auth_failure(account_id, credential=record)
                         raise NativeBridgeError(
@@ -883,18 +875,20 @@ async def _events_with_retry(fastapi_request: Request, record: dict, body: dict,
                             getattr(data, "retry_after", None))
                     elif status in ("retryable_error", "fatal_error"):
                         hint = getattr(data, "retry_after", None)
-                        if (not has_content and status == "retryable_error" and attempt < retry_max
+                        if (not committed and status == "retryable_error" and attempt < retry_max
                                 and advisory_fits(hint, fastapi_request, deadline=deadline)):
                             retry_now = data
                             break
                         default_code = 429 if status == "retryable_error" else 502
                         raise NativeBridgeError(
                             getattr(data, "status_code", None) or default_code, str(data)[:1024], hint)
+                    del item, data
             finally:
                 await events.aclose()
 
             if retry_now is None:
-                # A genuine refusal can finish without producing any Parts.
+                # A complete response may have only signed-empty Parts or be
+                # a refusal. Release the successful prefix in its original order.
                 for item in pending.drain():
                     yield item
                 return

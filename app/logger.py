@@ -2,6 +2,7 @@ import atexit
 import builtins
 import io
 from collections import deque
+from contextlib import contextmanager
 from contextvars import ContextVar
 import sys
 import time
@@ -15,8 +16,8 @@ original_print = builtins.print
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
 
-# Only the Chat SSE relay installs this on a body pull. It is inherited by
-# that pull's child tasks, never left installed across an async iterator yield.
+# Scoped to a Chat SSE pull or an internal buffered Chat producer. Child
+# tasks inherit it; no public ASGI send runs inside its scope.
 _stream_counts = ContextVar("stream_counts", default=None)
 
 
@@ -61,6 +62,16 @@ class StreamCounts:
         elif not self._counted and self.success is not None:
             self._counted = True
             self.success.add_success()
+
+
+@contextmanager
+def defer_producer_outcomes():
+    """Discard internal Chat outcomes when the outer protocol owns the tally."""
+    token = _stream_counts.set(StreamCounts())
+    try:
+        yield
+    finally:
+        _stream_counts.reset(token)
 
 
 class ProxyStats:

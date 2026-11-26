@@ -1,0 +1,184 @@
+"""Only a public Responses outcome should settle a request, not its Chat producer."""
+
+import asyncio
+from unittest.mock import patch
+
+import httpx
+from fastapi.responses import JSONResponse
+from starlette.requests import ClientDisconnect
+
+import channel_dispatch
+from logger import ProxyStats
+import main
+from routes import responses_api
+from test_replay_http_delivery import Peer
+from test_responses_api import PATH, event_list, request
+from test_schema_contract_fidelity import SchemaRouteHarness
+from upstreams import cookie_delivery, express_pipeline
+
+
+class ResponsesOutcomes(SchemaRouteHarness):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.counters = ProxyStats()
+        for mod in (main, channel_dispatch, responses_api, cookie_delivery, express_pipeline):
+            self.enterContext(patch.object(mod, "stats", self.counters))
+        self.usage_metadata = {"promptTokenCount": 7, "candidatesTokenCount": 5, "totalTokenCount": 12}
+
+    def assert_count_delta(self, before, *, success, error, tokens=None):
+        after = self.counters.get_json_stats()
+        if tokens is None:
+            tokens = (7, 5) if self.channel == "api_key" else (0, 0)
+        expected = {"total": 1, "success": success, "error": error,
+                    "prompt_tokens": tokens[0], "completion_tokens": tokens[1]}
+        self.assertEqual({key: after[key] - before[key] for key in expected}, expected)
+
+    async def post_at(self, body, phase):
+        if phase != "late":
+            with patch.object(responses_api, "SETUP_FAST_WINDOW_SECONDS", 2):
+                return await asyncio.wait_for(self.client.post(PATH, json=body), 5)
+
+        # Guarantee the status is committed before the real offline producer
+        # starts, independent of scheduler and mock transport speed.
+        producer = responses_api.call_upstream
+        ready = asyncio.Event()
+
+        async def wait_for_sse(*args):
+            await ready.wait()
+            return await producer(*args)
+
+        async def send(message):
+            if message.get("body", b"").startswith(b"event: response.in_progress"):
+                ready.set()
+
+        peer = Peer(PATH, payload=body)
+        with patch.object(responses_api, "SETUP_FAST_WINDOW_SECONDS", 0), patch.object(
+                responses_api, "call_upstream", wait_for_sse):
+            await asyncio.wait_for(peer.run(send), 5)
+        start, *frames = peer.messages
+        return httpx.Response(start["status"], headers=start["headers"],
+                              content=b"".join(frame.get("body", b"") for frame in frames))
+
+    async def test_projection_failure_and_completed_output_are_distinct_on_both_transports(self):
+        for self.channel in ("api_key", "web_proxy"):
+            for phase in ("json", "early", "late"):
+                for rejected in (False, True):
+                    with self.subTest(channel=self.channel, phase=phase, rejected=rejected):
+                        self.reply = {"text": "This is a genuine provider answer."}
+                        before = self.counters.get_json_stats()
+                        resp = await self.post_at(request(stream=phase != "json",
+                                                          tool_choice="required" if rejected else "auto"), phase)
+                        if rejected and phase != "late":
+                            self.assertEqual(resp.status_code, 502)
+                            self.assertIn("tool_choice", resp.json()["error"]["message"])
+                        else:
+                            self.assertEqual(resp.status_code, 200)
+                            public = (resp.json() if phase == "json"
+                                      else event_list(resp.text)[-1]["response"])
+                            self.assertEqual(public["status"], "failed" if rejected else "completed")
+                            if not rejected:
+                                self.assertEqual(public["usage"]["total_tokens"], 12)
+                        self.assert_count_delta(before, success=int(not rejected), error=int(rejected))
+
+    async def test_deliverable_incomplete_keeps_one_outcome(self):
+        for self.channel in ("api_key", "web_proxy"):
+            for stream in (False, True):
+                with self.subTest(channel=self.channel, stream=stream):
+                    self.reply = {"text": "An unfinished answer."}
+                    self.finish_reason = "MAX_TOKENS"
+                    before = self.counters.get_json_stats()
+                    response = await self.client.post(PATH, json=request(stream=stream))
+                    self.assertEqual(response.status_code, 200)
+                    public = event_list(response.text)[-1]["response"] if stream else response.json()
+                    self.assertEqual(public["status"], "incomplete")
+                    self.assertEqual(public["incomplete_details"], {"reason": "max_output_tokens"})
+                    self.assert_count_delta(before, success=1, error=0)
+
+    async def test_failed_terminal_render_is_counted_only_by_middleware(self):
+        event = responses_api.ResponsesEvents.event
+
+        def render(writer, kind, **payload):
+            if kind == "response.failed":
+                raise ValueError("fixture failed terminal rendering")
+            yield from event(writer, kind, **payload)
+
+        before = self.counters.get_json_stats()
+        with patch.object(responses_api.ResponsesEvents, "event", render):
+            with self.assertRaisesRegex(ValueError, "fixture failed terminal rendering"):
+                await self.post_at(request(stream=True, tool_choice="required"), "late")
+        self.assert_count_delta(before, success=0, error=1)
+
+    async def test_losing_primary_proposal_is_not_charged_after_standby_succeeds(self):
+        self.channel = "web_proxy"
+        self.settings["cross_channel_fallback"] = True
+
+        async def primary_failure(*args, **kwargs):
+            self.counters.add_error()
+            return JSONResponse({"error": {"message": "Unavailable"}}, status_code=503)
+
+        with patch.object(channel_dispatch.cookie_upstream, "chat_completions", primary_failure):
+            for phase in ("json", "early", "late"):
+                with self.subTest(phase=phase):
+                    before = self.counters.get_json_stats()
+                    self.sent.clear()
+                    self.reply = {"text": "From Express."}
+                    response = await self.post_at(request(stream=phase != "json"), phase)
+                    self.assertEqual(response.status_code, 200)
+                    public = response.json() if phase == "json" else event_list(response.text)[-1]["response"]
+                    self.assertEqual(public["status"], "completed")
+                    self.assertEqual(public["output"][0]["content"][0]["text"], "From Express.")
+                    self.assertEqual(len(self.sent), 1)
+                    self.assertNotIn("variables", self.sent[0])
+                    self.assert_count_delta(before, success=1, error=0, tokens=(7, 5))
+
+    async def test_internal_cookie_diagnostic_is_not_a_model_success(self):
+        self.channel = "web_proxy"
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                # Keep the legacy presentation for this narrow accounting
+                # change. Distinguish its provenance, not its text spelling.
+                self.reply = []
+                before = self.counters.get_json_stats()
+                response = await self.client.post(PATH, json=request(stream=stream))
+                self.assertEqual(response.status_code, 200)
+                public = event_list(response.text)[-1]["response"] if stream else response.json()
+                diagnostic = public["output"][0]["content"][0]["text"]
+                self.assertIn("[Studio 提示]", diagnostic)
+                self.assert_count_delta(before, success=0, error=1)
+
+                self.reply = {"text": diagnostic}
+                before = self.counters.get_json_stats()
+                response = await self.client.post(PATH, json=request(stream=stream))
+                self.assertEqual(response.status_code, 200)
+                public = event_list(response.text)[-1]["response"] if stream else response.json()
+                self.assertEqual(public["output"][0]["content"][0]["text"], diagnostic)
+                self.assert_count_delta(before, success=1, error=0)
+
+    async def test_success_waits_for_final_send_even_when_provider_usage_is_already_known(self):
+        for self.channel in ("api_key", "web_proxy"):
+            for stream in (False, True):
+                for loss in (None, "silent", "raised"):
+                    with self.subTest(channel=self.channel, stream=stream, loss=loss):
+                        self.reply = {"text": "Provider finished."}
+                        peer = Peer(PATH, payload=request(stream=stream))
+                        before = self.counters.get_json_stats()
+                        final_seen = False
+
+                        async def send(message):
+                            nonlocal final_seen
+                            if message["type"] != "http.response.body" or message.get("more_body", False):
+                                return
+                            final_seen = True
+                            self.assert_count_delta(before, success=0, error=0)
+                            if loss == "silent":
+                                await peer.drop()
+                            elif loss == "raised":
+                                raise OSError("fixture final send failed")
+
+                        if loss == "raised":
+                            with self.assertRaises(ClientDisconnect if stream else OSError):
+                                await asyncio.wait_for(peer.run(send), 5)
+                        else:
+                            await asyncio.wait_for(peer.run(send), 5)
+                        self.assertTrue(final_seen)
+                        self.assert_count_delta(before, success=int(loss is None), error=0)

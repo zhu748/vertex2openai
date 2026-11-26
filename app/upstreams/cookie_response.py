@@ -1,5 +1,6 @@
 """Cookie batchGraphql 响应解析、签名还原、诊断与 OpenAI 帧格式。"""
 
+import base64
 import hashlib
 import json
 import re
@@ -10,6 +11,7 @@ import httpx
 from image_delivery import has_inline_image
 from models import file_data_markdown
 from message_processing import iter_giant_content
+from protojson import standard_base64
 
 from response_validation import (IncompleteResponseError, StreamToolCallIds, complete_function_arguments,
                                  has_finish_reason, validate_generation_finish_reason)
@@ -19,11 +21,25 @@ from upstreams.cookie_candidate_metadata import native_candidate_metadata, nativ
 from upstreams.cookie_native_parts import extend_native_metadata, extend_native_payload
 from thought_signatures import (
     attach_signature_extra,
-    decode_thought_signature as signature_bytes_from_wire,
     encode_thought_signature,
     is_thought_part,
     ordinary_part_metadata,
 )
+
+
+def _provider_signature_base64(value: object) -> str | None:
+    """A declared Studio Bytes field has no legacy client-literal fallback."""
+    if value is None:
+        return None
+    canonical = standard_base64(value)
+    if canonical is None:
+        raise IncompleteResponseError("上游 thoughtSignature 不是有效的 ProtoJSON Base64 字符串。")
+    return canonical
+
+
+def _provider_signature_bytes(value: object) -> bytes | None:
+    canonical = _provider_signature_base64(value)
+    return base64.b64decode(canonical) if canonical else None
 
 
 def _current_created() -> int:
@@ -48,7 +64,7 @@ def apply_wire_signature(data: dict, ordinary_metadata: list, part_order: list) 
     伴随文本或媒体的签名才挂到相应块上。返回原始签名字节，
     空签名返回 None 且不做任何修改。
     """
-    signature = signature_bytes_from_wire(data.get("value"))
+    signature = _provider_signature_bytes(data.get("value"))
     if not signature:
         return None
     if data.get("part_kind") == "signature_only" or data.get("empty_part"):
@@ -66,7 +82,7 @@ def apply_wire_signature(data: dict, ordinary_metadata: list, part_order: list) 
 def openai_tool_call(response_id: str, call_index: int, call: dict, *, include_arguments: bool = True) -> dict:
     name, args = call["name"], call.get("args") or {}
     call_id = call.get("id") or _stable_cookie_tool_call_id(response_id, call_index, name, args)
-    signature = signature_bytes_from_wire(call.get("thought_signature"))
+    signature = _provider_signature_bytes(call.get("thought_signature"))
     # QUA-P2-2：三态拓扑写入收敛到 register_call_signature 单一入口。
     signature_store.register_call_signature(
         call_id, signature, unsigned_follower=call_index > 0)
@@ -318,10 +334,8 @@ class CookieCandidateBoundary:
             self.finish = finish
 
 
-def _finish_native_part(native_part: dict, signature: Any, *, empty_text: bool, thought: bool) -> None:
+def _finish_native_part(native_part: dict, signature: str | None, *, empty_text: bool, thought: bool) -> None:
     if signature:
-        if not isinstance(signature, str):
-            raise IncompleteResponseError("上游 thoughtSignature 必须是字符串。")
         # Signed standalone empty text is data, unlike proto defaults on
         # functionCall/media Parts. Never invent it for an absent text field.
         if not native_part and empty_text:
@@ -399,6 +413,10 @@ def extract_events(obj: dict, *, preserve_parts: bool = False, strip_thoughts: b
                 text = part.get("text", "")
                 if text is not None and not isinstance(text, str):
                     raise IncompleteResponseError("上游 part.text 必须是字符串。")
+                # Check before exposing this Part's visible data or recording
+                # any call. Native delivery keeps the original valid spelling.
+                signature = part.get("thoughtSignature")
+                _provider_signature_base64(signature)
                 native_part = {}
                 ordinary_kind = "signature_only"  # changed only by an ordinary event emitted for this Part
                 thought = is_thought_part(part)
@@ -416,7 +434,7 @@ def extract_events(obj: dict, *, preserve_parts: bool = False, strip_thoughts: b
                     native_part["functionCall"] = function_call
                     if not preserve_parts:
                         yield "function_call", {
-                            **function_call, "thought_signature": part.get("thoughtSignature") or None,
+                            **function_call, "thought_signature": signature or None,
                         }
                 inline_data = _wire_object(part.get("inlineData"), "inlineData")
                 if inline_data:
@@ -451,7 +469,6 @@ def extract_events(obj: dict, *, preserve_parts: bool = False, strip_thoughts: b
                     # its payload. If signed, the next event owns an opaque slot.
                     yield "hidden_thought", True
 
-                signature = part.get("thoughtSignature")
                 if signature and function_call is None and not preserve_parts:
                     # A genuine empty thought has no public delta, but its signed
                     # Part still has the thought bit and owns its own position.

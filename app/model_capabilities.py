@@ -24,6 +24,7 @@
 import re
 from typing import Any, Dict, Optional
 
+from model_resource import model_id_for_policy
 from models import normalize_content_part
 
 # 所有“采样类”参数键（用于按模型剥离）
@@ -189,7 +190,7 @@ def split_model_alias(model: str) -> tuple[str, str | None]:
 
 def supports_transport(model: str) -> bool:
     """该模型是否走文本传输（抗截断参数流只对纯文本生成模型有意义）。"""
-    name, _ = split_model_alias(model)
+    name, _ = split_model_alias(model_id_for_policy(model))
     return (not get_profile(name)["is_image"]
             and not re.search(r"audio|tts|live|embed|video|robotics", name, re.I))
 
@@ -237,7 +238,7 @@ def get_profile(model_name: str) -> Dict[str, Any]:
     满了整体清空重算，成本仅是单次档案计算。dict 读写依赖 GIL 原子性，
     最坏竞态也只是重复计算一次，无需加锁。
     """
-    raw = (model_name or "").lower()
+    raw = model_id_for_policy(model_name).lower()
     cached = _profile_cache.get(raw)
     if cached is not None:
         return cached

@@ -51,6 +51,17 @@ function setV(id, v) {
   if (!el) return;
   window.consoleForms?.clearError(el);
   el.removeAttribute('aria-invalid');
+  if (id === 'express_location') {
+    // The settings API accepts locations outside this list of presets.
+    // Preserve the actual saved value rather than displaying the empty route.
+    for (const option of el.querySelectorAll('[data-custom-location]'))
+      if (option.value !== v) option.remove();
+    if (typeof v === 'string' && v && ![...el.options].some((option) => option.value === v)) {
+      const option = new Option(v + '（非预设区域）', v);
+      option.dataset.customLocation = '';
+      el.add(option);
+    }
+  }
   if (id === 'image_aspect_ratio' && v && ![...el.options].some((option) => option.value === v)) {
     const option = document.createElement('option');
     option.value = v;
@@ -389,7 +400,13 @@ function changedSettings(values) {
   );
 }
 async function postFormSettings(values, onSaved, draftGroup) {
-  const patch = changedSettings(values);
+  const forms = window.consoleForms;
+  const edited = draftGroup === 'runtime' ? forms?.editedSettings?.(draftGroup) : null;
+  // The rendered baseline can differ from the wire value (e.g. URL input
+  // sanitization). Never submit such a difference as an unrelated edit.
+  const patch = changedSettings(
+    edited ? Object.fromEntries(Object.entries(values).filter(([key]) => edited.has(key))) : values
+  );
   const keys = Object.keys(patch);
   if (!keys.length) {
     toast('没有需要保存的修改');
@@ -397,7 +414,6 @@ async function postFormSettings(values, onSaved, draftGroup) {
   }
   const before = settingsExpectation(GLOBAL_SETTINGS, keys);
   const body = { ...patch, _expected: before };
-  const forms = window.consoleForms;
   if (forms?.guardSettings) body._expected = forms.guardSettings(body._expected);
   const write = draftGroup && forms?.beginSettingsWrite(draftGroup, keys);
   if (draftGroup && forms && !write) return false;
