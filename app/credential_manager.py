@@ -13,6 +13,8 @@ import random
 import threading
 import time
 
+from channel_capabilities import CookieModelScopeError, cookie_scope_matches
+from model_resource import GoogleModelResource
 from runtime_state import app_state
 
 _random = random.SystemRandom()
@@ -22,6 +24,7 @@ _random = random.SystemRandom()
 COOKIE_AUTH_FAILURE_THRESHOLD = 3
 COOKIE_COOLDOWN_SECONDS = 600
 MAX_COOKIE_HEALTH_ENTRIES = 10_000
+MAX_ROTATION_POOLS = 256
 
 
 class CookiePoolCoolingDown(Exception):
@@ -44,6 +47,12 @@ class CredentialManager:
             return None
         if app_state.get_setting("roundrobin", False):
             with self._lock:
+                if isinstance(pool, tuple) and pool not in self._indices and len(self._indices) >= MAX_ROTATION_POOLS:
+                    # Scoped pools correspond to configured projects, not to arbitrary
+                    # model names. Bound old entries across credential reconfiguration.
+                    oldest = next((key for key in self._indices if isinstance(key, tuple)), None)
+                    if oldest is not None:
+                        self._indices.pop(oldest)
                 index = self._indices.get(pool, 0) % len(records)
                 self._indices[pool] = index + 1
         else:
@@ -147,19 +156,23 @@ class CredentialManager:
                 for account_id, entry in self._cookie_health.items() if account_id in visible
             }
 
-    def has_cookie_record(self, *, require_project: bool = False) -> bool:
+    def has_cookie_record(self, *, require_project: bool = False, scope: GoogleModelResource | None = None) -> bool:
         """Can Cookie dispatch select a row, without reserving a round-robin/random turn?
 
         get_cookie_record prefers a complete, healthy row, but its existing
         all-incomplete and all-cooling fallbacks both keep the enabled pool.
         By default include incomplete rows so dispatch can issue its diagnostic.
         Callers advertising model capabilities can require a populated Project ID.
+        An explicit standby target must match an enabled account's own project.
         Neither view ranks rows or updates selector state.
         """
+        if scope is not None and scope.location != "global":
+            return False
         return any(record["enabled"] and (not require_project or record["project_id"])
+                   and (scope is None or cookie_scope_matches(scope, record["project_id"]))
                    for record in app_state.get_cookie_accounts(committed=True))
 
-    def get_cookie_record(self):
+    def get_cookie_record(self, *, scope: GoogleModelResource | None = None, legacy_project: str = ""):
         # 优先选 project_id 完整的账号：凭证接口允许保存空 project_id 的启用账号
         # （与 get_mixed_record 的 `r["project_id"]` 过滤口径一致）。旧实现不过滤，
         # 多账号池里选中缺 project 的账号会在 cookie 通道给出 400，其余账号正常，
@@ -172,21 +185,32 @@ class CredentialManager:
             records = [dict(r, channel="cookie") for r in self._health_accounts_locked() if r["enabled"]]
             complete = [r for r in records if r["project_id"]]
             pool = complete or records
+            if scope is not None:
+                # Only the native bridge supplies its existing legacy project for an
+                # all-incomplete pool. Never retarget an account with its own project.
+                pool = [r for r in pool if cookie_scope_matches(scope, r["project_id"] or legacy_project)]
+                if records and not pool:
+                    raise CookieModelScopeError()
             healthy = [r for r in pool
                        if not self._cookie_health.get(r["id"])
                        or self._cookie_health[r["id"]].get("cooldown_until", 0.0) <= now]
-        return self._select(healthy or pool, "cookie")
+        return self._select(healthy or pool, "cookie" if scope is None else ("cookie", scope.project_id))
 
-    def get_mixed_record(self, key_manager, *, express_only=False):
+    def get_mixed_record(self, key_manager, *, express_only=False, scope: GoogleModelResource | None = None):
         """Select an eligible credential; distinguish missing routes from a temporary cooldown."""
         records = [dict(r, channel="express") for r in key_manager.get_records()]
-        if express_only:
+        if express_only or (records and scope is not None and scope.location != "global"):
             return self._select(records, "mixed-express")
+        express_count = len(records)
+        has_incompatible_cookie = False
         with self._lock:
             now = time.time()
             next_ready = None
             for record in self._health_accounts_locked():
                 if not record["enabled"] or not record["project_id"]:
+                    continue
+                if scope is not None and not cookie_scope_matches(scope, record["project_id"]):
+                    has_incompatible_cookie = True
                     continue
                 until = self._cookie_health.get(record["id"], {}).get("cooldown_until", 0.0)
                 if until <= now:
@@ -197,7 +221,13 @@ class CredentialManager:
                 # Do not start another upstream attempt or send a false API-key
                 # error. The earliest eligible account can rejoin after this wait.
                 raise CookiePoolCoolingDown(next_ready - now)
-        return self._select(records, "mixed")
+            if not records and has_incompatible_cookie:
+                raise CookieModelScopeError()
+        if scope is not None:
+            pool = ("mixed", scope.project_id) if len(records) > express_count else "mixed-express"
+        else:
+            pool = "mixed"
+        return self._select(records, pool)
 
 
 credential_manager = CredentialManager()

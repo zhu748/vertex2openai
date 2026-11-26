@@ -200,7 +200,7 @@ class TestMixedModeRouting(unittest.TestCase):
 
         captured = {}
 
-        def fake_get_mixed_record(key_manager, express_only=None):
+        def fake_get_mixed_record(key_manager, *, express_only=None, scope=None):
             captured["express_only"] = express_only
             return None  # 无可用记录 -> 401，足以断言路由参数
 

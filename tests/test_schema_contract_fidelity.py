@@ -45,12 +45,24 @@ class SchemaRouteHarness(Round15Harness):
         self.reply = {"text": "ok"}
         self.usage_metadata = None
         self.finish_reason = "STOP"
+        self.safety_ratings = None
+        self.prompt_feedback = None
+        self.status_by_provider = {}
         def wire_response(request):
             body = json.loads(request.content)
             self.sent.append(body)
+            provider = "web_proxy" if "variables" in body else "api_key"
+            if status := self.status_by_provider.get(provider):
+                return httpx.Response(status, json={"error": {"code": status, "message": "offline failure"}})
             parts = self.reply if isinstance(self.reply, list) else [self.reply]
-            candidate = {"candidates": [{"content": {"role": "model", "parts": parts},
-                                         "finishReason": self.finish_reason}]}
+            item = {"content": {"role": "model", "parts": parts}}
+            if self.finish_reason is not None:
+                item["finishReason"] = self.finish_reason
+            if self.safety_ratings is not None:
+                item["safetyRatings"] = self.safety_ratings
+            candidate = {"candidates": [item]}
+            if self.prompt_feedback is not None:
+                candidate["promptFeedback"] = self.prompt_feedback
             if self.usage_metadata is not None:
                 candidate["usageMetadata"] = self.usage_metadata
             if "variables" in body:

@@ -86,12 +86,13 @@ def completed_response_needs_media_pool(response: Any) -> bool:
     return False
 
 
-def is_gemini_response_valid(response: Any) -> bool:
+def is_gemini_response_valid(response: Any, *, allow_empty_length: bool = False) -> bool:
     if response is None:
         return False
     for cand in getattr(response, "candidates", None) or ():
-        # An explicitly filtered candidate can legitimately have no content.
-        if map_finish_reason_to_openai(getattr(cand, "finish_reason", None), default=None) == "content_filter":
+        # Responses can carry an explicit token limit even with no content.
+        finish = map_finish_reason_to_openai(getattr(cand, "finish_reason", None), default=None)
+        if finish == "content_filter" or (allow_empty_length and finish == "length"):
             return True
         for part in getattr(getattr(cand, "content", None), "parts", None) or ():
             if (_nonblank(getattr(part, "text", None))

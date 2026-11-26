@@ -227,14 +227,24 @@ class SignatureStore:
         self._evict(now)
 
     def register_origin_batch(self, keys, signatures, destination) -> None:
+        self.register_origin_batches(((keys, signatures, destination),))
+
+    def register_origin_batches(self, batches) -> None:
         # Do not key by destination: identical visible batches produced in
         # different projects are indistinguishable to a metadata-thin caller.
+        # Publish all candidates together: a reader must not briefly see a
+        # positive record before another choice makes that same key ambiguous.
         with self._lock:
             now = time.monotonic()
-            for i, (key, sig) in enumerate(zip(keys, signatures, strict=True)):
-                state = (SignatureState.SIGNED if sig else SignatureState.UNSIGNED_FOLLOWER
-                         if i else SignatureState.UNKNOWN)
-                self._put_record(key, SignatureRecord(state, sig, destination), now)
+            for keys, signatures, destination in batches:
+                if signatures is None:
+                    for key in keys:
+                        self._put_record(key, SignatureRecord(SignatureState.AMBIGUOUS), now)
+                    continue
+                for i, (key, sig) in enumerate(zip(keys, signatures, strict=True)):
+                    state = (SignatureState.SIGNED if sig else SignatureState.UNSIGNED_FOLLOWER
+                             if i else SignatureState.UNKNOWN)
+                    self._put_record(key, SignatureRecord(state, sig, destination), now)
 
     def register_call_signature(self, call_id: CacheKey, signature: Optional[bytes],
                                 *, unsigned_follower: bool = False,

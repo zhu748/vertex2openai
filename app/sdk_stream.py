@@ -1,16 +1,17 @@
-"""Join HTTPX stream closure when an SDK iterator is stopped between reads."""
+"""Keep ownership of physical HTTPX responses through SDK reads and closure."""
 
 import asyncio
 from contextvars import ContextVar
 from typing import Any, AsyncIterable, Awaitable, Callable, Self
 
+import anyio
 import httpx
 
 from http_io import close_httpx_response, own_httpx_response
 from stream_cleanup import await_owned_close
 
 
-_active_responses = ContextVar("sdk_stream_responses", default=None)
+_active_responses = ContextVar("sdk_responses", default=None)
 
 
 class _Responses:
@@ -38,11 +39,49 @@ class _Responses:
                 if isinstance(result, BaseException):
                     raise result
 
+    async def join_live(self) -> None:
+        # Healthy whole calls have already completed HTTPX's implicit close.
+        # Only a still-owned transport needs a separate close waiter.
+        if any(not done.is_set() for done in self.live.values()):
+            await await_owned_close(self.aclose())
 
-async def capture_sdk_stream_response(response: httpx.Response) -> None:
-    """HTTPX response event hook, scoped to one active SDK stream attempt."""
+
+async def capture_sdk_response(response: httpx.Response) -> None:
+    """HTTPX response event hook, scoped to one active SDK attempt."""
     if (owner := _active_responses.get()) is not None:
         owner.add(response)
+
+
+async def read_sdk_response(generate: Callable[..., Awaitable[Any]], **kwargs: Any) -> Any:
+    """Own a whole SDK response before HTTPX implicitly reads and closes it."""
+    responses = _Responses()
+    task = asyncio.current_task()
+    cancellations = task.cancelling()
+    token = _active_responses.set(responses)
+
+    async def check_cancelled() -> None:
+        # A failed read's cleanup may replace CancelledError with a transport
+        # error. Do not let the SDK proxy facade retry the cancelled request.
+        await anyio.lowlevel.checkpoint_if_cancelled()
+        if task.cancelling() > cancellations:
+            raise asyncio.CancelledError()
+
+    try:
+        try:
+            result = await generate(**kwargs)
+            await responses.join_live()
+        except BaseException as error:
+            try:
+                await responses.join_live()
+            except Exception as close_error:
+                error.add_note(f"SDK response cleanup also failed ({type(close_error).__name__}).")
+            if isinstance(error, Exception):
+                await check_cancelled()
+            raise
+        await check_cancelled()
+        return result
+    finally:
+        _active_responses.reset(token)
 
 
 class _SDKStream:

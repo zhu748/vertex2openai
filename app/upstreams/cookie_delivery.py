@@ -1186,7 +1186,7 @@ def _apply_whole_body_event(gen: "CookieGeneration", st: _WholeBodyState, event_
             st.message_extra = thought_signature_extra(sig, data.get("part_kind"))
     elif event_type == "finish":
         st.finish_raw = data
-    elif event_type == "safety":
+    elif event_type == "safety" and gen.request_obj._completion_target != "responses":
         st.safety_html = safety_ratings_presentation(data, structured_output=wants_json_output(gen.request_obj))
     elif event_type == "blocked":
         st.blocked_msg = data
@@ -1255,28 +1255,46 @@ def _assemble_whole_response(gen: "CookieGeneration", st: _WholeBodyState) -> "R
     工具/签名拓扑）+ usage；无正文：明确诊断而非静默空回复（收到过思考
     仍清零账号失败计数，与流式路径同口径）。
     """
+    typed_output = gen.request_obj._completion_target == "responses"
+    prompt_blocked = typed_output and bool(st.blocked_msg)
+    if prompt_blocked:
+        # Prompt-level blocking is an authoritative outcome, not assistant
+        # prose. Don't attach even signed items from a contradictory record.
+        st = _WholeBodyState(usage_meta=st.usage_meta, got_thought=st.got_thought)
     got_text = bool(st.full_text.strip())
     got_output = got_text or bool(st.tool_calls)
     elapsed = time.time() - gen.start_time
 
-    if got_output:
-        require_finish_reason(st.finish_raw)
-        finish_reason = map_finish_reason_to_openai(st.finish_raw, has_tool_calls=bool(st.tool_calls))
+    if typed_output and not got_output and st.got_thought:
+        # Credential health is distinct from whether the reply is deliverable.
+        credential_manager.record_cookie_success(gen.account_id, credential=gen.record)
+
+    if got_output or typed_output:
+        if prompt_blocked:
+            finish_reason = "content_filter"
+        else:
+            require_finish_reason(st.finish_raw)
+            finish_reason = map_finish_reason_to_openai(st.finish_raw, has_tool_calls=bool(st.tool_calls))
+        if typed_output and not got_output:
+            has_reasoning = not gen.strip_thoughts and bool(st.reasoning_text.strip())
+            if finish_reason == "tool_calls" or finish_reason == "stop" and not has_reasoning:
+                raise IncompleteResponseError("上游未返回可交付的正文、思考或工具调用。")
         if st.tool_calls:
             if finish_reason in ("stop", "tool_calls"):
                 require_unique_tool_call_ids(call.get("id") for call in st.tool_calls)
             for i, call in enumerate(st.tool_calls):
                 st.tool_calls[i] = openai_tool_call(gen.response_id, i, call)
-        credential_manager.record_cookie_success(gen.account_id, credential=gen.record)
-        # 预填充智能兼容：去重后把预填充文本拼回输出开头
-        if gen.prefill_text and got_text:
-            st.full_text = gen.prefill_text + strip_prefill_overlap(
-                gen.prefill_text, st.full_text
+        if got_output:
+            credential_manager.record_cookie_success(gen.account_id, credential=gen.record)
+            # 预填充智能兼容：去重后把预填充文本拼回输出开头
+            if gen.prefill_text and got_text:
+                st.full_text = gen.prefill_text + strip_prefill_overlap(
+                    gen.prefill_text, st.full_text
+                )
+            stats.add_success()
+            print(
+                f"✅ [Studio] {gen.base_model_name} | {len(st.full_text)} 字符 | {elapsed:.1f}s"
             )
-        stats.add_success()
-        print(
-            f"✅ [Studio] {gen.base_model_name} | {len(st.full_text)} 字符 | {elapsed:.1f}s"
-        )
     else:
         # 无正文（只有思考 / 完全空）：返回明确诊断而不是一个空格
         desc, detail, notice, finish_reason = _no_body_outcome(
@@ -1337,13 +1355,8 @@ def _assemble_whole_response(gen: "CookieGeneration", st: _WholeBodyState) -> "R
     }
     response_class = LargeJSONResponse if gen.is_image else JSONResponse
     response = response_class(content=payload)
-    if not got_output:
-        # This body's fallback prose belongs to the gateway, not the model.
-        # Consumers of the accepted object can preserve its failure accounting
-        # without classifying model text by a prefix or leaking a wire flag.
-        response._chat_diagnostic_fallback = True
     if not gen.request_obj.stream:
-        note_accepted_destination(gen.request_obj, gen.signature_destination)
+        note_accepted_destination(gen.request_obj, gen.signature_destination, response=response)
         publish_completed_origins(gen.request_obj._signature_output_prefix, payload["choices"],
                                   stage_origin=gen.request_obj._stage_signature_origin,
                                   destination=gen.signature_destination)

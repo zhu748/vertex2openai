@@ -42,4 +42,4 @@ class NativeKnownRefusalWire(SchemaRouteHarness):
                                                                    "generationConfig": {"candidateCount": count}})
                     self.assertEqual(r.status_code, expected, r.text[:200])
                     if expected == 200:
-                        self.assertEqual(r.content.removeprefix(b": keep-alive\n\n") if sse else r.content, head + tail)
+                        self.assertEqual(r.content, (b"\n\n" if sse else b"") + head + tail)

@@ -60,7 +60,7 @@ class StreamDeadlineTests(unittest.IsolatedAsyncioTestCase):
             if message["type"] == "http.response.body":
                 chunk = message.get("body", b"")
                 frames.append(chunk)
-                if chunk.startswith(b":"):
+                if chunk == b"\n\n":
                     release_setup.set()
 
         path = "/v1beta/models/gemini-2.5-flash:streamGenerateContent"

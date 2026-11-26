@@ -22,7 +22,7 @@ from schema_validation import SchemaValidationError
 from signature_destination import publisher_destination, studio_model_resource
 from upstream_errors import create_openai_error_response
 from upstreams.base import BaseUpstream
-from channel_capabilities import cookie_feature_error, cookie_model_id
+from channel_capabilities import CookieModelScopeError, cookie_feature_error, cookie_model_id, cookie_model_scope
 from credential_manager import credential_manager
 from proxy_failover import ProxyChain
 from request_validation import validate_openai_request
@@ -147,8 +147,17 @@ def _prepare_cookie_generation(
         )
 
     # ===== 1. 验证认证 =====
-    record = credential_record or credential_manager.get_cookie_record()
-    cookie_str = record["cookie"] if record else _get_cookie_string()
+    scope = cookie_model_scope(request_obj.model)
+    try:
+        record = credential_record or credential_manager.get_cookie_record(scope=scope)
+    except CookieModelScopeError as exc:
+        return JSONResponse(status_code=400, content=create_openai_error_response(
+            400, str(exc), "invalid_request_error"))
+    # For a full resource, do not resurrect a different row through a separate
+    # legacy read if the credential snapshot has no enabled account.
+    cookie_str = record["cookie"] if record else ""
+    if record is None and scope is None:
+        cookie_str = _get_cookie_string()
     if not cookie_str:
         return JSONResponse(
             status_code=401,

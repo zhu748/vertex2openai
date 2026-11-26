@@ -40,6 +40,7 @@ class ClientConnection:
         self.disconnected_at = None
         self.disconnected_monotonic = None
         self.disconnect_during_final_send = False
+        self.final_body_sent = False
         self.event = asyncio.Event()
         self.listeners = []
 
@@ -166,6 +167,7 @@ class ConnectionReceiver:
         try:
             await send(message)
             if final:
+                self.connection.final_body_sent = True
                 self.completed = True
         except BaseException:
             self.disconnect()

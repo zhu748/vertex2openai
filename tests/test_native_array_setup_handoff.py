@@ -240,7 +240,7 @@ class ArrayHandoffTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(dict(start["headers"])[b"retry-after"], b"3")
         self.assertEqual(success.call_count, int(not disconnect))
         bodies = [m["body"] for m in self.sent if m["type"] == "http.response.body"]
-        self.assertEqual(b"".join(b for b in bodies if not b.startswith(b":")),
+        self.assertEqual(b"".join(b for b in bodies if b != b"\n\n"),
                          head if disconnect else head + tail)
         self.assertEqual(any(not m.get("more_body") for m in self.sent
                              if m["type"] == "http.response.body"), not disconnect)

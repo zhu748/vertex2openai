@@ -148,6 +148,9 @@ async def close_setup_task(setup: asyncio.Task, *, join: bool = False) -> None:
 HEARTBEAT = object()
 HEARTBEAT_INTERVAL = 10.0
 HEARTBEAT_FRAME = ": keep-alive\n\n"
+# Blank lines send bytes but do not dispatch an SSE event. The pinned Python
+# Gemini SDK mistakes nonempty synthetic comments for raw JSON.
+GEMINI_HEARTBEAT_FRAME = "\n\n"
 # SSE 端点统一关闭反代缓冲的响应头（2026-11 审查收敛：此前 8 处调用点
 # 逐字重复同一 dict，改一处漏一处）。
 SSE_NO_BUFFER_HEADERS = {"Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no"}
@@ -361,15 +364,16 @@ async def with_heartbeats(source: AsyncIterable, request: Optional[Any]=None, in
 
 
 async def keepalive_sse(source: AsyncIterable, request: Optional[Any] = None,
-                        interval: Optional[float] = None) -> AsyncIterator:
+                        interval: Optional[float] = None, *,
+                        heartbeat_frame: str = HEARTBEAT_FRAME) -> AsyncIterator:
     events = with_heartbeats(source, request, interval)
     started = False
     try:
-        yield HEARTBEAT_FRAME
+        yield heartbeat_frame
         started = True
         async for item in events:
             try:
-                yield HEARTBEAT_FRAME if item is HEARTBEAT else item
+                yield heartbeat_frame if item is HEARTBEAT else item
             finally:
                 del item  # the upstream read or disconnect check may now stall
     finally:
@@ -381,9 +385,16 @@ async def keepalive_sse(source: AsyncIterable, request: Optional[Any] = None,
                     await close()
 
 
+def _sse_json_error(payload: bytes) -> bytes:
+    # Pretty-printed upstream JSON is still one SSE event. Add only framing;
+    # do not parse and reserialize an error that already has a Google body.
+    return b"data: " + re.sub(rb"\r\n?|\n", rb"\g<0>data: ", payload) + b"\n\n"
+
+
 async def prepare_sse(operation: Callable, request: Optional[Any],
-                      error_body: Optional[Callable], on_error: Optional[Callable]) -> StreamingResponse:
-    """Keep preparation and first-reply retries alive without losing fast HTTP errors.
+                      error_body: Optional[Callable], on_error: Optional[Callable], *,
+                      error_first: bool = False) -> StreamingResponse:
+    """Keep native Gemini preparation and first-reply retries alive.
 
     快窗口（_FAST_ERROR_WINDOW，250ms）：上游立即拒绝（DNS 失败/401/429 等
     通常 <250ms）能以真实 HTTP 状态码 + Retry-After 头返回。超窗后只能
@@ -418,22 +429,24 @@ async def prepare_sse(operation: Callable, request: Optional[Any],
                     yield frame
             else:
                 on_error()
-                # 状态头已按 200 提交：把真实状态码与 Retry-After 以 SSE 注释行
-                # 透出（协议合法，data 解析器会忽略注释，排障与旁路可读）。
+                # Retain existing status/Retry-After comments for raw REST.
+                # The affected SDK stops on the actual Google APIError, so
+                # let it see that dispatch before reading the advisory.
                 status = getattr(response, "status_code", 0) or 0
                 headers = getattr(response, "headers", None) or {}
                 retry_after = bounded_sse_advisory(headers.get("retry-after"))
-                if status:
-                    yield f": upstream-status {status}\n".encode("ascii")
+                advisory = (f": upstream-status {status}\n" if status else "")
                 if retry_after:
-                    yield f": retry-after {retry_after}\n".encode("ascii")
-                yield b"data: " + error_body(response) + b"\n\n"
+                    advisory += f": retry-after {retry_after}\n"
+                comments = advisory.encode("ascii")
+                frame = _sse_json_error(error_body(response))
+                yield frame + comments + b"\n" if error_first and comments else comments + frame
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             on_error()
-            yield b"data: " + error_body(exc) + b"\n\n"
+            yield _sse_json_error(error_body(exc))
 
-    return ManagedStreamingResponse(keepalive_sse(frames(), request), media_type="text/event-stream",
-                                    headers=SSE_NO_BUFFER_HEADERS,
-                                    cleanup=cleanup)
+    return ManagedStreamingResponse(
+        keepalive_sse(frames(), request, heartbeat_frame=GEMINI_HEARTBEAT_FRAME),
+        media_type="text/event-stream", headers=SSE_NO_BUFFER_HEADERS, cleanup=cleanup)

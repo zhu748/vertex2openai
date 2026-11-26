@@ -51,6 +51,7 @@ from starlette.requests import ClientDisconnect
 from admission import GenerationCapacityError, ManagedStreamingResponse
 from auth import constant_time_equal, extract_candidate_key
 from config import API_KEY
+from express_fingerprint import sdk_label
 from logger import stats
 from model_loader import get_express_models
 from retry_policy import note_retry_deadline
@@ -168,6 +169,14 @@ def _direct_sender(request: Request, response):
     if isinstance(response, ManagedStreamingResponse):
         response.client_connection = ClientConnection.for_request(request)
     return response
+
+
+def _python_sdk_error_first(request: Request) -> bool:
+    # The pinned google-genai sends this token in both headers. Only the
+    # presentation of synthetic slow-setup diagnostics is negotiated here.
+    label = sdk_label()
+    return any(label in request.headers.get(name, "").split()
+               for name in ("x-goog-api-client", "user-agent"))
 
 
 def _passthrough_endpoint():
@@ -345,7 +354,9 @@ def _passthrough_endpoint():
                 code = result.status_code if result.status_code >= 400 else 502
                 return _native_error(code, f"上游返回非 SSE 响应（HTTP {result.status_code}）。").body
 
-            response = await prepare_sse(execute, request, error_body, stats.add_error) if sse else await execute()
+            response = (await prepare_sse(execute, request, error_body, stats.add_error,
+                                          error_first=_python_sdk_error_first(request))
+                        if sse else await execute())
             return _direct_sender(request, response)
         except ResumeRequestError as exc:
             return _native_error(exc.code, str(exc))

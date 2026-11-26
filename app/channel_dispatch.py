@@ -20,7 +20,7 @@ from google.genai.errors import APIError as GenAIAPIError
 from starlette.requests import ClientDisconnect
 
 from admission import SETUP_FAST_WINDOW_SECONDS, ManagedStreamingResponse
-from channel_capabilities import cookie_feature_error
+from channel_capabilities import CookieModelScopeError, cookie_feature_error, cookie_model_scope
 from credential_manager import CookiePoolCoolingDown, credential_manager
 from logger import StreamCounts, discard_current_stream_attempt, stats
 from models import OpenAIRequest
@@ -42,6 +42,9 @@ express_upstream = ExpressSDKUpstream()
 cookie_upstream = CookieProxyUpstream()
 
 _DONE_FRAME_BYTES = DONE_FRAME.encode("ascii")
+_STREAM_EOF = object()
+_ERROR_FRAME_PREFIX = 'data: {"error":'
+_ERROR_FRAME_PREFIX_BYTES = _ERROR_FRAME_PREFIX.encode("ascii")
 _TERMINAL_FINALIZE_TIMEOUT_SECONDS = 0.25
 _FALLBACK_PREFIX_MAX_BYTES = 2 * 1024 * 1024
 _FALLBACK_PREFIX_MAX_FRAMES = 128
@@ -106,7 +109,8 @@ def _other_channel(fastapi_request: Request, primary: str, request_obj: OpenAIRe
         # 结构化输出锁定 Express：没有可用的 Cookie 备用
         if _structured_locks_express(request_obj):
             return None
-        return "cookie" if credential_manager.has_cookie_record() else None
+        scope = cookie_model_scope(request_obj.model)
+        return "cookie" if credential_manager.has_cookie_record(scope=scope) else None
     if primary == "cookie":
         manager = _express_manager(fastapi_request)
         if manager is None or manager.get_total_keys() == 0:
@@ -207,6 +211,10 @@ async def _try_channel_fallback(
             f"🔁 [跨通道兜底] 主通道[{primary_label}]{reason}，"
             f"自动切换至[{_channel_label(fallback_channel)}]接力完成回复。"
         )
+        if (proof := request_obj._chat_origin_delivery) is not None:
+            # The primary never committed visible output. Its staged origins
+            # cannot ride on the standby response's terminal or HTTP send.
+            proof.start_attempt()
         return await _invoke_channel(request_obj, fastapi_request, fallback_channel)
 
     try:
@@ -418,6 +426,74 @@ class _AccountedStream:
             await close()
 
 
+def _relay_upstream_stream(response, request_obj, fastapi_request, deadline):
+    """Preserve public SSE framing and the accepted producer terminal."""
+    original = response.body_iterator
+    proof = request_obj._chat_origin_delivery
+
+    async def relay():
+        counts = StreamCounts()
+        stream = keepalive_sse(_AccountedStream(original, counts), fastapi_request)
+        error = terminal = None
+        saw_error = clean_terminal = False
+        try:
+            async for frame in reads_before_deadline(stream, deadline):
+                # The pending pull can mark an error before keepalive
+                # emits a comment. Comments never settle a generation.
+                if counts.failure is not None and _sse_frame_kind(frame)[0] != "keepalive":
+                    saw_error = True
+                    counts.commit_error()
+                # The translated producers' public error object always
+                # starts with this prefix. Don't reparse large data frames.
+                if proof is not None and not saw_error:
+                    if isinstance(frame, str):
+                        saw_error = frame.startswith(_ERROR_FRAME_PREFIX)
+                    elif isinstance(frame, bytes):
+                        saw_error = frame.startswith(_ERROR_FRAME_PREFIX_BYTES)
+                    else:
+                        saw_error = True  # not a proved source frame
+                if frame == DONE_FRAME or frame == _DONE_FRAME_BYTES:
+                    # Complete the producer's normal bookkeeping before handing
+                    # off [DONE]: downstream adapters may stop reading there.
+                    # The result is final, so do not apply the generation
+                    # deadline to this single cleanup pull or forward a trailer.
+                    with suppress(Exception):
+                        async with asyncio.timeout(_TERMINAL_FINALIZE_TIMEOUT_SECONDS) as timer:
+                            trailer = await anext(stream, _STREAM_EOF)
+                        clean_terminal = trailer is _STREAM_EOF and not timer.expired()
+                    terminal = frame
+                    break
+                yield frame
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            counts.commit_error(stats)
+            code, message = extract_upstream_error(exc)
+            # 裸 TimeoutError 的 str() 是空串，客户端会收到不可排障的空
+            # message 错误帧；对齐 resumable 路径的固定文案。
+            if not message and isinstance(exc, TimeoutError):
+                message = "本轮请求超过总执行期限。"
+            print(f"❌ [流式转发] {request_obj.model} | HTTP {code} | {message[:200]}")
+            error = create_openai_error_response(code, message[:1024], "upstream_error")
+            terminal = DONE_FRAME
+        finally:
+            await stream.aclose()
+        if error is not None:
+            yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
+        if terminal is not None:
+            if error is None:
+                if proof is not None and clean_terminal and not saw_error and counts.failure is None:
+                    proof.confirm_stream_terminal()
+                counts.commit_terminal()
+            yield terminal
+    headers = dict(response.headers)
+    headers.pop("content-length", None)
+    headers.update(SSE_NO_BUFFER_HEADERS)
+    return ManagedStreamingResponse(
+        relay(), status_code=response.status_code, headers=headers, background=response.background,
+        cleanup=getattr(response, "aclose", original.aclose))
+
+
 async def _dispatch_upstream(request_obj: OpenAIRequest, fastapi_request: Request):
     """Select an enabled upstream credential using the saved channel mode."""
     deadline = note_retry_deadline(fastapi_request, time.monotonic() + request_timeout_seconds())
@@ -436,10 +512,14 @@ async def _dispatch_upstream(request_obj: OpenAIRequest, fastapi_request: Reques
             structured = _structured_locks_express(request_obj)
             try:
                 record = credential_manager.get_mixed_record(
-                    fastapi_request.app.state.express_key_manager, express_only=structured)
+                    fastapi_request.app.state.express_key_manager, express_only=structured,
+                    scope=cookie_model_scope(request_obj.model))
             except CookiePoolCoolingDown as exc:
                 return JSONResponse(status_code=503, headers={"retry-after": str(exc.retry_after)},
                                     content=create_openai_error_response(503, str(exc), "upstream_error"))
+            except CookieModelScopeError as exc:
+                return JSONResponse(status_code=400, content=create_openai_error_response(
+                    400, str(exc), "invalid_request_error"))
             if record is None:
                 return JSONResponse(status_code=401, content=create_openai_error_response(
                     401, "没有可用的上游账号。请启用 Express Key 或填写完整的 Cookie 与 Project ID；结构化输出（未开启 Cookie 支持）、多候选与 logprobs 请求需要 Express Key。",
@@ -551,53 +631,5 @@ async def _dispatch_upstream(request_obj: OpenAIRequest, fastapi_request: Reques
         else:
             response = await generate_json()
     if isinstance(response, StreamingResponse):
-        original = response.body_iterator
-
-        async def relay():
-            counts = StreamCounts()
-            stream = keepalive_sse(_AccountedStream(original, counts), fastapi_request)
-            error = terminal = None
-            try:
-                async for frame in reads_before_deadline(stream, deadline):
-                    # The pending pull can mark an error before keepalive
-                    # emits a comment. Comments never settle a generation.
-                    if counts.failure is not None and _sse_frame_kind(frame)[0] != "keepalive":
-                        counts.commit_error()
-                    if frame == DONE_FRAME or frame == _DONE_FRAME_BYTES:
-                        # Complete the producer's normal bookkeeping before handing
-                        # off [DONE]: downstream adapters may stop reading there.
-                        # The result is final, so do not apply the generation
-                        # deadline to this single cleanup pull or forward a trailer.
-                        with suppress(Exception):
-                            async with asyncio.timeout(_TERMINAL_FINALIZE_TIMEOUT_SECONDS):
-                                await anext(stream, None)
-                        terminal = frame
-                        break
-                    yield frame
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                counts.commit_error(stats)
-                code, message = extract_upstream_error(exc)
-                # 裸 TimeoutError 的 str() 是空串，客户端会收到不可排障的空
-                # message 错误帧；对齐 resumable 路径的固定文案。
-                if not message and isinstance(exc, TimeoutError):
-                    message = "本轮请求超过总执行期限。"
-                print(f"❌ [流式转发] {request_obj.model} | HTTP {code} | {message[:200]}")
-                error = create_openai_error_response(code, message[:1024], "upstream_error")
-                terminal = DONE_FRAME
-            finally:
-                await stream.aclose()
-            if error is not None:
-                yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
-            if terminal is not None:
-                if error is None:
-                    counts.commit_terminal()
-                yield terminal
-        headers = dict(response.headers)
-        headers.pop("content-length", None)
-        headers.update(SSE_NO_BUFFER_HEADERS)
-        return ManagedStreamingResponse(
-            relay(), status_code=response.status_code, headers=headers, background=response.background,
-            cleanup=getattr(response, "aclose", original.aclose))
+        return _relay_upstream_stream(response, request_obj, fastapi_request, deadline)
     return response

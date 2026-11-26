@@ -1,6 +1,7 @@
 """Shared routing policy for features the Cookie bridge cannot preserve."""
 
-from model_resource import parse_google_model_resource
+from model_capabilities import split_model_alias
+from model_resource import GoogleModelResource, parse_google_model_resource
 from schema_validation import SchemaValidationError
 
 
@@ -11,16 +12,32 @@ COOKIE_STRUCTURED_OUTPUT_DISABLED_MESSAGE = (
 )
 
 
+class CookieModelScopeError(SchemaValidationError):
+    def __init__(self) -> None:
+        super().__init__("Cookie 通道仅支持本账号项目 global 区域下的 Google 模型；"
+                         "请使用对应的模型 ID，或改用支持目标资源的通道。")
+
+
+def cookie_model_scope(resource: str) -> GoogleModelResource | None:
+    """Apply account eligibility only to an explicit Google publisher resource."""
+    name = resource.strip()
+    if not name.startswith("projects/"):
+        return None
+    return parse_google_model_resource(split_model_alias(name)[0])
+
+
+def cookie_scope_matches(scope: GoogleModelResource, project_id: str) -> bool:
+    return scope.location == "global" and scope.project_id == project_id
+
+
 def cookie_model_id(resource: str, project_id: str) -> str:
     """Return the ID only when this Cookie account can address the same model."""
     if "/" not in resource and resource not in ("", ".", ".."):
         return resource
     parsed = parse_google_model_resource(resource)
-    if parsed is not None and (parsed.project_id is None or
-                               (parsed.project_id, parsed.location) == (project_id, "global")):
+    if parsed is not None and (parsed.project_id is None or cookie_scope_matches(parsed, project_id)):
         return parsed.model_id
-    raise SchemaValidationError("Cookie 通道仅支持本账号项目 global 区域下的 Google 模型；"
-                                "请使用对应的模型 ID，或改用支持目标资源的通道。")
+    raise CookieModelScopeError()
 
 
 def cookie_feature_error(request, *, structured_output=False):

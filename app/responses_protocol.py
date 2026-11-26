@@ -480,6 +480,7 @@ def parse_responses_request(body):
         max_completion_tokens=maximum, stream=False,
         **({"reasoning_effort": effort} if effort is not None else {}),
     )
+    chat._completion_target = "responses"
     base = {
         "id": "resp_" + uuid4().hex, "object": "response", "model": model, "created_at": int(time.time()),
         "completed_at": None, "status": "in_progress", "output": [], "usage": None, "error": None,

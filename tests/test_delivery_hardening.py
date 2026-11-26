@@ -456,7 +456,7 @@ class NativeRecoveryTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(gemini_native, "stats", stats), mock.patch.object(native_passthrough, "stats", stats):
             response = await gemini_native._relay_stream(upstream, keepalive=True)
             body = await collect(response)
-        self.assertTrue(body.startswith(streaming.HEARTBEAT_FRAME))
+        self.assertTrue(body.startswith("\n\n"))
         self.assertIn('"partial"', body)
         self.assertIn('"error"', body)
         self.assertEqual(stats.success_requests, 0)

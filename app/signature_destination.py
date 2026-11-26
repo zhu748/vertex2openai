@@ -43,6 +43,8 @@ def studio_model_resource(project: str, model: str) -> str:
     return f"projects/{project}/locations/global/publishers/google/models/{model}"
 
 
-def note_accepted_destination(request, destination: bytes) -> None:
+def note_accepted_destination(request, destination: bytes, *, response=None) -> None:
+    if (delivery := request._chat_origin_delivery) is not None:
+        delivery.accept_source(destination, response=response)
     if (observer := request._signature_output_destination) is not None:
         observer(destination)

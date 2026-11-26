@@ -57,7 +57,6 @@ class _Result:
     headers: dict = field(default_factory=dict)
     proof: dict | None = None
     destination: bytes | None = None
-    diagnostic_fallback: bool = False
 
 
 def _failure(status, message, *, param=None, error_type="upstream_error", headers=None):
@@ -139,7 +138,8 @@ async def _generate(parsed, fastapi_request):
         else:
             result = _parse_response(raw, status, hint, parsed.base)
         result.destination = destination
-        result.diagnostic_fallback = getattr(source, "_chat_diagnostic_fallback", False) is True
+        if result.proof:
+            result.proof["item_predecessor"] = parsed.chat._responses_item_predecessor
         return result
     except Exception as exc:
         code, message = extract_upstream_error(exc)
@@ -151,7 +151,8 @@ async def _publish(prefix, proof, connection, destination):
         return
 
     def publish(_finish, keys, signatures, accepted_destination):
-        publish_responses_item_origins(keys, signatures, accepted_destination, proof["item_witness"])
+        publish_responses_item_origins(keys, signatures, accepted_destination, proof["item_witness"],
+                                       predecessor=proof["item_predecessor"])
 
     if proof["withheld"]:
         message = proof["message"]
@@ -168,22 +169,19 @@ async def _publish(prefix, proof, connection, destination):
         publish_completed_origins(prefix, (proof,), stage_origin=publish, destination=destination)
 
 
-async def _finish_delivery(prefix, proof, connection, destination, diagnostic_fallback):
+async def _finish_delivery(prefix, proof, connection, destination):
     if connection is not None and not connection.delivery_possible:
         return
     if prefix and proof:
         await _publish(prefix, proof, connection, destination)
-    if diagnostic_fallback:
-        stats.add_error()
-    else:
-        stats.add_success()
+    stats.add_success()
 
 
 async def _as_json(result, prefix, connection):
     # HTTP errors are counted by the middleware. For 2xx, success (including
     # a valid incomplete envelope) requires a verified final ASGI send.
-    background = (BackgroundTask(_finish_delivery, prefix, result.proof, connection, result.destination,
-                                 result.diagnostic_fallback) if result.status < 400 else None)
+    background = (BackgroundTask(_finish_delivery, prefix, result.proof, connection, result.destination)
+                  if result.status < 400 else None)
     return await json_response_offloop(result.content, status_code=result.status, headers=result.headers,
                                        background=background)
 
@@ -238,12 +236,12 @@ async def _stream(parsed, fastapi_request, prefix, connection):
         else:
             for chunk in writer.output(result.content):
                 yield chunk
-            delivery = (result.proof, result.destination, result.diagnostic_fallback)
+            delivery = (result.proof, result.destination)
 
     async def finish_delivery():
         if delivery is not None:
-            proof, destination, diagnostic_fallback = delivery
-            await _finish_delivery(prefix, proof, connection, destination, diagnostic_fallback)
+            proof, destination = delivery
+            await _finish_delivery(prefix, proof, connection, destination)
 
     try:
         done, _ = await asyncio.wait({job}, timeout=SETUP_FAST_WINDOW_SECONDS)

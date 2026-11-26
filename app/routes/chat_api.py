@@ -7,7 +7,7 @@ from schema_validation import SchemaValidationError, preflight_schema_contracts,
 from starlette.background import BackgroundTask, BackgroundTasks
 from starlette.requests import ClientDisconnect
 from request_connection import ClientConnection
-from signature_origin import bind_signature_origins
+from signature_origin import DirectChatOriginDelivery, bind_signature_origins
 from models import OpenAIRequest
 from tool_policy import validate_model_tool_choice, validate_parallel_tool_calls
 from auth import get_api_key, get_api_key_flexible
@@ -401,13 +401,31 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
                 print(f"🖼️ [生图直通] {request.model}：绕过续传缓冲（resumable_image_streams=false），降低内存驻留。")
         if explicit:
             raise ResumeRequestError(409, "当前请求不支持续传；如需重新生成，请移除续传 ID 与游标。")
+        # Only this branch owns a direct public send, including implicit
+        # replay-capacity fallback. Detached producers keep their own policy.
+        proof = None
+        if request._signature_output_prefix:
+            proof = request._chat_origin_delivery = DirectChatOriginDelivery()
+            request._stage_signature_origin = proof.stage
         response = await _call_upstream(request, fastapi_request)
         if unbuffered:
             response.headers["X-Resumable"] = "false"
+        connection = ClientConnection.for_request(fastapi_request)
         if isinstance(response, ManagedStreamingResponse):
             # Bind only the final direct sender. Detached replay setup/pumps use
             # the same dispatcher, but never enter this branch.
-            response.client_connection = ClientConnection.for_request(fastapi_request)
+            response.client_connection = connection
+        if proof is not None:
+            streaming = isinstance(response, StreamingResponse)
+            if (connection is not None and 200 <= response.status_code < 300
+                    and bool(request.stream) == streaming and (streaming or proof.matches_json(response))):
+                tasks = BackgroundTasks()
+                tasks.add_task(proof.publish, connection, stream=streaming)
+                if (after := response.background) is not None:
+                    tasks.tasks.append(after)
+                response.background = tasks
+            else:
+                proof.discard()
         return response
     except ResumeRequestError as exc:
         # 续传参数错误是客户端 400，不是上游错误：单独分支保持

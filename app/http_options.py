@@ -5,7 +5,7 @@ from runtime_state import get_effective_proxy_url
 from express_fingerprint import build_sdk_channel_overrides
 from proxy_resolver import resolve_proxy_uri
 from proxy_tls import build_httpx_proxy
-from sdk_stream import capture_sdk_stream_response
+from sdk_stream import capture_sdk_response
 
 
 def _request_timeout(request):
@@ -75,7 +75,7 @@ def get_http_options(
         options["async_client_args"] = dict(
             client_args,
             transport=async_transport,
-            event_hooks={"request": [_async_request_timeout], "response": [capture_sdk_stream_response]},
+            event_hooks={"request": [_async_request_timeout], "response": [capture_sdk_response]},
         )
 
     headers_override = build_sdk_channel_overrides()

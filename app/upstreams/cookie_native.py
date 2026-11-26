@@ -41,7 +41,7 @@ import config as app_config
 import model_capabilities as mc
 from json_encoding import LargeJSONResponse, estimate_json_chars, iter_json_bytes
 from admission import GenerationCapacityError, limit_generation, run_with_image_limit
-from channel_capabilities import cookie_model_id
+from channel_capabilities import CookieModelScopeError, cookie_model_id, cookie_model_scope
 from cookie_auth import (
     STREAM_GENERATE_OPERATION_NAME,
     build_headers,
@@ -62,7 +62,7 @@ from schema_validation import (
 )
 from signature_store import SKIP_VALIDATOR_SENTINELS
 from streaming import (
-    HEARTBEAT, HEARTBEAT_FRAME, SSE_NO_BUFFER_HEADERS, StreamDeadlineExceeded,
+    GEMINI_HEARTBEAT_FRAME, HEARTBEAT, SSE_NO_BUFFER_HEADERS, StreamDeadlineExceeded,
     reads_before_deadline, with_heartbeats,
 )
 from tool_policy import has_search_suffix
@@ -893,7 +893,7 @@ async def _events_with_retry(fastapi_request: Request, record: dict, body: dict,
                     yield item
                 return
             pending.drain()  # release the losing attempt before sleeping
-            # 退避等待期间吐心跳保活（SSE 消费方转成 : keep-alive）；
+            # 退避等待期间吐心跳保活（原生 SSE 消费方转成空行）；
             # 同一 Cookie 身份重试，Retry-After 有约束力（口径见
             # cookie_transport._cookie_backoff_delay）。
             async for _hb in cookie_retry_backoff_heartbeats(
@@ -960,10 +960,19 @@ async def _handle_native_request_impl(fastapi_request: Request, model: str, acti
                                       parsed: dict, *, requested_model: str, deadline: float):
     if action not in ("generateContent", "streamGenerateContent"):
         return _native_error(400, f"Cookie 通道暂不支持 :{action}，请配置 Express API Key。", "INVALID_ARGUMENT")
-    record = credential_manager.get_cookie_record()
+    scope = cookie_model_scope(model)
+    # Snapshot the existing native legacy default in case all enabled rows have
+    # an empty project; only a string can name the same explicit destination.
+    legacy = app_state.get_project_id() if scope is not None else ""
+    legacy_project = legacy.strip() if isinstance(legacy, str) else ""
+    try:
+        record = credential_manager.get_cookie_record(scope=scope, legacy_project=legacy_project)
+    except CookieModelScopeError as exc:
+        return _native_error(400, str(exc), "INVALID_ARGUMENT")
     if record is None:
         return _native_error(403, "未配置任何启用的 Cookie 账号。", "PERMISSION_DENIED")
-    project_id = (record.get("project_id") or app_state.get_project_id() or "").strip()
+    project_id = record.get("project_id") or (legacy_project if scope is not None else app_state.get_project_id())
+    project_id = (project_id or "").strip()
     if not project_id:
         return _native_error(400, "Cookie 账号未配置 Project ID，无法构造上游请求。")
     if build_headers(record.get("cookie", "")) is None:
@@ -1006,12 +1015,12 @@ async def _handle_native_request_impl(fastapi_request: Request, model: str, acti
                 yield from iter_json_bytes(payload)
                 yield suffix
 
-            yield HEARTBEAT_FRAME if use_sse else "["
+            yield GEMINI_HEARTBEAT_FRAME if use_sse else "["
             try:
                 async with aclosing(_timed_events(fastapi_request, record, body, model, deadline)) as events:
                     async for kind, data in events:
                         if kind == "heartbeat":
-                            yield HEARTBEAT_FRAME if use_sse else " "
+                            yield GEMINI_HEARTBEAT_FRAME if use_sse else " "
                             continue
                         part = assembler.stream_event(kind, data)
                         if part is not None:

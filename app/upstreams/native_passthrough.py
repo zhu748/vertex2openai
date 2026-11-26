@@ -50,7 +50,7 @@ from client_pool import passthrough_client_pool
 from proxy_resolver import ProxyResolveError, resolve_proxy_uri
 from proxy_failover import ProxyChain
 from proxy_tls import build_httpx_proxy
-from streaming import (SSE_NO_BUFFER_HEADERS, sse_frames, with_heartbeats, HEARTBEAT, HEARTBEAT_FRAME,
+from streaming import (SSE_NO_BUFFER_HEADERS, sse_frames, with_heartbeats, HEARTBEAT, GEMINI_HEARTBEAT_FRAME,
                        StreamDeadlineExceeded, reads_before_deadline)
 from resumable import (resumable_store, resolve_buffer, ResumableBuffer, ResumeRequestError, BufferCapacityError,
                        DetachedRequest, ReplayStreamResponse, within_request_deadline, buffered_setup_result,
@@ -487,7 +487,8 @@ class _NativeStreamState:
     def __init__(self, reply_guard: Optional[FirstReplyGuard]=None, *, single_candidate: bool=True):
         self.reply_guard = reply_guard
         self.single_candidate = single_candidate
-        self.seen, self.finished = set(), set()
+        self.seen: set[int] = set()
+        self.finished: dict[int, bytes | None] = {}
         self.received = False
         self.blocked = False
         # 累积快照按已出现的字段更新；尾帧仅含输出用量时保留先前输入用量。
@@ -529,18 +530,26 @@ class _NativeStreamState:
                 if not isinstance(parts, list) or any(not isinstance(part, dict) for part in parts):
                     raise IncompleteResponseError("上游候选 parts 格式错误。")
                 index = candidate.get("index", index)
-                if not isinstance(index, int) or index < 0:
+                if type(index) is not int or index < 0:  # JSON booleans are not candidate indices
                     raise IncompleteResponseError("上游候选 index 格式错误。")
-                if type(index) is not int or index != 0:
+                if index != 0:
                     self.single_candidate = False
-                if candidate.get("finishReason") in FINISH_CONTENT_FILTER:
+                finish_reason = candidate.get("finishReason")
+                if finish_reason in FINISH_CONTENT_FILTER:
                     refusal_terminal = True
                 if index in self.finished and parts:
                     raise IncompleteResponseError("上游候选已结束，却继续返回内容。")
                 if parts:
                     self.seen.add(index)
-                if has_finish_reason(candidate.get("finishReason")):
-                    self.finished.add(index)
+                if has_finish_reason(finish_reason):
+                    # Compare raw string labels, including future provider values;
+                    # don't normalize enums or pin large unknown labels after yield.
+                    label = (hashlib.blake2s(finish_reason.encode("utf-8", "surrogatepass")).digest()
+                             if isinstance(finish_reason, str) else None)
+                    previous = self.finished.get(index)
+                    if label is not None and previous is not None and label != previous:
+                        raise IncompleteResponseError("上游候选返回了相互矛盾的结束原因。")
+                    self.finished[index] = label if label is not None else previous
             if self.reply_guard and not self.reply_guard.ready and generated is not True:
                 if native_has_reply(obj):
                     generated = True
@@ -558,7 +567,7 @@ class _NativeStreamState:
     def finish(self):
         if not self.received:
             raise IncompleteResponseError("上游流已结束，但未收到响应数据。")
-        if self.seen - self.finished:
+        if self.seen.difference(self.finished):
             raise IncompleteResponseError("上游连接已结束，但候选回复缺少结束标记。")
         if not self.finished and not self.blocked:
             raise IncompleteResponseError("上游流已结束，但未收到模型结束标记或请求拦截结果。")
@@ -677,10 +686,10 @@ async def _relay_stream(upstream: httpx.Response, *, keepalive: bool=False, dead
                 events = _native_json_chunks(upstream)
             if keepalive:
                 events = with_heartbeats(events)
-                yield HEARTBEAT_FRAME.encode()
+                yield GEMINI_HEARTBEAT_FRAME.encode()
             async for item in reads_before_deadline(events, end):
                 if item is HEARTBEAT:
-                    yield HEARTBEAT_FRAME.encode()
+                    yield GEMINI_HEARTBEAT_FRAME.encode()
                 elif item:
                     total += len(item)
                     yield item

@@ -10,7 +10,7 @@ import json
 import re
 import secrets
 
-from models import ContentPartText
+from models import ContentPartText, MAX_CANDIDATES
 from parallel_result_order import order_parallel_results
 from signature_destination import UNTRUSTED
 from signature_store import SignatureRecord, SignatureState, signature_store
@@ -170,9 +170,9 @@ def responses_item_witness(tokens: list[bytes | None]) -> bytes | None:
     return _hash(b"resp-items-v1", *tokens)
 
 
-def _responses_item_key(keys: tuple[bytes, ...], witness: bytes | None) -> bytes:
-    if keys and witness:
-        return _hash(b"resp-origin-v1", witness, *keys)
+def _responses_item_key(keys: tuple[bytes, ...], witness: bytes | None, predecessor: bytes | None) -> bytes:
+    if keys and witness and predecessor is not None:
+        return _hash(b"resp-origin-v2", predecessor, witness, *keys)
     return b""
 
 
@@ -437,6 +437,7 @@ def bind_signature_origins(request, api_key):
     if not isinstance(api_key, str) or not api_key:
         return
     request._signature_output_prefix = None
+    request._responses_item_predecessor = None
     has_tools = bool(request.tools)
     isolated = False
     for i, m in enumerate(request.messages):
@@ -457,6 +458,9 @@ def bind_signature_origins(request, api_key):
         budget = _Budget()
         prefix = _hash(b"tool-prefix-v2", budget.encode(api_key, _MAX_ID_BYTES),
                        budget.encode(request.model.strip(), _MAX_ID_BYTES))
+        responses = request._completion_target == "responses"
+        predecessor = b"" if responses else None
+        legacy_only = True
         stop = min(len(request.messages), _MAX_MESSAGES)
         cutoff = request._signature_origin_cutoff
         if cutoff is not None:
@@ -480,17 +484,25 @@ def bind_signature_origins(request, api_key):
                 prefix = _step_prefix(prefix, text_tag, reason_tag)
                 keys = _slot_keys(prefix, tags)
                 witness = m._responses_item_witness
-                if witness is None:
+                item_key = _responses_item_key(keys, witness, predecessor)
+                if witness is None and legacy_only:
                     m._signature_slots = keys
-                elif key := _responses_item_key(keys, witness):
+                elif item_key:
                     # All slots refer to a single record. Even under eviction
                     # the witness can never select signatures by slot alone.
-                    m._signature_slots = (key,) * len(keys)
+                    m._signature_slots = (item_key,) * len(keys)
+                if responses:
+                    # A syntactically complete but unknown vector is not a
+                    # receipt. Nor may a missing/unusable ancestor reset the
+                    # chain and grant an unchained positive descendant.
+                    predecessor = item_key if item_key and _responses_receipt(item_key) is not None else None
+                    legacy_only = legacy_only and witness is None
                 prefix = _hash(b"tool-step-v1", prefix, *tags)
                 continue
             prefix = _hash(b"tool-message-v2", prefix, _history_tag(m, budget))
         if cutoff is None and stop == len(request.messages):
             request._signature_output_prefix = prefix
+            request._responses_item_predecessor = predecessor
     except (TypeError, AttributeError, KeyError, ValueError, OverflowError, RecursionError):
         # Only complete prefixes are valid. A previously marked earlier turn
         # still has a complete prefix; never bind the incomplete suffix.
@@ -529,10 +541,11 @@ def _commit_origin(keys, signatures, destination):
 
 
 def publish_responses_item_origins(keys: tuple[bytes, ...], signatures: tuple[bytes | None, ...] | None,
-                                   destination: bytes | None, witness: bytes | None) -> None:
+                                   destination: bytes | None, witness: bytes | None, *,
+                                   predecessor: bytes | None) -> None:
     """Commit the legacy origin and the exact whole-batch receipt after delivery."""
     _commit_origin(keys, signatures, destination)
-    if not (key := _responses_item_key(keys, witness)):
+    if not (key := _responses_item_key(keys, witness, predecessor)):
         return
     if signatures is None or destination is None or destination == UNTRUSTED:
         mark_unrestorable_origin(key)
@@ -544,12 +557,19 @@ def publish_responses_item_origins(keys: tuple[bytes, ...], signatures: tuple[by
     signature_store.put_record(key, SignatureRecord(SignatureState.SIGNED, packed, destination))
 
 
+def _responses_receipt(scope: bytes) -> SignatureRecord | None:
+    record = signature_store.get_record(scope)
+    if record is not None and record.state is SignatureState.SIGNED and record.signature:
+        return record
+    return None
+
+
 def responses_item_record(scope: bytes | None, count: int, index: int) -> SignatureRecord:
     """A present but missing or invalid witness always vetoes weaker lookup."""
     if not scope or not 0 <= index < count <= _MAX_CALLS:
         return _UNRESTORABLE_ORIGIN
-    record = signature_store.get_record(scope)
-    if record is None or record.state is not SignatureState.SIGNED or not record.signature:
+    record = _responses_receipt(scope)
+    if record is None:
         return _UNRESTORABLE_ORIGIN
     data = record.signature
     start = size = offset = 0
@@ -630,6 +650,60 @@ class DeliveredOrigin:
         self.discard()
         if pending is not None:
             _commit_origin(*pending[1:])
+
+
+class DirectChatOriginDelivery:
+    """Bounded, one-shot delivery stage for the direct Chat route only."""
+
+    def __init__(self):
+        self.start_attempt()
+
+    def start_attempt(self):
+        self._pending = []
+        self._destination = None
+        self._marker = object()
+        self._valid = True
+        self._source_stream = False
+        self._stream_terminal = False
+
+    def accept_source(self, destination, *, response=None):
+        # The adapters report a validated result before staging its choices.
+        # A second result in this attempt must not inherit the first stage.
+        if not self._valid or self._destination is not None:
+            self.discard()
+            return
+        self._destination = destination
+        self._source_stream = response is None
+        if response is not None:
+            response._chat_origin_marker = self._marker
+
+    def stage(self, _finish, keys, signatures, destination):
+        if (not self._valid or self._destination is None or self._destination != destination
+                or len(self._pending) >= MAX_CANDIDATES):
+            self.discard()
+            return
+        # OriginBatch has already bounded each tuple (64 slots, at most
+        # 512 KiB of original bytes). No arguments or response body are held.
+        self._pending.append((keys, signatures, destination))
+
+    def matches_json(self, response):
+        return self._valid and bool(self._pending) and getattr(response, "_chat_origin_marker", None) is self._marker
+
+    def confirm_stream_terminal(self):
+        self._stream_terminal = self._valid and self._source_stream
+
+    def discard(self):
+        self._valid = False
+        self._pending.clear()
+
+    async def publish(self, connection, *, stream):
+        batches = ()
+        if (self._valid and self._pending and (not stream or self._stream_terminal)
+                and connection.final_body_sent and connection.delivery_possible):
+            batches = tuple(self._pending)
+        self.discard()
+        if batches:
+            signature_store.register_origin_batches(batches)
 
 
 class OriginBatch:

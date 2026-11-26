@@ -73,7 +73,7 @@ from retry_policy import (
 )
 from runtime_state import app_state
 from schema_validation import SchemaValidationError
-from sdk_stream import open_sdk_stream
+from sdk_stream import open_sdk_stream, read_sdk_response
 from tool_stream import ToolStreamAssembler
 from streaming import DONE_FRAME, HEARTBEAT_FRAME, MAX_ERROR_MESSAGE_CHARS
 from streaming import disconnected as _request_disconnected
@@ -270,7 +270,10 @@ async def _convert_completed_response(response: Any, request: OpenAIRequest) -> 
     # contract; large, unknown and media shapes still use the media executor.
     return await run_media_task(
         convert_to_openai_format, response, request.model,
-        structured_output=wants_json_output(request), heavy=completed_response_needs_media_pool(response),
+        # Neither structured Chat text nor typed Responses items may be
+        # decorated with the gateway's safety score HTML.
+        structured_output=(wants_json_output(request) or request._completion_target == "responses"),
+        heavy=completed_response_needs_media_pool(response),
     )
 
 
@@ -295,7 +298,7 @@ class _SDKAttempt:
         if isinstance(client, FailoverSDKClient):
             return generate(_actual_attempt=self._prepare, **kwargs)
         actual = self._prepare(client, kwargs)
-        return open_sdk_stream(generate, **actual) if stream else generate(**actual)
+        return open_sdk_stream(generate, **actual) if stream else read_sdk_response(generate, **actual)
 
 
 async def _fake_stream_response_frames(
@@ -1402,13 +1405,20 @@ class SDKGeneration:
                 ),
             )
 
+        typed_output = self.request_obj._completion_target == "responses"
+        if typed_output:
+            # Provider usage can be genuine even when the public output fails.
+            # Responses owns outcome accounting after the final public send.
+            _record_usage(response_obj_call)
         require_unblocked_response(response_obj_call)
         require_complete_response(response_obj_call)
         if self.text_transport:
             decoder = self.text_transport.decoder()
             response_obj_call = decoder.restore_sdk(response_obj_call)
             decoder.validate_end()
-        if not is_gemini_response_valid(response_obj_call):
+        if not is_gemini_response_valid(response_obj_call, allow_empty_length=typed_output):
+            if typed_output:
+                raise IncompleteResponseError("上游未返回可交付的正文、思考或工具调用。")
             error_details = (
                 f"Agent Platform 非流式响应无有效内容，模型：{self.model_to_call}。"
             )
@@ -1435,7 +1445,8 @@ class SDKGeneration:
                 error_details += f"Response type: {type(response_obj_call).__name__}"
             raise ValueError(error_details)
 
-        _record_usage(response_obj_call)
+        if not typed_output:
+            _record_usage(response_obj_call)
 
         openai_response_content = await _convert_completed_response(response_obj_call, self.request_obj)
         # 与假流式路径同因：释放 SDK 响应（持有图片原始 bytes），
@@ -1451,7 +1462,7 @@ class SDKGeneration:
             result = LargeJSONResponse(content=openai_response_content)
         else:
             result = JSONResponse(content=openai_response_content)
-        note_accepted_destination(self.request_obj, route.destination)
+        note_accepted_destination(self.request_obj, route.destination, response=result)
         publish_completed_origins(self.request_obj._signature_output_prefix, openai_response_content["choices"],
                                   stage_origin=self.request_obj._stage_signature_origin,
                                   destination=route.destination)

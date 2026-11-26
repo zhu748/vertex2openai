@@ -240,10 +240,12 @@ class FailoverSDKClient:
         return getattr(self.client, name)
 
     async def generate_content(self, *, _actual_attempt=None, **kwargs):
+        from sdk_stream import read_sdk_response
+
         async def operation(raw, resolved):
             self.client = self.factory(raw, resolved)
             actual = _actual_attempt(self.client, kwargs) if _actual_attempt else kwargs
-            return await self.client.aio.models.generate_content(**actual)
+            return await read_sdk_response(self.client.aio.models.generate_content, **actual)
         return await self.chain.run(operation)
 
     async def generate_content_stream(self, *, _actual_attempt=None, **kwargs):

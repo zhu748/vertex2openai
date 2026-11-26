@@ -80,6 +80,9 @@ class NativeSetupReceiptTests(unittest.IsolatedAsyncioTestCase):
         signed, stop = [line for line in self.body(first).splitlines() if line.startswith(b"data: ")]
         self.assertIn(b'"thoughtSignature":"AP9maXh0dXJl"', signed)
         rid = first.receipt.encode()
+        self.assertTrue(self.body(first).startswith(b": keep-alive\n\n"))
+        self.assertEqual([line for line in self.body(first).splitlines() if line.startswith(b"id: ")],
+                         [b"id: " + rid + b":0", b"id: " + rid + b":1"])
 
         with patch.object(cookie_native, "handle_native_request", wraps=cookie_native.handle_native_request) as cookie:
             for mode, key_count, has_cookie in (("api_key", 0, False), ("web_proxy", 1, True), ("mixed", 0, True)):

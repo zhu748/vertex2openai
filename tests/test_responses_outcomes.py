@@ -12,7 +12,7 @@ from logger import ProxyStats
 import main
 from routes import responses_api
 from test_replay_http_delivery import Peer
-from test_responses_api import PATH, event_list, request
+from test_responses_api import MODEL, PATH, event_list, request
 from test_schema_contract_fidelity import SchemaRouteHarness
 from upstreams import cookie_delivery, express_pipeline
 
@@ -131,27 +131,108 @@ class ResponsesOutcomes(SchemaRouteHarness):
                     self.assertNotIn("variables", self.sent[0])
                     self.assert_count_delta(before, success=1, error=0, tokens=(7, 5))
 
-    async def test_internal_cookie_diagnostic_is_not_a_model_success(self):
+    async def test_cookie_legacy_notice_and_identically_spelled_real_output(self):
         self.channel = "web_proxy"
-        for stream in (False, True):
-            with self.subTest(stream=stream):
-                # Keep the legacy presentation for this narrow accounting
-                # change. Distinguish its provenance, not its text spelling.
+        self.reply = []
+        before = self.counters.get_json_stats()
+        chat = await self.client.post("/v1/chat/completions", json={
+            "model": MODEL, "messages": [{"role": "user", "content": "Test the legacy notice."}],
+            # A client cannot select the server's private production contract.
+            "_completion_target": "responses",
+        })
+        self.assertEqual(chat.status_code, 200, chat.text[:240])
+        diagnostic = chat.json()["choices"][0]["message"]["content"]
+        self.assertIn("[Studio 提示]", diagnostic)
+        self.assert_count_delta(before, success=0, error=1)
+
+        for self.channel in ("web_proxy", "api_key"):
+            for phase in ("json", "early", "late"):
+                with self.subTest(channel=self.channel, phase=phase):
+                    self.reply = {"text": diagnostic}
+                    self.settings["safety_score"] = True
+                    self.safety_ratings = [{"category": "HARM_CATEGORY_HARASSMENT", "probability": "LOW"}]
+                    before = self.counters.get_json_stats()
+                    response = await self.post_at(request(stream=phase != "json"), phase)
+                    self.assertEqual(response.status_code, 200)
+                    public = response.json() if phase == "json" else event_list(response.text)[-1]["response"]
+                    self.assertEqual(public["status"], "completed")
+                    self.assertEqual(public["output"][0]["content"][0]["text"], diagnostic)
+                    self.assert_count_delta(before, success=1, error=0)
+
+    async def test_missing_finish_and_empty_stops_are_upstream_failures(self):
+        for self.channel in ("web_proxy", "api_key"):
+            for phase in ("json", "early", "late"):
+                for self.finish_reason, self.reply in (
+                    ("STOP", []), ("STOP", [{"text": "  "}]),
+                    (None, []), (None, [{"text": "thought without a terminal", "thought": True}]),
+                    ("FINISH_REASON_UNSPECIFIED", []),
+                ):
+                    with self.subTest(channel=self.channel, phase=phase, finish=self.finish_reason, reply=self.reply):
+                        before = self.counters.get_json_stats()
+                        response = await self.post_at(request(stream=phase != "json"), phase)
+                        if phase == "late":
+                            self.assertEqual(response.status_code, 200)
+                            events = event_list(response.text)
+                            self.assertEqual([e["type"] for e in events], [
+                                "response.created", "response.in_progress", "response.failed",
+                            ])
+                            self.assertEqual(events[-1]["response"]["output"], [])
+                            self.assertEqual(events[-1]["response"]["error"]["code"], "server_error")
+                        else:
+                            self.assertEqual(response.status_code, 502, response.text[:220])
+                            self.assertEqual(response.json()["error"]["type"], "upstream_error")
+                        self.assertNotIn("[Studio 提示]", response.text)
+                        self.assert_count_delta(before, success=0, error=1)
+
+    async def test_real_empty_terminals_and_reasoning_only_outputs_are_typed(self):
+        self.settings["safety_score"] = True
+        self.safety_ratings = [{"category": "HARM_CATEGORY_HARASSMENT", "probability": "LOW"}]
+        text = "Actually visible reasoning."
+        thought = {"text": text, "thought": True}
+        for self.channel in ("web_proxy", "api_key"):
+            for phase in ("json", "early", "late"):
+                for self.finish_reason, self.reply, incomplete in (
+                    ("STOP", [thought], None),
+                    ("MAX_TOKENS", [], "max_output_tokens"),
+                    ("MAX_TOKENS", [thought], "max_output_tokens"),
+                    ("SAFETY", [], "content_filter"),
+                    ("SAFETY", [thought], "content_filter"),
+                ):
+                    with self.subTest(channel=self.channel, phase=phase, finish=self.finish_reason, reply=self.reply):
+                        before = self.counters.get_json_stats()
+                        response = await self.post_at(request(stream=phase != "json"), phase)
+                        self.assertEqual(response.status_code, 200, response.text[:220])
+                        public = response.json() if phase == "json" else event_list(response.text)[-1]["response"]
+                        self.assertEqual(public["status"], "incomplete" if incomplete else "completed")
+                        self.assertEqual(public["incomplete_details"], {"reason": incomplete} if incomplete else None)
+                        self.assertEqual(public["usage"]["output_tokens"], 5)
+                        if self.reply:
+                            self.assertEqual([item["type"] for item in public["output"]], ["reasoning"])
+                            self.assertEqual(public["output"][0]["content"], [{"type": "reasoning_text", "text": text}])
+                        else:
+                            self.assertEqual(public["output"], [])
+                        self.assert_count_delta(before, success=1, error=0)
+
+    async def test_cookie_empty_and_blocked_output_never_estimates_the_gateway_notice(self):
+        self.channel = "web_proxy"
+        self.usage_metadata = None
+        self.settings["usage_estimation"] = True
+        for phase in ("json", "early", "late"):
+            for self.finish_reason, self.prompt_feedback in (
+                ("MAX_TOKENS", None), (None, {"blockReason": "SAFETY", "blockReasonMessage": "fixture hint"}),
+            ):
                 self.reply = []
                 before = self.counters.get_json_stats()
-                response = await self.client.post(PATH, json=request(stream=stream))
-                self.assertEqual(response.status_code, 200)
-                public = event_list(response.text)[-1]["response"] if stream else response.json()
-                diagnostic = public["output"][0]["content"][0]["text"]
-                self.assertIn("[Studio 提示]", diagnostic)
-                self.assert_count_delta(before, success=0, error=1)
-
-                self.reply = {"text": diagnostic}
-                before = self.counters.get_json_stats()
-                response = await self.client.post(PATH, json=request(stream=stream))
-                self.assertEqual(response.status_code, 200)
-                public = event_list(response.text)[-1]["response"] if stream else response.json()
-                self.assertEqual(public["output"][0]["content"][0]["text"], diagnostic)
+                response = await self.post_at(request(stream=phase != "json"), phase)
+                self.assertEqual(response.status_code, 200, response.text[:240])
+                public = response.json() if phase == "json" else event_list(response.text)[-1]["response"]
+                incomplete = "content_filter" if self.prompt_feedback else "max_output_tokens"
+                self.assertEqual(public["status"], "incomplete")
+                self.assertEqual(public["incomplete_details"], {"reason": incomplete})
+                self.assertEqual(public["output"], [])
+                self.assertNotIn("fixture hint", response.text)
+                self.assertEqual(public["usage"]["output_tokens"], 0)
+                self.assertTrue(public["usage"]["estimated"])
                 self.assert_count_delta(before, success=1, error=0)
 
     async def test_success_waits_for_final_send_even_when_provider_usage_is_already_known(self):

@@ -1,7 +1,10 @@
 from collections.abc import Callable
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from signature_origin import DirectChatOriginDelivery
 
 # Define data models
 MAX_CANDIDATES = 8
@@ -90,12 +93,19 @@ class OpenAIMessage(BaseModel):
         return [*parts, {"type": "text", "text": self.refusal}]
 
 class OpenAIRequest(BaseModel):
+    # Set only by the public Responses projection. Its internal Chat producer
+    # must deliver provider items, never compatibility text for a Chat UI.
+    _completion_target: Literal["chat", "responses"] = PrivateAttr(default="chat")
+    # None: no exact predecessor chain; b"": genesis/no historical calls.
+    # A nonempty key identifies the last verified receipt, including its chain.
+    _responses_item_predecessor: bytes | None = PrivateAttr(default=None)
     _signature_output_prefix: bytes | None = PrivateAttr(default=None)
     _signature_origin_cutoff: int | None = PrivateAttr(default=None)
     _stage_signature_origin: Callable[
         [str, tuple[bytes, ...], tuple[bytes | None, ...] | None, bytes | None], None
     ] | None = PrivateAttr(default=None)
     _signature_output_destination: Callable[[bytes], None] | None = PrivateAttr(default=None)
+    _chat_origin_delivery: "DirectChatOriginDelivery | None" = PrivateAttr(default=None)
     model: str
     messages: list[OpenAIMessage]
     # Legacy field accepted for compatibility; only an enabled model suffix

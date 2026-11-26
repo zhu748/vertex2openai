@@ -66,7 +66,7 @@ async def assert_prefetch(framing, part, valid):
                     assert b"".join([fragment async for fragment in prefetched]) == b"".join(raw)
                 finally:
                     await prefetched.aclose()
-                assert state.finished == {0} and state.usage == {"totalTokenCount": 1}
+                assert set(state.finished) == {0} and state.usage == {"totalTokenCount": 1}
             else:
                 with pytest.raises(FirstReplyTimeout):
                     await native._prefetch_stream_reply(response, guard, state, framing == "sse")
