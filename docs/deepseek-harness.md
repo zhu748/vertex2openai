@@ -4,6 +4,21 @@
 
 DSH 的 [Gemini API 模式](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/user/guide/providers.md#add-a-custom-model-api) 使用带版本的 Base URL，例如 `https://你的网关/v1beta`。在这里复核的版本使用 [pi-ai 1.3.0](https://github.com/earendil-works/pi/blob/v1.3.0/packages/ai/src/api/transform-messages.ts#L109-L152)：同 provider、协议和模型的回执可以带回原签名，跨模型时会去掉旧签名，但可能仍把原工具调用和结果编码成 Gemini 原生结构。Vertex2OpenAI 的原生 Express 通道按原样转发这些普通请求，不知道旧调用来自哪个模型，也不能重造签名。错误里的 `compress` 自身不能识别 DSH 插件或判断历史能否迁移。
 
+## 同模型回传：修复 pi-ai 1.3.0 误丢签名
+
+pi-ai 1.3.0 默认只接受带标准填充的 Base64。已保存在 DSH 回放记录里的合法 Base64URL 或无填充 Base64 签名，可能在下一次生成请求序列化时被省略。Gemini 的签名是 ProtoJSON bytes；[ProtoJSON](https://protobuf.dev/programming-guides/json/#representation-of-each-type) 接受这两种字符表及有无填充的形式。
+
+[签名编码补丁](deepseek-harness-gemini-signatures-4b399c39.patch) 适用于 DSH 源码提交 `4b399c39a6d1479cd84ca591b4d7c88e24d38a96`，更新已固定的 pi-ai 补丁和锁文件。应用到客户端源码、重装锁定依赖并重新构建后默认生效，无需设置 provider 开关。补丁原样保留有效签名字符串，不移动到其他 Part，不生成签名、不跨 provider/模型复用，也不往客户端回放写入跳过标记。无法恢复本来就没收到或已经丢失的签名。
+
+```sh
+git apply --check /path/to/vertex2openai/docs/deepseek-harness-gemini-signatures-4b399c39.patch
+git apply /path/to/vertex2openai/docs/deepseek-harness-gemini-signatures-4b399c39.patch
+pnpm install --frozen-lockfile
+pnpm exec vitest run packages/llm/llm-pi-ai/tests/gemini-protocol.spec.ts
+```
+
+此客户端补丁和下方跨模型文字交接补丁用途不同，可分开使用。网关的原生 Express 缺签重试是另一层兜底：仅在上游明确报缺签时触发，并不能恢复 Gemini 的思考状态。
+
 ## 可选：给 DSH 客户端打兼容补丁
 
 [本地 DSH 源码补丁](deepseek-harness-4b399c39.patch) 只适用于 DSH 上游的 `4b399c39a6d1479cd84ca591b4d7c88e24d38a96`。这是 DSH 客户端补丁，不需要修改网关，不会改动网关的原生协议、模型路径、项目、鉴权、重试或设置。已用真实 DSH AgentLoop、固定 pi-ai 和本地模拟 Gemini 验证，没有在你的 DSH 版本或 Google 线上模型验证。
