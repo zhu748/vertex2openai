@@ -16,7 +16,6 @@ from console_auth import (
     clear_login_failure,
     client_ip,
     is_authenticated,
-    has_separate_debug_admin_password,
     issue_session,
     login_retry_after,
     proxy_headers_trusted,
@@ -171,8 +170,7 @@ async def request_detail(request_id: str, _auth: bool = Depends(require_auth)):
     if not trace:
         return JSONResponse(status_code=404, content={"error": "请求记录不存在或已超过保留期限。"})
     detail = trace.snapshot(detail=True)
-    detail["raw_body_available"] = (has_separate_debug_admin_password()
-                                    and app_state.failed_request_bodies.contains(trace.id))
+    detail["raw_body_available"] = app_state.failed_request_bodies.contains(trace.id)
     return JSONResponse(content=detail, headers={"Cache-Control": "no-store"})
 
 
@@ -194,7 +192,7 @@ async def download_request_body(request_id: str, request: Request, _auth: bool =
     headers = {"Cache-Control": "no-store", "Vary": "Cookie"}
     if request.headers.get("sec-fetch-site") not in (None, "same-origin", "none"):
         return JSONResponse(status_code=403, headers=headers, content={"error": "仅可从本站下载。"})
-    trace = request_registry.get(request_id) if has_separate_debug_admin_password() else None
+    trace = request_registry.get(request_id)
     store = app_state.failed_request_bodies
     if trace and store.contains(trace.id):
         slots = store.download_slots

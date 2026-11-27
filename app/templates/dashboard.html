@@ -1044,7 +1044,7 @@
         <div class="inline-notice" id="failed-request-body-warning">
          <div class="space-y-2">
           <p><strong>默认关闭。原始请求体未经脱敏，可能含聊天内容、密钥或附件。</strong> 请仅在排查时启用。</p>
-          <p>启用及下载需显式配置与 <code>API_KEY</code> 不同、至少 12 个字符的 <code>ADMIN_PASSWORD</code>。仅登录的管理员可下载，建议通过 HTTPS 使用。</p>
+          <p>用现有控制台密码登录即可启用和下载，不强制设置 <code>ADMIN_PASSWORD</code>。未设置时，知道 <code>API_KEY</code> 的人也能登录并下载；共享 Key 的部署请设置独立密码或保持关闭，并使用 HTTPS。</p>
           <p>启用后会尝试暂存所有通过 API 认证的生成请求，不限于管理员发出的请求。只保留失败请求的完整请求体，不含请求头或 URL 查询参数。</p>
           <p>每个请求最多 4 MiB，超限不保留。内存中最多保留 15 分钟，总上限 16 MiB、64 条，可能提前清除。关闭并保存、停止或重启服务会清空暂存；开关设置会保留。</p>
          </div>

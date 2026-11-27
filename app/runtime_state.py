@@ -14,7 +14,6 @@ from typing import Optional
 import config as app_config
 from config import state_dir as _state_dir_env  # QUA-P2-7：STATE_DIR 单点定义
 import state_crypto
-from console_auth import has_separate_debug_admin_password
 from failed_request_bodies import FailedRequestBodies, SETTING as FAILED_BODY_SETTING
 from model_capabilities import _strip_known_suffixes
 from model_resource import model_id_for_policy
@@ -498,8 +497,7 @@ class AppState:
 
     def _apply_failed_body_setting(self) -> None:
         self.failed_request_bodies.set_enabled(
-            self._setting_from(self._committed, FAILED_BODY_SETTING) is True
-            and has_separate_debug_admin_password())
+            self._setting_from(self._committed, FAILED_BODY_SETTING) is True)
 
     def refresh_failed_body_capture(self) -> None:
         with self._lock:

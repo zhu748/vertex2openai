@@ -10,8 +10,7 @@ from starlette.convertors import PathConvertor, register_url_convertor
 
 import config
 import model_capabilities as mc
-from console_auth import has_separate_debug_admin_password, require_auth
-from failed_request_bodies import SETTING as FAILED_BODY_SETTING
+from console_auth import require_auth
 from keepalive import keepalive_service
 from model_loader import get_express_models
 from model_resource import parse_google_model_resource
@@ -128,11 +127,6 @@ async def update_settings_api(request: Request, _auth: bool = Depends(require_au
     error = validate_global_settings_patch(patch)
     if error:
         return JSONResponse(status_code=400, content=error)
-    if patch.get(FAILED_BODY_SETTING) is True and not has_separate_debug_admin_password():
-        return JSONResponse(status_code=400, content={
-            "field": FAILED_BODY_SETTING,
-            "error": "保留原始请求体需先配置独立的 ADMIN_PASSWORD（至少 12 字符，不能与 API_KEY 相同）。",
-        })
     refresh_keys = {"cookie_auto_refresh", "cookie_refresh_interval_seconds"} & set(patch)
     refresh_changed = False
     try:

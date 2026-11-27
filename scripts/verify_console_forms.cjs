@@ -350,7 +350,7 @@ async function main(){
    const field='debug_failed_request_body',capture=el(field);
    const warning=el('failed-request-body-warning').textContent;
    assert.equal(capture.checked,false);
-   for(const text of ['默认关闭','未经脱敏','ADMIN_PASSWORD','API_KEY','12 个字符','HTTPS','通过 API 认证的生成请求','请求头','查询参数','4 MiB','15 分钟','内存','16 MiB','64 条','可能提前清除','重启'])
+   for(const text of ['默认关闭','未经脱敏','ADMIN_PASSWORD','API_KEY','不强制设置','HTTPS','通过 API 认证的生成请求','请求头','查询参数','4 MiB','15 分钟','内存','16 MiB','64 条','可能提前清除','重启'])
     assert(warning.includes(text),text);
    assert.equal(capture.getAttribute('aria-describedby'),'failed-request-body-warning');
    const saves=()=>requests.filter(r=>r.path==='/api/settings'&&r.method==='POST');
@@ -359,11 +359,11 @@ async function main(){
    edit(field,true);await w.loadParams();
    assert.equal(saves().length,before);assert.equal(capture.checked,true);assert.equal(w.consoleForms.dirty(),true);
    transport=(url,options)=>url.pathname==='/api/settings'&&options.method==='POST'
-    ?new Response(JSON.stringify({field,error:'请先配置独立的 ADMIN_PASSWORD'}),{status:400}):undefined;
+    ?new Response(JSON.stringify({field,error:'测试：请求诊断设置值无效'}),{status:400}):undefined;
    await saveRuntime();
    assert.equal(settings[field],false);assert.equal(capture.checked,true);assert.equal(w.consoleForms.dirty(),true);
    assert.equal(capture.getAttribute('aria-invalid'),'true');
-   assert.match(el(field+'-error').textContent,/ADMIN_PASSWORD/);
+   assert.match(el(field+'-error').textContent,/请求诊断设置值无效/);
    transport=null;
    await saveRuntime();
    assert.deepEqual(saves().at(-1).body,{[field]:true,_expected:{[field]:{present:true,value:false}}});

@@ -96,8 +96,6 @@ class TestFailedBodyRoute(NativeSDKHarness):
             for _ in range(MAX_DOWNLOADS):
                 self.store.download_slots.release()
         self.assertEqual((await self.client.get(base + "/raw-body")).content, BODY)
-        with patch.object(config, "ADMIN_PASSWORD", config.API_KEY):
-            self.assertEqual((await self.client.get(base + "/raw-body")).status_code, 404)
         self.assertEqual((await self.set_capture(False)).status_code, 200)
         self.assertEqual((await self.client.get(base + "/raw-body")).status_code, 404)
 
@@ -194,12 +192,26 @@ class TestFailedBodyRoute(NativeSDKHarness):
         await self.check_export(failure, True)
         self.assertEqual((await self.set_capture(False)).status_code, 200)
 
-    async def test_no_shared_or_short_password_and_wrong_setting_type(self):
-        for password in (None, config.API_KEY, "short"):
-            with self.subTest(password=bool(password)), patch.object(config, "ADMIN_PASSWORD", password):
-                self.assertEqual((await self.set_capture(True)).status_code, 400)
-        self.assertEqual((await self.set_capture("yes")).status_code, 400)
-        self.assertFalse(self.store.begin("not-enabled", "0"))
+    async def test_fallback_console_login_can_enable_and_download(self):
+        self.client.cookies.clear()
+        with patch.object(config, "ADMIN_PASSWORD", None):
+            # The generation Bearer alone is not a console session.
+            self.assertEqual((await self.set_capture(True)).status_code, 401)
+            login = await self.client.post("/api/login", json={"password": config.API_KEY})
+            self.assertEqual(login.status_code, 200)
+            self.assertIn(console_auth.AUTH_COOKIE, self.client.cookies)
+            self.assertEqual((await self.set_capture("yes")).status_code, 400)
+            self.assertFalse(self.store.begin("not-enabled", "0"))
+            self.assertEqual((await self.set_capture(True)).status_code, 200)
+            try:
+                async with self.provider(lambda *_: httpx.Response(400, json=ERROR)):
+                    failure = await self.request()
+                base = await self.check_export(failure, True)
+                self.client.cookies.clear()
+                self.assertEqual((await self.client.get(base + "/raw-body")).status_code, 401)
+            finally:
+                await self.client.post("/api/login", json={"password": config.API_KEY})
+                await self.set_capture(False)
 
 
 def test_bounds_and_incomplete_capture():

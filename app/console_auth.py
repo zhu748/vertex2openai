@@ -23,13 +23,6 @@ def resolve_admin_password() -> str:
 
 
 
-def has_separate_debug_admin_password() -> bool:
-    """Raw body exports must not be available via the shared generation key."""
-    password = config.ADMIN_PASSWORD
-    return bool(password and len(password.strip()) >= 12
-                and password.strip() != (config.API_KEY or "").strip())
-
-
 AUTH_COOKIE = "ap_session"
 # SEC-P2-3（2026-11 收紧）：会话有效期从固定 30 天改为「绝对上限 + 闲置
 # 超时」双窗口——泄漏一个 token 的完全控制期从最长 30 天收敛到

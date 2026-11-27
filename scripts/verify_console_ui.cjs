@@ -16,7 +16,8 @@ const {chromium} = require('playwright');
 const root = path.resolve(__dirname, '..');
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const fixtureAPIKey = 'ui-browser-test';
-const fixtureAdminPassword = 'ui-browser-admin-secret';
+const fixtureAdminPassword = process.env.UI_USE_API_KEY_LOGIN === '1' ? '' : 'ui-browser-admin-secret';
+const fixtureConsolePassword = fixtureAdminPassword || fixtureAPIKey;
 const modelLeaf = 'gemini-3.5-flash-lite';
 const scopedModel = `projects/fixture-project/locations/global/publishers/google/models/${modelLeaf}`;
 const fixture = `
@@ -111,7 +112,7 @@ async function main() {
     const errors = [], external = [];
     context.on('page', page => {page.on('pageerror', error => errors.push(error.message));
       // SEC-P3-4：Cookie reveal 的二次口令 prompt 用独立控制台口令应答。
-      page.on('dialog', dialog => dialog.type() === 'prompt' ? dialog.accept(fixtureAdminPassword) : dialog.accept());});
+      page.on('dialog', dialog => dialog.type() === 'prompt' ? dialog.accept(fixtureConsolePassword) : dialog.accept());});
     await context.route('**/*', route => {
       if (!route.request().url().startsWith(origin)) {external.push(route.request().url());return route.abort();}
       return route.continue();
@@ -152,7 +153,7 @@ async function main() {
     await page.waitForFunction(() => document.querySelector('#err').textContent.includes('密码错误'));
     await page.click('#password-toggle');
     assert.equal(await page.getAttribute('#pw', 'type'), 'text');
-    await page.fill('#pw', fixtureAdminPassword);
+    await page.fill('#pw', fixtureConsolePassword);
     await page.click('#login-submit');
     await page.waitForSelector('#s-total');
     if(process.env.UI_TEST_CJK_FONT)await page.evaluate(()=>document.fonts.ready);
