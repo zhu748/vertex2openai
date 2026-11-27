@@ -948,15 +948,17 @@ Express 生成。目录不会放宽翻译或原生 POST 的通道与资源范围
 
 在控制台「模型参数」中先选择具体模型，将「模型列表中的抗截断后缀」设为“不显示”“显示两种”“仅非流式”或“仅流式”，点「保存为该模型专属」，再刷新客户端模型列表。设置只控制该模型的后缀，不会改变普通入口，也不支持全局开启。
 
-例如，先为 `gemini-3.6-flash` 开启流式后缀，再发送：
+例如，确认你的上游项目可用 `gemini-4-hydrogen`，在控制台为该模型开启流式后缀，再发送：
 
 ```json
 {
-  "model": "gemini-3.6-flash-antitruncation-stream",
+  "model": "gemini-4-hydrogen-antitruncation-stream",
   "stream": true,
   "messages": [{"role": "user", "content": "请完整解释这个算法"}]
 }
 ```
+
+Google Cloud 已于 2026-11-19 停止向新项目和非活跃项目提供 [Gemini 3.6 Flash](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/3-6-flash)。[官方生命周期表](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/model-versions)列出 3.6 Flash 和 3.7 Flash 的退役日期均为 2027-01-28，替代模型为 `gemini-4-hydrogen`。代理不会据此改写旧模型 ID 或迁移模型专属设置；这些日期也不是 Studio Cookie 通道的可用性保证。
 
 配置字段 `anti_truncation_mode` 现在仅控制各模型发布的后缀：`off` 不发布，`stream` / `nonstream` 仅发布对应后缀，`both` 发布两种。已保存的模型专属值继续有效；旧全局值不再应用。请求体中的同名旧参数保留接收兼容，但不能开启抗截断或覆盖所选后缀；需要普通回复请使用无后缀名称。
 
@@ -1116,9 +1118,12 @@ SSE 心跳与元数据不会重置计时，退避仍由 `retry_backoff_seconds` 
 `retry_after` 字段（秒数或 HTTP 日期的原始字符串）。响应头已对跨域浏览器暴露。JSON、轮询和 SSE 交付标记均在实际 ASGI
 发送成功后更新；这不是客户端应用层收件确认。
 
-Gemini 原生 `streamGenerateContent?alt=sse` 默认增加安全的事件间注释保活，并检查事件和候选结束标记。
+Gemini 原生 `streamGenerateContent?alt=sse` 默认在事件之间发送保活空行，并检查事件和候选结束标记。
 原始 JSON data 内容保持不变。需要后台缓冲/续传时加 `X-Resumable: true`；之后同样使用
 `X-Resume-Id` / 完整事件 ID 或轮询恢复。原生 SSE 不添加 OpenAI 的 `[DONE]`。非 SSE 原生响应仍按原协议透传。
+已识别的 Python `google-genai 2.31.0` 在主动使用原生续传时会收到仅含 `data:` 字段与保活空行的 SSE，因为该版本无法解析
+`id:` 和注释。生成 ID 仍通过 `X-Resume-Id` 返回；SDK 不会自动维护事件游标，调用方可按回执重放全量，
+或使用已知序号/现有轮询接口指定恢复位置。其他客户端仍收到原有编号事件和诊断注释。
 续传开关允许且身份与原请求匹配时，已保留的原生回执可在切换上游通道后继续读取；Cookie 桥接仍不为新请求建立续传缓冲。
 上游半途断流时返回错误，不把缓存中的半截内容当成完整成功，也不自动拼接另一轮生成。
 

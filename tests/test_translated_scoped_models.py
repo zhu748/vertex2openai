@@ -18,7 +18,8 @@ from model_resource import model_id_for_policy
 from routes import claude_api, gemini_native, models_api
 from runtime_state import AppState, app_state
 from test_req_round15_contracts import Round15Harness
-from upstreams import cookie_delivery, cookie_native, cookie_proxy, express_sdk, native_passthrough
+from upstreams import (cookie_delivery, cookie_native, cookie_proxy, cookie_request, cookie_transport,
+                       express_sdk, native_passthrough)
 
 
 MODEL = "gemini-3.6-flash"
@@ -419,6 +420,90 @@ class TranslatedScopedModelRoutes(Round15Harness):
                     self.assertEqual(reply.status_code, 400, reply.text[:220])
                     self.assertIn("本账号项目 global", reply.json()["error"]["message"])
                     self.assertEqual(self.wire, [])
+
+    async def test_studio_translated_paths_use_scope_overrides_without_repointing_the_wire(self):
+        self.channel = "web_proxy"
+        scoped = resource()
+        relative = f"models/{MODEL}"
+        publisher = f"publishers/google/models/{MODEL}"
+        self.settings["model_overrides"] = {
+            MODEL: {"default_max_tokens": 321, "first_reply_timeout_seconds": 18, "anti_truncation_mode": "off"},
+            scoped: {"default_max_tokens": 987, "first_reply_timeout_seconds": 27, "anti_truncation_mode": "both",
+                     "native_thinking_mode": "console", "thinking_g3_level": "high",
+                     "inject_system_instruction": "Scoped fixture instruction."},
+            relative: {"default_max_tokens": 654},
+            publisher: {"default_max_tokens": 765},
+        }
+        catalog = [MODEL, scoped, relative, publisher]
+        sdk = self.catalog_fixture(catalog)
+        with patch.object(app_state, "get_settings", return_value=self.settings):
+            openai, claude, _ = await self.catalogs(sdk)
+        scope_alias = scoped + "-antitruncation-nonstream"
+        for listed in (openai, claude):
+            self.assertIn(scope_alias, listed)
+            self.assertNotIn(MODEL + "-antitruncation-nonstream", listed)
+
+        for protocol in ("chat", "responses", "messages"):
+            for target, tokens in ((scoped, 987), (MODEL, 321), (relative, 654), (publisher, 765),
+                                   (scope_alias, 987), (scoped + "-search", 987)):
+                with self.subTest(protocol=protocol, target=target):
+                    reply = await self.send(protocol, target)
+                    if protocol == "responses" and target.endswith("-search"):
+                        # Responses still rejects search aliases before dispatch.
+                        self.assertEqual(reply.status_code, 400, reply.text[:220])
+                        self.assertEqual(self.wire, [])
+                        continue
+                    self.assertEqual(reply.status_code, 200, reply.text[:220])
+                    self.assertEqual(len(self.wire), 1)
+                    self.assertEqual(self.wire_accounts, ["SAPISID=fixture-test-account"])
+                    wire = self.wire[0][1]
+                    self.assertEqual(wire["model"], scoped)
+                    self.assertEqual(wire["generationConfig"]["maxOutputTokens"],
+                                     128 if protocol == "messages" else tokens)
+                    if target.startswith(scoped):
+                        self.assertEqual(wire.get("systemInstruction"), {"parts": [{"text": "Scoped fixture instruction."}]})
+                        self.assertEqual(wire["generationConfig"]["thinkingConfig"]["thinkingLevel"], "HIGH")
+                    else:
+                        self.assertNotIn("systemInstruction", wire)
+                    if target == scope_alias:
+                        self.assertTrue(wire["tools"][0]["functionDeclarations"][0]["name"].startswith("v2o_emit_"))
+                    if target.endswith("-search"):
+                        self.assertEqual(wire["tools"], [{"googleSearch": {}}])
+
+        explicit_search = scoped + "-search"
+        catalog.append(explicit_search)
+        self.settings["model_overrides"][explicit_search] = {"default_max_tokens": 555}
+        search = await self.send("chat", explicit_search)
+        self.assertEqual(search.status_code, 200, search.text[:220])
+        self.assertEqual(self.wire[0][1]["model"], scoped)
+        self.assertEqual(self.wire[0][1]["generationConfig"]["maxOutputTokens"], 555)
+
+        unlisted = await self.send("chat", MODEL + "-antitruncation-nonstream")
+        self.assertEqual(unlisted.status_code, 400, unlisted.text)
+        self.assertEqual(self.wire, [])
+        self.wire.clear()
+        with patch.object(cookie_transport, "timeout_seconds", wraps=timeout_seconds) as timeout:
+            streamed = await self.client.post("/v1/chat/completions", json={
+                "model": scoped, "messages": PROMPT, "stream": True,
+            })
+        self.assertEqual(streamed.status_code, 200, streamed.text)
+        self.assertIn("A fixture reply.", streamed.text)
+        timeout.assert_called_once_with(scoped)
+        self.assertEqual([payload["model"] for _, payload in self.wire], [scoped])
+
+    async def test_direct_studio_builder_does_not_import_settings_of_a_different_wire_target(self):
+        from models import OpenAIRequest
+
+        same = resource()
+        other_project = resource(project="wrong-project")
+        other_region = resource(location="us-west2")
+        other_leaf = resource(model="gemini-3-flash-preview")
+        for target in (same, other_project, other_region, other_leaf):
+            self.settings["model_overrides"][target] = {"default_max_tokens": 987}
+            body = cookie_request.build_request_body(PROJECT, MODEL, OpenAIRequest(model=target, messages=PROMPT))
+            wire = body["variables"]
+            self.assertEqual(wire["model"], same)
+            self.assertEqual(wire["generationConfig"]["maxOutputTokens"], 987 if target == same else 321)
 
     async def test_scoped_cookie_rotation_uses_only_eligible_project_before_advancing(self):
         self.channel = "web_proxy"

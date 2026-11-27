@@ -22,7 +22,8 @@ from schema_validation import SchemaValidationError
 from signature_destination import publisher_destination, studio_model_resource
 from upstream_errors import create_openai_error_response
 from upstreams.base import BaseUpstream
-from channel_capabilities import CookieModelScopeError, cookie_feature_error, cookie_model_id, cookie_model_scope
+from channel_capabilities import (CookieModelScopeError, cookie_feature_error, cookie_model_id, cookie_model_scope,
+                                  cookie_settings_model)
 from credential_manager import credential_manager
 from proxy_failover import ProxyChain
 from request_validation import validate_openai_request
@@ -256,7 +257,7 @@ def _prepare_cookie_generation(
     force_builtin_search = force_builtin_search or is_grounded_search or _forced_search
 
     _profile = mc.get_profile(base_model_name)
-    _inj_settings = app_state.get_effective_settings(base_model_name)
+    _inj_settings = app_state.get_effective_settings(cookie_settings_model(model_display, project_id, base_model_name))
     request_obj, prefill_text, prefill_active = prepare_messages(
         request_obj,
         _profile,

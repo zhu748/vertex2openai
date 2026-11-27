@@ -6,6 +6,7 @@ import os
 import tempfile
 import threading
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from functools import lru_cache
 from typing import Optional
@@ -45,6 +46,18 @@ def _saved_model_map(state: dict) -> dict:
     settings = state.get("settings")
     overrides = settings.get("model_overrides") if isinstance(settings, dict) else None
     return overrides if isinstance(overrides, dict) else {}
+
+
+def model_override_lookup_keys(key: str) -> Iterator[str]:
+    """Exact key first, then normalized alias and typed resource fallbacks."""
+    yield key
+    stripped = _strip_known_suffixes(key)
+    if stripped != key:
+        yield stripped
+    if (leaf := model_id_for_policy(key)) != key:
+        yield leaf
+        if (stripped_leaf := _strip_known_suffixes(leaf)) != leaf:
+            yield stripped_leaf
 
 
 def model_override_receipt(model_name: str, saved: dict) -> dict:
@@ -1066,23 +1079,13 @@ class AppState:
         # aliases. Only an explicit per-model choice (including built-ins) does.
         base["anti_truncation_mode"] = "off"
         overrides = base.get("model_overrides") or {}
-        ov = overrides.get(key)
-        if not isinstance(ov, dict):
-            # 顶部导入（无循环依赖）：此函数在每请求/每模型路径上执行，
-            # 旧写法的函数内 import 在热路径上反复做模块查找。
-            stripped = _strip_known_suffixes(key)
-            if stripped != key:
-                ov = overrides.get(stripped)
-        if not isinstance(ov, dict) and (leaf := model_id_for_policy(key)) != key:
-            # The destination scope can own an explicit override, but should
-            # otherwise inherit the same defaults as its bare publisher ID.
-            ov = overrides.get(leaf)
-            if not isinstance(ov, dict):
-                ov = overrides.get(_strip_known_suffixes(leaf))
-        if isinstance(ov, dict):
-            for k in app_config.PER_MODEL_KEYS:
-                if k in ov:
-                    base[k] = ov[k]
+        for candidate in model_override_lookup_keys(key):
+            ov = overrides.get(candidate)
+            if isinstance(ov, dict):
+                for k in app_config.PER_MODEL_KEYS:
+                    if k in ov:
+                        base[k] = ov[k]
+                break
         if revision is not None:
             with self._lock:
                 if revision == self._settings_rev and key not in self._effective_cache:

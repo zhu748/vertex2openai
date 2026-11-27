@@ -1,6 +1,6 @@
 """Shared routing policy for features the Cookie bridge cannot preserve."""
 
-from model_capabilities import split_model_alias
+from model_capabilities import split_model_alias, strip_image_and_search_suffixes
 from model_resource import GoogleModelResource, parse_google_model_resource
 from schema_validation import SchemaValidationError
 
@@ -38,6 +38,26 @@ def cookie_model_id(resource: str, project_id: str) -> str:
     if parsed is not None and (parsed.project_id is None or cookie_scope_matches(parsed, project_id)):
         return parsed.model_id
     raise CookieModelScopeError()
+
+
+def cookie_settings_model(requested_model: str, project_id: str, wire_model: str) -> str:
+    """Use the validated explicit resource for translated policy, never for routing."""
+    if "/" not in requested_model:
+        return wire_model
+    name, _ = split_model_alias(requested_model)
+    resource = parse_google_model_resource(name)
+    if (resource is None
+            or (resource.project_id is not None and not cookie_scope_matches(resource, project_id))
+            or strip_image_and_search_suffixes(resource.model_id)[0] != wire_model):
+        return wire_model
+    # Preserve an expressly configured single search/size alias's exact
+    # record. The ordinary settings lookup already falls back for these.
+    suffix = resource.model_id[len(wire_model):].lower()
+    if suffix in ("", "-search", "-512", "-1k", "-2k", "-4k"):
+        return name
+    # Hand-combined aliases are not published by the catalog. Keep their
+    # previous normalized base policy rather than inventing fallback order.
+    return f"{name.rsplit('/', 1)[0]}/{wire_model}"
 
 
 def cookie_feature_error(request, *, structured_output=False):

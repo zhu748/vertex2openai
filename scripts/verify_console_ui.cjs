@@ -15,17 +15,22 @@ const {chromium} = require('playwright');
 
 const root = path.resolve(__dirname, '..');
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const modelLeaf = 'gemini-3.5-flash-lite';
+const scopedModel = `projects/fixture-project/locations/global/publishers/google/models/${modelLeaf}`;
 const fixture = `
 import time
 from main import app
 import model_loader
 model_loader._next_refresh_allowed = float('inf')  # use only the packaged model catalog
+model_loader._model_cache = model_loader._load_local_models_config()
+model_loader._model_cache['models'].append('${scopedModel}')
 from logger import stats, rt_logger
 from request_tracking import request_registry
 from runtime_state import app_state
 import uvicorn, os
 app_state.set_express_keys([{'key':'ui-fixture-key','project_id':'fixture-project','project_source':'auto','enabled':True}])
 app_state.set_cookie_accounts([])
+app_state.set_model_override('${modelLeaf}', {'default_max_tokens':321,'first_reply_timeout_seconds':23})
 # Start disabled so checking the guard below makes a real model-specific edit.
 # Its production default is already enabled; an unchanged value is not posted.
 app_state.update_settings({'image_aspect_ratio':'16:9','express_location':'us-west2','express_ua_profile':'custom','express_ua_custom':'fixture-gateway/'+'x'*360,
@@ -165,6 +170,52 @@ async function main() {
 
     await openTab('params');
     assert.equal(await page.inputValue('#native_thinking_mode'), 'request');
+    await page.selectOption('#model-sel', scopedModel);
+    const scopedPath = '/api/model-overrides/' + encodeURIComponent(scopedModel);
+    const tokens = '#default_max_tokens';
+    const firstReply = '#first_reply_timeout_seconds';
+    const savedModel = async (button = '#btn-scope-save', method = 'POST') => {
+      const complete = responseFor(scopedPath, method);
+      await page.click(button);
+      const result = await complete;
+      assert.equal(result.status(), 200, await result.text());
+      await page.waitForFunction(() => !document.querySelector('#btn-scope-save').disabled);
+      return result.request().postDataJSON();
+    };
+    assert.equal(await page.inputValue(tokens), '321');
+    assert.equal(await page.inputValue(firstReply), '23');
+    assert.equal(await page.inputValue('#anti_truncation_mode'), 'both');
+    assert.match(await page.textContent('#source-default_max_tokens'), /继承基础模型/);
+    assert.doesNotMatch(await page.textContent('#model-sel option:checked'), /★/);
+    await page.fill(tokens, '987');
+    await page.fill(firstReply, '44');
+    assert.deepEqual(await savedModel(), {
+      default_max_tokens: 987, first_reply_timeout_seconds: 44,
+      _expected: {default_max_tokens:{present:false}, first_reply_timeout_seconds:{present:false}},
+    });
+    assert.match(await page.textContent('#model-sel option:checked'), /★/);
+    assert.equal(await page.inputValue('#anti_truncation_mode'), 'off');
+    await page.selectOption('#model-sel', modelLeaf);
+    assert.equal(await page.inputValue(tokens), '321');
+    await page.selectOption('#model-sel', scopedModel);
+    assert.equal(await page.inputValue(tokens), '987');
+    await page.click('#source-first_reply_timeout_seconds button[data-value=true]');
+    assert.equal(await page.inputValue(firstReply), '0');
+    await page.click('#source-default_max_tokens button[data-value=true]');
+    assert.equal(await page.inputValue(firstReply), '23');
+    assert.equal(await page.inputValue(tokens), '321');
+    const inherit = await savedModel();
+    assert.deepEqual(new Set(inherit._inherit), new Set(['default_max_tokens', 'first_reply_timeout_seconds']));
+    assert.equal(await page.inputValue(tokens), '321');
+    assert.doesNotMatch(await page.textContent('#model-sel option:checked'), /★/);
+    await page.fill(tokens, '555');
+    await savedModel();
+    assert.deepEqual(await savedModel('#btn-scope-clear', 'DELETE'), {expected_override:{default_max_tokens:555}});
+    assert.equal(await page.inputValue(tokens), '321');
+    assert.equal(await page.inputValue(firstReply), '23');
+    assert.equal(await page.inputValue('#anti_truncation_mode'), 'both');
+    check('带路径的模型按完整 ID 独立保存与重置，准确显示基础模型的继承值');
+
     await page.selectOption('#model-sel', 'gemini-4-argon');
     await page.fill('#first_reply_timeout_seconds', '28.5');
     assert.equal(await page.locator('#prefill_cot_guard').isChecked(), false);

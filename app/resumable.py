@@ -24,7 +24,7 @@ import json
 import math
 import secrets
 import time
-from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
 
 from fastapi.responses import JSONResponse, StreamingResponse
 from request_connection import ClientConnection
@@ -1321,32 +1321,33 @@ async def pump_stream(buf: ResumableBuffer, body_iterator: AsyncIterator[Any], *
                 pass
 
 
-async def sse_from_buffer(buf: ResumableBuffer, start_seq: int = 0) -> AsyncIterator[str]:
-    """把缓冲区内容按 SSE 吐给当前这条前端连接（可从任意 seq 续取）。
-
-    事件落缓冲时已带 `id: <seq>`（见 pump_stream），这里原样吐出，不再二次加工。
-    """
+async def sse_from_buffer(buf: ResumableBuffer, start_seq: int = 0, *,
+                          heartbeat_frame: str = HEARTBEAT_FRAME,
+                          render_frame: Callable[[str], str] | None = None) -> AsyncIterator[str]:
+    """Deliver retained SSE from a sequence, optionally rendering it for this reader only."""
     if start_seq > 0:
         print(f"↩️ [续传] {buf.id} 从事件 #{start_seq} 续传（缓冲区已有 {buf.next_seq} 个事件）。")
-    yield HEARTBEAT_FRAME
+    yield heartbeat_frame
     events = with_heartbeats(buf.iter_from(start_seq))
     try:
         async for item in events:
             if item is HEARTBEAT:
-                yield HEARTBEAT_FRAME
+                yield heartbeat_frame
                 continue
             _seq, frame = item
-            yield frame
+            yield frame if render_frame is None else render_frame(frame)
     finally:
         await events.aclose()
 
 
 class ReplayStreamResponse(StreamingResponse):
     """Only a successful, connected ASGI send through EOF can consume a replay."""
-    def __init__(self, request, buf: ResumableBuffer, start: int, *, headers):
+    def __init__(self, request, buf: ResumableBuffer, start: int, *, headers, heartbeat_frame: str = HEARTBEAT_FRAME,
+                 render_frame: Callable[[str], str] | None = None):
         self.connection = ClientConnection.for_request(request)
         self.buffer, self.start = buf, start
-        super().__init__(sse_from_buffer(buf, start), media_type="text/event-stream", headers=headers)
+        content = sse_from_buffer(buf, start, heartbeat_frame=heartbeat_frame, render_frame=render_frame)
+        super().__init__(content, media_type="text/event-stream", headers=headers)
 
     async def stream_response(self, send):
         connection, buf = self.connection, self.buffer

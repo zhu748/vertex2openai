@@ -3,22 +3,47 @@
 import asyncio
 from typing import Literal
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from starlette.convertors import PathConvertor, register_url_convertor
 
 import config
 import model_capabilities as mc
 from console_auth import require_auth
 from keepalive import keepalive_service
 from model_loader import get_express_models
-from runtime_state import app_state, SettingsConflictError, model_override_receipt
+from model_resource import parse_google_model_resource
+from runtime_state import app_state, SettingsConflictError, model_override_lookup_keys, model_override_receipt
 from request_connection import BodyTooLargeError
 from request_ingress import IngressError
 from settings_validation import validate_global_settings_patch, validate_settings_patch
 
 
 router = APIRouter()
+
+
+class _ConsoleModelIDConvertor(PathConvertor):
+    # Unlike :path, leave an empty ID and a bare ID's trailing slash to
+    # Starlette's existing matching/redirect logic. Capture a nested ID's
+    # trailing slash so it cannot redirect to a different configured key.
+    regex = r"[^/]+(?:/[^/].*)?"
+
+
+register_url_convertor("console_model_id", _ConsoleModelIDConvertor())
+
+
+async def _require_editable_model(model_name: str) -> None:
+    # ASGI has already decoded the request path. Never unquote again or use
+    # the leaf as a write key. Keep arbitrary bare IDs for legacy clients;
+    # a literal %2F spelling is allowed only if configured as its own ID.
+    if "/" in model_name:
+        if parse_google_model_resource(model_name) is None:
+            raise HTTPException(404, "Not Found")
+    elif "%2f" not in model_name.lower():
+        return
+    if model_name not in await get_express_models():
+        raise HTTPException(404, "Not Found")
 
 
 def _expected_settings(patch, keys):
@@ -138,8 +163,16 @@ async def get_capabilities_api(_auth: bool = Depends(require_auth)):
     }
     # 附带各模型是否已有专属参数覆盖，供前端标示
     overrides = settings_base["model_overrides"]
+    # Fallback keys are presentation metadata, not owned override records.
+    # The browser can recompute the effective display after saves/reset using
+    # the same first-existing-record order, without changing CAS baselines.
+    override_fallbacks = {
+        m: list(model_override_lookup_keys(m))[1:]
+        for m in models if "/" in m and parse_google_model_resource(m) is not None
+    }
     return JSONResponse(content={"models": models, "capabilities": caps, "overrides": overrides,
                                  "saved_overrides": saved_overrides,
+                                 "override_fallbacks": override_fallbacks,
                                  "builtin_overrides": config.DEFAULT_SETTINGS["model_overrides"]},
                         headers={"Cache-Control": "no-store"})
 
@@ -149,8 +182,9 @@ async def list_model_overrides(_auth: bool = Depends(require_auth)):
     return JSONResponse(content=app_state.get_model_overrides(), headers={"Cache-Control": "no-store"})
 
 
-@router.post("/api/model-overrides/{model_name}")
+@router.post("/api/model-overrides/{model_name:console_model_id}")
 async def save_model_override(model_name: str, request: Request, _auth: bool = Depends(require_auth)):
+    await _require_editable_model(model_name)
     try:
         patch = await request.json()
     except (BodyTooLargeError, IngressError):
@@ -194,8 +228,9 @@ class ModelOverrideReset(BaseModel):
     expected_override: dict
 
 
-@router.delete("/api/model-overrides/{model_name}")
+@router.delete("/api/model-overrides/{model_name:console_model_id}")
 async def delete_model_override(model_name: str, _auth: bool = Depends(require_auth), body: ModelOverrideReset | None = None):
+    await _require_editable_model(model_name)
     # No body retains the legacy unconditional API; a supplied object must
     # contain the complete loaded baseline, even when there were no overrides.
     try:

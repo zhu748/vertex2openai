@@ -123,6 +123,17 @@ class WireFramingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ReplayDispatchTests(unittest.TestCase):
+    def test_data_only_view_preserves_fields_and_line_boundaries_without_json_reencoding(self):
+        from replay_event import ReplayEvent, data_only_frame
+
+        # A bare CR followed by metadata then an LF-only empty line must
+        # remain two line breaks after the metadata is removed.
+        raw = ('id: receipt:0\n: keep-alive\r\nevent: message\n'
+               'data:  {\rdata\rdata:"text":"中文\u2028🌱"}\rretry: 2\n\n')
+        projected = data_only_frame(raw)
+        self.assertEqual(projected, 'data:  {\rdata: \rdata: "text":"中文\u2028🌱"}\r\n\n')
+        self.assertEqual(ReplayEvent(projected).data(), ReplayEvent(raw).data())
+
     def test_data_bearing_dispatch_owns_the_only_server_cursor(self):
         from replay_event import ReplayEvent
 

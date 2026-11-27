@@ -359,16 +359,29 @@ def _native_partial_delta(arg):
     if any(camel in arg and snake in arg for camel, snake in
            (("jsonPath", "json_path"), ("willContinue", "will_continue"))):
         return None
-    selected = [(camel, arg[key]) for camel, snake in _PARTIAL_ARMS for key in (camel, snake) if key in arg]
-    if len(selected) != 1:
-        return None  # multiple oneof arms (including two spellings), or just the envelope
-    kind, value = selected[0]
+    kind, value = None, None
+    for camel, snake in _PARTIAL_ARMS:
+        if camel in arg:
+            if snake in arg:
+                return None  # ambiguous aliases even when both values are null
+            raw = arg[camel]
+        elif snake in arg:
+            raw = arg[snake]
+        else:
+            continue
+        # Ordinary ProtoJSON null fields are unset. NullValue is the exception:
+        # its explicitly present JSON null selects that oneof arm.
+        if raw is None and camel != "nullValue":
+            continue
+        if kind is not None:
+            return None
+        kind, value = camel, raw
+    if kind is None:
+        return None
     continued = arg.get("willContinue", arg.get("will_continue"))
     if continued is not None and (type(continued) is not bool or (continued and kind != "stringValue")):
         return None
-    # google.protobuf.NullValue is the exception to ordinary ProtoJSON null
-    # handling: an explicitly present JSON null is the selected delta. Keep
-    # the enum spelling emitted by SDKs; neither bool nor zero selects it.
+    # Keep the NullValue enum spelling emitted by SDKs; neither bool nor zero selects it.
     if not (kind == "boolValue" and type(value) is bool
             or kind == "numberValue" and (type(value) is int or type(value) is float and isfinite(value))
             or kind == "stringValue" and isinstance(value, str)

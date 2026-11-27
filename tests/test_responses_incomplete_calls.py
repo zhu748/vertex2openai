@@ -89,6 +89,12 @@ class IncompleteResponsesCalls(SchemaRouteHarness):
                 {"functionCall": {"name": "count_colors", "partialArgs": [{"jsonPath": "$.x", "boolValue": True,
                                                                            "stringValue": "another arm"}]}},
                 {"functionCall": {"name": "count_colors", "partialArgs": [{"stringValue": "missing path"}]}},
+                {"functionCall": {"name": "count_colors", "partialArgs": [{"jsonPath": "$.x", "boolValue": None,
+                                                                           "stringValue": None}]}},
+                {"functionCall": {"name": "count_colors", "partialArgs": [{"jsonPath": "$.x", "boolValue": False,
+                                                                           "nullValue": None, "numberValue": None}]}},
+                {"functionCall": {"name": "count_colors", "partialArgs": [{"jsonPath": "$.x", "numberValue": 0,
+                                                                           "stringValue": None, "willContinue": True}]}},
             ):
                 with self.subTest(channel=self.channel, bad=bad):
                     self.reply = [assistant("whole", SIGNATURES[0]), bad]
@@ -96,6 +102,43 @@ class IncompleteResponsesCalls(SchemaRouteHarness):
                         result = await self.post_at(request(), "json")
                         self.assertEqual(result.status_code, 502, result.text[:200])
                         register.assert_not_called()
+
+    async def test_typed_fragments_with_inactive_nulls_follow_only_a_verified_terminal(self):
+        for self.channel in ("api_key", "web_proxy"):
+            for phase in ("json", "late"):
+                for self.finish_reason, reason in (("MAX_TOKENS", "max_output_tokens"), ("SAFETY", "content_filter"),
+                                                   ("STOP", None)):
+                    with self.subTest(channel=self.channel, phase=phase, finish=self.finish_reason):
+                        self.sent.clear()
+                        partial = {
+                            "functionCall": {**OPEN["functionCall"], "partialArgs": [
+                                {"jsonPath": "$.nil", "nullValue": None, "boolValue": None, "stringValue": None},
+                                {"jsonPath": "$.zero", "numberValue": 0, "boolValue": None},
+                                {"jsonPath": "$.flag", "boolValue": False, "stringValue": None},
+                                {"jsonPath": "$.label", "stringValue": "", "numberValue": None, "willContinue": True},
+                            ]},
+                            "thoughtSignature": OPEN["thoughtSignature"],
+                        }
+                        self.reply = [{"text": "provider prefix"}, partial]
+                        with patch.object(signature_store, "register_call_signature") as register:
+                            result = await self.post_at(request(stream=phase != "json"), phase)
+                            register.assert_not_called()
+                        self.assertEqual(len(self.sent), 1)
+                        self.assertNotIn("function_call_arguments", result.text)
+                        self.assertNotIn("cGFydGlhbA==", result.text)
+                        if reason is None:
+                            if phase == "json":
+                                self.assertEqual(result.status_code, 502, result.text[:200])
+                            else:
+                                self.assertEqual(public(result, phase)["status"], "failed")
+                        else:
+                            self.assertEqual(result.status_code, 200, result.text[:200])
+                            out = public(result, phase)
+                            self.assertEqual(out["status"], "incomplete")
+                            self.assertEqual(out["incomplete_details"], {"reason": reason})
+                            self.assertEqual(out["usage"]["total_tokens"], 12)
+                            self.assertEqual([item["content"][0]["text"] for item in out["output"]],
+                                             ["provider prefix"])
 
     async def test_private_text_transport_does_not_publish_real_argument_fragments(self):
         # Only generation transport name is fixed, so provider fixtures can return it.

@@ -11,6 +11,7 @@ import asyncio
 import codecs
 import hashlib
 import json
+import re
 import time
 from functools import partial
 from typing import Any, AsyncIterator, Iterable, Optional
@@ -25,7 +26,7 @@ from google.genai.types import BlockedReason
 from starlette.background import BackgroundTasks
 from request_connection import ClientConnection
 from request_ingress import hold_ingress
-from replay_event import ReplayEvent
+from replay_event import ReplayEvent, data_only_frame
 
 import config as app_config
 from retry_policy import advisory_fits, get_retry_settings, is_retryable_exception, is_retryable_status, note_retry_deadline
@@ -65,6 +66,10 @@ from upstreams.native_catalog import (
 _PROMPT_BLOCK_REASONS = frozenset(reason.value for reason in BlockedReason
                                   if reason is not BlockedReason.BLOCKED_REASON_UNSPECIFIED)
 _UPSTREAM_TIMEOUT = httpx.Timeout(connect=30.0, read=600.0, write=60.0, pool=10.0)
+# The audited client parser treats non-data SSE lines as JSON. This is a
+# client-version match, not the server's installed SDK version or an identity.
+_DATA_ONLY_REPLAY_SDK = "google-genai-sdk/2.31.0"
+_PYTHON_RUNTIME_LABEL = re.compile(r"gl-python/[0-9]+\.[0-9]+\.[0-9]+(?:(?:a|b|rc)[0-9]+)?\+?")
 
 
 class NativeAPIError(Exception):
@@ -795,6 +800,14 @@ def native_replay_fingerprint(model: str, action: str, query: str, payload: byte
         ensure_ascii=False, separators=(",", ":"))
 
 
+def _sdk_native_replay_view(request: Request) -> bool:
+    for name in ("x-goog-api-client", "user-agent"):
+        labels = request.headers.get(name, "").split()
+        if _DATA_ONLY_REPLAY_SDK in labels and any(_PYTHON_RUNTIME_LABEL.fullmatch(label) for label in labels):
+            return True
+    return False
+
+
 async def _resumable_native(request: Request, api_key: str, model: str, action: str, query: str, payload: bytes,
                             *, fingerprint: Optional[str] = None, allow_admit: bool = True) -> Optional[Response]:
     if fingerprint is None:
@@ -893,6 +906,9 @@ async def _resumable_native(request: Request, api_key: str, model: str, action: 
             # still addresses the numbered SSE event, not a brand-new HTTP result.
             return _acknowledge_native_http(
                 JSONResponse(buf.payload, status_code=buf.status_code, headers=headers), request, buf)
+    if _sdk_native_replay_view(request):
+        return ReplayStreamResponse(request, buf, start, headers=headers, heartbeat_frame=GEMINI_HEARTBEAT_FRAME,
+                                    render_frame=data_only_frame)
     return ReplayStreamResponse(request, buf, start, headers=headers)
 
 

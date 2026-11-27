@@ -8,7 +8,7 @@ from typing import Any, Optional
 
 import config as app_config
 import model_capabilities as mc
-from channel_capabilities import COOKIE_STRUCTURED_OUTPUT_DISABLED_MESSAGE, cookie_feature_error
+from channel_capabilities import COOKIE_STRUCTURED_OUTPUT_DISABLED_MESSAGE, cookie_feature_error, cookie_settings_model
 from cookie_auth import (
     STREAM_GENERATE_OPERATION_NAME,
     get_client_version,
@@ -586,7 +586,7 @@ def build_request_body(
         destination=publisher_destination(model_path), literal_text=request._completion_target == "responses",
     )
 
-    settings = app_state.get_effective_settings(model_name)
+    settings = app_state.get_effective_settings(cookie_settings_model(request.model, project_id, model_name))
     profile = mc.apply_sampling_policy(mc.get_profile(model_name), settings)
     allowed = profile["allowed_sampling"]
 

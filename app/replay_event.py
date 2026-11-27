@@ -32,6 +32,20 @@ def _append_lines(parts, raw, start, end):
         parts.append(raw[start:end])
 
 
+def data_only_frame(raw: str) -> str:
+    """Remove SSE control lines, preserving the exact data values and dispatch."""
+    parts = []
+    for start, end, after in _lines(raw):
+        if start == end or raw.startswith("data: ", start, end):
+            _append_lines(parts, raw, start, after)
+        elif raw.startswith("data:", start, end) or (end == start + 4 and raw.startswith("data", start)):
+            # The pinned SDK only recognizes "data: ". A missing colon or
+            # optional separator space changes no part of the SSE field value.
+            parts.append("data: ")
+            _append_lines(parts, raw, min(start + 5, end), after)
+    return "".join(parts)
+
+
 class ReplayEvent:
     """Parse SSE field boundaries once; only allocate joined data when needed."""
     def __init__(self, raw: str):

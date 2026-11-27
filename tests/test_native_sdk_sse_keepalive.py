@@ -49,15 +49,17 @@ def mime(studio):
     return {"content-type": "application/json" if studio else "text/event-stream"}
 
 
-class NativeSDKKeepalive(SchemaRouteHarness):
+class NativeSDKHarness(SchemaRouteHarness):
     @staticmethod
-    def transport(on_send, on_request=None):
+    def transport(on_send, on_request=None, *, on_start=None):
         async def observe(scope, receive, send):
             if on_request is not None:
                 on_request(scope)
 
             async def send_observed(message):
-                if message["type"] == "http.response.body" and (body := message.get("body")):
+                if message["type"] == "http.response.start" and on_start is not None:
+                    on_start(message)
+                elif message["type"] == "http.response.body" and (body := message.get("body")):
                     on_send(body)
                 await send(message)
 
@@ -65,11 +67,13 @@ class NativeSDKKeepalive(SchemaRouteHarness):
 
         return httpx.ASGITransport(app=observe)
 
-    def api(self, on_send, on_request=None):
+    def api(self, on_send, on_request=None, *, headers=None, on_start=None, transport=None):
+        if transport is None:
+            transport = self.transport(on_send, on_request, on_start=on_start)
         sdk = genai.Client(api_key="test-key", http_options=types.HttpOptions(
-            base_url="http://local", api_version="v1beta",
+            base_url="http://local", api_version="v1beta", headers=headers,
             retry_options=types.HttpRetryOptions(attempts=1),
-            async_client_args={"transport": self.transport(on_send, on_request)}))
+            async_client_args={"transport": transport}))
         self.addCleanup(sdk.close)
         self.addAsyncCleanup(sdk.aio.aclose)
         return sdk
@@ -105,6 +109,8 @@ class NativeSDKKeepalive(SchemaRouteHarness):
         self.assertEqual(chunks[1].candidates[0].finish_reason, types.FinishReason.STOP)
         self.assertEqual(chunks[1].usage_metadata.total_token_count, 4)
 
+
+class NativeSDKKeepalive(NativeSDKHarness):
     async def test_opening_keepalive_is_transport_only_and_signed_part_roundtrips(self):
         sent = []
         sdk = self.api(sent.append)
@@ -136,7 +142,7 @@ class NativeSDKKeepalive(SchemaRouteHarness):
                 if studio:
                     self.assertEqual(signature, "+/8=")  # private Bytes scalar is standard Base64
 
-    async def test_owned_nullable_tool_delta_roundtrips_as_present_null_and_reassembles(self):
+    async def test_owned_nullable_tool_deltas_roundtrip_and_reassemble(self):
         from request_tracking import current_trace
         from tool_stream import ToolStreamAssembler
 
@@ -145,28 +151,43 @@ class NativeSDKKeepalive(SchemaRouteHarness):
                     "parts": [{"functionCall": call, **part_fields}]}}]}
 
         owner = chunk({"name": "lookup", "id": "owner", "willContinue": True}, thoughtSignature="+/8=")
-        delta = chunk({"id": "owner", "partialArgs": [{"jsonPath": "$.slot", "nullValue": None}]})
+        cases = (
+            ({"nullValue": None}, None),
+            ({"nullValue": None, "boolValue": None, "stringValue": None, "numberValue": None}, None),
+            ({"nullValue": "NULL_VALUE", "numberValue": None}, None),
+            ({"boolValue": False, "stringValue": None}, False),
+            ({"numberValue": 0, "boolValue": None}, 0.0),
+            ({"stringValue": "", "numberValue": None}, ""),
+        )
         sent, traces = [], []
-        wire_bytes = b"".join(encoded(obj, studio=False) for obj in (owner, delta, TAIL))
+        sdk = self.api(sent.append)
+        for fields, value in cases:
+            with self.subTest(fields=fields):
+                sent.clear()
+                traces.clear()
+                fragment = {"jsonPath": "$.slot", **fields}
+                delta = chunk({"id": "owner", "partialArgs": [fragment]})
+                wire_bytes = b"".join(encoded(obj, studio=False) for obj in (owner, delta, TAIL))
 
-        def wire(_request, _count):
-            traces.append(current_trace.get())
-            return httpx.Response(200, content=wire_bytes, headers=mime(False))
+                def wire(_request, _count):
+                    traces.append(current_trace.get())
+                    return httpx.Response(200, content=wire_bytes, headers=mime(False))
 
-        async with self.provider(wire) as requests:
-            chunks = await self.receive(self.api(sent.append))
-        self.assertEqual((len(requests), len(chunks)), (1, 3))
-        self.assertEqual(b"".join(sent), PADDING + wire_bytes)
-        partial = chunks[1].candidates[0].content.parts[0].function_call.partial_args[0]
-        self.assertEqual(partial.model_dump(mode="json", by_alias=True, exclude_unset=True),
-                         {"jsonPath": "$.slot", "nullValue": None})
-        self.assertEqual(traces[0].snapshot()["tool_deltas"], 2)
-        assembler = ToolStreamAssembler()
-        restored = [assembler.restore_sdk(chunk) for chunk in chunks]
-        assembler.validate_end()
-        call = restored[1].candidates[0].content.parts[0]
-        self.assertEqual((call.function_call.name, call.function_call.id, call.function_call.args,
-                          call.thought_signature), ("lookup", "owner", {"slot": None}, b"\xfb\xff"))
+                async with self.provider(wire) as requests:
+                    chunks = await self.receive(sdk)
+                self.assertEqual((len(requests), len(chunks)), (1, 3))
+                self.assertEqual(b"".join(sent), PADDING + wire_bytes)
+                partial = chunks[1].candidates[0].content.parts[0].function_call.partial_args[0]
+                self.assertEqual(partial.model_dump(mode="json", by_alias=True, exclude_unset=True), fragment)
+                self.assertEqual(traces[0].snapshot()["tool_deltas"], 2)
+                assembler = ToolStreamAssembler()
+                restored = [assembler.restore_sdk(chunk) for chunk in chunks]
+                assembler.validate_end()
+                self.assertFalse(restored[0].candidates[0].content.parts)
+                call = restored[1].candidates[0].content.parts[0]
+                self.assertEqual((call.function_call.name, call.function_call.id, call.function_call.args,
+                                  call.thought_signature), ("lookup", "owner", {"slot": value}, b"\xfb\xff"))
+                self.assertIs(type(call.function_call.args["slot"]), type(value))
 
     async def test_periodic_keepalive_waits_during_slow_setup_and_between_real_frames(self):
         for studio in (False, True):

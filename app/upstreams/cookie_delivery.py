@@ -17,6 +17,7 @@ from contextlib import aclosing
 from itertools import chain
 
 from anti_truncation import buffered_sse
+from channel_capabilities import cookie_settings_model
 from fastapi.responses import JSONResponse
 from media_tasks import run_media_task
 from upstreams.cookie_request import build_request_body_async
@@ -1043,6 +1044,7 @@ async def deliver_stream_events(gen: "CookieGeneration") -> AsyncIterator[str]:
     单次尝试的状态经 _StreamAttemptState 传递。
     """
     body_cache = _body_cache_for(gen)
+    settings_model = cookie_settings_model(gen.model_display, gen.project_id, gen.base_model_name)
 
     for attempt in range(gen.retry_max + 1):
         # 客户端已断开则立即停止，避免无谓的上游调用与重试
@@ -1063,7 +1065,7 @@ async def deliver_stream_events(gen: "CookieGeneration") -> AsyncIterator[str]:
                 body,
                 sampler=st.sampler,
                 fallback_body=fallback_body,
-                model=gen.base_model_name,
+                model=settings_model,
                 strip_thoughts=gen.strip_thoughts,
             )
             if gen.text_transport:
@@ -1162,6 +1164,25 @@ class _WholeBodyState:
     sampler: RawSampler = field(default_factory=RawSampler)
 
 
+def _discard_responses_direct_text(st: _WholeBodyState) -> None:
+    """The first private call supersedes only prior direct text, not its siblings."""
+    st.text_pieces.clear()  # No decoded private text has reached the collector yet.
+    parts, order = [], []
+    st.message_extra = None
+    for slot in st.part_order:
+        if slot["type"] == "tool_call":
+            order.append(slot)
+            continue
+        part = st.ordinary_metadata[slot["index"]]
+        if part["kind"] == "text":
+            continue
+        order.append({"type": "ordinary", "index": len(parts)})
+        parts.append(part)
+        if signature := part.get("thought_signature"):
+            st.message_extra = {"google": {"thought_signature": signature, "thought_signature_part": part["kind"]}}
+    st.ordinary_metadata, st.part_order = parts, order
+
+
 def _apply_whole_body_event(gen: "CookieGeneration", st: _WholeBodyState, event_type: str, data: Any) -> None:
     """单个解析事件 → 整取状态（deliver_collect_response 拆分）。
 
@@ -1177,6 +1198,8 @@ def _apply_whole_body_event(gen: "CookieGeneration", st: _WholeBodyState, event_
         else:
             st.text_pieces.append(data)
         _record_output_slot(st.ordinary_metadata, st.part_order, event_type, data)
+    elif event_type == "responses_discard_direct":
+        _discard_responses_direct_text(st)
     elif event_type == "responses_partial_call":
         # No call ID, arguments or signature are retained for this marker.
         st.partial_response_call = True

@@ -151,6 +151,7 @@ class TextDecoder:
         self.real_tool = False
         self.last_call_owned = False
         self.visible = False
+        self.visible_reasoning = False
         self.pending_text = []
         self.pending_size = 0
 
@@ -237,14 +238,21 @@ class TextDecoder:
         if not self.finish_reason:
             raise AntiTruncationError("抗截断：上游连接已结束，但未收到结束标记。")
         if not self.visible and not self.real_tool and not (
-                self.response_owner and self.finish_reason in FINISH_TRUNCATING):
+                self.response_owner and (self.finish_reason in FINISH_TRUNCATING or
+                self.finish_reason == "STOP" and not self.seen and self.visible_reasoning)):
             raise AntiTruncationError("抗截断：上游没有返回正文或真实工具调用。")
 
     def restore_sdk(self, response):
         candidates = []
         for candidate in response.candidates or []:
             out = []
-            for part in getattr(candidate.content, "parts", None) or []:
+            parts = getattr(candidate.content, "parts", None) or []
+            # Only Responses supplies a complete buffered candidate here. If it
+            # contains no private call, its original Parts are the fallback. Do
+            # not move direct text (or its signature) past a real tool/thought.
+            ordered_fallback = self.response_owner is not None and not any(
+                getattr(getattr(part, "function_call", None), "name", None) == self.tool_name for part in parts)
+            for part in parts:
                 if self.finish_reason:
                     raise AntiTruncationError("抗截断：结束标记之后仍有输出。")
                 call = sdk_function_call(part, active=self.seen and not self.closed)
@@ -260,12 +268,18 @@ class TextDecoder:
                         self.pending_size += len(part.text)
                         if self.pending_size > 8 * 1024 * 1024:
                             raise AntiTruncationError("抗截断：未按正文函数输出的文本超出缓冲上限。")
-                        self.pending_text.append(part)
+                        if ordered_fallback:
+                            out.append(part)
+                            self.visible = True
+                        elif not self.response_owner:
+                            self.pending_text.append(part)
                 elif not part.text and part.thought_signature and self.last_call_owned:
                     # Some endpoints send the function signature in a later,
                     # otherwise empty Part. It still belongs to the hidden call.
                     continue
                 else:
+                    if self.response_owner and part.thought is True and part.text and not part.text.isspace():
+                        self.visible_reasoning = True
                     out.append(part)
             if candidate.finish_reason:
                 pending = self.finish(candidate.finish_reason)
@@ -276,9 +290,24 @@ class TextDecoder:
             candidates.append(candidate.model_copy(update={"content": content}))
         return response.model_copy(update={"candidates": candidates})
 
+    def _cookie_call_output(self, name, args, partial=None, will_continue=None):
+        # On the buffered Responses path provisional direct text already has
+        # its correct position in the collector. Withdraw it once, only on the
+        # first actual private call. Never confuse real calls with this marker.
+        had_direct = self.response_owner is not None and not self.seen and self.pending_size > 0
+        text = self.call(name, args, partial, will_continue)
+        if text is None:
+            return None
+        events = [("responses_discard_direct", None)] if had_direct else []
+        if text:
+            events.append(("text", text))
+        return events
+
     def cookie_event(self, status, data):
         if self.finish_reason and status in ("function_call", "text", "thought", "image", "thought_image", "hidden_thought"):
             raise AntiTruncationError("抗截断：结束标记之后仍有输出。")
+        if self.response_owner and status == "thought" and data and not data.isspace():
+            self.visible_reasoning = True
         if status in ("thought_image", "hidden_thought"):
             # A subsequent opaque signature belongs to this real source part,
             # not a private transport call from earlier in the response.
@@ -292,30 +321,35 @@ class TextDecoder:
             # Only this request's own private tool is a text transport. Preserve
             # its visible prefix; its private name, signatures and ID stay hidden.
             call = types.FunctionCall.model_validate(data)
-            text = self.call(call.name, call.args, call.partial_args, call.will_continue)
-            return [("text", text)] if text else []
+            return self._cookie_call_output(call.name, call.args, call.partial_args, call.will_continue)
         if status == "function_call":
             if self.response_owner:
                 self.response_owner.owns(data.get("name"), data.get("id"), False, False)
-            text = self.call(data.get("name"), data.get("args"))
-            if text is None:
-                return [(status, data)]
-            return [("text", text)] if text else []
+            events = self._cookie_call_output(data.get("name"), data.get("args"))
+            return [(status, data)] if events is None else events
         if status == "text":
             if not self.seen:
                 self.pending_size += len(data)
                 if self.pending_size > 8 * 1024 * 1024:
                     raise AntiTruncationError("抗截断：未按正文函数输出的文本超出缓冲上限。")
+                if self.response_owner:
+                    return [(status, data)]  # Provisional only; Responses never streams this collector.
                 self.pending_text.append((status, data))
             return []
         if status == "thought_signature":
             if self.last_call_owned and data.get("part_kind") == "signature_only":
                 return []
+            if self.response_owner:
+                # An attached signature follows its own source event. Direct
+                # text suppressed after the private call has no public carrier.
+                return [] if self.seen and data.get("part_kind") == "text" else [(status, data)]
             if not self.seen and self.pending_text:
                 self.pending_text.append((status, data))
                 return []
         if status == "finish":
             pending = self.finish(data)
+            if self.response_owner and not self.seen and self.pending_size:
+                self.visible = True
             self.visible |= any(kind == "text" and value for kind, value in pending)
             self.validate_end()
             return pending + [(status, data)]

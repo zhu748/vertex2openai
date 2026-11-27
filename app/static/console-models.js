@@ -5,6 +5,7 @@ let GLOBAL_SETTINGS = {},
   OVERRIDES = {},
   SAVED_MODEL_OVERRIDES = {},
   BUILTIN_OVERRIDES = {},
+  MODEL_OVERRIDE_FALLBACKS = {},
   MODEL_CATALOG = new Set();
 // The runtime form has always used these reset values for blank controls.
 // Keep draft comparison and the submitted wire value on the same conversion.
@@ -224,6 +225,7 @@ async function loadParams() {
       load.models
     );
     BUILTIN_OVERRIDES = c.builtin_overrides || {};
+    MODEL_OVERRIDE_FALLBACKS = c.override_fallbacks || {};
     MODEL_CATALOG = new Set(
       (c.models || []).filter((m) => m !== '__global__' && Object.hasOwn(CAPS, m) && CAPS[m])
     );
@@ -340,6 +342,17 @@ function recordModelField(key, kind = 'edit') {
 }
 function refreshModelDraft() {
   const draft = MODEL_DRAFTS.get(renderedModel);
+  if (draft && Object.hasOwn(MODEL_OVERRIDE_FALLBACKS, renderedModel)) {
+    // Removing the last exact field can reveal the fallback record for all
+    // pending inherit actions, including ones clicked before this last one.
+    for (const [key, edit] of draft) {
+      if (edit.kind !== 'inherit') continue;
+      const value = inheritedModelValue(renderedModel, key);
+      if (modelFieldValue(key) !== modelRawValue(key, value)) setV(key, value);
+      edit.raw = modelFieldValue(key);
+      if (key === 'image_aspect_ratio') curAR = edit.raw;
+    }
+  }
   const count = [...(draft || [])].filter(
     ([key, edit]) => !sameExpectation(edit.origin.expected, modelSnapshot[key].expected)
   ).length;
@@ -404,13 +417,34 @@ function discardModelDraft() {
   MODEL_DRAFTS.delete(model);
   renderCaps(false);
 }
+function retainsExactModelFields(model, removing) {
+  const fields = new Set(Object.keys(modelOwnedFields(model)));
+  for (const [key, edit] of MODEL_DRAFTS.get(model) || []) {
+    if (edit.kind === 'inherit') fields.delete(key);
+    else fields.add(key);
+  }
+  fields.delete(removing);
+  return fields.size > 0;
+}
+function inheritedModelSetting(model, key, removing = false) {
+  const builtin = Object.hasOwn(BUILTIN_OVERRIDES, model) ? BUILTIN_OVERRIDES[model] : null;
+  if (builtin && Object.hasOwn(builtin, key))
+    return { value: builtin[key], source: '继承内置默认' };
+  if (Object.hasOwn(MODEL_OVERRIDE_FALLBACKS, model)) {
+    const exact = removing ? retainsExactModelFields(model, key) : Object.hasOwn(OVERRIDES, model);
+    if (!builtin && !exact) {
+      // Runtime uses the first existing record, not the first having each key.
+      const fallback = MODEL_OVERRIDE_FALLBACKS[model].find((id) => Object.hasOwn(OVERRIDES, id));
+      if (fallback && Object.hasOwn(OVERRIDES[fallback], key))
+        return { value: OVERRIDES[fallback][key], source: '继承基础模型设置' };
+    }
+  }
+  return key === 'anti_truncation_mode'
+    ? { value: 'off', source: '继承模型默认' }
+    : { value: GLOBAL_SETTINGS[key], source: '继承全局默认' };
+}
 function inheritedModelValue(model, key) {
-  const builtin = BUILTIN_OVERRIDES[model] || {};
-  return Object.hasOwn(builtin, key)
-    ? builtin[key]
-    : key === 'anti_truncation_mode'
-      ? 'off'
-      : GLOBAL_SETTINGS[key];
+  return inheritedModelSetting(model, key, true).value;
 }
 function setFieldInheritance(key, inherit) {
   if (!PER_MODEL_KEYS.includes(key) || renderedModel === '__global__') return;
@@ -440,10 +474,12 @@ function renderFieldSources() {
       (edit
         ? edit.kind !== 'inherit'
         : Object.hasOwn(SAVED_MODEL_OVERRIDES[renderedModel] || {}, key));
-    const builtin = Object.hasOwn(BUILTIN_OVERRIDES[renderedModel] || {}, key);
+    const source = own
+      ? '模型专属'
+      : inheritedModelSetting(renderedModel, key, edit?.kind === 'inherit').source;
     row.innerHTML = global
       ? ''
-      : `<span>${own ? '模型专属' : builtin ? '继承内置默认' : key === 'anti_truncation_mode' ? '继承模型默认' : '继承全局默认'}${edit ? ' · 未保存' : ''}</span><button type="button" data-inherit="${key}" data-value="${own}" ${el.disabled && !own ? 'disabled' : ''}>${own ? '恢复继承' : '设为专属'}</button>`;
+      : `<span>${source}${edit ? ' · 未保存' : ''}</span><button type="button" data-inherit="${key}" data-value="${own}" ${el.disabled && !own ? 'disabled' : ''}>${own ? '恢复继承' : '设为专属'}</button>`;
     row.hidden = global;
   }
 }
@@ -486,11 +522,7 @@ function modelOwnedFields(model) {
 }
 function modelEffectiveValue(model, key) {
   const override = model === '__global__' ? {} : OVERRIDES[model] || {};
-  return Object.hasOwn(override, key)
-    ? override[key]
-    : key === 'anti_truncation_mode'
-      ? 'off'
-      : GLOBAL_SETTINGS[key];
+  return Object.hasOwn(override, key) ? override[key] : inheritedModelSetting(model, key).value;
 }
 function modelRawValue(key, value) {
   return $(key).type === 'checkbox' ? !!value : value == null ? '' : String(value);
