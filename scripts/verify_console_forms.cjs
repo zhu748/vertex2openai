@@ -15,7 +15,7 @@ async function main(){
  const w=dom.window,d=w.document;
  const settings={thinking_g3_level:'low',native_thinking_mode:'request',first_reply_timeout_seconds:15,image_size:'4K',image_aspect_ratio:'16:9',sampling_policy:'auto',default_top_p:null,default_temperature:null,default_max_tokens:null,roundrobin:false,retry_backoff_mode:'fixed',image_max_concurrency:1,proxy_urls:[],cookie_impersonate:'chrome',express_ua_profile:'sdk',retry_max:10,retry_backoff_seconds:5,retry_jitter_seconds:1,request_timeout_seconds:1800,upstream_max_concurrency:32,resumable_enabled:true,resumable_disconnect_grace_seconds:10,resumable_ttl_seconds:1800,resumable_max_streams:200,resumable_max_buffer_mb:64,resumable_max_total_mb:256,keepalive_interval:60,img_compress_enabled:true,img_compress_max_dim:1536,img_compress_max_mb:1.5,img_compress_quality:85,fake_streaming_interval:1,prefill_mode:'smart',express_location:'global'};
  const overrides={},builtins={text:{anti_truncation_mode:'both'}};
- settings.cookie_auto_refresh=true;settings.cookie_refresh_interval_seconds=600;
+ settings.cookie_auto_refresh=true;settings.cookie_refresh_interval_seconds=600;settings.debug_failed_request_body=false;
  let mode='mixed';
  let keys=[{key:'ui-fixture-key',project_id:'project-one',note:'主账号',enabled:true,proxies:[],proxy_fallback:true}];
  let cookies=[{id:'cookie-one',project_id:'project-cookie',note:'备用账号',enabled:true,cookie_configured:true,proxies:[],proxy_fallback:true}];
@@ -347,6 +347,35 @@ async function main(){
   check('Runtime draft reload preservation, save and undo');
 
   {
+   const field='debug_failed_request_body',capture=el(field);
+   const warning=el('failed-request-body-warning').textContent;
+   assert.equal(capture.checked,false);
+   for(const text of ['默认关闭','未经脱敏','ADMIN_PASSWORD','API_KEY','12 个字符','HTTPS','通过 API 认证的生成请求','请求头','查询参数','4 MiB','15 分钟','内存','16 MiB','64 条','可能提前清除','重启'])
+    assert(warning.includes(text),text);
+   assert.equal(capture.getAttribute('aria-describedby'),'failed-request-body-warning');
+   const saves=()=>requests.filter(r=>r.path==='/api/settings'&&r.method==='POST');
+   const saveRuntime=async()=>{d.querySelector('button[onclick*="saveSettings"]').click();await tick();};
+   const before=saves().length;
+   edit(field,true);await w.loadParams();
+   assert.equal(saves().length,before);assert.equal(capture.checked,true);assert.equal(w.consoleForms.dirty(),true);
+   transport=(url,options)=>url.pathname==='/api/settings'&&options.method==='POST'
+    ?new Response(JSON.stringify({field,error:'请先配置独立的 ADMIN_PASSWORD'}),{status:400}):undefined;
+   await saveRuntime();
+   assert.equal(settings[field],false);assert.equal(capture.checked,true);assert.equal(w.consoleForms.dirty(),true);
+   assert.equal(capture.getAttribute('aria-invalid'),'true');
+   assert.match(el(field+'-error').textContent,/ADMIN_PASSWORD/);
+   transport=null;
+   await saveRuntime();
+   assert.deepEqual(saves().at(-1).body,{[field]:true,_expected:{[field]:{present:true,value:false}}});
+   assert.equal(settings[field],true);assert.equal(w.consoleForms.dirty(),false);
+   await w.loadParams();assert.equal(capture.checked,true);
+   edit(field,false);await saveRuntime();
+   assert.deepEqual(saves().at(-1).body,{[field]:false,_expected:{[field]:{present:true,value:true}}});
+   assert.equal(settings[field],false);assert.equal(w.consoleForms.dirty(),false);
+   check('Failed-body diagnostics warn before enablement, track sparse CAS drafts, and keep drafts on a server prerequisite error');
+  }
+
+  {
    const saveRuntime=async()=>{d.querySelector('button[onclick*="saveSettings"]').click();await tick();};
    const writes=()=>requests.filter(r=>r.path==='/api/settings'&&r.method==='POST');
    assert.equal(el('retry_backoff_mode').value,'fixed');
@@ -605,6 +634,31 @@ async function main(){
   assert.equal(el('request-detail-id').textContent,'new-record');assert.equal(el('request-detail-state').textContent,detailState);
   el('request-dialog').close();
   check('Retained-page clamping, stale response isolation and paused retry messages');
+  {
+   const pane=el('request-raw-body-actions'),link=el('request-raw-body-download');
+   const hidden=()=>{assert.equal(pane.hidden,true);assert.equal(link.hasAttribute('href'),false);};
+   const reply=(data,status=200)=>new Response(JSON.stringify(data),{status});
+   const detailPath='/api/requests/'+record.id;
+   let available=true, reported=record.id, status=200;
+   transport=target=>target.pathname===detailPath?reply({...record,id:reported,raw_body_available:available},status):undefined;
+   hidden();w.requestMonitor.open(record.id);await tick();
+   assert.equal(pane.hidden,false);assert.equal(link.getAttribute('href'),detailPath+'/raw-body');
+   assert.equal(link.hasAttribute('download'),true);assert.equal(link.getAttribute('referrerpolicy'),'no-referrer');
+   assert.equal(new URL(link.href).origin,w.location.origin);
+   link.focus();el('request-refresh').click();await tick();assert.equal(d.activeElement,link);
+   available=false;el('request-refresh').click();await tick();hidden();assert.equal(d.activeElement,el('request-detail-close'));
+   available='true';el('request-refresh').click();await tick();hidden();
+   available=true;reported='trace-0123456789abcdef';el('request-refresh').click();await tick();hidden();
+   reported=record.id;el('request-refresh').click();await tick();assert.equal(pane.hidden,false);
+   status=401;el('request-refresh').click();await tick();hidden();
+   status=200;el('request-refresh').click();await tick();assert.equal(pane.hidden,false);
+   el('request-dialog').close();hidden();
+   const invalidId='not-a-valid-trace';
+   transport=target=>target.pathname==='/api/requests/'+invalidId?reply({...record,id:invalidId,raw_body_available:true}):undefined;
+   w.requestMonitor.open(invalidId);await tick();hidden();el('request-dialog').close();transport=null;
+   assert.equal(requests.filter(r=>r.path.endsWith('/raw-body')).length,0);
+   check('Raw-body actions require a matching available trace, survive refresh focus, and never fetch sensitive bytes');
+  }
   const ids=[...d.querySelectorAll('[id]')].map(e=>e.id);assert.equal(new Set(ids).size,ids.length);
   assert.deepEqual(errors,[]);
   check('Stable request rows, pause/resume, pagination and unique DOM IDs');

@@ -1024,7 +1024,7 @@
     <section aria-labelledby="tab-runtime" class="view hidden" id="view-runtime" role="tabpanel" tabindex="0">
      <div class="page-heading"><div><p class="eyebrow">WORKSPACE / RUNTIME</p><h2>运行设置</h2><p>按任务配置超时、交付与资源限制。修改后统一保存，对所有模型生效。</p></div></div>
      <div class="inline-notice hidden" id="runtime-load-error" role="alert"><span></span><button class="btn-ghost" onclick="runAction(this,loadParams)">重新加载配置</button></div>
-     <nav class="settings-jump" aria-label="运行设置分区"><a href="#runtime-network">上游区域</a><a href="#runtime-retry">重试</a><a href="#runtime-transport">超时与续传</a><a href="#runtime-delivery">交付开关</a><a href="#runtime-cookie-refresh">Cookie 续期</a><a href="#runtime-resources">图片压缩</a><a href="#runtime-keepalive">保活</a><a href="#runtime-compatibility">预填充兼容</a></nav>
+     <nav class="settings-jump" aria-label="运行设置分区"><a href="#runtime-failed-request">失败诊断</a><a href="#runtime-network">上游区域</a><a href="#runtime-retry">重试</a><a href="#runtime-transport">超时与续传</a><a href="#runtime-delivery">交付开关</a><a href="#runtime-cookie-refresh">Cookie 续期</a><a href="#runtime-resources">图片压缩</a><a href="#runtime-keepalive">保活</a><a href="#runtime-compatibility">预填充兼容</a></nav>
      <div class="settings-divider" id="global-settings">
       <div>
        <h3>全局运行设置</h3>
@@ -1034,7 +1034,24 @@
      </div>
      <fieldset class="global-settings-section" data-draft-group="runtime">
       <legend class="visually-hidden">全局运行设置</legend>
-      <div class="settings-grid">
+      <div class="card settings-card" id="runtime-failed-request">
+       <h3 class="settings-card-title">失败请求诊断</h3>
+       <div class="flex items-center justify-between gap-3">
+        <label class="text-sm" for="debug_failed_request_body">暂存失败请求的原始请求体</label>
+        <label class="switch"><input id="debug_failed_request_body" type="checkbox" aria-describedby="failed-request-body-warning"/><span class="slider"></span></label>
+       </div>
+       <div class="mt-3">
+        <div class="inline-notice" id="failed-request-body-warning">
+         <div class="space-y-2">
+          <p><strong>默认关闭。原始请求体未经脱敏，可能含聊天内容、密钥或附件。</strong> 请仅在排查时启用。</p>
+          <p>启用及下载需显式配置与 <code>API_KEY</code> 不同、至少 12 个字符的 <code>ADMIN_PASSWORD</code>。仅登录的管理员可下载，建议通过 HTTPS 使用。</p>
+          <p>启用后会尝试暂存所有通过 API 认证的生成请求，不限于管理员发出的请求。只保留失败请求的完整请求体，不含请求头或 URL 查询参数。</p>
+          <p>每个请求最多 4 MiB，超限不保留。内存中最多保留 15 分钟，总上限 16 MiB、64 条，可能提前清除。关闭并保存、停止或重启服务会清空暂存；开关设置会保留。</p>
+         </div>
+        </div>
+       </div>
+      </div>
+      <div class="settings-grid mt-3">
 <div class="card settings-card" id="runtime-network">
         <h3 class="settings-card-title">上游区域</h3>
         <div class="flex items-center justify-between gap-3">
@@ -1739,6 +1756,10 @@
    </div>
    <div class="request-detail-body">
     <div id="request-detail-state" role="status">
+    </div>
+    <div class="mt-3" id="request-raw-body-actions" hidden>
+     <a class="btn-ghost" id="request-raw-body-download" download referrerpolicy="no-referrer" aria-describedby="request-raw-body-warning">下载原始请求体</a>
+     <p class="lbl mt-2" id="request-raw-body-warning">文件未经脱敏，可能含敏感信息。下载的副本不会随服务端清理，请妥善保管。</p>
     </div>
     <div id="request-detail-content">
     </div>

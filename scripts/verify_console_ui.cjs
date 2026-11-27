@@ -7,7 +7,7 @@
  */
 const assert = require('node:assert/strict');
 const {spawn} = require('node:child_process');
-const {mkdtemp, rm, mkdir} = require('node:fs/promises');
+const {mkdtemp, rm, mkdir, readFile} = require('node:fs/promises');
 const {tmpdir} = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
@@ -15,6 +15,8 @@ const {chromium} = require('playwright');
 
 const root = path.resolve(__dirname, '..');
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const fixtureAPIKey = 'ui-browser-test';
+const fixtureAdminPassword = 'ui-browser-admin-secret';
 const modelLeaf = 'gemini-3.5-flash-lite';
 const scopedModel = `projects/fixture-project/locations/global/publishers/google/models/${modelLeaf}`;
 const fixture = `
@@ -77,7 +79,7 @@ async function main() {
   const origin = `http://127.0.0.1:${port}`;
   const server = spawn(process.env.PYTHON || 'python', ['-u', '-c', fixture], {
     cwd: path.join(root, 'app'),
-    env: {...process.env, STATE_DIR: state, API_KEY: 'ui-browser-test', UI_TEST_PORT: String(port),
+    env: {...process.env, STATE_DIR: state, API_KEY: fixtureAPIKey, ADMIN_PASSWORD: fixtureAdminPassword, UI_TEST_PORT: String(port),
       VERTEX_EXPRESS_API_KEY: '', VERTEX_EXPRESS_API_KEYS: '', GOOGLE_COOKIE: '', GOOGLE_COOKIES: '',
       GOOGLE_PROJECT_ID: '', GOOGLE_PROJECT_IDS: '', PROXY_URL: '', PROXY_URLS: '', UPSTREAM_MODE: 'api_key', MODELS_CONFIG_URL: ''},
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -108,9 +110,8 @@ async function main() {
     await context.addInitScript(() => Object.defineProperty(Crypto.prototype, 'randomUUID', {value: undefined}));
     const errors = [], external = [];
     context.on('page', page => {page.on('pageerror', error => errors.push(error.message));
-      // SEC-P3-4：Cookie reveal 的二次口令 prompt 用控制台口令应答
-      //（口令 = API_KEY 'ui-browser-test'，未设 ADMIN_PASSWORD 时回退）。
-      page.on('dialog', dialog => dialog.type() === 'prompt' ? dialog.accept('ui-browser-test') : dialog.accept());});
+      // SEC-P3-4：Cookie reveal 的二次口令 prompt 用独立控制台口令应答。
+      page.on('dialog', dialog => dialog.type() === 'prompt' ? dialog.accept(fixtureAdminPassword) : dialog.accept());});
     await context.route('**/*', route => {
       if (!route.request().url().startsWith(origin)) {external.push(route.request().url());return route.abort();}
       return route.continue();
@@ -151,7 +152,7 @@ async function main() {
     await page.waitForFunction(() => document.querySelector('#err').textContent.includes('密码错误'));
     await page.click('#password-toggle');
     assert.equal(await page.getAttribute('#pw', 'type'), 'text');
-    await page.fill('#pw', 'ui-browser-test');
+    await page.fill('#pw', fixtureAdminPassword);
     await page.click('#login-submit');
     await page.waitForSelector('#s-total');
     if(process.env.UI_TEST_CJK_FONT)await page.evaluate(()=>document.fonts.ready);
@@ -1625,6 +1626,74 @@ async function main() {
       await numberPage.close();
     }
     check('模型切换保留未完成的数字及校验；撤销或明确清空才会恢复超时和采样默认值');
+
+    await openTab('runtime');
+    const rawBodyToggle = page.getByRole('checkbox', {name: '暂存失败请求的原始请求体', exact: true});
+    assert.equal(await rawBodyToggle.isChecked(), false);
+    assert.match(await page.locator('#failed-request-body-warning').innerText(), /未经脱敏[^]*ADMIN_PASSWORD[^]*4 MiB[^]*15 分钟/);
+    await rawBodyToggle.check();
+    const enabledRawBody = await saveRuntime(page);
+    assert.equal(enabledRawBody.status(), 200, await enabledRawBody.text());
+    assert.deepEqual(enabledRawBody.request().postDataJSON(), {
+      debug_failed_request_body: true, _expected: {debug_failed_request_body: {present: true, value: false}},
+    });
+    assert.equal((await enabledRawBody.json()).debug_failed_request_body, true);
+    await page.waitForFunction(() => !consoleForms.dirty());
+
+    // Rejected by the real generation route's input validation, before any upstream call.
+    const marker = 'offline raw-body fixture';
+    const rawBody = Buffer.from(`{\n  "model": null,\n  "messages":[{"role":"user","content":"${marker}"}]\n}\n`);
+    const failed = await page.request.post(origin + '/v1/chat/completions', {
+      data: rawBody, headers: {Authorization: 'Bearer ' + fixtureAPIKey, 'Content-Type': 'application/json'},
+    });
+    assert.equal(failed.status(), 422, await failed.text());
+    const traceId = failed.headers()['x-trace-id'];
+    assert.match(traceId, /^trace-[0-9a-f]{16}$/);
+    const tracePath = '/api/requests/' + traceId;
+    const traceMetadata = await page.request.get(origin + tracePath);
+    assert.equal((await traceMetadata.json()).raw_body_available, true);
+    assert.ok(!(await traceMetadata.text()).includes(marker), 'regular request detail must not return the raw body');
+
+    const rawFileRequests = [];
+    const logRawFileRequest = request => {
+      if (new URL(request.url()).pathname === tracePath + '/raw-body') rawFileRequests.push(request);
+    };
+    page.on('request', logRawFileRequest);
+    await openTab('requests');
+    await page.fill('#request-search', traceId);
+    const failedRow = page.locator(`#request-rows tr[data-request="${traceId}"]`);
+    await failedRow.click();
+    const downloadLink = page.getByRole('link', {name: '下载原始请求体', exact: true});
+    await downloadLink.waitFor();
+    assert.equal(await downloadLink.getAttribute('href'), tracePath + '/raw-body');
+    assert.equal(await downloadLink.getAttribute('referrerpolicy'), 'no-referrer');
+    assert.deepEqual(rawFileRequests, [], 'opening request details must not prefetch the raw body');
+    assert.ok(!(await page.locator('#request-dialog').innerText()).includes(marker));
+    const initialURL = page.url();
+    const [download] = await Promise.all([page.waitForEvent('download'), downloadLink.click()]);
+    assert.equal(download.suggestedFilename(), traceId + '-request-body.bin');
+    assert.deepEqual(await readFile(await download.path()), rawBody);
+    assert.equal(page.url(), initialURL);
+    await page.keyboard.press('Escape');
+
+    await openTab('runtime');
+    await rawBodyToggle.uncheck();
+    const disabledRawBody = await saveRuntime(page);
+    assert.equal(disabledRawBody.status(), 200, await disabledRawBody.text());
+    assert.deepEqual(disabledRawBody.request().postDataJSON(), {
+      debug_failed_request_body: false, _expected: {debug_failed_request_body: {present: true, value: true}},
+    });
+    assert.equal((await disabledRawBody.json()).debug_failed_request_body, false);
+    await page.waitForFunction(() => !consoleForms.dirty());
+    assert.equal((await page.request.get(origin + tracePath + '/raw-body')).status(), 404);
+    await openTab('requests');
+    await failedRow.click();
+    await page.waitForSelector('#request-advanced');
+    assert.equal(await page.locator('#request-raw-body-actions').isHidden(), true);
+    assert.equal(await page.getAttribute('#request-raw-body-download', 'href'), null);
+    await page.keyboard.press('Escape');
+    page.off('request', logRawFileRequest);
+    check('失败请求暂存默认关闭并按草稿保存；详情不预读原文，管理员手动下载字节一致，停用后入口及文件同时失效');
 
     const beforeLogout=page.url();
     await page.route('**/api/logout',route=>route.fulfill({status:503,json:{error:'测试退出失败'}}));

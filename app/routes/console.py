@@ -5,7 +5,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 import config  # QUA-P2-7：环境开关读取集中层
@@ -16,6 +16,7 @@ from console_auth import (
     clear_login_failure,
     client_ip,
     is_authenticated,
+    has_separate_debug_admin_password,
     issue_session,
     login_retry_after,
     proxy_headers_trusted,
@@ -29,6 +30,7 @@ from console_assets import versioned_assets
 from streaming import SSE_NO_BUFFER_HEADERS
 from logger import rt_logger, stats
 from request_tracking import request_registry
+from runtime_state import app_state
 
 
 router = APIRouter()
@@ -168,7 +170,46 @@ async def request_detail(request_id: str, _auth: bool = Depends(require_auth)):
     trace = request_registry.get(request_id)
     if not trace:
         return JSONResponse(status_code=404, content={"error": "请求记录不存在或已超过保留期限。"})
-    return JSONResponse(content=trace.snapshot(detail=True), headers={"Cache-Control": "no-store"})
+    detail = trace.snapshot(detail=True)
+    detail["raw_body_available"] = (has_separate_debug_admin_password()
+                                    and app_state.failed_request_bodies.contains(trace.id))
+    return JSONResponse(content=detail, headers={"Cache-Control": "no-store"})
+
+
+class _RawBodyDownload(Response):
+    def __init__(self, content, *, release, headers):
+        super().__init__(content, media_type="application/octet-stream", headers=headers)
+        self.release = release
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self.body = b""
+            self.release()
+
+
+@router.get("/api/requests/{request_id}/raw-body", include_in_schema=False)
+async def download_request_body(request_id: str, request: Request, _auth: bool = Depends(require_auth)):
+    headers = {"Cache-Control": "no-store", "Vary": "Cookie"}
+    if request.headers.get("sec-fetch-site") not in (None, "same-origin", "none"):
+        return JSONResponse(status_code=403, headers=headers, content={"error": "仅可从本站下载。"})
+    trace = request_registry.get(request_id) if has_separate_debug_admin_password() else None
+    store = app_state.failed_request_bodies
+    if trace and store.contains(trace.id):
+        slots = store.download_slots
+        if not slots.acquire(blocking=False):
+            return JSONResponse(status_code=503, headers=headers, content={"error": "下载繁忙，请稍后重试。"})
+        body = store.get(trace.id)
+        if body is not None:
+            return _RawBodyDownload(body, release=slots.release, headers={
+                **headers, "Content-Disposition": f'attachment; filename="{trace.id}-request-body.bin"',
+                "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "sandbox",
+                "Cross-Origin-Resource-Policy": "same-origin",
+            })
+        slots.release()  # Disable or expiry won between lookup and acquisition.
+    return JSONResponse(status_code=404, headers=headers,
+                        content={"error": "原始请求体不可用、已清除或已过期。"})
 
 
 @router.get("/stream-logs")

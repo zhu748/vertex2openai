@@ -14,6 +14,8 @@ from typing import Optional
 import config as app_config
 from config import state_dir as _state_dir_env  # QUA-P2-7：STATE_DIR 单点定义
 import state_crypto
+from console_auth import has_separate_debug_admin_password
+from failed_request_bodies import FailedRequestBodies, SETTING as FAILED_BODY_SETTING
 from model_capabilities import _strip_known_suffixes
 from model_resource import model_id_for_policy
 from proxy_config import parse_proxy_list
@@ -480,6 +482,8 @@ class AppState:
         self._state = self._read_from_disk() or {}
         self._clean_orphan_temp_files()
         self._committed = copy.deepcopy(self._state)
+        self.failed_request_bodies = FailedRequestBodies()
+        self._apply_failed_body_setting()
         # PRF-P1-3：get_effective_settings 的修订号 + 每模型缓存。旧实现
         # 在每个请求上被调 2-4 次，base 为空时每次都全量 deepcopy 含
         # model_overrides 的整棵设置树（约 90µs，全部发生在 RLock 内，
@@ -491,6 +495,15 @@ class AppState:
         self._effective_cache: dict[str, dict] = {}
         # QUA-P2-6：凭证 CRUD 委托给仓库（存储/持久化仍归本类）。
         self._credentials = CredentialsRepository(self)
+
+    def _apply_failed_body_setting(self) -> None:
+        self.failed_request_bodies.set_enabled(
+            self._setting_from(self._committed, FAILED_BODY_SETTING) is True
+            and has_separate_debug_admin_password())
+
+    def refresh_failed_body_capture(self) -> None:
+        with self._lock:
+            self._apply_failed_body_setting()
 
     def _invalidate_effective_cache_locked(self) -> None:
         """设置变更时作废每模型生效设置缓存（调用方需已持 self._lock）。"""
@@ -670,6 +683,7 @@ class AppState:
                         self._invalidate_effective_cache_locked()
                     self._persisted_seq = seq
                     self._committed = snapshot
+                    self._apply_failed_body_setting()
             except Exception as exc:
                 with self._lock:
                     self._state = copy.deepcopy(self._committed)
@@ -728,6 +742,7 @@ class AppState:
                 # during the next unrelated transaction.
                 self._state = loaded if loaded is not None else {}
                 self._committed = copy.deepcopy(self._state)
+                self._apply_failed_body_setting()
                 # 作废重载前已拍下、尚未落盘的快照，避免旧保存覆盖外部编辑。
                 self._save_seq += 1
                 self._persisted_seq = self._save_seq

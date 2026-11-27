@@ -18,6 +18,7 @@
   const modes = { stream: '真流式', fake_stream: '假流式', json: '非流式' };
   const protocols = { openai: 'OpenAI', claude: 'Claude', gemini: 'Gemini 原生' };
   const channels = { express: 'Express', cookie: 'Cookie', mixed: '混合' };
+  const rawBodyTraceID = /^trace-[0-9a-f]{16}$/;
   // 协议·通道·模式三段标签：mode 恒有值，旧写法 modes[r.mode]||r.protocol 会把协议吞掉，
   // 三协议共存的部署里无法分辨请求来自哪套端点。
   const flowLabel = (r) =>
@@ -168,6 +169,30 @@
     }
   }
 
+  function renderRawBodyDownload(record) {
+    const actions = $('request-raw-body-actions');
+    const link = $('request-raw-body-download');
+    const id = record?.id;
+    // The browser downloads directly using the console session. Never read
+    // these bytes into page JavaScript or trust a server-provided download URL.
+    if (
+      record?.raw_body_available === true &&
+      typeof id === 'string' &&
+      id.length === 22 &&
+      id === state.selected &&
+      rawBodyTraceID.test(id)
+    ) {
+      link.setAttribute('href', '/api/requests/' + encodeURIComponent(id) + '/raw-body');
+      actions.hidden = false;
+    } else {
+      const focused = document.activeElement === link;
+      actions.hidden = true;
+      link.removeAttribute('href');
+      if (focused && $('request-dialog').open)
+        $('request-detail-close').focus({ preventScroll: true });
+    }
+  }
+
   async function detail(force = true) {
     if (!state.selected || !$('request-dialog').open || document.hidden) return;
     if (!force && (state.detailLoading || state.paused)) return;
@@ -274,6 +299,7 @@
           : '') +
         `<h3 class="request-section-title">阶段时间线</h3><ol class="request-timeline">${r.events.map((e) => `<li><span style="color:var(--accent);margin-right:10px">+${duration(e.elapsed_ms)}</span><span class="lbl">${esc(date(e.at))}</span><div style="margin-top:4px">${esc(e.message)}</div></li>`).join('')}</ol>` +
         `<h3 class="request-section-title">关联日志</h3><div id="request-detail-logs" class="request-detail-logs" tabindex="0" aria-label="此请求的关联日志">${esc(r.logs.map((l) => `[${date(l.at)}] ${l.message}`).join('\n') || '暂无关联日志')}</div>`;
+      renderRawBodyDownload(r);
       const logs = $('request-detail-logs');
       logs.scrollTop = atBottom ? logs.scrollHeight : scroll;
       if (focusSummary)
@@ -285,10 +311,12 @@
         controller === state.detailController &&
         !controller.signal.aborted &&
         error.name !== 'AbortError'
-      )
+      ) {
+        renderRawBodyDownload();
         $('request-detail-state').textContent =
           (error.name === 'TimeoutError' ? '详情连接超时' : error.message) +
           (state.paused ? '，请手动刷新重试' : '，稍后自动重试');
+      }
     } finally {
       if (controller === state.detailController) state.detailLoading = false;
     }
@@ -299,6 +327,7 @@
     $('request-detail-title').textContent = '请求详情';
     $('request-detail-id').textContent = id;
     $('request-detail-state').textContent = '加载中…';
+    renderRawBodyDownload();
     $('request-detail-content').replaceChildren();
     if (!$('request-dialog').open) $('request-dialog').showModal();
     detail();
@@ -327,6 +356,7 @@
   $('request-dialog').addEventListener('close', () => {
     state.selected = null;
     state.detailController?.abort();
+    renderRawBodyDownload();
   });
   $('request-prev').addEventListener('click', () => {
     state.offset = Math.max(0, state.offset - state.limit);

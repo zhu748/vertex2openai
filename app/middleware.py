@@ -11,6 +11,7 @@ from request_errors import (MAX_GENERATION_BODY_BYTES, MAX_RESPONSES_REQUEST_BYT
                             declared_body_exceeds, ingress_error_response)
 from request_ingress import IngressError, IngressReceive, current_ingress, early_generation_auth
 from request_tracking import PayloadObserver, current_trace, request_registry
+from runtime_state import app_state
 from starlette.requests import ClientDisconnect
 
 # 请求体体积上限：与原生透传通道（gemini_native.MAX_NATIVE_BODY_BYTES）的
@@ -290,7 +291,9 @@ class StatsMiddleware:
                 headers.append((b"x-trace-id", trace.id.encode()))
                 message = dict(message, headers=headers)
                 content_type = dict(headers).get(b"content-type", b"").lower()
-                observer = PayloadObserver(trace, sent=True, sse=b"text/event-stream" in content_type)
+                observer = PayloadObserver(
+                    trace, sent=True, sse=b"text/event-stream" in content_type,
+                    inspect_errors=trace.has_failed_body_capture)
                 trace.milestone("response_start", f"开始响应前端：HTTP {message['status']}。")
                 if message["status"] >= 400:
                     stats.add_error()
@@ -321,9 +324,12 @@ class StatsMiddleware:
                     return
                 await _large_body_reads.acquire()
                 body_gate = _BodyReadGate(_large_body_reads)
-            ingress = IngressReceive(
-                body_gate.wrap(receive) if body_gate is not None else receive,
-                limit)
+            raw_receive = body_gate.wrap(receive) if body_gate is not None else receive
+            bodies = app_state.failed_request_bodies
+            if bodies.begin(trace.id, declared_length):
+                trace.capture_failed_body(bodies)
+                raw_receive = partial(bodies.receive, raw_receive, trace.id)
+            ingress = IngressReceive(raw_receive, limit)
             ingress_token = current_ingress.set(ingress)
             receiver.receive = ingress
             with generation_settings_scope():

@@ -98,6 +98,7 @@ def enforce_strong_api_key() -> None:
 async def lifespan(app: FastAPI):
     global _shutting_down
     _shutting_down = False
+    app_state.refresh_failed_body_capture()
     singbox_manager.reopen()
     bridge_manager.reopen()
     print("🚀 [服务启动] agentplatform2api 适配器已启动（Express API Key / Cookie 直连 双通道）。")
@@ -214,6 +215,7 @@ async def lifespan(app: FastAPI):
     start_background_task(_probe_express_projects_on_startup())
     # 过期缓冲清理器（弱网续传用，见 resumable.py）
     start_background_task(resumable_store.sweeper_loop())
+    start_background_task(app_state.failed_request_bodies.sweep())
     # Cookie 短期令牌自动续期（RotateCookies；默认开，控制台/设置 API 可关，
     # 见 cookie_refresh.py。失败只打日志，绝不影响生成流量。）
     try:
@@ -231,6 +233,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         _shutting_down = True
+        app_state.failed_request_bodies.set_enabled(False)
         # 排空循环：单次快照会漏掉收尾期间新注册的任务（如正在断开的控制台
         # 请求触发的 Key 探测），逐轮取消直至集合清空（上限 5 轮防病态自续）。
         for _round in range(5):

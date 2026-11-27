@@ -155,6 +155,7 @@ class RequestTrace:
         self.events = deque(maxlen=160)
         self.logs = deque(maxlen=200)
         self.retained_bytes = 0
+        self._failed_bodies = None
         self.event("received", "请求已接收，等待鉴权与参数校验。")
 
     def event(self, kind, message, *, phase=None):
@@ -244,12 +245,25 @@ class RequestTrace:
             self.data["outcome"] = "cancelled"
         self.event("cancelled", message, phase="cancelling" if self.data["generation_active"] else "cancelled")
 
+    @property
+    def has_failed_body_capture(self) -> bool:
+        return self._failed_bodies is not None
+
+    def capture_failed_body(self, store) -> None:
+        with self._lock:
+            self._failed_bodies = store
+
     def _settle(self):
         if not self.data["http_active"] and not self.data["generation_active"] and self.ended is None:
             self.ended = time.monotonic()
             self.data["finished_at"] = time.time()
             self.data["outcome"] = self.data["outcome"] or "succeeded"
             self.data["phase"] = self.data["outcome"]
+            if self._failed_bodies is not None:
+                failed = (self.data["outcome"] == "error" and self.data["http_status"] != 499
+                          and self.data.get("error_code") != 499)
+                self._failed_bodies.finish(self.id, failed=failed)
+                self._failed_bodies = None
 
     def end_generation(self, outcome="succeeded", message=None):
         with self._lock:
@@ -379,7 +393,7 @@ class RequestTrace:
 
 class PayloadObserver:
     """Inspect bounded SSE/JSON copies, never keep prompt or generated text."""
-    def __init__(self, trace, *, sent=False, sse=True, inspect=None):
+    def __init__(self, trace, *, sent=False, sse=True, inspect=None, inspect_errors=False):
         self.trace, self.sent, self.sse = trace, sent, sse
         self.buffer = bytearray()
         self.skipping = False
@@ -398,12 +412,13 @@ class PayloadObserver:
             except Exception:
                 inspect = True
         self._inspect = inspect
+        self._inspect_errors = inspect_errors
 
     def feed(self, chunk, final=False):
         raw = chunk.encode("utf-8") if isinstance(chunk, str) else bytes(chunk)
         with self.trace._lock:
             self.trace.data["sent_bytes" if self.sent else "generated_bytes"] += len(raw)
-        if not self.sse and not self._inspect:
+        if not self.sse and not (self._inspect or self._inspect_errors):
             # Byte accounting needs no copy of a non-streaming response when
             # payload inspection is disabled (up to 2 MiB per observer).
             return
@@ -465,14 +480,24 @@ class PayloadObserver:
             self._scan = max(0, len(self.buffer) - 3)
 
     def _payload(self, raw):
-        if not self._inspect:
+        if not (self._inspect or self._inspect_errors):
             # 诊断降级：只保留字节数/帧数计数（feed 与 _ingest_sse 已计），
             # 跳过 json.loads 与逐字段检查。
             return
         try:
             payload = json.loads(raw)
             for item in payload if isinstance(payload, list) else [payload]:
-                self.trace.inspect_payload(item, sent=self.sent)
+                if self._inspect:
+                    self.trace.inspect_payload(item, sent=self.sent)
+                if self._inspect_errors and isinstance(item, dict):
+                    if self._inspect and item.get("error"):
+                        continue  # Normal diagnostics already classified this.
+                    nested = item.get("response") if item.get("type") == "response.failed" else None
+                    error = item.get("error") or (nested.get("error") if isinstance(nested, dict) else None)
+                    if error:
+                        code = error.get("code") if isinstance(error, dict) else None
+                        # Capture must not newly write caller/upstream text to logs.
+                        self.trace.fail("流式响应包含错误事件。", code)
         except (ValueError, TypeError, AttributeError, RecursionError, OverflowError):
             # Diagnostics must never change protocol delivery.
             return

@@ -149,6 +149,7 @@ def _reset_shared_singletons() -> None:
         # 生效设置泄漏给下一模块（跨模块隔离静默退化）。
         _APP_STATE._effective_cache.clear()
         _APP_STATE._settings_rev = 0
+        _APP_STATE.refresh_failed_body_capture()
     _clean_state_files()
     # 凭证 / 轮询器 / 客户端池 / 统计：实例字段整体回出厂快照。
     for obj, snap in _SNAPSHOT_SINGLETONS:

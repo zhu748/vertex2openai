@@ -186,6 +186,7 @@ async function loadParams() {
       'keepalive_url'
     ].forEach((k) => setV(k, s[k]));
     setV('retry_backoff_mode', s.retry_backoff_mode || 'fixed');
+    setV('debug_failed_request_body', s.debug_failed_request_body === true);
     [
       'img_compress_enabled',
       'fake_streaming',
@@ -944,6 +945,7 @@ async function saveSettings() {
     cookie_debug: $('cookie_debug').checked,
     cookie_structured_output: $('cookie_structured_output').checked,
     debug_outbound: $('debug_outbound').checked,
+    debug_failed_request_body: $('debug_failed_request_body').checked,
     prefill_mode: $('prefill_mode').value,
     retry_backoff_mode: $('retry_backoff_mode').value,
     express_location: $('express_location').value,

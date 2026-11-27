@@ -184,6 +184,7 @@ DEFAULT_SETTINGS = {
     # 实机验证思考档位、采样裁剪是否生效时必开。
     # （旧键名 cookie_debug 保留为别名，只作用于 Cookie 通道的额外诊断）
     "debug_outbound": False,
+    "debug_failed_request_body": False,
     "cookie_debug": False,
     # Cookie 通道结构化输出（response_format.json_object / json_schema）：
     # 默认关 = 保持显式 400 拒绝。batchGraphql 的 generationConfig 输入类型

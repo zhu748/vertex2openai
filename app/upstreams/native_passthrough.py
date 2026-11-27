@@ -881,6 +881,7 @@ async def _resumable_native(request: Request, api_key: str, model: str, action: 
             await close()
 
     async def pump(response: Response):
+        terminal_error = False
         try:
             async for frame in response.body_iterator:
                 text = frame.decode("utf-8") if isinstance(frame, bytes) else frame
@@ -894,6 +895,7 @@ async def _resumable_native(request: Request, api_key: str, model: str, action: 
                     code = error.get("code") if isinstance(error, dict) else None
                     await buf.finish("error", error=error, status_code=(
                         code if isinstance(code, int) and 400 <= code <= 599 else 502))
+                    terminal_error = buf.status == "error" and buf.status_code != 499
                     return
             await buf.finish()
         except (asyncio.CancelledError, TimeoutError):
@@ -902,7 +904,14 @@ async def _resumable_native(request: Request, api_key: str, model: str, action: 
             await buf.fail(str(exc), getattr(exc, "code", 502), within_deadline=True)
         finally:
             with anyio.CancelScope(shield=True):
-                await response.body_iterator.aclose()
+                iterator = response.body_iterator
+                close_terminal = getattr(iterator, "aclose_terminal", None)
+                if terminal_error and close_terminal is not None:
+                    # The buffered error is terminal even if no reader remains
+                    # to observe it. Close the original lease as error, not cancel.
+                    await close_terminal("error")
+                else:
+                    await iterator.aclose()
 
     if new:
         async def setup():
