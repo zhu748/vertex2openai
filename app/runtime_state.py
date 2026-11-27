@@ -502,9 +502,8 @@ class AppState:
     def _read_from_disk(self):
         """读盘并返回字典，不改动当前内存态。
 
-        文件缺失/损坏时**不改 _state**并返回 None：调用方（reload）需要
-        区分「读到了什么」与「内存里还有什么」，不能拿内存态充当磁盘真相
-        （2026-11 C-11）。
+        文件缺失或损坏且已成功备份时返回 None。其他读取错误抛出异常，
+        调用方不能把暂时无法读取当作空状态。
         SEC-P2-2：支持可选静态加密——密文信封需 STATE_ENCRYPTION_KEY 才能读；
         有信封而无密钥/密钥错误时拒绝启动（RuntimeError），不进损坏备份路径：
         加密文件本身没坏，降级启动反而会把加密状态覆盖丢失。
@@ -723,14 +722,12 @@ class AppState:
         with self._io_lock:
             loaded = self._read_from_disk()
             with self._lock:
-                if loaded is not None:
-                    self._state = loaded
-                # 提交基线取「刚读到的磁盘数据」而非内存态（2026-11 C-11）：
-                # 文件缺失/损坏时不改 _state，旧写法会把含
-                # 未落盘变更的内存态发布为已提交基线——此后任一次保存失败
-                # 的回滚都会复活这些幽灵变更（从未真正落盘过）。读不到文件
-                # 时磁盘真相为空，基线同置空，与启动时的空态一致。
-                self._committed = copy.deepcopy(loaded if loaded is not None else {})
+                # Both future drafts and committed reads must start from the
+                # same disk result. Missing/quarantined state starts empty;
+                # leaving the old draft here would re-save a superseded edit
+                # during the next unrelated transaction.
+                self._state = loaded if loaded is not None else {}
+                self._committed = copy.deepcopy(self._state)
                 # 作废重载前已拍下、尚未落盘的快照，避免旧保存覆盖外部编辑。
                 self._save_seq += 1
                 self._persisted_seq = self._save_seq
@@ -944,22 +941,29 @@ class AppState:
             previous = self.get_committed_settings(*watch) if watch else {}
             current = self._state.get("settings")
             current = dict(current) if isinstance(current, dict) else {}
-            accepted = 0
+            accepted = []
             for k, v in patch.items():
                 if k in app_config.DEFAULT_SETTINGS and k != "model_overrides":
                     # 深拷贝入参：写侧存引用、读侧深拷贝的不对称会让复用可变
                     # dict/list 的调用方静默污染内存态（不触发落盘），防御性
                     # 对齐读侧口径（2026-10 补齐）。
                     current[k] = copy.deepcopy(v)
-                    accepted += 1
+                    accepted.append(k)
             if "proxy_urls" in patch or "proxy_url" in patch:
                 proxies = parse_proxy_list(patch.get("proxy_urls") if "proxy_urls" in patch else patch["proxy_url"])
                 current["proxy_urls"] = proxies
                 current["proxy_url"] = proxies[0] if proxies else ""
+            intended = {key: current[key] for key in accepted} if expected is not None else {}
             self._state["settings"] = current
             commit()
-        print(f"🔧 [状态管理器] 已更新 {accepted} 项运行时设置。")
         updated = self._merged_settings(saved[0])
+        # If a reload won before I/O, a guarded edit may acknowledge only the
+        # actual accepted values (including canonicalized proxies). A later
+        # writer must not invalidate this write's already durable receipt.
+        for key, value in intended.items():
+            if updated[key] != value:
+                raise SettingsConflictError(key)
+        print(f"🔧 [状态管理器] 已更新 {len(accepted)} 项运行时设置。")
         return updated, any(updated[key] != value for key, value in previous.items())
 
     # ---------- 按模型参数覆盖 ----------

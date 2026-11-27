@@ -259,6 +259,8 @@ curl -s https://你的域名/v1beta/models -H "x-goog-api-key: 你的API_KEY"
   fallback 行为一致；其余错误仍原样透传。
 - **客户端接入示例**（google-genai / Cherry Studio / LobeChat 等）：API Base 填
   `https://你的域名/`，API Key 填本服务 `API_KEY`，选 "Gemini / Google" 供应商类型即可。
+- **DeepSeek Harness (DSH)**：Gemini API 的 Base URL 填 `https://你的域名/v1beta`。
+  遇到切换模型后的 `thought_signature` 错误，见 [DSH 模型切换与工具历史](docs/deepseek-harness.md)。
 
 ## Claude（Anthropic）格式端点
 
@@ -1125,6 +1127,9 @@ Gemini 原生 `streamGenerateContent?alt=sse` 默认在事件之间发送保活�
 `id:` 和注释。生成 ID 仍通过 `X-Resume-Id` 返回；SDK 不会自动维护事件游标，调用方可按回执重放全量，
 或使用已知序号/现有轮询接口指定恢复位置。其他客户端仍收到原有编号事件和诊断注释。
 续传开关允许且身份与原请求匹配时，已保留的原生回执可在切换上游通道后继续读取；Cookie 桥接仍不为新请求建立续传缓冲。
+Express 若在已发出 HTTP 200 后收到上游 HTTP 错误，不能改写已发送的状态码；请读取后续 SSE
+`data:` 中的 `error.code`、`error.message` 和 `error.details`。上游以完整 SSE 发送的 Google 错误也会保留诊断，
+尚未开始响应的快速失败与非流式请求仍按原 HTTP 状态码及正文透传。
 上游半途断流时返回错误，不把缓存中的半截内容当成完整成功，也不自动拼接另一轮生成。
 
 默认预算（控制台“请求与缓冲预算”可调整）：

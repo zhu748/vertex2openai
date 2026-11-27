@@ -24,7 +24,7 @@ from message_processing import (
 )
 from prefill import PrefillDeduper, strip_prefill_overlap
 from response_validation import (
-    IncompleteResponseError, ResponsesMediaError, ResponsesTextCallOwner, StreamToolCallIds,
+    IncompleteResponseError, ResponsesMediaError, ResponsesProjectionError, ResponsesTextCallOwner, StreamToolCallIds,
     map_finish_reason_to_openai,
     complete_function_arguments,
     require_responses_supported_part,
@@ -91,8 +91,9 @@ def completed_response_needs_media_pool(response: Any) -> bool:
 def responses_sdk_source(response: GenerateContentResponse, private_text_name: str | None = None) -> GenerateContentResponse:
     """Gate the original typed candidate before Chat renders media or registers a call.
 
-    A length/filter finish never authorizes an executable subset. Leave a private
-    text-transport call to its own decoder; its arguments represent visible text.
+    A length/filter finish never authorizes an executable subset. Only a
+    validated fragment owned by the private call may be decoded as visible text,
+    regardless of whether the candidate stopped normally or was truncated.
     """
     candidates = getattr(response, "candidates", None) or ()
     if len(candidates) != 1:
@@ -107,15 +108,20 @@ def responses_sdk_source(response: GenerateContentResponse, private_text_name: s
         if sdk_media_payload(part) is not None:
             raise ResponsesMediaError()
         require_responses_supported_part(part)
-        if incomplete and (fc := sdk_function_call(part)) is not None:
+        if (incomplete or owner is not None) and (fc := sdk_function_call(part)) is not None:
             fragmented = responses_partial_call(fc)
             if not (owner and owner.owns(fc.name, fc.id, fc.will_continue, fragmented)):
-                # Validate the shape, never stage a public ID/signature for dropped data.
-                if not fragmented:
-                    complete_function_arguments(fc)
-                if kept is None:
-                    kept = parts[:index]
-                continue
+                if incomplete:
+                    # Validate the shape; do not stage public IDs/signatures for dropped calls.
+                    if not fragmented:
+                        complete_function_arguments(fc)
+                    if kept is None:
+                        kept = parts[:index]
+                    continue
+                if fragmented or not fc.name:
+                    # A completed generation cannot leave a public fragment or nameless
+                    # call behind. In particular, the decoder must not treat it as private.
+                    raise ResponsesProjectionError("上游返回尚未完成的工具参数；当前工具通道需要完整调用。")
         if kept is not None:
             kept.append(part)
     if kept is None:

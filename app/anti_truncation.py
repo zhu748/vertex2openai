@@ -237,9 +237,12 @@ class TextDecoder:
     def validate_end(self):
         if not self.finish_reason:
             raise AntiTruncationError("抗截断：上游连接已结束，但未收到结束标记。")
+        # The closed private call may carry a valid empty string. It cannot
+        # erase a genuine reasoning item, nor may reasoning close an open call.
+        reasoning_stop = (self.finish_reason == "STOP" and self.visible_reasoning
+                          and (not self.seen or self.closed))
         if not self.visible and not self.real_tool and not (
-                self.response_owner and (self.finish_reason in FINISH_TRUNCATING or
-                self.finish_reason == "STOP" and not self.seen and self.visible_reasoning)):
+                self.response_owner and (self.finish_reason in FINISH_TRUNCATING or reasoning_stop)):
             raise AntiTruncationError("抗截断：上游没有返回正文或真实工具调用。")
 
     def restore_sdk(self, response):
@@ -273,9 +276,10 @@ class TextDecoder:
                             self.visible = True
                         elif not self.response_owner:
                             self.pending_text.append(part)
-                elif not part.text and part.thought_signature and self.last_call_owned:
-                    # Some endpoints send the function signature in a later,
-                    # otherwise empty Part. It still belongs to the hidden call.
+                elif (not part.text and part.thought_signature and self.last_call_owned
+                      and not (self.response_owner and part.thought is True and part.text == "")):
+                    # A bare late signature can belong to the private call. An
+                    # explicit empty thought is a different typed carrier.
                     continue
                 else:
                     if self.response_owner and part.thought is True and part.text and not part.text.isspace():

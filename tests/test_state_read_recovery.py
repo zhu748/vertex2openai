@@ -1,7 +1,9 @@
 """Recovery must protect recoverable state through both startup and hot reload."""
 import json
 import stat
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 from unittest import mock
 
 import pytest
@@ -62,6 +64,69 @@ def test_failed_quarantine_leaves_source_for_a_later_successful_recovery(state_p
     state.import_env_express_keys_once([])
     assert {p.read_bytes() for p in backups(state_path)} == {source, b"prior fixture"}
     assert json.loads(state_path.read_text())["express_keys_initialized"] is True
+
+
+@pytest.mark.parametrize(("replacement", "durable_retry"), [
+    (None, None),
+    (b'{"settings":{', None),
+    (b'{"settings":{"retry_max":9}}', 9),
+], ids=["removed", "quarantined", "valid"])
+def test_successful_reload_discards_superseded_drafts_before_an_unrelated_write(state_path, replacement, durable_retry):
+    state = rs.AppState()
+    default_retry = state.get_setting("retry_max")
+    state.update_settings({"retry_max": 3})
+    model = "offline-fixture"
+    assert state.get_effective_settings(model)["retry_max"] == 3
+    waiting, release = Event(), Event()
+    original_save = state._save
+
+    def before_io(seq, snapshot):
+        waiting.set()
+        assert release.wait(5)
+        return original_save(seq, snapshot)
+
+    wanted = default_retry if durable_retry is None else durable_retry
+    with mock.patch.object(state, "_save", side_effect=before_io), ThreadPoolExecutor(1) as pool:
+        pending = pool.submit(state.update_settings, {"retry_max": 17})
+        try:
+            assert waiting.wait(5)
+            assert state.get_setting("retry_max", committed=False) == 17
+            if replacement is None:
+                state_path.unlink()
+            else:
+                state_path.write_bytes(replacement)
+            state.reload()
+            assert state.get_effective_settings(model)["retry_max"] == wanted
+        finally:
+            release.set()
+        assert pending.result(5)["retry_max"] == wanted
+
+    if replacement is not None and durable_retry is None:
+        assert [backup.read_bytes() for backup in backups(state_path)] == [replacement]
+    assert state_path.exists() is (durable_retry is not None)
+    state.update_settings({"image_max_concurrency": 2})
+    durable = json.loads(state_path.read_bytes())["settings"]
+    assert durable == ({"image_max_concurrency": 2} if durable_retry is None
+                       else {"retry_max": durable_retry, "image_max_concurrency": 2})
+    assert state.get_setting("retry_max", committed=False) == wanted
+    assert rs.AppState().get_setting("retry_max") == wanted
+
+
+def test_failed_reload_quarantine_preserves_original_and_both_in_memory_baselines(state_path):
+    state = rs.AppState()
+    state.update_settings({"retry_max": 3})
+    assert state.get_effective_settings("offline-fixture")["retry_max"] == 3
+    sequence, revision = state._persisted_seq, state._settings_rev
+    source = b'{"settings":{'
+    state_path.write_bytes(source)
+    with (mock.patch.object(rs.os, "replace", side_effect=OSError("mount unavailable")),
+          pytest.raises(rs.StatePersistenceError, match="备份")):
+        state.reload()
+    assert state_path.read_bytes() == source
+    assert not backups(state_path)
+    assert state.get_setting("retry_max") == state.get_setting("retry_max", committed=False) == 3
+    assert state.get_effective_settings("offline-fixture")["retry_max"] == 3
+    assert (state._persisted_seq, state._settings_rev) == (sequence, revision)
 
 
 def test_noncolliding_private_backups_always_keep_the_latest_two(state_path):

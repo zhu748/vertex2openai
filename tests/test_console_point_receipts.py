@@ -2,11 +2,13 @@
 from concurrent.futures import ThreadPoolExecutor
 import json
 from threading import Event
+from unittest.mock import Mock
 
 from fastapi.testclient import TestClient
 import pytest
 
 import console_auth
+import cookie_refresh
 import main
 from routes import credentials_api, settings_api
 import runtime_state
@@ -84,6 +86,70 @@ def test_point_edit_reports_the_snapshot_that_won_reload(console, monkeypatch, p
         records, revision = runtime_state.AppState().credential_snapshot("keys")
         assert (body["keys"], body["revision"]) == (records, revision)
         assert body["keys"][0]["note"] == "external edit"
+
+
+@pytest.mark.parametrize(("field", "before", "requested", "winner", "guarded", "status"), [
+    ("retry_max", 3, 7, 7, True, 200),
+    ("retry_max", 3, 7, 9, True, 409),
+    ("retry_max", 3, 7, 9, False, 200),
+    ("proxy_urls", [], ["http://new.example"], ["http://new.example:80"], True, 200),
+    ("proxy_urls", [], ["http://new.example"], ["http://different.example:80"], True, 409),
+    ("proxy_url", "", "http://new.example", "http://new.example:80", True, 200),
+    ("proxy_url", "", "http://new.example", "http://different.example:80", True, 409),
+    ("cookie_refresh_interval_seconds", 601, 610, 610, True, 200),
+    ("cookie_refresh_interval_seconds", 601, 610, 612, True, 409),
+])
+def test_guarded_global_receipt_must_match_the_accepted_values(console, monkeypatch, field, before,
+                                                               requested, winner, guarded, status):
+    client, state, store = console
+    state.update_settings({field: before})
+    notify = Mock()
+    monkeypatch.setattr(cookie_refresh, "notify_settings_changed", notify)
+    entered, release = Event(), Event()
+    save = state._save
+
+    def before_io(seq, snapshot):
+        entered.set()
+        assert release.wait(5)
+        return save(seq, snapshot)
+
+    monkeypatch.setattr(state, "_save", before_io)
+    payload = {field: requested}
+    if guarded:
+        payload["_expected"] = {field: {"present": True, "value": before}}
+    with ThreadPoolExecutor(1) as pool:
+        post = pool.submit(client.post, "/api/settings", json=payload)
+        try:
+            assert entered.wait(5)
+            external = json.loads(store.read_bytes())
+            external["settings"].update({field: winner, "image_max_concurrency": 4})
+            if field == "proxy_urls":
+                external["settings"]["proxy_url"] = winner[0]
+            elif field == "proxy_url":
+                external["settings"]["proxy_urls"] = [winner]
+            store.write_text(json.dumps(external))
+            state.reload()
+        finally:
+            release.set()
+        result = post.result(5)
+    assert result.status_code == status, result.text
+    if status == 409:
+        assert result.json()["field"] == field
+    else:
+        assert result.json()[field] == winner
+        assert result.json()["image_max_concurrency"] == 4
+    persisted = runtime_state.AppState().get_settings()
+    assert persisted[field] == winner and persisted["image_max_concurrency"] == 4
+    assert notify.call_count == (1 if status == 200 and field == "cookie_refresh_interval_seconds" else 0)
+
+
+@pytest.mark.parametrize("payload", [{"_expected": {}}, {"unused": 17, "_expected": {}}])
+def test_guarded_global_noop_and_unknown_fields_keep_legacy_success(console, payload):
+    client, state, _ = console
+    before = state.get_settings()
+    result = client.post("/api/settings", json=payload)
+    assert result.status_code == 200
+    assert result.json() == before == state.get_settings()
 
 
 @pytest.mark.parametrize("path", [MODE, PROJECT])

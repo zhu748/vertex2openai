@@ -99,6 +99,7 @@ from upstreams.native_passthrough import (  # noqa: F401
     NativeAPIError,
     native_expects_one_candidate,
     native_replay_fingerprint,
+    native_setup_error_body,
     NativeStreamError,
     _NativeStreamState,
     _close_upstream,
@@ -361,6 +362,8 @@ def _passthrough_endpoint():
                 if isinstance(result, Exception):
                     code, message = extract_upstream_error(result)
                     return _native_error(code, message).body
+                if 400 <= result.status_code <= 599:
+                    return native_setup_error_body(result)
                 try:
                     if json.loads(result.body).get("error"):
                         return result.body

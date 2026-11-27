@@ -42,7 +42,7 @@ from request_tracking import upstream_attempt, upstream_chunk
 import first_reply as first_reply_module
 from first_reply import FirstReplyGuard, native_has_reply
 from json_stream import MAX_JSON_OBJECT_BYTES, JsonObjects
-from http_io import (buffer_upstream_response, close_httpx_response as _close_upstream,
+from http_io import (MAX_UPSTREAM_ERROR_BYTES, buffer_upstream_response, close_httpx_response as _close_upstream,
                      read_upstream_bytes, send_owned_httpx)
 from runtime_state import app_state
 from express_endpoint import is_location_pin_failure
@@ -53,7 +53,7 @@ from proxy_failover import ProxyChain
 from proxy_tls import build_httpx_proxy
 from stream_cleanup import AttemptCancellation
 from streaming import (SSE_NO_BUFFER_HEADERS, sse_frames, with_heartbeats, HEARTBEAT, GEMINI_HEARTBEAT_FRAME,
-                       StreamDeadlineExceeded, reads_before_deadline)
+                       StreamDeadlineExceeded, reads_before_deadline, sse_separator)
 from resumable import (resumable_store, resolve_buffer, ResumableBuffer, ResumeRequestError, BufferCapacityError,
                        DetachedRequest, ReplayStreamResponse, within_request_deadline, buffered_setup_result,
                        fast_setup_completed, request_timeout_seconds, resume_cursor)
@@ -753,28 +753,80 @@ async def _relay_stream(upstream: httpx.Response, *, keepalive: bool=False, dead
 
 # Error terminals must fit even when the normal replay event budget is exhausted.
 _MAX_REPLAY_DIAGNOSTIC_BYTES = 8192
+# Many tiny keepalives can fit in the byte budget. Bound the synchronous
+# diagnostic scan too; a terminal HTTP error needs only one data dispatch.
+_MAX_SETUP_SSE_DISPATCHES = 64
+
+
+def _single_sse_error_data(raw: bytes) -> str | None:
+    """Read one complete diagnostic dispatch from an already bounded HTTP body."""
+    data = None
+    start = 0
+    for _ in range(_MAX_SETUP_SSE_DISPATCHES):
+        match = sse_separator(raw, start, final=True)
+        if match is None:
+            break
+        event = ReplayEvent(raw[start:match.end()].decode("utf-8-sig" if not start else "utf-8"))
+        if event.has_data:
+            if data is not None:
+                return None  # never pick one of several competing events
+            data = event.data()
+        start = match.end()
+    return data if not raw[start:].strip(b"\r\n") else None
+
+
+def _decode_setup_error(response: Response) -> tuple[Any, bool]:
+    raw = response.body
+    try:
+        # Bytes JSON accepts BOMs and UTF-16/32 too; only ordinary UTF-8 JSON
+        # can be placed as-is inside an SSE data field.
+        return json.loads(raw), not raw.startswith(codecs.BOM_UTF8) and b"\x00" not in raw
+    except ValueError:
+        # Some Google-style failures on streamGenerateContent arrive as a
+        # real HTTP error whose diagnostic is itself already SSE-framed.
+        media_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if media_type == "text/event-stream" and (data := _single_sse_error_data(raw)) is not None:
+            return json.loads(data), False
+        raise
+
+
+def _normalize_setup_error(response: Response, limit: int, *, preserve_json_wire: bool = False) -> tuple[dict, bytes]:
+    """Project a completed HTTP error into bounded Google JSON; never change its status."""
+    code = response.status_code
+    fallback = {"message": f"上游返回 HTTP {code}，错误详情不可用。", "status": google_status_detail(code), "code": code}
+    if len(response.body) <= limit:
+        try:
+            document, plain_json = _decode_setup_error(response)
+            error = document["error"]
+            if isinstance(error, dict):
+                normalized = {**fallback, **error, "code": code}
+                for key in ("message", "status"):
+                    if not isinstance(normalized[key], str):
+                        normalized[key] = fallback[key]
+                # The pinned SDK recognizes a streamed Google error when
+                # "error" is the first key. HTTP sets its code; retain details.
+                payload = {"error": normalized}
+                if preserve_json_wire:
+                    payload.update((key, value) for key, value in document.items() if key != "error")
+                wire = JSONResponse(payload).body  # validate Unicode and reject NaN
+                if len(wire) <= limit:
+                    if (preserve_json_wire and plain_json and next(iter(document)) == "error"
+                            and type(error.get("code")) is int and normalized == error):
+                        wire = response.body
+                    return payload, wire
+        except (KeyError, ValueError, TypeError, RecursionError):
+            pass
+    payload = {"error": fallback}
+    return payload, JSONResponse(payload).body
+
+
+def native_setup_error_body(response: Response) -> bytes:
+    """Error JSON for direct SSE after 200 is committed, not a new HTTP response."""
+    return _normalize_setup_error(response, MAX_UPSTREAM_ERROR_BYTES, preserve_json_wire=True)[1]
 
 
 def _native_setup_payload(response: Response) -> dict:
-    code = response.status_code
-    fallback = {"message": f"上游返回 HTTP {code}，错误详情不可用。", "status": google_status_detail(code), "code": code}
-    if len(response.body) <= _MAX_REPLAY_DIAGNOSTIC_BYTES:
-        try:
-            error = json.loads(response.body)["error"]
-            if isinstance(error, dict):
-                # Keep Google's details and status; HTTP is authoritative for code.
-                error = {**fallback, **error, "code": code}
-                for key in ("message", "status"):
-                    if not isinstance(error[key], str):
-                        error[key] = fallback[key]
-                payload = {"error": error}
-                # Also rejects NaN, invalid Unicode, etc. before committing a receipt
-                # that could not later be rendered to either HTTP JSON or SSE.
-                if len(JSONResponse(payload).body) <= _MAX_REPLAY_DIAGNOSTIC_BYTES:
-                    return payload
-        except (KeyError, ValueError, TypeError, RecursionError):
-            pass
-    return {"error": fallback}
+    return _normalize_setup_error(response, _MAX_REPLAY_DIAGNOSTIC_BYTES)[0]
 
 
 def _acknowledge_native_http(response: Response, request: Request, buf: ResumableBuffer) -> Response:

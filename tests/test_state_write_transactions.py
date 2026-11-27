@@ -6,6 +6,7 @@ import threading
 from unittest import mock
 
 from fastapi.testclient import TestClient
+import pytest
 
 import console_auth
 import main
@@ -84,7 +85,8 @@ def test_credential_save_survives_failed_settings_write_and_reads_stay_live():
             assert [rec["id"] for rec in result.get_cookie_accounts()] == ["fixture"]
 
 
-def test_global_receipt_is_its_own_durable_write_not_a_later_failed_draft(tmp_path, monkeypatch):
+@pytest.mark.parametrize("guarded", [False, True], ids=["legacy", "guarded"])
+def test_global_receipt_is_its_own_durable_write_not_a_later_failed_draft(tmp_path, monkeypatch, guarded):
     monkeypatch.setattr(runtime_state, "STATE_FILE", str(tmp_path / "state.json"))
     state = runtime_state.AppState()
     monkeypatch.setattr(settings_api, "app_state", state)
@@ -109,20 +111,23 @@ def test_global_receipt_is_its_own_durable_write_not_a_later_failed_draft(tmp_pa
     monkeypatch.setattr(state, "_write_snapshot", fail_later)
     token = console_auth.issue_session()
 
-    def post(count):
+    def post(count, previous):
         client = TestClient(main.app)
         try:
             client.cookies.set(console_auth.AUTH_COOKIE, token)
-            return client.post("/api/settings", json={"retry_max": count})
+            body = {"retry_max": count}
+            if guarded:
+                body["_expected"] = {"retry_max": {"present": True, "value": previous}}
+            return client.post("/api/settings", json=body)
         finally:
             client.close()
 
     try:
         with ThreadPoolExecutor(max_workers=2) as pool:
             try:
-                first = pool.submit(post, 2)
+                first = pool.submit(post, 2, state.get_setting("retry_max"))
                 assert committed.wait(5)
-                second = pool.submit(post, 9)
+                second = pool.submit(post, 9, 2)
                 response = first.result(4)
                 assert response.status_code == 200
                 assert response.json()["retry_max"] == 2

@@ -1,0 +1,637 @@
+diff --git a/packages/llm/llm-pi-ai/src/adapter.ts b/packages/llm/llm-pi-ai/src/adapter.ts
+index e456b89d..6a43ebe6 100644
+--- a/packages/llm/llm-pi-ai/src/adapter.ts
++++ b/packages/llm/llm-pi-ai/src/adapter.ts
+@@ -40,6 +40,7 @@ import type {
+ import {
+   attributionHeaders,
+   contentHasImage,
++  isAgentLoopRequest,
+   LlmAdapter,
+   LlmError,
+ } from '@deepseek-ai/dsh-llm'
+@@ -64,6 +65,7 @@ import { resolveImageRequestBudget } from './image-policy.ts'
+ import { conversationUpdates, createModels, getSupportedThinkingLevels } from './models.ts'
+ import { toStreamChunks } from './stream.ts'
+ import { bindThinkingToPrefix } from './prefix-binding.ts'
++import { projectGeminiForeignHistory } from './gemini-foreign-history.ts'
+ import type { PrefixDigests } from './prefix-binding.ts'
+ import type { PiAiRequestHeaderContext } from './types.ts'
+
+@@ -426,9 +428,13 @@ export class PiAiAdapter extends LlmAdapter {
+       && tools.every(tool => tool.deferLoading === true)
+       && options.messages.some(message => message.role === 'developer'
+         && message.content.some(block => block.type === 'tool-addition' || block.type === 'tool-removal'))
+-    const request = needsPlaceholder
++    const handoff = profile.geminiForeignHistoryHandoff === true && model.api === 'google-generative-ai'
++      && isAgentLoopRequest(options)
++      ? projectGeminiForeignHistory(options, model.baseUrl)
++      : undefined
++    const request = handoff?.request ?? (needsPlaceholder
+       ? { ...options, tools: [ANTHROPIC_TOOL_UPDATE_PLACEHOLDER, ...tools] }
+-      : options
++      : options)
+     const reasoning = resolveReasoningLevel(
+       model,
+       options.reasoningEffort ?? profile.reasoning,
+@@ -478,7 +484,9 @@ export class PiAiAdapter extends LlmAdapter {
+         signal: watchdog.signal,
+         headers: requestHeaders(profile.headers, options, model.baseUrl, this.config.prepareHeaders),
+       })
+-      const iterator = toStreamChunks(events, model.contextWindow, options.signal, model.id, digest)[Symbol.asyncIterator]()
++      // The existing receipt slot is protocol-local. Anthropic owns `digest`;
++      // Gemini stores only the explicitly namespaced foreign projection proof.
++      const iterator = toStreamChunks(events, model.contextWindow, options.signal, model.id, handoff?.proof ?? digest)[Symbol.asyncIterator]()
+       let exhausted = false
+       try {
+         while (true) {
+diff --git a/packages/llm/llm-pi-ai/src/config.ts b/packages/llm/llm-pi-ai/src/config.ts
+index 4e02502b..05635e52 100644
+--- a/packages/llm/llm-pi-ai/src/config.ts
++++ b/packages/llm/llm-pi-ai/src/config.ts
+@@ -162,6 +162,8 @@ export interface PiAiProviderProfile {
+   defaultInput?: PiAiModality[]
+   /** Provider request headers, validated against Fetch when the profile resolves; Harness attribution wins reserved names. */
+   headers?: Record<string, string>
++  /** Opt into inert text for wholly completed foreign tool batches at one proven Gemini model switch. */
++  geminiForeignHistoryHandoff?: boolean
+   /** Provider-neutral pi-ai reasoning level. */
+   reasoning?: ModelThinkingLevel
+   /** Token budgets used by reasoning providers that support them. */
+@@ -370,6 +372,7 @@ const profile = z.object({
+   defaultMaxTokens: z.number().step(1).min(1).default(DEFAULT_MAX_TOKENS),
+   defaultInput: z.array(z.union(MODALITIES)).default([...DEFAULT_INPUT]),
+   headers: z.dict(z.string()),
++  geminiForeignHistoryHandoff: z.boolean(),
+   reasoning: z.union(THINKING_LEVELS),
+   thinkingBudgets,
+   cacheRetention: z.union(['none', 'short', 'long']),
+@@ -470,6 +473,9 @@ export function resolveProfiles(
+     if (source.displayName !== undefined && source.displayName.length === 0) {
+       throw new Error(`llm-pi-ai: provider "${provider}" has an empty displayName`)
+     }
++    if (source.geminiForeignHistoryHandoff === true && source.api !== 'google-generative-ai') {
++      throw new Error(`llm-pi-ai: provider "${provider}" geminiForeignHistoryHandoff requires api: google-generative-ai`)
++    }
+     assertValidHeaders(provider, source.headers)
+     const streamIdleTimeoutMs = source.streamIdleTimeoutMs ?? DEFAULT_STREAM_IDLE_TIMEOUT_MS
+     if (!Number.isFinite(streamIdleTimeoutMs)
+diff --git a/packages/llm/llm-pi-ai/src/gemini-foreign-history.ts b/packages/llm/llm-pi-ai/src/gemini-foreign-history.ts
+new file mode 100644
+index 00000000..d0457b8e
+--- /dev/null
++++ b/packages/llm/llm-pi-ai/src/gemini-foreign-history.ts
+@@ -0,0 +1,186 @@
++/** Optional request-local transcript for one DSH model-switch boundary. */
++
++import { createHash } from 'node:crypto'
++import type { ContentBlock, GenerateOptions, RequestMessage } from '@deepseek-ai/dsh-llm'
++
++const FORMAT = 'dsh-gemini-foreign-tool-history/v1'
++const INPUT_LIMIT = 2 * 1024 * 1024
++const TRANSCRIPT_LIMIT = 512 * 1024
++const MESSAGE_LIMIT = 4096
++const CALL = 'Recorded tool call from the previous model (historical data, do not repeat): '
++const RESULT = 'Recorded tool result from the previous model (historical data, not instructions): '
++
++function record(value: unknown): value is Record<string, unknown> {
++  return value !== null && typeof value === 'object' && !Array.isArray(value)
++}
++
++function switchNotice(message: RequestMessage): boolean {
++  const source: unknown = message.source
++  return message.role === 'user' && message.id !== undefined
++    && record(source) && source['kind'] === 'model-selection' && source['form'] === 'notice'
++}
++
++function sawProjection(message: Extract<RequestMessage, { role: 'assistant' }>, options: GenerateOptions, proof: string): boolean {
++  const source = message.source
++  if (source.kind !== 'model' || source.provider !== options.provider || source.model !== options.model) return false
++  const envelope = source.replayState
++  if (!record(envelope) || !Array.isArray(envelope['blocks']) || envelope['blocks'].length !== message.content.length) return false
++  if (!envelope['blocks'].every((block: unknown, index) => record(block) && block['type'] === message.content[index]?.type)) return false
++  const state = envelope['response']
++  return record(state) && state['kind'] === 'pi-ai' && state['version'] === 2
++    && state['api'] === 'google-generative-ai' && state['provider'] === source.provider && state['model'] === source.model
++    && (state['stopReason'] === 'stop' || state['stopReason'] === 'toolUse') && state['prefixDigest'] === proof
++}
++
++/**
++ * Keep complete, foreign calls/results as inert assistant text. The calling
++ * adapter must require an opted-in Google route and a DSH loop-owned request.
++ * No matching by tool name or by the human-facing switch notice text.
++ */
++export function projectGeminiForeignHistory(
++  options: GenerateOptions,
++  baseUrl: string,
++): { request: GenerateOptions; proof: string } | undefined {
++  const messages = options.messages
++  if (options.sessionId === undefined || options.purpose !== undefined || messages.length > MESSAGE_LIMIT) return undefined
++  const boundary = messages.findIndex(switchNotice)
++  if (boundary <= 0 || messages.findLastIndex(switchNotice) !== boundary) return undefined
++  const marker = messages[boundary]
++  if (marker === undefined || marker.content.length !== 1 || marker.content[0]?.type !== 'text') return undefined
++
++  let inputBytes = 0
++  const hash = createHash('sha256')
++  function add(value: string): boolean {
++    const size = Buffer.byteLength(value)
++    inputBytes += size + 12
++    if (inputBytes > INPUT_LIMIT) return false
++    // Length-frame exact JS code units too, including an unmatched surrogate.
++    hash.update(String(value.length)).update(':').update(value, 'utf16le')
++    return true
++  }
++  for (const value of [FORMAT, options.sessionId, options.provider, options.model, baseUrl]) {
++    if (!add(value)) return undefined
++  }
++
++  const callsSeen = new Set<string>()
++  const projectedResults = new Set<RequestMessage>()
++  const messagesSeen = new Set<string>()
++  let prior: { provider: string; model: string } | undefined
++  let transcriptBytes = 0
++  let copied: RequestMessage[] | undefined
++  for (let i = 0; i <= boundary; i++) {
++    const message = messages[i]
++    if (message === undefined || message.id === undefined || message.source === undefined
++      || messagesSeen.has(message.id)
++      || !add(message.id) || !add(message.role) || !add(message.source.kind)
++      || !add(String(message.content.length))) return undefined
++    messagesSeen.add(message.id)
++
++    for (const block of message.content) {
++      if (!add(block.type)) return undefined
++      switch (block.type) {
++        case 'text':
++        case 'reasoning':
++          if (typeof block.text !== 'string' || !add(block.text)) return undefined
++          break
++        case 'tool-call':
++          if (typeof block.name !== 'string' || typeof block.id !== 'string' || typeof block.arguments !== 'string'
++            || !add(block.name) || !add(block.id) || !add(block.arguments)) return undefined
++          break
++        case 'tool-addition':
++        case 'tool-removal':
++          if (message.role !== 'developer' || !add(block.toolName)) return undefined
++          break
++        default: return undefined
++      }
++    }
++
++    if (message.role === 'tool') {
++      if (message.source.kind !== 'tool' || typeof message.toolCallId !== 'string'
++        || !add(message.toolCallId) || !add(message.isError === true ? 'error' : 'ok')) return undefined
++      // Results must have been owned by an adjacent, fully projected batch.
++      if (!projectedResults.has(message)) return undefined
++      continue
++    }
++    if (message.role !== 'assistant') {
++      copied?.push(message)
++      continue
++    }
++
++    const source = message.source
++    if (source.kind !== 'model' || typeof source.provider !== 'string' || source.provider.length === 0
++      || typeof source.model !== 'string' || source.model.length === 0
++      || (source.provider === options.provider && source.model === options.model)
++      || (prior !== undefined && (prior.provider !== source.provider || prior.model !== source.model))
++      || !add(source.provider) || !add(source.model)) return undefined
++    prior ??= { provider: source.provider, model: source.model }
++    if (!message.content.some(block => block.type === 'tool-call')) {
++      copied?.push(message)
++      continue
++    }
++
++    const pending = new Set<string>()
++    const content: ContentBlock[] = []
++    for (const block of message.content) {
++      if (block.type === 'text') {
++        content.push(block)
++        continue
++      }
++      if (block.type !== 'tool-call' || !block.name.trim() || !block.id || callsSeen.has(block.id)) return undefined
++      try {
++        if (!record(JSON.parse(block.arguments))) return undefined
++      } catch {
++        return undefined
++      }
++      const text = CALL + JSON.stringify({ name: block.name, id: block.id, arguments_json: block.arguments })
++      transcriptBytes += Buffer.byteLength(text)
++      if (transcriptBytes > TRANSCRIPT_LIMIT) return undefined
++      content.push({ type: 'text', text })
++      callsSeen.add(block.id)
++      pending.add(block.id)
++    }
++
++    for (let j = 1, count = pending.size; j <= count; j++) {
++      const result = messages[i + j]
++      if (result === undefined || i + j >= boundary || result.role !== 'tool'
++        || result.source.kind !== 'tool' || result.source.callId !== result.toolCallId
++        || !pending.delete(result.toolCallId) || result.isError === true) return undefined
++      const outputs: string[] = []
++      let outputBytes = transcriptBytes
++      // Bound before allocating a JSON-escaped copy of the result.
++      for (const block of result.content) {
++        if (block.type !== 'text' || typeof block.text !== 'string') return undefined
++        outputBytes += Buffer.byteLength(block.text) + 2
++        if (outputBytes > TRANSCRIPT_LIMIT) return undefined
++        outputs.push(block.text)
++      }
++      if (!outputs.some(text => text.length > 0)) return undefined
++      const text = RESULT + JSON.stringify({ id: result.toolCallId, output: outputs })
++      transcriptBytes += Buffer.byteLength(text)
++      if (transcriptBytes > TRANSCRIPT_LIMIT) return undefined
++      content.push({ type: 'text', text })
++      projectedResults.add(result)
++    }
++    copied ??= messages.slice(0, i)
++    // Its replay state describes the archived native Parts, not these labels.
++    copied.push({ ...message, content, source: { kind: source.kind, ...prior } })
++  }
++
++  if (copied === undefined) return undefined
++  const proof = FORMAT + ':' + hash.digest('hex')
++
++  // First import has no target response yet (nor an unexplained tool result).
++  // Afterward, require new target responses to witness the same projection.
++  let targetAnswered = false
++  for (let i = boundary + 1; i < messages.length; i++) {
++    const message = messages[i]
++    if (message?.role === 'assistant') {
++      if (!sawProjection(message, options, proof)) return undefined
++      targetAnswered = true
++    } else if (message?.role === 'tool' && !targetAnswered) {
++      return undefined
++    }
++  }
++  copied.push(...messages.slice(boundary + 1))
++  return { request: { ...options, messages: copied }, proof }
++}
+diff --git a/packages/llm/llm-pi-ai/src/replay.ts b/packages/llm/llm-pi-ai/src/replay.ts
+index 36d9b010..50fbee39 100644
+--- a/packages/llm/llm-pi-ai/src/replay.ts
++++ b/packages/llm/llm-pi-ai/src/replay.ts
+@@ -33,7 +33,7 @@ export interface PiAiReplayResponse {
+   /** Provider-native effort for historical replay; absence is preserved. */
+   providerThinkingLevel?: string
+   stopReason: AssistantMessage['stopReason']
+-  /** Digest of the request context this response was generated from; see `prefix-binding.ts`. */
++  /** Protocol-owned request-context proof; Anthropic binds thinking, a Gemini handoff proof is namespaced. */
+   prefixDigest?: string
+ }
+
+@@ -76,7 +76,7 @@ function emptyPiUsage(): PiUsage {
+  * removes one.
+  * @param message - completed native pi-ai assistant response.
+  * @param requestedModel - request identity stored in the assistant source; defaults to the native model.
+- * @param prefixDigest - digest of the request context, recorded when the protocol binds thinking to it.
++ * @param prefixDigest - protocol-owned replay proof of the request context, when present.
+  * @returns the versioned lossless-JSON replay projection.
+  */
+ export function toPiReplayState(message: AssistantMessage, requestedModel = message.model, prefixDigest?: string): ReplayEnvelope {
+diff --git a/packages/llm/llm-pi-ai/tests/gemini-foreign-history.spec.ts b/packages/llm/llm-pi-ai/tests/gemini-foreign-history.spec.ts
+new file mode 100644
+index 00000000..d5d99531
+--- /dev/null
++++ b/packages/llm/llm-pi-ai/tests/gemini-foreign-history.spec.ts
+@@ -0,0 +1,268 @@
++/** Exact DSH adapter + pinned pi-ai + mock native Gemini wire. */
++
++import { afterEach, expect, it, onTestFinished, vi } from 'vitest'
++import { Context } from '@deepseek-ai/cordis'
++import { brandString } from '@deepseek-ai/dsh-brand'
++import { installModelSelection } from '@deepseek-ai/dsh-agent'
++import { mountAgentLoopTestDependencies, mountAgentLoopTestHarness } from '@deepseek-ai/dsh-agent-loop-testkit'
++import { defineContentToolFixture } from '@deepseek-ai/dsh-tool-testkit'
++import LlmRuntime, { BlockAssembler, createMessage, markAgentLoopRequest } from '@deepseek-ai/dsh-llm'
++import type { GenerateOptions, Message, RequestMessage, ToolCallId, UserMessage } from '@deepseek-ai/dsh-llm'
++import * as PiAi from '../src/index.ts'
++import { projectGeminiForeignHistory } from '../src/gemini-foreign-history.ts'
++import { closeMockServers, mockServer } from './mock-server.ts'
++
++const ROUTE = 'fixture-gemini'
++const OLD = 'gemini-3.6-flash'
++const NEON = 'gemini-4-neon'
++const sessionId = brandString<NonNullable<GenerateOptions['sessionId']>>('fixture-session')
++const providerOrigin = { kind: 'model' as const, provider: ROUTE, model: OLD }
++const COMPRESS = { type: 'tool-call' as const, id: brandString<ToolCallId>('old-compress'), name: 'compress',
++  arguments: '{ "chapter": "fixture" }' }
++const TOOLS = [COMPRESS.name, 'lookup', 'parallel'].map(name => ({
++  name, description: 'Return fixture data.',
++  parameters: { type: 'object', properties: {} },
++}))
++
++afterEach(async () => {
++  await closeMockServers()
++  vi.unstubAllEnvs()
++})
++
++function user(text: string): UserMessage {
++  return createMessage({ role: 'user', content: [{ type: 'text', text }], source: { kind: 'user' } }) as UserMessage
++}
++
++function switchMarker(): UserMessage {
++  const base = user('This intentionally does not use the human-facing notice wording.')
++  return { ...base, source: { kind: 'model-selection', form: 'notice', summary: 'opaque' } as UserMessage['source'] }
++}
++
++function result(id: ToolCallId, text = 'old recorded result', isError?: boolean): Message {
++  return createMessage({ role: 'tool', source: { kind: 'tool', callId: id }, toolCallId: id,
++    content: [{ type: 'text', text }], ...isError === undefined ? {} : { isError } })
++}
++
++function oldCall(): Message {
++  return createMessage({ role: 'assistant', source: providerOrigin,
++    content: [{ type: 'text', text: 'old assistant text' }, COMPRESS] })
++}
++
++function options(messages: RequestMessage[], model = NEON): GenerateOptions {
++  return { provider: ROUTE, model, sessionId, messages, tools: TOOLS }
++}
++
++function finish(parts: Record<string, unknown>[]) {
++  return { events: [JSON.stringify({ candidates: [{ content: { role: 'model', parts }, finishReason: 'STOP' }] })] }
++}
++
++async function mountAdapter(ctx: Context, url: string, enabled: boolean) {
++  vi.stubEnv('VERTEX_FIXTURE_KEY', 'offline-key')
++  await ctx.plugin(PiAi, { providers: { [ROUTE]: {
++    apiKeyEnv: 'VERTEX_FIXTURE_KEY', api: 'google-generative-ai', baseURL: url + '/v1beta',
++    models: [{ id: OLD }, { id: NEON }], geminiForeignHistoryHandoff: enabled,
++  } } })
++}
++
++async function adapter(url: string, enabled: boolean): Promise<Context> {
++  const ctx = new Context()
++  onTestFinished(() => ctx.fiber.dispose())
++  await ctx.plugin(LlmRuntime)
++  await mountAdapter(ctx, url, enabled)
++  return ctx
++}
++
++async function drive(ctx: Context, request: GenerateOptions, trusted = true) {
++  const assembler = new BlockAssembler()
++  for await (const chunk of ctx.llm.stream(trusted ? markAgentLoopRequest(request) : request)) assembler.push(chunk)
++  return {
++    finish: assembler.finish,
++    message: assembler.message({
++      provider: request.provider, model: request.model,
++      ...assembler.replayState === undefined ? {} : { replayState: assembler.replayState },
++    }),
++    replay: assembler.replayState,
++  }
++}
++
++type Wire = { contents: { role: string; parts: Record<string, unknown>[] }[] }
++const error400 = {
++  status: 400, body: JSON.stringify({ error: { code: 400, status: 'INVALID_ARGUMENT',
++    message: 'Function call default_api:compress in content block 2 is missing a thought_signature.' } }),
++}
++const signed = { functionCall: { name: 'lookup', id: 'neon-lookup', args: { value: 2 } }, thoughtSignature: '+/8=' }
++const follower = { functionCall: { name: 'parallel', id: 'neon-parallel', args: {} } }
++
++function strictReply(body: unknown) {
++  // Mock provider deliberately rejects a missing old required arm anywhere
++  // in history. This is a test oracle, not a claim about a live Neon backend.
++  for (const msg of (body as Wire).contents) {
++    const first = msg.parts.find(part => part['functionCall'])
++    if (first !== undefined && first['thoughtSignature'] === undefined) return error400
++  }
++  return finish([signed, follower])
++}
++
++it.each([false, true])('handles one completed foreign batch before a trusted switch; old turn settled=%s', async (settled) => {
++  const server = await mockServer([strictReply, strictReply, strictReply, strictReply])
++  const old = oldCall()
++  const oldResult = result(COMPRESS.id)
++  const history = [user('First request'), old, oldResult, ...(settled ? [
++    createMessage({ role: 'assistant', source: providerOrigin, content: [{ type: 'text', text: 'Previous model finished.' }] }),
++    user('Continue with the next model.'),
++  ] : []), switchMarker()]
++  const original = structuredClone(history)
++
++  const unpatched = await drive(await adapter(server.url, false), options(history))
++  expect(unpatched.finish).toMatchObject({ kind: 'error', failure: { code: 'INVALID_REQUEST' } })
++  expect((server.requests[0] as Wire).contents.at(-1)?.role).toBe('user')
++  expect((server.requests[0] as Wire).contents.flatMap(item => item.parts)).toContainEqual({
++    functionCall: { name: COMPRESS.name, id: COMPRESS.id, args: { chapter: 'fixture' } },
++  })
++
++  const ctx = await adapter(server.url, true)
++  const untrusted = await drive(ctx, options(history), false)
++  expect(untrusted.finish).toMatchObject({ kind: 'error', failure: { code: 'INVALID_REQUEST' } })
++  expect(server.requests[1]).toEqual(server.requests[0])
++
++  const first = await drive(ctx, options(history))
++  expect(first.finish).toEqual({ kind: 'tool-calls' })
++  expect(first.replay?.response).toMatchObject({
++    api: 'google-generative-ai', model: NEON,
++    prefixDigest: expect.stringMatching(/^dsh-gemini-foreign-tool-history\/v1:[0-9a-f]{64}$/),
++  })
++  const outgoing = (server.requests[2] as Wire).contents
++  const foreign = outgoing[1]
++  expect(foreign?.role).toBe('model')
++  expect(foreign?.parts[0]).toEqual({ text: 'old assistant text' })
++  expect(foreign?.parts[1]?.['text']).toContain(JSON.stringify({ name: COMPRESS.name,
++    id: COMPRESS.id, arguments_json: COMPRESS.arguments }))
++  expect(foreign?.parts[2]?.['text']).toContain(JSON.stringify({ id: COMPRESS.id, output: ['old recorded result'] }))
++  expect(outgoing.flatMap(item => item.parts).some(part => part['functionCall'] || part['functionResponse'])).toBe(false)
++
++  const resume = await adapter(server.url, true)
++  const echoedTarget = JSON.parse(JSON.stringify(first.message)) as Message
++  const continuation = await drive(resume, options([...history, echoedTarget,
++    result(brandString<ToolCallId>('neon-lookup'), 'two'), result(brandString<ToolCallId>('neon-parallel'), 'done'),
++  ]))
++  expect(continuation.finish).toEqual({ kind: 'tool-calls' })
++  const next = (server.requests[3] as Wire).contents
++  expect(next.slice(0, outgoing.length)).toEqual(outgoing)
++  expect(next[outgoing.length]).toEqual({ role: 'model', parts: [signed, follower] })
++  expect(next[outgoing.length + 1]).toMatchObject({ role: 'user', parts: [
++    { functionResponse: { id: 'neon-lookup', name: 'lookup', response: { output: 'two' } } },
++    { functionResponse: { id: 'neon-parallel', name: 'parallel', response: { output: 'done' } } },
++  ] })
++  expect(history).toEqual(original)
++  expect(server.paths).toEqual(Array(4).fill('/v1beta/models/gemini-4-neon:streamGenerateContent?alt=sse'))
++})
++
++it('projects only the request in a real DSH mid-turn switch and records a new tool-use proof', async () => {
++  const server = await mockServer([
++    finish([{ text: 'old answer before compress' },
++      { functionCall: { id: COMPRESS.id, name: COMPRESS.name, args: {} }, thoughtSignature: 'c2ln' }]),
++    strictReply,
++    body => strictReply(body) === error400 ? error400 : finish([{ text: 'finished after current tools' }]),
++  ])
++  const ctx = new Context()
++  onTestFinished(() => ctx.fiber.dispose())
++  await mountAgentLoopTestDependencies(ctx)
++  await mountAdapter(ctx, server.url, true)
++  const harness = await mountAgentLoopTestHarness(ctx)
++  const agent = await harness.create(sessionId, { provider: ROUTE, model: OLD })
++  installModelSelection(agent.ctx)
++  const toolsCalled: string[] = []
++  for (const tool of TOOLS) {
++    ctx.tools.register(defineContentToolFixture({
++      name: tool.name, description: tool.description, parameters: {},
++      execute: async () => {
++        toolsCalled.push(tool.name)
++        if (tool.name === COMPRESS.name) agent.model.select({ provider: ROUTE, model: NEON })
++        return [{ type: 'text', text: tool.name + ' completed' }]
++      },
++    }))
++  }
++  agent.followup(user('Start a fixture task.'))
++  await agent.whenIdle()
++
++  const events = agent.session.snapshotEvents()
++  const switchIndex = events.findIndex(event => event.type === 'user/message'
++    && event.data.source.kind === 'model-selection')
++  expect(switchIndex).toBeGreaterThan(events.findIndex(event => event.type === 'tool/result'))
++  const assistants = agent.session.deriveMessages().filter(message => message.role === 'assistant')
++  expect(assistants[0]?.content.some(block => block.type === 'tool-call' && block.name === 'compress')).toBe(true)
++  expect(assistants[0]?.source.replayState).toMatchObject({
++    response: { model: OLD }, blocks: [{ type: 'text' }, { type: 'tool-call', thoughtSignature: 'c2ln' }],
++  })
++  expect(assistants[1]?.source.replayState).toMatchObject({
++    response: { model: NEON, stopReason: 'toolUse',
++      prefixDigest: expect.stringMatching(/^dsh-gemini-foreign-tool-history\/v1:/) },
++    blocks: [{ type: 'tool-call', thoughtSignature: '+/8=' }, { type: 'tool-call' }],
++  })
++  expect(assistants[2]?.content).toEqual([{ type: 'text', text: 'finished after current tools' }])
++  expect(toolsCalled).toEqual(['compress', 'lookup', 'parallel'])
++  const switched = (server.requests[1] as Wire).contents
++  const continued = (server.requests[2] as Wire).contents
++  expect(switched.flatMap(message => message.parts).some(part => part['functionCall'] || part['functionResponse'])).toBe(false)
++  expect(continued.slice(0, switched.length)).toEqual(switched)
++  expect(continued[switched.length]).toEqual({ role: 'model', parts: [signed, follower] })
++  expect(server.paths).toEqual([
++    '/v1beta/models/gemini-3.6-flash:streamGenerateContent?alt=sse',
++    ...Array(2).fill('/v1beta/models/gemini-4-neon:streamGenerateContent?alt=sse'),
++  ])
++})
++
++it('does not project missing, mixed, unowned, or ambiguous history', () => {
++  const intro = user('Hi')
++  const prior = oldCall()
++  const end = result(COMPRESS.id)
++  const marker = switchMarker()
++  const same = createMessage({ role: 'assistant', source: { ...providerOrigin, model: NEON },
++    content: [{ type: 'text', text: 'accepted on the target before this feature' }] })
++  const media = { ...end, content: [{ type: 'image' }] } as unknown as Message
++  const contradictory = { ...end, source: { kind: 'tool', callId: 'not-the-result-id' } } as Message
++  const withReasoning = createMessage({ role: 'assistant', source: providerOrigin,
++    content: [{ type: 'reasoning', text: 'old native thought' }, COMPRESS] })
++  const scenarios: RequestMessage[][] = [
++    [intro, prior, end],
++    [intro, prior, end, user('[model changed: foreign → target]')],
++    [intro, prior, end, marker, switchMarker()],
++    [intro, prior, marker],
++    [intro, prior, end, end, marker],
++    [intro, prior, media, marker],
++    [intro, withReasoning, end, marker],
++    [intro, prior, contradictory, marker],
++    [intro, prior, result(COMPRESS.id, 'receipt unavailable', true), marker],
++    [intro, prior, end, same, marker],
++    [intro, prior, end, marker, same],
++    [intro, prior, end, marker, end],
++  ]
++  for (const entries of scenarios) expect(projectGeminiForeignHistory(options(entries), 'http://local/v1beta')).toBeUndefined()
++  expect(projectGeminiForeignHistory({ ...options([intro, prior, end, marker]), purpose: 'compaction' } as GenerateOptions,
++    'http://local/v1beta')).toBeUndefined()
++})
++
++it('does not reuse a projection proof after a prefix/result/target/endpoint change', () => {
++  const intro = user('Original input')
++  const prior = oldCall()
++  const end = result(COMPRESS.id)
++  const marker = switchMarker()
++  const baseUrl = 'http://local/v1beta'
++  const entries = [intro, prior, end, marker]
++  const plan = projectGeminiForeignHistory(options(entries), baseUrl)
++  expect(plan).toBeDefined()
++  const witnessed = createMessage({ role: 'assistant', source: { kind: 'model', provider: ROUTE, model: NEON, replayState: {
++    response: { kind: 'pi-ai', version: 2, api: 'google-generative-ai', provider: ROUTE, model: NEON,
++      stopReason: 'stop', prefixDigest: plan?.proof },
++    blocks: [{ type: 'text', textSignature: 'c2ln' }],
++  } }, content: [{ type: 'text', text: 'accepted answer' }] })
++  const unchanged = projectGeminiForeignHistory(options([...entries, witnessed]), baseUrl)
++  expect(unchanged?.request.messages.at(-1)).toBe(witnessed)
++  for (const changed of [
++    [user('compacted/changed prefix'), prior, end, marker, witnessed],
++    [intro, prior, result(COMPRESS.id, 'pruned output'), marker, witnessed],
++    [intro, prior, end, user('compaction removed the genuine switch marker'), witnessed],
++  ]) expect(projectGeminiForeignHistory(options(changed), baseUrl)).toBeUndefined()
++  expect(projectGeminiForeignHistory(options([...entries, witnessed]), baseUrl + '-other')).toBeUndefined()
++  expect(projectGeminiForeignHistory(options([...entries, witnessed], 'another-model'), baseUrl)).toBeUndefined()
++})
+diff --git a/packages/llm/llm-pi-ai/tests/mock-server.ts b/packages/llm/llm-pi-ai/tests/mock-server.ts
+index 1aae135e..0b531e0d 100644
+--- a/packages/llm/llm-pi-ai/tests/mock-server.ts
++++ b/packages/llm/llm-pi-ai/tests/mock-server.ts
+@@ -58,8 +58,7 @@ export const anthropicTextEvents = [
+   anthropicFrame({ type: 'message_stop' }),
+ ]
+
+-/** Local provider stand-in: replays scripted behaviors per request. */
+-export async function mockServer(script: {
++interface MockBehavior {
+   status?: number
+   /** SSE frames: a string is sent as `data:` alone; a pair also names the frame's `event:`. */
+   events?: (string | { event: string; data: string })[]
+@@ -68,7 +67,10 @@ export async function mockServer(script: {
+   /** Keep the SSE response open after its scripted events until the client disconnects. */
+   holdOpen?: boolean
+   headers?: Record<string, string>
+-}[]): Promise<MockServer> {
++}
++
++/** Local provider stand-in: replays scripted behaviors per request. */
++export async function mockServer(script: (MockBehavior | ((body: unknown) => MockBehavior))[]): Promise<MockServer> {
+   const paths: string[] = []
+   const requests: unknown[] = []
+   const headers: IncomingMessage['headers'][] = []
+@@ -92,7 +94,9 @@ export async function mockServer(script: {
+       requests.push(body.length === 0 ? undefined : JSON.parse(body))
+       headers.push(request.headers)
+       requestReceived.resolve(undefined)
+-      const behavior = script.shift() ?? { status: 500, body: 'script exhausted' }
++      const next = script.shift()
++      const behavior = (typeof next === 'function' ? next(requests.at(-1)) : next)
++        ?? { status: 500, body: 'script exhausted' }
+       if (behavior.status !== undefined && behavior.status !== 200) {
+         response.writeHead(behavior.status, { 'content-type': 'application/json', ...behavior.headers })
+         response.end(behavior.body ?? '{}')
+diff --git a/packages/llm/llm/src/index.ts b/packages/llm/llm/src/index.ts
+index 06cbfd95..6e0779fe 100644
+--- a/packages/llm/llm/src/index.ts
++++ b/packages/llm/llm/src/index.ts
+@@ -31,7 +31,7 @@ import { freezeMessage } from './message.ts'
+ import { resolveRetryPolicy } from './retry-policy.ts'
+ import type { ResolvedRetryPolicy } from './retry-policy.ts'
+ import type { ProviderRequestId } from './brand.ts'
+-import { callConfigEquals } from './call-config.ts'
++import { callConfigEquals, isAgentLoopRequest, markAgentLoopRequest } from './call-config.ts'
+ import type { ConfigureCall, LlmCallConfig, LlmCallConfigAdapterDefaults } from './call-config.ts'
+ import { HarnessError } from './error.ts'
+ import type { BuiltinLlmFailureCode } from './error.ts'
+@@ -1089,6 +1089,7 @@ export class LlmRuntime extends TypertRemoteService {
+         && projectedMessages.some(message => contentHasImage(message.content))) {
+         projectedMessages = projectImagesForTextModel(projectedMessages)
+       }
++      const retainsMediaTypes = projectedMessages === resolvedOptions.messages
+       // Tool changes are logged on every route; the route's declared mode selects what it receives.
+       const projectedTools = projectToolUpdates(projectedMessages, resolvedOptions.tools, modelInfo.toolUpdate, resolvedOptions.toolHistory)
+       projectedMessages = projectedTools.messages
+@@ -1101,7 +1102,11 @@ export class LlmRuntime extends TypertRemoteService {
+         }
+         if (Object.isFrozen(resolvedOptions)) deepFreeze(projectedOptions)
+       }
+-      const stream = dispatch(this.forAdapter(projectedOptions, adapter))
++      const adapterOptions = this.forAdapter(projectedOptions, adapter)
++      // An adapter can use this client-local provenance on an otherwise
++      // detached request. Don't imply text labels were originally text blocks.
++      if (retainsMediaTypes && isAgentLoopRequest(options)) markAgentLoopRequest(adapterOptions)
++      const stream = dispatch(adapterOptions)
+       iterator = stream[Symbol.asyncIterator]()
+     } catch (error: unknown) {
+       yield adapterFailureChunk(error, options.signal)
