@@ -9,7 +9,7 @@ Express 通道可以字节级透传原生 REST 请求；Cookie 通道的私有 G
   响应侧：extract_events 的事件流（text/thought/image/function_call/finish…）
           → 重组回 Gemini 原生形状（candidates.content.parts / finishReason /
           usageMetadata / promptFeedback.blockReason），支持 SSE、JSON 数组流
-          与非流式 JSON，保留每个 part 的签名。
+          与非流式 JSON，保留每个 part 的签名；流式保留原候选的并行调用分组。
 
 传输层完全复用 Cookie 通道基建：SAPISIDHASH 认证、curl_cffi 伪装、代理链
 故障转移、首回复窗口、429 退避重试、账号健康隔离。
@@ -680,7 +680,7 @@ def _part_json_size(part: dict) -> int:
 class NativeAssembler:
     """把 cookie 通道事件流拼装成 Gemini 原生响应。
 
-    流式：stream_event 返回应立即下发的 part（无则 None）；terminal 返回
+    流式：stream_event 返回应立即下发的一组 parts（无则 None）；terminal 返回
     收尾帧（finishReason/usageMetadata/safetyRatings）。
     非流式：collect 同样喂事件，payload 一次性出整包。
     """
@@ -695,11 +695,11 @@ class NativeAssembler:
             MAX_RESPONSE_BYTES if max_response_bytes is None else max_response_bytes
         )
         self.part_count = 0
-        # 累计响应字节（预算口径）与最后一个 part 的字节（分帧口径）分开记：
+        # 累计响应字节（预算口径）与当前 parts 数组的字节（分帧口径）分开记：
         # 2026-11 P2-3 —— 流式路径旧写法在 retain_parts=False 时逐 part 重置
         # response_bytes，「响应预算」实际只约束单 part，与文档语义不符。
         self.response_bytes = 0
-        self.last_part_bytes = 0
+        self.last_parts_bytes = 0
         self.finish: Optional[str] = None
         self.usage: Optional[dict] = None
         self.safety: Any = None
@@ -709,9 +709,12 @@ class NativeAssembler:
         self.has_content = False
 
     # -- 事件喂入 --------------------------------------------------------
-    def feed(self, kind: str, data: Any) -> Optional[dict]:
-        """处理一个事件；返回需立即下发的新增 part（流式用），None 表示不发。"""
+    def feed(self, kind: str, data: Any) -> dict | list[dict] | None:
+        """处理一个事件，返回新增 part 或原候选的一组 parts。"""
         part: Optional[dict] = None
+        if kind == "native_parts":
+            self._record_parts(data)
+            return data
         if kind == "native_part":
             part = data
         elif kind == "text":
@@ -748,22 +751,30 @@ class NativeAssembler:
         elif kind == "blocked":
             self.prompt_feedback = data
         if part is not None:
-            size = _part_json_size(part)
-            # 累计语义（2026-11 P2-3）：流式/非流式同口径，预算名副其实；
-            # 图像模型经 max_response_bytes 放宽（见 IMAGE_RESPONSE_BYTES）。
-            self.response_bytes += size
-            self.last_part_bytes = size
-            if self.response_bytes > self.max_response_bytes:
-                raise NativeBridgeError(502, "上游响应超过允许的大小。")
-            if self.retain_parts:
-                self.parts.append(part)
-            self.part_count += 1
-            self.has_content = True
+            self._record_parts([part])
         return part
 
-    # 流式别名（语义清晰）
-    def stream_event(self, kind: str, data: Any) -> Optional[dict]:
-        return self.feed(kind, data)
+    def _record_parts(self, parts: list[dict]) -> None:
+        if not parts:
+            return
+        # Validate the whole candidate before delivering any of its Parts.
+        # Preserve the cumulative per-Part budget for both delivery modes.
+        total = self.response_bytes
+        for part in parts:
+            total += _part_json_size(part)
+            if total > self.max_response_bytes:
+                raise NativeBridgeError(502, "上游响应超过允许的大小。")
+        # Include the array brackets and two bytes per separator.
+        self.last_parts_bytes = total - self.response_bytes + 2 * len(parts)
+        self.response_bytes = total
+        if self.retain_parts:
+            self.parts.extend(parts)
+        self.part_count += len(parts)
+        self.has_content = True
+
+    def stream_event(self, kind: str, data: Any) -> list[dict] | None:
+        parts = self.feed(kind, data)
+        return [parts] if isinstance(parts, dict) else parts
 
     # -- 收尾 ------------------------------------------------------------
     def _require_finish(self) -> str:
@@ -857,7 +868,7 @@ async def _events_with_retry(fastapi_request: Request, record: dict, body: dict,
             try:
                 async for item in events:
                     status, data = item
-                    if status in ("text", "thought", "image", "function_call", "thought_signature", "native_part",
+                    if status in ("text", "thought", "image", "function_call", "thought_signature", "native_part", "native_parts",
                                   "finish", "usage", "blocked", "safety", "candidate_metadata"):
                         if not committed and _event_has_reply(item):
                             committed = True
@@ -998,7 +1009,7 @@ async def _handle_native_request_impl(fastapi_request: Request, model: str, acti
                 max_response_bytes=_bridge_response_budget(model))
             first = True
 
-            def encode(payload: bytes, *, fragmented: bool=False):
+            def encode(payload: dict, *, fragmented: bool=False):
                 nonlocal first
                 if use_sse:
                     prefix, suffix = b"data: ", b"\n\n"
@@ -1006,7 +1017,7 @@ async def _handle_native_request_impl(fastapi_request: Request, model: str, acti
                     prefix, suffix = (b"" if first else b","), b""
                     first = False
                 if not fragmented:
-                    # Keep ordinary token/tool events as one text frame.
+                    # Keep smaller candidate groups as one text frame.
                     yield prefix.decode("ascii") + json.dumps(payload, ensure_ascii=False) + suffix.decode("ascii")
                     return
                 yield prefix
@@ -1022,11 +1033,13 @@ async def _handle_native_request_impl(fastapi_request: Request, model: str, acti
                         if kind == "heartbeat":
                             yield GEMINI_HEARTBEAT_FRAME if use_sse else " "
                             continue
-                        part = assembler.stream_event(kind, data)
-                        if part is not None:
-                            for chunk in encode({"candidates": [{"content": {"role": "model", "parts": [part]}, "index": 0}]},
-                                                fragmented=assembler.last_part_bytes > 1024 * 1024):
+                        parts = assembler.stream_event(kind, data)
+                        if parts:
+                            for chunk in encode({"candidates": [{"content": {"role": "model", "parts": parts}, "index": 0}]},
+                                                fragmented=assembler.last_parts_bytes > 1024 * 1024):
                                 yield chunk
+                                del chunk
+                        del parts, data
                 for chunk in encode(assembler.terminal()):
                     yield chunk
                 stats.add_success()

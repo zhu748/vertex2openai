@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse, Response
 from models import OpenAIRequest
 from generation_config import create_generation_config
 from express_endpoint import resolve_express_model_path
+from model_resource import parse_google_model_resource
 from upstream_errors import create_openai_error_response
 from anti_truncation import prepare_transport, split_model_alias
 from upstreams.base import BaseUpstream
@@ -76,6 +77,15 @@ def _normalize_model_name(model_name: str) -> tuple[str, bool, str | None]:
         return base_model_name, False, "模型名称不能为空。"
 
     return base_model_name, is_grounded_search, None
+
+
+def _qualified_search_alias(requested_model: str, base_model: str) -> str | None:
+    """Recognize only the exact qualified name and one ordinary Search suffix."""
+    model = requested_model.strip()
+    if (base_model.startswith("projects/") and model.lower().endswith("-search")
+            and model[:-len("-search")] == base_model and parse_google_model_resource(base_model) is not None):
+        return model
+    return None
 
 
 def _build_thinking_config(
@@ -226,8 +236,16 @@ class ExpressSDKUpstream(BaseUpstream):
 
         profile = mc.get_profile(base_model_name)
 
+        # The qualified Search row may own distinct generation settings.
+        # Use its existing defaults snapshot for injection and thinking too,
+        # but leave location, retries, and synthetic-alias admission on base.
+        search_alias = _qualified_search_alias(request_obj.model, base_model_name)
+        search_settings = app_state.get_effective_settings(search_alias) if search_alias else None
+        overrides = search_settings.get("model_overrides") if search_settings is not None else None
+        generation_policy = (search_settings if isinstance(overrides, dict)
+                             and isinstance(overrides.get(search_alias), dict) else _inj_settings)
         request_obj, prefill_text, prefill_active = prepare_messages(
-            request_obj, profile, _inj_settings
+            request_obj, profile, generation_policy
         )
 
         request_obj, text_transport = prepare_transport(
@@ -238,11 +256,11 @@ class ExpressSDKUpstream(BaseUpstream):
             native_stream=not app_state.get_setting("fake_streaming", False),
             prefill=prefill_active or bool(prefill_text),
         )
-        gen_config_dict = create_generation_config(request_obj)
+        gen_config_dict = create_generation_config(request_obj, settings=search_settings)
         if text_transport and text_transport.native_stream:
             gen_config_dict["tool_config"]["function_calling_config"]["stream_function_call_arguments"] = True
         thinking_config = _build_thinking_config(
-            base_model_name, request_obj, prefill_active=prefill_active, settings=_inj_settings
+            base_model_name, request_obj, prefill_active=prefill_active, settings=generation_policy
         )
         if thinking_config:
             gen_config_dict["thinking_config"] = thinking_config

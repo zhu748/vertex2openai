@@ -31,6 +31,7 @@ from response_validation import (
 # split_model_alias` 的历史路径与 patch seam。
 from model_capabilities import SUFFIX_MODES, split_model_alias, supports_transport  # noqa: F401
 from model_catalog import listed_suffixes
+from model_resource import model_id_for_policy
 # Preserve existing imports while new directory consumers use the owning module.
 from model_catalog import catalog_variant_ids, search_variant_available  # noqa: F401
 
@@ -40,9 +41,12 @@ class TransportSelectionError(ValueError):
 
 def supports_argument_stream(model: str) -> bool:
     """Official native stream: Gemini 3+, except 3.1 Flash-Lite."""
-    match = re.search(r"gemini-(\d+)", model, re.I)
+    model = model_id_for_policy(model)
+    if "/" in model:  # An opaque resource does not identify a typed model.
+        return False
+    match = re.match(r"gemini-(\d+)(?=$|[.-])", model, re.I)
     return bool(match and int(match[1]) >= 3
-                and not re.search(r"gemini-3\.1-flash-lite(?:$|-)", model, re.I)
+                and not re.match(r"gemini-3\.1-flash-lite(?:$|-)", model, re.I)
                 and "stream_function_call_arguments" in types.FunctionCallingConfig.model_fields
                 and "partial_args" in types.FunctionCall.model_fields)
 

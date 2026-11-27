@@ -491,6 +491,92 @@ class TranslatedScopedModelRoutes(Round15Harness):
         timeout.assert_called_once_with(scoped)
         self.assertEqual([payload["model"] for _, payload in self.wire], [scoped])
 
+    async def test_express_exact_scoped_search_override_supplies_one_generation_policy(self):
+        scoped = resource()
+        search = scoped + "-search"
+        self.express_rows[0]["project_id"] = "alternate-key-project"
+        self.settings["express_location"] = "us-west2"
+        self.settings["model_overrides"] = {
+            scoped: {"default_max_tokens": 341, "native_thinking_mode": "off",
+                     "inject_system_instruction": "Base scoped settings."},
+            search: {"default_max_tokens": 719, "native_thinking_mode": "console", "thinking_g3_level": "high",
+                     "inject_system_instruction": "Search scoped settings."},
+        }
+        self.catalog_fixture([scoped, search])
+        for protocol in ("chat", "messages"):
+            for target, default_tokens, system_text, level, show in (
+                (scoped, 341, "Base scoped settings.", "MINIMAL", False),
+                (search, 719, "Search scoped settings.", "HIGH", True),
+            ):
+                with self.subTest(protocol=protocol, target=target):
+                    response = await self.send(protocol, target)
+                    self.assertEqual(response.status_code, 200, response.text[:220])
+                    self.assertEqual(len(self.wire), 1)
+                    path, wire = self.wire[0]
+                    self.assertEqual(path, f"/v1beta1/{scoped}:generateContent")
+                    self.assertEqual(wire["systemInstruction"]["parts"], [{"text": system_text}])
+                    generation = wire["generationConfig"]
+                    self.assertEqual(generation["maxOutputTokens"], 128 if protocol == "messages" else default_tokens)
+                    thinking = generation["thinkingConfig"]
+                    self.assertEqual(thinking.get("thinkingLevel", thinking.get("thinking_level")), level)
+                    self.assertIs(thinking.get("includeThoughts", thinking.get("include_thoughts")), show)
+                    if target == search:
+                        self.assertEqual(wire["tools"], [{"googleSearch": {}}])
+        rejected = await self.send("responses", search)
+        self.assertEqual(rejected.status_code, 400, rejected.text[:220])
+        self.assertEqual(self.wire, [])
+
+    async def test_express_generated_or_nonqualified_search_keeps_previous_injection_policy(self):
+        scoped = resource()
+        relative = f"models/{MODEL}"
+        self.settings["model_overrides"] = {
+            MODEL: {"default_max_tokens": 341, "inject_system_instruction": "Unchanged base settings."},
+            MODEL + "-search": {"default_max_tokens": 711, "inject_system_instruction": "Bare alias only."},
+            relative + "-search": {"default_max_tokens": 722, "inject_system_instruction": "Relative alias only."},
+            scoped + "-search-search": {"default_max_tokens": 733, "inject_system_instruction": "Compound only."},
+        }
+        for model, tokens, path in (
+            (scoped + "-search", 711, scoped),
+            (MODEL + "-search", 711, scoped),
+            (relative + "-search", 722, relative),
+            (scoped + "-search-search", 733, scoped),
+        ):
+            with self.subTest(model=model):
+                response = await self.send("chat", model)
+                self.assertEqual(response.status_code, 200, response.text[:220])
+                self.assertEqual(len(self.wire), 1)
+                wire_path, wire = self.wire[0]
+                self.assertEqual(wire_path, f"/v1beta1/{path}:generateContent")
+                self.assertEqual(wire["systemInstruction"]["parts"], [{"text": "Unchanged base settings."}])
+                self.assertEqual(wire["generationConfig"]["maxOutputTokens"], tokens)
+
+    async def test_express_exact_search_generation_reads_one_override_snapshot(self):
+        search = resource() + "-search"
+        before = {"default_max_tokens": 700, "inject_system_instruction": "Before reload.",
+                  "native_thinking_mode": "console", "thinking_g3_level": "high"}
+        after = {"default_max_tokens": 800, "inject_system_instruction": "After reload.",
+                 "native_thinking_mode": "console", "thinking_g3_level": "low"}
+        self.settings["model_overrides"] = {search: before}
+        prepare = express_sdk.prepare_messages
+
+        def reload_during_preparation(request, profile, settings):
+            self.settings["model_overrides"] = {search: after}
+            return prepare(request, profile, settings)
+
+        with patch.object(express_sdk, "prepare_messages", side_effect=reload_during_preparation):
+            first = await self.send("chat", search)
+        self.assertEqual(first.status_code, 200, first.text[:220])
+        first_wire = self.wire[0][1]
+        second = await self.send("chat", search)
+        self.assertEqual(second.status_code, 200, second.text[:220])
+        for body, expected in ((first_wire, before), (self.wire[0][1], after)):
+            self.assertEqual(body["systemInstruction"]["parts"], [{"text": expected["inject_system_instruction"]}])
+            generation = body["generationConfig"]
+            self.assertEqual(generation["maxOutputTokens"], expected["default_max_tokens"])
+            thinking = generation["thinkingConfig"]
+            self.assertEqual(thinking.get("thinkingLevel", thinking.get("thinking_level")),
+                             expected["thinking_g3_level"].upper())
+
     async def test_direct_studio_builder_does_not_import_settings_of_a_different_wire_target(self):
         from models import OpenAIRequest
 

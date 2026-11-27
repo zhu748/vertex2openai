@@ -392,9 +392,15 @@ def _responses_ordinary_tag(google, content, reasoning, budget):
         if content:
             parts.append(("text", content, None))
         kind = google.get("thought_signature_part")
-        if parts:
-            i = next((i for i in range(len(parts) - 1, -1, -1) if parts[i][0] == kind), len(parts) - 1)
+        if kind in ("text", "thought"):
+            # Same target rule as both adapters: no witness for a signature
+            # whose explicitly typed owner was removed from the public turn.
+            i = next((i for i in range(len(parts) - 1, -1, -1) if parts[i][0] == kind), None)
+            if i is None:
+                raise _Unsupported
             parts[i] = (*parts[i][:2], sig)
+        elif parts:
+            parts[-1] = (*parts[-1][:2], sig)
         else:
             parts.append(("text", "", sig))
         ordinary_first = False

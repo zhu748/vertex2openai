@@ -238,8 +238,8 @@ class RequestConversionTests(unittest.TestCase):
 class NativeAssemblerTests(unittest.TestCase):
     def test_stream_parts_and_terminal(self):
         asm = NativeAssembler("gemini-3.5-flash-lite")
-        self.assertEqual(asm.stream_event("text", "你好"), {"text": "你好"})
-        self.assertEqual(asm.stream_event("thought", "思考"), {"text": "思考", "thought": True})
+        self.assertEqual(asm.stream_event("text", "你好"), [{"text": "你好"}])
+        self.assertEqual(asm.stream_event("thought", "思考"), [{"text": "思考", "thought": True}])
         self.assertIsNone(asm.stream_event("usage", {"totalTokenCount": 5}))
         self.assertIsNone(asm.stream_event("safety", [{"category": "X"}]))
         self.assertIsNone(asm.stream_event("finish", "STOP"))
@@ -290,16 +290,16 @@ class NativeAssemblerTests(unittest.TestCase):
         asm.feed("thought_signature", {"value": "c2ln", "part_kind": "text"})
         self.assertEqual(asm.parts[-1], {"text": "hi", "thoughtSignature": "c2ln"})
 
-    def test_stream_budget_is_cumulative_and_tracks_last_part(self):
+    def test_stream_budget_is_cumulative_and_tracks_last_parts(self):
         # 2026-11 P2-3 回归：流式（retain_parts=False）预算改**累计**语义，
-        # 不再逐 part 重置——预算名副其实；分帧判定用 last_part_bytes，
+        # 不再逐 part 重置——预算名副其实；分帧判定用 last_parts_bytes，
         # 不被累计值污染（小 part 保持单帧编码）。
         asm = NativeAssembler("m", retain_parts=False, max_response_bytes=1000)
         asm.feed("text", "a" * 100)
         self.assertEqual(asm.response_bytes, 100 + len('{"text": ""}'))
         asm.feed("text", "b")
-        self.assertGreater(asm.response_bytes, asm.last_part_bytes)
-        self.assertLess(asm.last_part_bytes, 1024 * 1024)  # 小 part 不触发分帧
+        self.assertGreater(asm.response_bytes, asm.last_parts_bytes)
+        self.assertLess(asm.last_parts_bytes, 1024 * 1024)  # 小 part 不触发分帧
         # 累计超出预算：即使本 part 很小也要拒绝。
         with self.assertRaises(NativeBridgeError):
             asm.feed("text", "c" * 900)

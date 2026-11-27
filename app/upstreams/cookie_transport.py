@@ -186,6 +186,8 @@ def _event_has_reply(event: tuple[str, Any]) -> bool:
     kind, data = event
     if kind == "native_part":
         return native_part_has_reply(data)
+    if kind == "native_parts":
+        return any(native_part_has_reply(part) for part in data)
     return kind in ("text", "thought", "image", "thought_image", "hidden_thought", "function_call") and bool(data)
 
 
@@ -424,8 +426,10 @@ async def _execute_stream_request_generator_once(
                         "function_call",
                         "thought_signature",
                         "native_part",
+                        "native_parts",
                     ):
-                        has_content = has_content or event_type != "native_part" or native_part_has_reply(data)
+                        has_content = (has_content or event_type not in ("native_part", "native_parts")
+                                       or _event_has_reply((event_type, data)))
                         yield event_type, data
 
                     elif event_type in ("finish", "usage", "blocked", "safety", "candidate_metadata"):
@@ -603,7 +607,7 @@ async def stream_events(
                     return
                 if not guard.ready:
                     # PRF-P2-1（2026-11 收敛）：元数据计量不再 str(data)
-                    # 物化——native_part 含数十 MB base64 时先拼整串再
+                    # 物化——原生 parts 含数十 MB base64 时先拼整串再
                     # UTF-8 编码只为算字节数；改无拷贝递归估长（str/bytes
                     # 直接 len，容器走结构估算），上限闸粗估口径不变。
                     if isinstance(data, str):

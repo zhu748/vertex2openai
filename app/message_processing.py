@@ -667,21 +667,16 @@ def _rindex_by_identity(seq: list, item: Any) -> int:
     raise ValueError("签名目标 part 不在列表中（不应发生）")
 
 
-def _attach_message_signature(parts: list, message_sig: Optional[str], signature_kind: str) -> None:
-    """把消息级思考签名挂到目标 part（带工具调用与普通两条恢复路径共用）。
+def _attach_message_signature(parts: list, message_sig: bytes, signature_kind: str | None) -> None:
+    """A typed text/thought signature cannot outlive its owning kind of Part.
 
-    目标选择（与浏览器端语义对齐）：thought 签名挂最后一个思考 part；
-    text 签名挂最后一个非思考文本 part；都找不到时退回最后一个 part；
-    仅当 signature_only 才不退回（无 part 可挂时补一个空签名 part）。
-    挂载位置按对象身份反查（见 _rindex_by_identity 注释）。
-    （2026-11 审查收敛：此前 _assistant_tool_parts 与 _ordinary_message_parts
-    各持一份同构实现，注释互指“同上”。）
+    Exact descriptors take precedence elsewhere. Keep the legacy untyped
+    fallback, and preserve signature_only as its own independent carrier.
     """
     target = None
     if signature_kind == "thought":
-        target = next(
-            (p for p in reversed(parts) if getattr(p, "thought", None)), None
-        )
+        target = next((p for p in reversed(parts) if getattr(p, "thought", None)
+                       and getattr(p, "text", None) is not None), None)
     elif signature_kind == "text":
         target = next(
             (
@@ -692,6 +687,8 @@ def _attach_message_signature(parts: list, message_sig: Optional[str], signature
             ),
             None,
         )
+    if target is None and signature_kind in ("text", "thought"):
+        return  # The client no longer supplied the original kind of carrier.
     if target is None and signature_kind != "signature_only":
         target = parts[-1] if parts else None
     if target is None:

@@ -143,7 +143,8 @@ async def iter_json_objects(
 # 非流式正文里这些事件类型说明响应已有正文/工具内容：诊断采样器应停止留存
 # （「无正文」样本只对失败路径有价值，正文已到则 dump 永不触发；生图响应
 # 的单个对象可达 30-90MB inlineData，留存即钉住整份 base64 到函数返回）。
-BODY_EVENT_TYPES = frozenset({"text", "image", "thought_image", "hidden_thought", "function_call", "native_part"})
+BODY_EVENT_TYPES = frozenset({"text", "image", "thought_image", "hidden_thought", "function_call",
+                              "native_part", "native_parts"})
 
 
 class CompleteTextObjectCursor:
@@ -377,6 +378,17 @@ def _finish_native_part(native_part: dict, signature: str | None, *, empty_text:
         native_part["thought"] = True
 
 
+def _native_candidate_part_events(parts: list[dict]) -> Iterator[tuple[str, Any]]:
+    # SDKs may replay each streamed candidate Content separately. A signed
+    # first parallel call and its unsigned followers are one model step. Only
+    # multiple complete calls in the same source record prove this boundary;
+    # other native Parts keep their cadence.
+    if sum("functionCall" in part for part in parts) >= 2:
+        yield "native_parts", parts
+    else:
+        yield from (("native_part", part) for part in parts)
+
+
 def extract_events(obj: dict, *, preserve_parts: bool = False, strip_thoughts: bool = False,
                    boundary: CookieCandidateBoundary | None = None,
                    responses_output: bool = False) -> Iterator[tuple]:
@@ -440,6 +452,7 @@ def extract_events(obj: dict, *, preserve_parts: bool = False, strip_thoughts: b
                 # Gemini-native consumers retain their original finishReason.
                 validate_generation_finish_reason(candidate.get("finishReason"))
 
+            native_parts: list[dict] = []
             for part in parts:
                 part = _wire_object(part, "part", allow_null=False)
                 if responses_output:
@@ -523,7 +536,9 @@ def extract_events(obj: dict, *, preserve_parts: bool = False, strip_thoughts: b
                     _finish_native_part(native_part, signature, empty_text=part.get("text") == "", thought=thought)
                     extend_native_metadata(part, native_part)
                     if native_part:
-                        yield "native_part", native_part
+                        native_parts.append(native_part)
+
+            yield from _native_candidate_part_events(native_parts)
 
             # finishReason 全量透出（含 SAFETY/PROHIBITED_CONTENT 等），由消费方统一映射；
             # 旧实现只认 STOP/MAX_TOKENS/SAFETY 白名单，其余被静默吞掉，导致“无正文”无从排查。

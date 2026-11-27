@@ -819,7 +819,7 @@ class SDKGeneration:
             # silent queueing still times out, native tool fragments do not.
             if (
                 self.text_transport is None
-                and supports_argument_stream(self.request_obj.model)
+                and supports_argument_stream(self.model_to_call)
                 and any(tool.get("function_declarations") for tool in self.gen_config_dict.get("tools", []))
                 and self.gen_config_dict.get("tool_config", {}).get("function_calling_config", {}).get("mode") != "NONE"
             ):

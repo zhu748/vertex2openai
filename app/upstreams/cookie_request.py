@@ -351,18 +351,18 @@ def _ordinary_wire_parts_from_extra(message: Any, history: ManagedImageHistory |
     return parts
 
 
-def _attach_message_signature(parts: list[dict], message: Any) -> None:
-    signature, kind = standalone_message_signature(message)
-    # thoughtSignature 是 GraphQL Bytes 标量：哨兵与真实签名一样 base64 编码
-    #（字面量会被校验层拒绝，2026-11-16 真机验证，见 signature_store 说明）。
+def _attach_message_signature(parts: list[dict], signature: bytes | None, kind: str | None) -> None:
+    # A typed text or thought carrier is not interchangeable with another Part.
     encoded = encode_thought_signature(signature)
     if not encoded:
         return
     target = None
     if kind == "thought":
-        target = next((p for p in reversed(parts) if is_thought_part(p)), None)
+        target = next((p for p in reversed(parts) if "text" in p and is_thought_part(p)), None)
     elif kind == "text":
         target = next((p for p in reversed(parts) if "text" in p and not is_thought_part(p)), None)
+    if target is None and kind in ("text", "thought"):
+        return
     if target is None and kind != "signature_only":
         target = parts[-1] if parts else None
     if target is None:
@@ -482,7 +482,7 @@ def _convert_messages_to_contents(messages: list, model_name: str = "", native_t
                     ordinary = _ordinary_wire_parts_from_extra(msg, history)
                     if ordinary is None:
                         ordinary = openai_content_to_wire_parts(content, history)
-                        _attach_message_signature(ordinary, msg)
+                        _attach_message_signature(ordinary, *standalone_message_signature(msg))
                     contents.append({"role": "model", "parts": [*ordinary, {"text": "\n".join(lines)}]})
                 else:
                     if said:
@@ -521,7 +521,7 @@ def _convert_messages_to_contents(messages: list, model_name: str = "", native_t
                 if reasoning:
                     ordinary_parts.extend(openai_content_to_wire_parts(reasoning, history, thought=True))
                 ordinary_parts.extend(openai_content_to_wire_parts(content, history, literal_text=literal_text))
-                _attach_message_signature(ordinary_parts, msg)
+                _attach_message_signature(ordinary_parts, *standalone_message_signature(msg))
 
             google = google_metadata(msg)
             # QUA-P2-3：part_order 交错重组收敛到 thought_signatures.merge_by_order
@@ -540,9 +540,14 @@ def _convert_messages_to_contents(messages: list, model_name: str = "", native_t
             parts = openai_content_to_wire_parts(content, history if assistant else None, literal_text=literal_text)
             if assistant:
                 reasoning = msg.reasoning_content
-                if reasoning and (literal_text or "ordinary_parts" in google_metadata(msg) or history and history.pattern.search(reasoning)):
+                signature, kind = standalone_message_signature(msg)
+                # Preserve a supplied signed thought even outside a tool turn.
+                # Do not change the visibility of unsigned legacy thought text.
+                if reasoning and (literal_text or signature and kind == "thought"
+                                  or "ordinary_parts" in google_metadata(msg)
+                                  or history and history.pattern.search(reasoning)):
                     parts = openai_content_to_wire_parts(reasoning, history, thought=True) + parts
-                _attach_message_signature(parts, msg)
+                _attach_message_signature(parts, signature, kind)
         if parts:
             contents.append({"role": gemini_role, "parts": parts})
 

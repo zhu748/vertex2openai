@@ -231,6 +231,9 @@ curl -s https://你的域名/v1beta/models -H "x-goog-api-key: 你的API_KEY"
 - **SDK 多轮签名**：Cookie 桥接将 `thoughtSignature` 和 `inlineData.data`（含工具结果中的内联媒体）
   的合法 ProtoJSON Base64 转成 GraphQL 所需的标准 Base64，保留原始字节与 Part 顺序。
   普通参数、工具结果 JSON 及 Express 的原生透传不作此改写。
+  Cookie 原生流会保留同一上游候选中完整并行工具调用的 Part 分组与顺序，不把无签名的并行跟随调用
+  拆成一个新步骤。此行为默认生效，不区分 harness；不合并来自不同上游记录的调用。
+  Express 不从客户端名称、工具名称或调用 ID 猜测旧模型来源，也不替原生历史制造缺失签名。
 - **原生 SSE 保活**：直连流式接口只用空行保活，不注入空模型事件；这避免 Python
   `google-genai` 2.31.0 把代理的心跳注释当成 JSON。显式续传的 `id:` 游标格式不变。
   如果响应头已经发出，Express 的迟到错误仍用原有 Google 错误数据；检测到当前锁定的

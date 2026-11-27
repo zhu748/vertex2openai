@@ -23,6 +23,7 @@ class ActiveCallSiblings(unittest.TestCase):
                     siblings = [
                         types.Part(text="progress ", function_call=marker),
                         types.Part(text="thinking", thought=True, thought_signature=b"thought", function_call=marker),
+                        types.Part(text="", thought=True, thought_signature=b"signed-empty", function_call=marker),
                         types.Part(file_data=types.FileData(file_uri="local://example", mime_type="text/plain"),
                                    thought_signature=b"file", function_call=marker),
                         types.Part(inline_data=types.Blob(data=b"\x00\xff", mime_type="image/png"),

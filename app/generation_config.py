@@ -158,9 +158,10 @@ def _configure_images(config: dict, request: OpenAIRequest, settings: dict, prof
     )
 
 
-def create_generation_config(request: OpenAIRequest) -> dict[str, Any]:
+def create_generation_config(request: OpenAIRequest, *, settings: dict | None = None) -> dict[str, Any]:
     """请求值优先于控制台默认值，最后按模型能力剥离不支持的参数。"""
-    settings = app_state.get_effective_settings(request.model)
+    if settings is None:
+        settings = app_state.get_effective_settings(request.model)
     profile = mc.apply_sampling_policy(mc.get_profile(request.model), settings)
     config = _request_parameters(request)
     config.update(_response_format(request))

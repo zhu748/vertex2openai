@@ -118,6 +118,9 @@ class DirectWireParsingTests(unittest.TestCase):
 
     def test_signature_only_native_parts_never_count_as_first_reply(self):
         self.assertFalse(cookie_transport._event_has_reply(("native_part", {"thoughtSignature": "c2ln"})))
+        self.assertFalse(cookie_transport._event_has_reply(("native_parts", [
+            {"thoughtSignature": "c2ln"}, {"text": "", "thoughtSignature": "AQI="},
+        ])))
         self.assertFalse(cookie_transport._event_has_reply(("usage", {"totalTokenCount": 10})))
 
 

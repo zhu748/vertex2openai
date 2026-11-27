@@ -225,7 +225,12 @@ def sdk_function_call(part, *, active=False):
     if active and not getattr(part, "text", None) and sdk_media_payload(part) is None:
         # An otherwise-empty Part can close the current call; a bare late
         # signature can belong to it too. Neither justifies consuming a
-        # separate visible text/thought/media Part as that call's terminator.
+        # separate text/thought/media Part as that call's terminator.
+        if (getattr(part, "text", None) == "" and getattr(part, "thought", None) is True
+                and getattr(part, "thought_signature", None)):
+            # An explicit signed empty thought is still its own typed Part.
+            # The default FunctionCall shell proves no tool ownership.
+            return None
         return call
     return None
 
