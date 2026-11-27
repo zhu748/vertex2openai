@@ -242,7 +242,14 @@ curl -s https://你的域名/v1beta/models -H "x-goog-api-key: 你的API_KEY"
   普通参数、工具结果 JSON 及 Express 的原生透传不作此改写。
   Cookie 原生流会保留同一上游候选中完整并行工具调用的 Part 分组与顺序，不把无签名的并行跟随调用
   拆成一个新步骤。此行为默认生效，不区分 harness；不合并来自不同上游记录的调用。
-  Express 不从客户端名称、工具名称或调用 ID 猜测旧模型来源，也不替原生历史制造缺失签名。
+  Express 不从客户端名称、工具名称或调用 ID 猜测旧模型来源。Gemini 3+ 原生生成请求先使用
+  原始请求体；仅当上游 HTTP 400 明确表示工具调用缺少签名时，才在原 Key、模型路径和出口
+  上追加一次兼容重试。该重试只给各缺签工具组的首个调用加
+  [Google 官方兼容标记](https://aistudio.google.com/docs/thought-signatures?generate-content=true#faqs)
+  `skip_thought_signature_validator`（不是模型签名，不能恢复原有推理状态）。
+  已有签名、并行跟随调用及工具结果不改；不为无结果的调用造结果。此额外尝试不计入 429/5xx 换 Key 预算，
+  不处理已返回模型内容的流式错误，不改变原始请求下载。单次兼容重写限 4 MiB，
+  有歧义的格式不会猜测。
 - **原生 SSE 保活**：直连流式接口只用空行保活，不注入空模型事件；这避免 Python
   `google-genai` 2.31.0 把代理的心跳注释当成 JSON。显式续传的 `id:` 游标格式不变。
   如果响应头已经发出，Express 的迟到错误仍用原有 Google 错误数据；检测到当前锁定的

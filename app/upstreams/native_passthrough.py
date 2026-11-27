@@ -38,7 +38,9 @@ from response_validation import FINISH_CONTENT_FILTER, IncompleteResponseError, 
 from admission import (count_slow_setup_failure, GenerationCapacityError, limit_generation, ManagedStreamingResponse,
                        run_with_image_limit, SETUP_FAST_WINDOW_SECONDS)
 from logger import stats
-from request_tracking import upstream_attempt, upstream_chunk
+from request_tracking import current_trace, upstream_attempt, upstream_chunk
+from native_signature_fallback import (fallback_supported, missing_signature_error,
+                                       with_missing_native_signatures)
 import first_reply as first_reply_module
 from first_reply import FirstReplyGuard, native_has_reply
 from json_stream import MAX_JSON_OBJECT_BYTES, JsonObjects
@@ -295,6 +297,10 @@ async def _passthrough_request_impl(fastapi_request: Request, model: str, action
     key_attempts = 0           # 上游错误已重试次数（不含首次）
     pin_fallback_used = False  # 每次选 Key 后最多兜底一次
 
+    fallback_allowed = fallback_supported(model_id, action)
+    compatibility_payload: bytes | None = None
+    winning_client: httpx.AsyncClient | None = None
+
     while True:
         if await fastapi_request.is_disconnected():
             return Response(status_code=499)
@@ -356,10 +362,17 @@ async def _passthrough_request_impl(fastapi_request: Request, model: str, action
             upstream_attempt()
             async def send(raw: dict, resolved: Any,
                            _key: str = express_key, _path: str = model_path):  # B023：默认参数绑定重试循环变量
+                nonlocal winning_client
+                winning_client = client_for(raw, resolved)
                 return await _passthrough_once(
-                    client_for(raw, resolved), _key, _path, action, query, payload,
-                    stream=is_stream)
-            upstream = await first_reply.wait(proxy_chain.run(send))
+                    winning_client, _key, _path, action, query, payload, stream=is_stream)
+            if compatibility_payload is not None:
+                assert winning_client is not None
+                stats.add_retry()
+                upstream = await first_reply.wait(_passthrough_once(
+                    winning_client, express_key, model_path, action, query, compatibility_payload, stream=is_stream))
+            else:
+                upstream = await first_reply.wait(proxy_chain.run(send))
             if not is_stream:
                 upstream_chunk()
                 if upstream.status_code < 400:
@@ -380,6 +393,9 @@ async def _passthrough_request_impl(fastapi_request: Request, model: str, action
         except Exception as e:
             if upstream is not None:
                 await _close_upstream(upstream)
+            if compatibility_payload is not None:
+                last_error_status, last_error_body, last_error_headers = _classify_attempt_error(e, upstream)
+                break  # Exactly one compatibility attempt; never rotate keys or exits.
             # The HTTP handshake can succeed and the body then fail before
             # prefetch has exposed any output. Try the same account's next
             # proxy before consuming model retry budget or selecting a Key.
@@ -422,7 +438,7 @@ async def _passthrough_request_impl(fastapi_request: Request, model: str, action
 
         # 429/5xx：按控制台预算重选 Key，不能因单 Key / 池已用遍而提前退出。
         retryable_status = is_retryable_status(upstream.status_code)
-        if retryable_status and key_attempts < retry_max:
+        if compatibility_payload is None and retryable_status and key_attempts < retry_max:
             last_error_status, ctype, last_error_headers, last_error_body = await _buffered_upstream_result(upstream)
             hint = last_error_headers.get("retry-after")
             if not advisory_fits(hint, fastapi_request, deadline=deadline):
@@ -450,8 +466,14 @@ async def _passthrough_request_impl(fastapi_request: Request, model: str, action
         # 错误（或非流式响应）：缓冲 body 再透传，顺带供钉定失败判定
         status, ctype, headers, body = await _buffered_upstream_result(upstream)
 
+        if patched := _try_native_signature_retry(
+                fallback_allowed and compatibility_payload is None, upstream, status, ctype, body, payload,
+                min(deadline, first_reply.deadline) if first_reply.seconds else deadline):
+            compatibility_payload = patched
+            continue
+
         # 钉定路径失败 → 退回裸模型名再试一次（不占 Key 轮换预算）
-        if (not pin_fallback_used and model_path != model
+        if (compatibility_payload is None and not pin_fallback_used and model_path != model
                 and _looks_like_pin_failure(status, body) and not response_requests_delay(upstream)):
             pin_fallback_used = True
             last_error_status, last_error_body = status, body
@@ -788,6 +810,25 @@ def _decode_setup_error(response: Response) -> tuple[Any, bool]:
         if media_type == "text/event-stream" and (data := _single_sse_error_data(raw)) is not None:
             return json.loads(data), False
         raise
+
+
+def _try_native_signature_retry(enabled: bool, upstream: httpx.Response, status: int, content_type: str,
+                                body: bytes, original: bytes, deadline: float) -> bytes | None:
+    if not enabled or status != 400 or response_requests_delay(upstream) or time.monotonic() >= deadline:
+        return None
+    try:
+        document, _ = _decode_setup_error(Response(body, media_type=content_type, status_code=400))
+    except (ValueError, RecursionError):
+        return None
+    if missing_signature_error(document) and (result := with_missing_native_signatures(original)):
+        patched, leaders = result
+        if time.monotonic() >= deadline:
+            return None
+        if trace := current_trace.get():
+            trace.event("native_signature_fallback",
+                        f"上游拒绝缺少思考签名的请求；对 {leaders} 组缺签调用使用官方兼容标记，仅重试一次。")
+        return patched
+    return None
 
 
 def _normalize_setup_error(response: Response, limit: int, *, preserve_json_wire: bool = False) -> tuple[dict, bytes]:
