@@ -640,8 +640,14 @@ async function main(){
    const reply=(data,status=200)=>new Response(JSON.stringify(data),{status});
    const detailPath='/api/requests/'+record.id;
    let available=true, reported=record.id, status=200;
-   transport=target=>target.pathname===detailPath?reply({...record,id:reported,raw_body_available:available},status):undefined;
+   let thinking={thinking_level:'XHIGH',thinking_source:'console'};
+   transport=target=>target.pathname===detailPath?reply({...record,protocol:'gemini',id:reported,raw_body_available:available,...thinking},status):undefined;
    hidden();w.requestMonitor.open(record.id);await tick();
+   assert.match(el('request-detail-content').textContent,/XHIGH \/ 未指定[^]*控制台强制/);
+   thinking={};el('request-refresh').click();await tick();
+   assert.match(el('request-detail-content').textContent,/未记录 \/ 未记录/);
+   thinking={thinking_source:'unspecified'};el('request-refresh').click();await tick();
+   assert.match(el('request-detail-content').textContent,/未指定 \/ 未指定[^]*客户端未指定/);
    assert.equal(pane.hidden,false);assert.equal(link.getAttribute('href'),detailPath+'/raw-body');
    assert.equal(link.hasAttribute('download'),true);assert.equal(link.getAttribute('referrerpolicy'),'no-referrer');
    assert.equal(new URL(link.href).origin,w.location.origin);

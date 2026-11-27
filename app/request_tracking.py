@@ -170,7 +170,8 @@ class RequestTrace:
     def configure(self, **values):
         with self._lock:
             for key in ("model", "protocol", "channel", "stream", "mode", "generation_id", "parent_id", "detached",
-                        "thinking_level", "include_thoughts", "max_output_tokens", "upstream_model", "project_id"):
+                        "thinking_level", "include_thoughts", "max_output_tokens", "upstream_model", "project_id",
+                        "thinking_source"):
                 if key in values:
                     value = values[key]
                     self.data[key] = redact(value[:500]) if isinstance(value, str) else value

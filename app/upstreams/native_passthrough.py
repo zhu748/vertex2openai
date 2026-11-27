@@ -38,7 +38,8 @@ from response_validation import FINISH_CONTENT_FILTER, IncompleteResponseError, 
 from admission import (count_slow_setup_failure, GenerationCapacityError, limit_generation, ManagedStreamingResponse,
                        run_with_image_limit, SETUP_FAST_WINDOW_SECONDS)
 from logger import stats
-from request_tracking import current_trace, upstream_attempt, upstream_chunk
+from request_tracking import configure as track_configure, current_trace, upstream_attempt, upstream_chunk
+from native_thinking import native_destination_fields
 from native_signature_fallback import (fallback_supported, missing_signature_error,
                                        with_missing_native_signatures)
 import first_reply as first_reply_module
@@ -217,6 +218,12 @@ def native_expects_one_candidate(body: dict) -> bool:
     return not values or (len(values) == 1 and (values[0] is None or int32_value(values[0]) == 1))
 
 
+def _track_native_delivery(request: Request, model_path: str, record: dict) -> None:
+    wire_fields = getattr(request, "scope", {}).get("state", {}).get("native_generation_fields")
+    if wire_fields is not None:
+        track_configure(**wire_fields, **native_destination_fields(model_path, record.get("project_id", "")))
+
+
 async def _passthrough_request_impl(fastapi_request: Request, model: str, action: str,
                                    query: str, payload: bytes):
     """选 Key → 透传 → 429/5xx 换 Key 重试 → 钉定失败兜底。返回 Response。
@@ -359,6 +366,7 @@ async def _passthrough_request_impl(fastapi_request: Request, model: str, action
         upstream = None
         prefetched = None
         try:
+            _track_native_delivery(fastapi_request, model_path, record)
             upstream_attempt()
             async def send(raw: dict, resolved: Any,
                            _key: str = express_key, _path: str = model_path):  # B023：默认参数绑定重试循环变量

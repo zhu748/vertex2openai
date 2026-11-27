@@ -52,6 +52,8 @@ from impersonate import open_upstream_client
 from logger import stats
 from proxy_failover import ProxyChain
 from protojson import int32_value, standard_base64
+from request_tracking import configure as track_configure
+from native_thinking import native_destination_fields, native_generation_fields
 from response_validation import IncompleteResponseError, PendingMetadataGate
 from resumable import request_timeout_seconds
 from retry_policy import advisory_fits, get_retry_settings, note_retry_deadline
@@ -827,6 +829,15 @@ class NativeAssembler:
 # ============================================================
 # 事件泵：复用 cookie 通道生成器 + 429 退避重试（首个内容前）
 # ============================================================
+def _track_native_cookie_delivery(request: Request, body: dict) -> None:
+    variables = body.get("variables")
+    if not isinstance(variables, dict) or not isinstance(variables.get("model"), str):
+        return
+    state = getattr(request, "scope", {}).get("state", {})
+    track_configure(**native_generation_fields(variables, forced=state.get("native_thinking_forced", False)),
+                    **native_destination_fields(variables["model"]))
+
+
 async def _events_with_retry(fastapi_request: Request, record: dict, body: dict,
                              model_name: str, *, deadline: Optional[float] = None):
     """yield (kind, data) 原始事件；"heartbeat" 用于退避等待期间的 SSE 保活。
@@ -857,6 +868,7 @@ async def _events_with_retry(fastapi_request: Request, record: dict, body: dict,
             stats.add_retry()
         req_headers = build_headers(cookie_str)
         async with open_upstream_client(client_kwargs) as client:
+            _track_native_cookie_delivery(fastapi_request, body)
             committed = False
             # The inner transport may flush a signed-empty or diagnostic prefix
             # before an error. Neither belongs to a later successful attempt.

@@ -267,8 +267,20 @@
         metric('结束原因', r.finish_reasons.join(', ') || '尚未结束'),
         metric(
           '思考档位 / 输出上限',
-          `${r.thinking_level ?? '默认'} / ${r.max_output_tokens ?? '默认'}`
+          r.protocol === 'gemini'
+            ? `${r.thinking_level ?? (r.thinking_source ? '未指定' : '未记录')} / ${r.max_output_tokens ?? (r.thinking_source ? '未指定' : '未记录')}`
+            : `${r.thinking_level ?? '默认'} / ${r.max_output_tokens ?? '默认'}`
         ),
+        ...(r.protocol === 'gemini'
+          ? [
+              metric(
+                '思考档位来源',
+                { console: '控制台强制', client: '客户端请求', unspecified: '客户端未指定' }[
+                  r.thinking_source
+                ] || '未记录'
+              )
+            ]
+          : []),
         metric('HTTP / 流内错误码', `${r.http_status ?? '—'} / ${r.error_code ?? '—'}`),
         metric('最后上游活动', date(r.timings.last_upstream?.at)),
         metric('无上游新数据', duration(r.idle_ms), true),

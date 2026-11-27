@@ -9,9 +9,10 @@ Gemini 直连的客户端）说的是另一套协议：
     POST /v1beta/models/{model}:countTokens
     GET  /v1beta/models                              （模型列表）
 
-本模块把这些端点**原样透传**到 Gemini Express（api_key）端点，不做任何
-字段转换——tools / function calling / thinkingConfig / safetySettings /
-cachedContent / responseSchema 等字段保持原请求体，兼容性取决于上游模型与端点；
+本模块默认把这些端点按原协议透传到 Gemini Express（api_key）。
+仅显式强制思考档位、命名变体或上游缺签兜底有局部改写；
+tools / function calling / safetySettings / cachedContent / responseSchema
+等字段是否可用取决于上游模型与端点；
 认证从本服务 Key 替换为 Express Key。
 
 实现要点：
@@ -55,6 +56,7 @@ from catalog_pagination import CatalogPageError, gemini_model_page
 from config import API_KEY
 from express_fingerprint import sdk_label
 from logger import stats
+from native_thinking import forced_native_generation, native_generation_fields, rewrite_native_generation
 from model_loader import get_express_models
 from retry_policy import note_retry_deadline
 from request_connection import ClientConnection
@@ -183,6 +185,22 @@ def _python_sdk_error_first(request: Request) -> bool:
                for name in ("x-goog-api-client", "user-agent"))
 
 
+def _prepare_native_thinking(request: Request, requested_model: str, model_id: str,
+                             action: str, explicit: bool, raw_body: bytes, parsed: dict) -> bytes:
+    if explicit or action not in ("generateContent", "streamGenerateContent"):
+        return raw_body
+    result = forced_native_generation(model_id, app_state.get_effective_settings(requested_model), parsed)
+    if result is not None:
+        key, cfg = result
+        raw_body = rewrite_native_generation(raw_body, key, cfg, has_members=bool(parsed))
+        parsed[key] = cfg
+    if hasattr(request, "scope"):
+        state = request.scope.setdefault("state", {})
+        state["native_thinking_forced"] = result is not None
+        state["native_generation_fields"] = native_generation_fields(parsed, forced=result is not None)
+    return raw_body
+
+
 def _passthrough_endpoint():
     """为 /v1beta 与 /v1 两个前缀注册同一个透传处理。
 
@@ -292,6 +310,13 @@ def _passthrough_endpoint():
                 track_configure(model=requested_model, protocol="gemini", channel="express", stream=True,
                                 mode="stream")
                 return replay
+
+        try:
+            raw_body = _prepare_native_thinking(request, requested_model, model_id, action, explicit, raw_body, parsed)
+        except SchemaValidationError as exc:
+            return _native_error(400, str(exc))
+        if len(raw_body) > MAX_NATIVE_BODY_BYTES:
+            return _native_error(413, f"请求体超过 {MAX_NATIVE_BODY_BYTES // (1024 * 1024)}MiB 上限。")
 
         # 通道选择（尊重控制台的通道模式开关，与 chat_api 的选路语义对齐）：
         # - web_proxy（Cookie 模式）：配置了 Cookie 账号就走 Cookie 通道**协议级桥接**
